@@ -524,6 +524,8 @@ Providers cache on an exact *leading* prefix. The per-domain instruction normall
 
 **Why it stays off anyway, for this project:** the same four runs surfaced something bigger than the caching question — only 18 of 259 distinct findings reproduced across 3 or more of the 4 runs, meaning a single run here is roughly 75% non-reproducible regardless of this setting. Against that, a $0.55 saving on a ~$8 run (≈7%) optimizes the cost of a measurement this pipeline's own output doesn't yet make trustworthy in one copy — and the setting is a second prompt-assembly path to keep working. That's a judgment call about this pipeline's priorities, not a defect in the feature: **if your use case runs the pipeline at high volume, or already aggregates multiple runs into one result (where the saving scales with run count instead of being swamped by per-run noise), this is a legitimate setting to turn on.** The code, tests, and this section exist so that decision is cheap to make.
 
+**Re-examine this now that aggregation has landed (2026-09-05).** The clause above names a condition — "already aggregates multiple runs into one result" — that the pipeline now meets part of the way by itself: every run is scored against earlier runs of the same draft (see [Reproducibility context](#reproducibility-context) below). That does not flip the decision on its own, and the default stays `false`. What changed is the incentive underneath it. Re-running an unchanged draft used to buy nothing but a different random sample; it now measurably improves the report, because each repeat run enlarges the denominator every finding is scored against. **If you start deliberately running a draft two or three times before revising it, you are the use case this setting was left open for, and the per-run saving multiplies by the number of runs you make.** If you keep running each draft once, nothing here has changed and it should stay off.
+
 **The golden report cannot verify this.** `test_pipeline_end_to_end.py` stubs `_run_domain`, and that is exactly where this setting is applied, so flipping the flag produces an empty golden diff by construction. An empty diff there is evidence the code never ran, not evidence the findings held. Verifying it means a live run compared against a prior live run of the same article — and, per the finding above, at least two runs per condition, since a single run's findings are not a stable baseline to diff against.
 
 ---
@@ -710,6 +712,111 @@ search is disabled for these calls. Refutations past the limit are logged rather
 than dropped silently. The pass does not run with `--offline`. A claim traced to
 the draft's own citation block was asserted by the author rather than by a
 model, so there is nobody to hand it back to and it is skipped.
+
+---
+
+### Reproducibility context
+
+Every run compares itself against earlier runs of the same draft and reports what
+it finds. There is no setting: it is always on, it costs nothing, and it makes no
+model calls.
+
+**The problem it addresses.** A review report used to present one run's findings
+as a definitive list — counts, weights, and a ranked Section 1 that feeds the
+revision prompt. It is not one. As measured above, only 18 of 259 distinct
+findings reproduced across 3 or more of 4 runs of the same unedited article. A
+reader — including the person who wrote the draft — reasonably takes "4 consensus
+flags" as a property of their article. It is substantially a property of that
+run. Reports now say so, at the top, in a **Reading this report** block that
+frames the sections rather than footnoting them.
+
+**Where the comparison comes from.** `pipeline_history/` already holds a full
+report for every run ever made, including the draft text each one reviewed. So
+the Nth run of a draft can be scored against the N-1 that preceded it using work
+already paid for. Nothing is re-run, and no run costs more than it did before.
+This directly answers the objection that reproducibility can only be bought by
+paying N times per draft: for the second and later runs of a draft, it is free.
+
+**What counts as comparable.** Two runs are compared only when they reviewed the
+same draft *and* ran the same ensemble configuration. Both halves matter, and
+the second is easy to get wrong. This project's own
+`pipeline_history/dc-environment` holds 47 runs over 8 distinct drafts, and its
+largest same-draft cluster — 23 runs — mixes single-pass probes with full 25-pass
+`maximum` runs. Grouping on the draft alone would report a finding as "absent
+from 11 runs" that never ran the domain capable of producing it. Runs that do not
+match are listed in the report as skipped, with the reason, so a small
+denominator never looks like a thin history.
+
+The key covers more than the pass list, because `model:domain` names a
+*provider*: `openai:fact_check` is the same string whether the run used
+`gpt-5.4-mini` or `gpt-5.5`. So the distinct model identities are folded in from
+the run's call log, together with `consensus_threshold` and
+`consensus_min_models` — the two settings that decide what reaches Section 1 at
+all. Change a preset or retune either gate and later runs stop being scored
+against the old ones, which is correct: they are measuring a different pipeline.
+
+Every part of that key was chosen by measuring what it costs against the 47-run
+`dc-environment` history, counting runs that still find a comparable
+predecessor: pass list alone 25, plus the two consensus gates 25 (free), plus
+model identities 20. Two further candidates were rejected for what they cost —
+splitting on the `[grounded]` suffix (14) and on per-call reasoning effort (11).
+The grounding suffix in particular marks a *call*, not a configuration: the same
+model appears with and without it inside a single run.
+
+Whitespace-only differences do not count as a different draft. `prompt_cache_layout`
+is deliberately *not* part of the comparability key: the four-run test above found
+its two conditions indistinguishable within run-to-run noise, and it is the pairing
+of those two conditions that produced the 18-of-259 figure in the first place.
+
+**Partial failures.** A run whose `voice_style` passes all failed had no
+opportunity to raise a voice finding, and scoring it as "did not reproduce" would
+understate every voice finding in the report. Denominators are therefore per
+section: a prior run counts toward a section only if at least one pass feeding
+that section succeeded. This matters more than it sounds — of the 12 comparable
+25-pass runs of one draft in this repo, exactly **one** finished with no failed
+passes, so discarding degraded runs would have discarded the history. The
+correction is partial by construction (a run that lost one of five voice passes
+still counts as a whole unit), so reproduction counts are a floor rather than a
+point estimate, and the report says that whenever any comparable run was degraded.
+
+**What the report shows.**
+
+- A **Reading this report** block at the top: how many comparable runs were
+  found, how many of this run's findings recurred in at least half of them, and
+  a per-section table. With no comparable history it says so plainly and quotes
+  the 18-of-259 calibration figure instead of implying a measurement it did not
+  take.
+- **Section 1 in bands, not ranked.** The old strict ordering by `weight_sum`
+  was misleading: in one measured run of this repo's own history, the
+  top-ranked finding (weight 2.5) appeared in *none* of the 4 comparable prior
+  runs, while the finding ranked third appeared in all 4. Findings are now
+  grouped into `Reproduced in earlier runs` / `Partly reproduced` / `New in
+  this run`, and order within a band carries no meaning. They say
+  "reproduced", not "corroborated": this report uses corroboration for a
+  different axis — several models agreeing *within one run*, in Section 8's
+  ranking and in the Ensemble Width block — and a finding can be one without
+  the other. Without comparable
+  history the bands fall back to how many passes flagged each finding, which is
+  a count of evidence rather than a weighted score.
+- **Weights to one decimal, labelled "run weight".** Two decimals implied a
+  precision the process does not have: the same finding on the same draft scored
+  anywhere from 2.0 to 7.4 across repeat runs.
+- **Per-finding notes** in Sections 1 through 5, reading `[also in 3 of 4
+  comparable prior runs]` or `[new — in none of 4 ...]`.
+
+A finding raised only once is not thereby wrong. Most findings are single-run,
+and single-run findings include real ones. It means the evidence for it is one
+sample, which is what the report now says.
+
+**In the report JSON**, findings carry `reproduced_in` / `reproduced_of`, and a
+`reproducibility` block records the fingerprint, the comparable runs, the skipped
+ones with reasons, and per-section totals. When nothing comparable was found the
+per-finding fields are **absent rather than zero** — a measurement that was never
+taken must not read as a measurement that came back empty.
+
+**To get the measurement**, run the same draft twice before revising it. The
+second run reports against the first at no extra cost. Editing the draft resets
+it, which is correct: findings about the old text are not evidence about the new.
 
 ---
 

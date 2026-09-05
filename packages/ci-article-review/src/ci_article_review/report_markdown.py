@@ -114,11 +114,21 @@ def _render_alternates(urls, indent="  "):
     return lines
 
 
+#: Reproducibility bookkeeping written onto findings by ``reproducibility
+#: .annotate``. Excluded from the generic key/value dump everywhere, because
+#: every site that shows them renders them deliberately through
+#: ``_reproduction_note`` — "Reproduced in: 3" with no denominator beside it
+#: says nothing a reader can use.
+_REPRODUCIBILITY_FIELDS = ("reproduced_in", "reproduced_of")
+
+
 def _kv_lines(d, exclude=()):
     """Render remaining key/value pairs of a flag dict as indented bullets."""
     lines = []
     for key, value in d.items():
-        if key in exclude or value in (None, "", [], {}):
+        if key in exclude or key in _REPRODUCIBILITY_FIELDS:
+            continue
+        if value in (None, "", [], {}):
             continue
         if key == "wayback" and isinstance(value, dict):
             lines.append(f"  - Wayback: {_wayback_summary(value)}")
@@ -192,7 +202,198 @@ def _skipped_note(dropped_by_field):
     ]
 
 
-def _render_section_1(consensus_flags):
+#: Section keys carrying per-finding reproduction counts, with the labels used
+#: in the summary table. Kept in the renderer rather than imported so this
+#: module stays a dependency-free renderer over a plain dict; a test asserts it
+#: stays in step with ``reproducibility``.
+_REPRODUCIBILITY_SECTIONS = (
+    ("section_1_consensus", "1 Consensus"),
+    ("section_2_fact_check", "2 Fact-check"),
+    ("section_3_voice", "3 Voice"),
+    ("section_4_argument", "4 Argument"),
+    ("section_5_completeness", "5 Completeness"),
+)
+
+
+def _render_reading_note(report):
+    """The variance caveat, at the top where it frames everything below it.
+
+    This is the honest core of the report. Every count, weight and ordering
+    below is a property of one non-deterministic run at least as much as it is
+    a property of the draft, and a reader who does not know that will read "4
+    consensus flags" as a fact about their article. Measured: four full live
+    runs of one unedited article produced 259 distinct findings, of which 18
+    appeared in three or more of the four.
+
+    It is deliberately not a footnote. A caveat placed after the findings is
+    read after the reader has already formed a view of them.
+    """
+    repro = report.get("reproducibility") or {}
+    calibration = repro.get("calibration") or {}
+    runs = repro.get("comparable_run_count") or 0
+
+    lines = [
+        "## Reading this report",
+        "",
+        "**This is one run, and one run is not a measurement.** The review "
+        "pipeline is not deterministic: repeat runs over an unedited draft "
+        "return substantially different findings. The counts, the weights and "
+        "the order of Section 1 are properties of this run at least as much as "
+        "properties of the draft.",
+        "",
+    ]
+
+    if runs:
+        totals = repro.get("sections") or {}
+        found = sum(s.get("findings", 0) for s in totals.values())
+        at_least_half = sum(s.get("at_least_half", 0) for s in totals.values())
+        never = sum(
+            s.get("findings", 0) - s.get("reproduced", 0) for s in totals.values()
+        )
+        lines.append(
+            f"**Measured on this draft.** This run was compared against "
+            f"{runs} earlier run(s) of the same draft with the same ensemble "
+            f"configuration — already on disk, so the comparison cost nothing. "
+            f"Of {found} findings, {at_least_half} were raised again in at least "
+            f"half of those runs and {never} appeared in none of them."
+        )
+        lines.append("")
+        lines.append("| Section | Findings | Also in >=1 prior run | In >=half |")
+        lines.append("|---|---:|---:|---:|")
+        for key, label in _REPRODUCIBILITY_SECTIONS:
+            stats = totals.get(key)
+            if not stats:
+                continue
+            lines.append(
+                f"| {label} | {stats.get('findings', 0)} | "
+                f"{stats.get('reproduced', 0)} | {stats.get('at_least_half', 0)} |"
+            )
+        lines.append("")
+        degraded = repro.get("degraded_runs") or 0
+        if degraded:
+            lines.append(
+                f"{degraded} of the {runs} comparable run(s) were themselves "
+                f"missing model passes. A run that never ran a domain cannot "
+                f"reproduce a finding from it, so counts above are conservative "
+                f"— read them as a floor, not a point estimate."
+            )
+            lines.append("")
+    else:
+        skipped = repro.get("skipped_count") or 0
+        why = (
+            f" {skipped} earlier run(s) of this article exist but none were "
+            f"comparable — a different draft, or a different ensemble "
+            f"configuration."
+            if skipped
+            else ""
+        )
+        lines.append(
+            f"**Not measured for this draft.** No earlier run of this exact "
+            f"draft and ensemble configuration was available, so nothing below "
+            f"has been checked for reproducibility.{why} For calibration, a "
+            f"{calibration.get('runs', 4)}-run test of one article found only "
+            f"{calibration.get('reproduced_in_3_or_more', 18)} of "
+            f"{calibration.get('distinct_findings', 259)} distinct findings "
+            f"reproduced in three or more of the "
+            f"{calibration.get('runs', 4)} runs. Running the same draft again "
+            f"makes this section a measurement instead of an estimate."
+        )
+        lines.append("")
+
+    lines.append(
+        "A finding raised only once is not thereby wrong — most findings here "
+        "are single-run, and single-run findings include real ones. It means "
+        "the evidence for it is one sample."
+    )
+    lines.append("")
+    return lines
+
+
+def _reproduction_note(finding):
+    """Inline note saying how many comparable prior runs also raised a finding.
+
+    Empty when the comparison could not be made, which is the first run of a
+    draft and every run of an article whose history holds nothing comparable.
+    Silence there is correct: an absent measurement must not read as a zero.
+    """
+    if not isinstance(finding, dict):
+        return ""
+    denominator = finding.get("reproduced_of")
+    if not denominator:
+        return ""
+    seen = finding.get("reproduced_in", 0)
+    if seen == 0:
+        return f" [new — in none of {denominator} comparable prior runs]"
+    return f" [also in {seen} of {denominator} comparable prior runs]"
+
+
+#: Section 1 bands, strongest evidence first. Which one is used depends on
+#: whether this draft has comparable history: with it, findings are grouped by
+#: how often they actually reproduced, which is a measurement; without it, by
+#: how many model passes flagged them, which is at least an integer count of
+#: evidence rather than a weighted score that varies run to run.
+def _consensus_bands(consensus_flags, comparable_runs):
+    """Group Section 1 findings into bands, returning (title, note, entries).
+
+    The list used to be rendered as a strict ranking by ``weight_sum``. On this
+    project's own history that ranking is misleading: in one measured run the
+    top-ranked finding (weight 2.5) appeared in none of the four comparable
+    prior runs, while the finding ranked third appeared in all four. Ordering
+    within a band is not meaningful and the bands say so.
+
+    Deliberately says "reproduced", never "corroborated". This report already
+    uses corroboration for a different axis — several models agreeing inside a
+    single run, in Section 8's ranking and in the Ensemble Width block. Two
+    findings can be corroborated and not reproduced, or the reverse, so reusing
+    the word would leave the reader unable to tell which claim is being made.
+    """
+    if comparable_runs:
+        strong, partial, unseen = [], [], []
+        for entry in consensus_flags:
+            denominator = entry.get("reproduced_of") or 0
+            seen = entry.get("reproduced_in", 0)
+            if denominator and seen * 2 >= denominator:
+                strong.append(entry)
+            elif seen:
+                partial.append(entry)
+            else:
+                unseen.append(entry)
+        return [
+            (
+                "Reproduced in earlier runs",
+                "Raised again in at least half of the comparable prior runs of "
+                "this same draft. The strongest signal this report has. "
+                "Distinct from corroboration elsewhere in this report, which "
+                "means several models agreed within this one run.",
+                strong,
+            ),
+            (
+                "Partly reproduced",
+                "Raised in at least one comparable prior run, but not most.",
+                partial,
+            ),
+            (
+                "New in this run",
+                "Raised only in this run. That does not make a finding wrong — "
+                "most findings here are single-run — but it is the weakest "
+                "evidence in the section.",
+                unseen,
+            ),
+        ]
+
+    multi, pair = [], []
+    for entry in consensus_flags:
+        if len(entry.get("models") or []) >= 3:
+            multi.append(entry)
+        else:
+            pair.append(entry)
+    return [
+        ("Flagged by three or more passes", "", multi),
+        ("Flagged by two passes", "", pair),
+    ]
+
+
+def _render_section_1(consensus_flags, comparable_runs=0):
     lines = ["## SECTION 1: Consensus Flags", ""]
     consensus_flags, dropped = _dicts(consensus_flags)
     lines.extend(_skipped_note({"section_1_consensus": dropped}))
@@ -204,41 +405,68 @@ def _render_section_1(consensus_flags):
         )
         return lines
 
-    for i, entry in enumerate(consensus_flags, 1):
-        passage = entry.get("passage", "")
-        models = ", ".join(entry.get("models", []))
-        weight = entry.get("weight_sum")
-        lt = (
-            " (LanguageTool also flagged)"
-            if entry.get("languagetool_also_flagged")
-            else ""
-        )
-        lines.append(f'### {i}. "{passage}"')
-        lines.append(f"- Flagged by: {models} — weight {weight}{lt}")
-        flags, flags_dropped = _dicts(entry.get("flags", []))
-        lines.extend(_skipped_note({"section_1_consensus[].flags": flags_dropped}))
-        for flag in flags:
-            source = flag.get("source_model", "?")
-            domain = flag.get("domain", "?")
-            lines.append(f"  - **{source}:{domain}**")
-            for kv in _kv_lines(
-                flag,
-                exclude=(
-                    "domain",
-                    "source_model",
-                    "type",
-                    "passage",
-                    "passage_reference",
-                    # Fact-check findings reach Section 1 now, and their quoted
-                    # text lives in "claim" rather than "passage" — which is
-                    # already the heading directly above, so printing it again
-                    # under every source repeated the passage five or six times
-                    # per entry.
-                    "claim",
-                ),
-            ):
-                lines.append(f"  {kv}")
+    lines.append(
+        "> Grouped into bands, not ranked. Order within a band carries no "
+        "meaning, and neither does the exact weight: the same finding on the "
+        "same draft scored anywhere from 2.0 to 7.4 across repeat runs of this "
+        "pipeline. See *Reading this report* above."
+    )
+    lines.append("")
+
+    counter = 0
+    for title, note, entries in _consensus_bands(consensus_flags, comparable_runs):
+        if not entries:
+            continue
+        lines.append(f"### {title} ({len(entries)})")
+        if note:
+            lines.append(f"_{note}_")
         lines.append("")
+        for entry in entries:
+            counter += 1
+            passage = entry.get("passage", "")
+            models = entry.get("models") or []
+            weight = entry.get("weight_sum")
+            lt = (
+                " (LanguageTool also flagged)"
+                if entry.get("languagetool_also_flagged")
+                else ""
+            )
+            lines.append(f'#### {counter}. "{passage}"')
+            # One decimal, and called a "run weight" rather than a weight. Two
+            # decimals implied a precision the process does not have: the same
+            # finding on the same draft scored 2.0 to 7.4 across repeat runs.
+            # The pass count beside it is the actual evidence, and is an integer.
+            attribution = f"- Flagged by {len(models)} pass(es): {', '.join(models)}"
+            if isinstance(weight, (int, float)):
+                attribution += f" — run weight {weight:.1f}"
+            lines.append(f"{attribution}{lt}")
+            note_text = _reproduction_note(entry)
+            if note_text:
+                lines.append(f"- Reproducibility:{note_text}")
+            flags, flags_dropped = _dicts(entry.get("flags", []))
+            lines.extend(_skipped_note({"section_1_consensus[].flags": flags_dropped}))
+            for flag in flags:
+                source = flag.get("source_model", "?")
+                domain = flag.get("domain", "?")
+                lines.append(f"  - **{source}:{domain}**")
+                for kv in _kv_lines(
+                    flag,
+                    exclude=(
+                        "domain",
+                        "source_model",
+                        "type",
+                        "passage",
+                        "passage_reference",
+                        # Fact-check findings reach Section 1 now, and their
+                        # quoted text lives in "claim" rather than "passage" —
+                        # which is already the heading directly above, so
+                        # printing it again under every source repeated the
+                        # passage five or six times per entry.
+                        "claim",
+                    ),
+                ):
+                    lines.append(f"  {kv}")
+            lines.append("")
     return lines
 
 
@@ -654,7 +882,7 @@ def _render_section_2(fact_check, report=None):
         lines.append(f"### {label}")
         for item in items:
             claim = item.get("claim", "")
-            lines.append(f'- "{claim}"')
+            lines.append(f'- "{claim}"{_reproduction_note(item)}')
             for kv in _kv_lines(item, exclude=("claim",)):
                 lines.append(kv)
         lines.append("")
@@ -686,7 +914,7 @@ def _render_flags_section(title, flags, passage_key="passage", note=(), field=No
         return lines
     for flag in flags:
         passage = flag.get(passage_key, "")
-        lines.append(f'- "{passage}"')
+        lines.append(f'- "{passage}"{_reproduction_note(flag)}')
         for kv in _kv_lines(flag, exclude=(passage_key,)):
             lines.append(kv)
     lines.append("")
@@ -2460,6 +2688,11 @@ def render_report_markdown(report):
     lines.extend(_render_model_currency(report))
     lines.extend(_render_provenance(report))
 
+    # Above the worklist, not below it. The worklist is the part the author acts
+    # on directly, so it is the part most in need of saying how much of it is a
+    # property of this run rather than of the draft.
+    lines.extend(_render_reading_note(report))
+
     lines.append("---")
     lines.append("")
 
@@ -2472,7 +2705,12 @@ def render_report_markdown(report):
     lines.append("---")
     lines.append("")
 
-    lines.extend(_render_section_1(report.get("section_1_consensus", [])))
+    lines.extend(
+        _render_section_1(
+            report.get("section_1_consensus", []),
+            (report.get("reproducibility") or {}).get("comparable_run_count") or 0,
+        )
+    )
     lines.extend(_render_section_2(report.get("section_2_fact_check", {}), report))
     lines.extend(
         _render_flags_section(

@@ -20,6 +20,13 @@ to the JSON report in `pipeline_history/<article-slug>/`) and paste its
 SECTION 1 through SECTION 9 content below it, plus the SEO SUGGESTIONS and
 SEO STRUCTURE REVIEW blocks at the end of that file if the run produced them.
 
+Paste the "Reading this report" block at the top of the file as well. It
+carries how many comparable prior runs this draft was measured against, and the
+per-finding notes below it ("also in 3 of 4 comparable prior runs") only make
+sense with it. A single review run is roughly 75% non-reproducible, so a model
+handed the findings without that framing will treat every one of them as an
+established defect in the article.
+
 Paste SECTION 9 too — it is easy to skip because it is long, and it is where
 the citation work lands. In particular its "Unresolved" block contains
 content-mismatch entries: sources that were fetched and read, where a model
@@ -42,6 +49,18 @@ review pipeline and I'm pasting the consolidated findings below. Revise the
 draft to address the findings you agree are valid, then output BOTH the
 revised draft and an updated metadata block — in the exact format below, with
 no additional commentary outside the two files.
+
+How to weigh the findings:
+- This is ONE run of a non-deterministic pipeline, not a defect list. Where the
+  review says a finding also appeared in prior runs of the same draft, that is
+  the strongest evidence in the report. Where it says the finding is new, the
+  evidence for it is a single sample.
+- SECTION 1 is grouped into bands, not ranked. Order within a band means
+  nothing, and the weight figure is a per-run score, not a severity. Do not
+  work top-down as though the first item were the most important.
+- Prefer corroborated findings when they conflict with single-run ones. Do not
+  dismiss a single-run finding for being single-run: most real findings appear
+  once. Judge it on the argument it makes, and say so if you decline it.
 
 Rules for the metadata update:
 - PRIMARY CLAIM: leave unchanged UNLESS a finding directly challenges the core

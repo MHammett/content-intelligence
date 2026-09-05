@@ -68,6 +68,7 @@ from .handoff_parser import (
 from . import history as hist
 from . import consolidation
 from . import handoff_gaps
+from . import reproducibility
 from ci_core import redact
 from ci_core.config_helpers import normalize_model_configs
 from ci_core import llm
@@ -2636,6 +2637,47 @@ def run_draft_pipeline(
         drafted_with=_declared_drafter(handoff, pipeline_cfg),
     )
 
+    # A replay is a code test over captured results, and it lands in the
+    # _replay/ quarantine tree rather than the article's real history (see
+    # save_run below). Reproducibility has to read the same tree it writes: a
+    # replay compared against the live run its capture came from would rediscover
+    # its own findings and report near-perfect reproduction, which is the one
+    # number this whole feature exists to stop the report from implying.
+    history_root = (
+        str(Path(HISTORY_ROOT) / "_replay") if replay_results else HISTORY_ROOT
+    )
+
+    # Measure this run against every earlier run of the same draft under the
+    # same ensemble configuration. Those runs are already on disk and already
+    # paid for, so the Nth run of a draft gets the benefit of the previous N-1
+    # for free — no extra model calls, no extra spend. Without it the report
+    # presents one non-deterministic run's findings as a definitive list.
+    #
+    # Best-effort by construction: a history directory that cannot be read must
+    # degrade to "not measured for this draft" in the report, never take down a
+    # run that has already spent money on its findings.
+    try:
+        reproducibility.annotate(
+            report,
+            history_root,
+            _history_key(handoff),
+            before_ts=run_start_ts,
+        )
+        repro_runs = (report.get("reproducibility") or {}).get("comparable_run_count")
+        if repro_runs:
+            log.info(
+                "Reproducibility: compared against %d earlier run(s) of this "
+                "draft (free — read from pipeline_history/)",
+                repro_runs,
+            )
+        else:
+            log.info(
+                "Reproducibility: no comparable earlier run of this draft; "
+                "findings in this report are unverified single-run output"
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Reproducibility context unavailable: %s", exc)
+
     # Pass 3: Citation resolution — extract factual claims from fact-check results
     #
     # Deliberately NOT gated on citation_sources. The known_url path never reads
@@ -2892,16 +2934,14 @@ def run_draft_pipeline(
     if replay_results:
         report["replayed_from"] = str(replay_results)
 
-    # A replay is a code test, not a review of the article. Writing it into the
+    # Saved under the ``history_root`` chosen before consolidation, above. A
+    # replay is a code test, not a review of the article. Writing it into the
     # article's own history would give the next real run a replay as its delta
     # baseline, and would count toward the distinct-article totals in
     # ci-voice-patterns. It goes to a sibling tree instead: still exercises the
     # whole save path, still readable, invisible to anything scanning
     # pipeline_history/ for real runs (that scan looks for reports one level
     # down, and finds only the nested _replay/<slug>/ directory).
-    history_root = (
-        str(Path(HISTORY_ROOT) / "_replay") if replay_results else HISTORY_ROOT
-    )
     paths = hist.save_run(
         history_root,
         _history_key(handoff),
@@ -3121,6 +3161,43 @@ def _print_live_model_check(live):
         print(f"  (model availability data {source}; oldest entry {age}h old)")
 
 
+def _reproducibility_line(report):
+    """One console line qualifying the section counts printed under it.
+
+    The summary's "Section 1 - Consensus flags: 3" is the number a reader most
+    readily mistakes for a property of their draft. It is substantially a
+    property of the run: repeat runs of an unedited article reproduce roughly a
+    quarter of their findings. The counts stay, with a line above them saying
+    what they are.
+    """
+    repro = report.get("reproducibility") or {}
+    runs = repro.get("comparable_run_count") or 0
+    if not runs:
+        calibration = repro.get("calibration") or {}
+        return (
+            "\nReproducibility: NOT MEASURED — no earlier run of this draft "
+            "and ensemble to compare against. The counts below are one "
+            "non-deterministic run; in a "
+            f"{calibration.get('runs', 4)}-run test only "
+            f"{calibration.get('reproduced_in_3_or_more', 18)} of "
+            f"{calibration.get('distinct_findings', 259)} findings recurred in "
+            "3+ runs. Re-run the same draft to measure it."
+        )
+    sections = repro.get("sections") or {}
+    found = sum(v.get("findings", 0) for v in sections.values())
+    at_least_half = sum(v.get("at_least_half", 0) for v in sections.values())
+    degraded = (
+        f", {repro['degraded_runs']} of them missing passes"
+        if repro.get("degraded_runs")
+        else ""
+    )
+    return (
+        f"\nReproducibility: {at_least_half} of {found} findings recurred in "
+        f"at least half of {runs} comparable earlier run(s) of this "
+        f"draft{degraded}. The counts below are one run's."
+    )
+
+
 def _print_draft_summary(
     report, delta_cfg, elapsed_total=None, markdown_path=None, worklist_path=None
 ):
@@ -3257,6 +3334,7 @@ def _print_draft_summary(
             f"\nLanguageTool: {len(report['lt_corrections_applied'])} corrections applied"
         )
 
+    print(_reproducibility_line(report))
     print(f"\nSection 1 — Consensus flags: {len(report['section_1_consensus'])}")
     fact = report["section_2_fact_check"]
     fact_count = (
