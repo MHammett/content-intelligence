@@ -727,4 +727,6 @@ content-intelligence/
 
 - **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — Error messages and fixes for every service, plus pipeline behavior edge cases.
 
+- **[docs/AI-DETECTORS.md](docs/AI-DETECTORS.md)** — Why this pipeline does not call a commercial AI-text detector (GPTZero, Originality.ai, Pangram, Turnitin). Evidence on detector accuracy for LLM-assisted-then-edited prose, false positives on technical writing, API cost against this repo's own per-run numbers, and the specific findings that would reverse the decision.
+
 - **[docs/NAMING.md](docs/NAMING.md)** / **[docs/TERMINOLOGY.md](docs/TERMINOLOGY.md)** — Package naming convention, and the deliberate "voice" vs. "style" distinction.
