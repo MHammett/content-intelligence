@@ -32,6 +32,9 @@ SOURCES ALREADY CITED
 UNCERTAIN SECTIONS
 [list or summarize; if none provided, write "None identified by author."]
 
+OUT OF SCOPE FOR FACT-CHECK
+[list or summarize; if none provided, write "None identified by author."]
+
 KNOWN GAPS
 [list or summarize; if none provided, write "None identified by author."]
 

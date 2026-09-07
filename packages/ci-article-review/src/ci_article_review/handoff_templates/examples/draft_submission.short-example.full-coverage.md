@@ -41,6 +41,9 @@ UNCERTAIN SECTIONS
 - Illinois's BEAD Final Proposal status: as of this writing I believe NTIA had not yet approved Illinois's Final Proposal — the step that authorizes subgrantee selection and releases construction dollars, distinct from the 2024 Initial Proposal approval — but this is based on industry tracking of the program's 56 state and territory entities, not a direct check of NTIA's own live status page. Program status changes monthly; verify against NTIA's current BEAD dashboard before this ships.
 - DeKalb County's own permitting throughput: based on public meeting commentary, not an independent audit of the county's application volume or processing time. The piece's central argument leans on this without that audit existing.
 
+OUT OF SCOPE FOR FACT-CHECK
+- My own read on why the permitting backlog persists is a hypothesis the piece frames as one, not a documented cause
+
 KNOWN GAPS
 - This piece is about deployment mechanics — funding, poles, permits — not about whether $42.45 billion is enough money nationally to close the digital divide, or about the affordability side of the gap (low-income subscription rates, subsidy program status). That's a genuinely important question; it takes a different set of sources and is a different piece.
 - No independent data on DeKalb County's specific permit-processing timeline exists in this draft; the county has not published a make-ready or right-of-way permit backlog report.

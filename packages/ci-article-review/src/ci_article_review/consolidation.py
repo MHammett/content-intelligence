@@ -417,6 +417,10 @@ _FACT_CHECK_ITEM_KEYS = (
     "contradicted",
     "unverifiable",
     "primary_source_needed",
+    # Not a verdict, but tagged like one for the same reason: which model made
+    # a scope call is a fact about that model's judgment, and the report names
+    # it. See :mod:`ci_article_review.fact_check_scope`.
+    "out_of_scope",
 )
 
 
@@ -540,8 +544,16 @@ def _demote_unsourced_confirmations(data):
     }
 
 
-def _build_fact_check(results, ensemble_cfg):
-    """Merge fact_check results from all models that ran the domain."""
+def _build_fact_check(results, ensemble_cfg, scope=None):
+    """Merge fact_check results from all models that ran the domain.
+
+    ``scope`` is the run's :class:`~ci_article_review.fact_check_scope.ScopeRules`.
+    It is applied here, on the merged section, rather than per model: an author
+    marking has to sweep every model's verdict on the same claim, and a claim one
+    model puts out of scope has to be reconciled with another model's verdict on
+    it. Both are cross-model questions, and this is the only place the whole set
+    exists at once.
+    """
     domain_results = [
         (model, {**r, "data": _demote_unsourced_confirmations(r["data"])})
         for (model, d), r in results.items()
@@ -564,7 +576,7 @@ def _build_fact_check(results, ensemble_cfg):
         # when one did — and `standard` thoroughness runs one. Anything keyed on
         # the asserting model was therefore dead on precisely the cheaper preset:
         # the citation re-ask had nobody to hand a refutation back to.
-        return {
+        merged = {
             **r["data"],
             **{
                 key: [{**item, **tag} for item in (r["data"].get(key) or [])]
@@ -574,6 +586,7 @@ def _build_fact_check(results, ensemble_cfg):
                 model_name: {"weight": round(weight, 2), "grounding": grounding}
             },
         }
+        return _apply_scope(merged, scope)
 
     # Multiple sources — merge all lists, tag each item with source model and weight
     merged: dict = {
@@ -582,6 +595,7 @@ def _build_fact_check(results, ensemble_cfg):
         "contradicted": [],
         "unverifiable": [],
         "primary_source_needed": [],
+        "out_of_scope": [],
         "additional_observations": [],
         "_sources": {},
     }
@@ -598,14 +612,8 @@ def _build_fact_check(results, ensemble_cfg):
             "grounding": grounding,
         }
         data = r["data"]
-        for key in (
-            "confirmed",
-            "outdated",
-            "contradicted",
-            "unverifiable",
-            "primary_source_needed",
-        ):
-            for item in data.get(key, []):
+        for key in _FACT_CHECK_ITEM_KEYS:
+            for item in data.get(key, []) or []:
                 merged[key].append({**item, **tag})
         for obs in data.get("additional_observations", []):
             merged["additional_observations"].append(
@@ -633,7 +641,21 @@ def _build_fact_check(results, ensemble_cfg):
     ):
         merged[key].sort(key=lambda x: x.get("source_weight", 1.0), reverse=True)
 
-    return merged
+    return _apply_scope(merged, scope)
+
+
+def _apply_scope(merged, scope):
+    """Hand the merged section to the run's scope rules, if there are any.
+
+    A run with no rules object — an older captured report replayed, a caller
+    that predates this argument — is left exactly as it was, minus an empty
+    ``out_of_scope`` key so the report renderer and the citation collector do
+    not each need their own ``or []``.
+    """
+    if scope is None:
+        merged.setdefault("out_of_scope", [])
+        return merged
+    return scope.apply(merged)
 
 
 def _build_flags_section(domain, results, ensemble_cfg):
@@ -1035,6 +1057,7 @@ def build_report(
     prior_report=None,
     primary_claim="",
     prior_report_path=None,
+    fact_check_scope=None,
     domains_not_run=None,
     drafted_with="",
 ):
@@ -1047,6 +1070,9 @@ def build_report(
         Each result dict has at minimum: failed, data, model, tokens, elapsed_seconds.
     ensemble_cfg:
         The ``ensemble`` section from user.yaml (may be empty dict for defaults).
+    fact_check_scope:
+        The run's ``ScopeRules``, or None to leave the fact-check section
+        untouched. See :mod:`ci_article_review.fact_check_scope`.
     domains_not_run:
         ``{domain: reason}`` for domains the run should have covered but made no
         call for. Supplied by the pipeline, which is what knows the presets and
@@ -1070,7 +1096,7 @@ def build_report(
     )
 
     # Sections 2-6 — Domain sections
-    section_2_fact_check = _build_fact_check(results, ensemble_cfg)
+    section_2_fact_check = _build_fact_check(results, ensemble_cfg, fact_check_scope)
     section_3_voice = _build_flags_section("voice_style", results, ensemble_cfg)
     section_4_argument = _build_flags_section(
         "argument_integrity", results, ensemble_cfg

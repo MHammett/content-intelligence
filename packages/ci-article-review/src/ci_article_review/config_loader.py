@@ -263,6 +263,7 @@ KNOWN_PUB_KEYS = frozenset(
         "author_name",
         "citation_sources",
         "custom_domains",
+        "fact_check_scope",
         "languagetool",
         "publication_description",
         "publication_name",

@@ -627,6 +627,7 @@
       }
     ],
     "contradicted": [],
+    "out_of_scope": [],
     "outdated": [
       {
         "claim": "The 2019 figure was 33 percent.",

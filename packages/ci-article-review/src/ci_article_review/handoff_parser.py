@@ -42,6 +42,7 @@ DRAFT_HEADERS = [
     "PRE-DRAFT ANALYSIS SUMMARY",
     "SOURCES ALREADY CITED",
     "UNCERTAIN SECTIONS",
+    "OUT OF SCOPE FOR FACT-CHECK",
     "KNOWN GAPS",
     "ADDITIONAL CONTEXT FOR REVIEW MODELS",
     "DRAFT",
@@ -66,6 +67,7 @@ METADATA_HEADERS = [
     "PRE-DRAFT ANALYSIS SUMMARY",
     "SOURCES ALREADY CITED",
     "UNCERTAIN SECTIONS",
+    "OUT OF SCOPE FOR FACT-CHECK",
     "KNOWN GAPS",
     "ADDITIONAL CONTEXT FOR REVIEW MODELS",
     "DRAFT",
@@ -77,6 +79,15 @@ METADATA_HEADERS = [
 #: same question, and when they were two hand-maintained lists they disagreed —
 #: this one said ``target_audience`` reached "voice_style and completeness",
 #: while the prompt templates show four domains reasoning about audience.
+#:
+#: ``out_of_scope`` is deliberately absent. Every other field here is one whose
+#: absence costs the run something on every draft, which is what makes a debug
+#: line about it useful. Most articles have nothing that no source can settle,
+#: so an empty OUT OF SCOPE FOR FACT-CHECK section is the normal case rather
+#: than a gap, and reporting it as one would be noise on most runs. The signal
+#: that the section *should* have been filled in is not its emptiness — it is
+#: the fact-check models classifying claims out of scope on their own, which
+#: Section 2 reports directly. See :mod:`ci_article_review.fact_check_scope`.
 _OPTIONAL_FIELD_IMPACT = (
     "sources_cited",
     "uncertain_sections",
@@ -190,6 +201,7 @@ def parse_metadata_only(text):
         "pre_draft_analysis": section("PRE-DRAFT ANALYSIS SUMMARY"),
         "sources_cited": section("SOURCES ALREADY CITED"),
         "uncertain_sections": section("UNCERTAIN SECTIONS"),
+        "out_of_scope": section("OUT OF SCOPE FOR FACT-CHECK"),
         "known_gaps": section("KNOWN GAPS"),
         "additional_context": section("ADDITIONAL CONTEXT FOR REVIEW MODELS"),
         "author": author,
@@ -279,6 +291,7 @@ def parse_draft_submission(text):
         "pre_draft_analysis": _ADVISORY_FIELDS["pre_draft_analysis"][1],
         "sources_cited": section("SOURCES ALREADY CITED"),
         "uncertain_sections": section("UNCERTAIN SECTIONS"),
+        "out_of_scope": section("OUT OF SCOPE FOR FACT-CHECK"),
         "known_gaps": section("KNOWN GAPS"),
         "additional_context": section("ADDITIONAL CONTEXT FOR REVIEW MODELS"),
         "author": author,

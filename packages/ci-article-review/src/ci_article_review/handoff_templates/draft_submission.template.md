@@ -62,6 +62,27 @@ UNCERTAIN SECTIONS
 scrutiny here, so this directs effort where you want it.
 If none, write "None identified by author."]
 
+OUT OF SCOPE FOR FACT-CHECK
+[Passages no outside source can settle, so fact-checking them can only produce a
+false negative. One per line, starting with "- ". A short quote is enough; add a
+reason after an em dash if it helps you remember why.
+
+The three that come up constantly:
+- first-person statements about your own life or work ("I have a side job")
+- arithmetic the article derives from figures already in it
+- conjectures the piece explicitly frames as your own reading
+
+These are excluded from fact-checking and from citation resolution ONLY. Every
+passage still goes to the red-team, argument, voice and completeness passes —
+a claim only you can confirm can still be an argumentative weakness, and hiding
+it from every reviewer would cost real findings.
+
+You can mark passages in the draft itself instead, which also works with
+--raw-draft: wrap them in <!-- ci:no-verify --> and <!-- /ci:no-verify -->. The
+markers are HTML comments, so a reader never sees them.
+
+If none, write "None identified by author."]
+
 KNOWN GAPS
 [What you know is missing, so the models assess whether the gap is acceptable
 rather than simply reporting it back to you.
