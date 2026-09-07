@@ -7,7 +7,9 @@ N — see ``test_repeat_execution_at_same_run_number_*``.
 """
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from ci_article_review import consolidation, history as hist
 
@@ -376,3 +378,113 @@ class TestRunNumberCollision:
         assert (
             hist.existing_run_numbers(tmp_path / "nope", "Some Article Title") == set()
         )
+
+
+class TestAGeneratedFileFailingDoesNotCostTheRun:
+    """``save_run`` writes the report JSON, then three files derived from it.
+
+    The derived writes used to call their renderer *inside* ``with open(...)``
+    while catching only ``OSError``. So a renderer bug left a zero-byte file on
+    disk and propagated out of ``save_run``, losing the corrections log written
+    below it — the run kept its report JSON and nothing else.
+    """
+
+    def _report(self):
+        return {
+            "generated": _ts(1).isoformat(),
+            "run_number": 1,
+            "article_title": TITLE,
+            "section_1_consensus": [],
+        }
+
+    def _corrections(self):
+        return [{"category": "spelling", "original": "teh", "replacement": "the"}]
+
+    def _files(self, root):
+        return {p.name: p.stat().st_size for p in root.rglob("*") if p.is_file()}
+
+    def test_a_broken_markdown_renderer_leaves_the_rest_of_the_run(
+        self, tmp_path, monkeypatch
+    ):
+        def boom(report):
+            raise ValueError("simulated renderer bug")
+
+        monkeypatch.setattr(hist, "render_report_markdown", boom)
+        paths = hist.save_run(
+            str(tmp_path), TITLE, 1, self._report(), self._corrections(), run_ts=_ts(1)
+        )
+
+        assert paths["markdown_path"] is None
+        assert paths["report_path"] is not None
+        # The one the old behaviour lost: it is written after the markdown.
+        assert paths["corrections_path"] is not None
+        assert "the" in Path(paths["corrections_path"]).read_text(encoding="utf-8")
+
+    def test_a_broken_renderer_leaves_no_zero_byte_file_behind(
+        self, tmp_path, monkeypatch
+    ):
+        """An empty review.md is worse than an absent one — it reads as a run
+        that rendered and found nothing to say.
+        """
+
+        def boom(report):
+            raise ValueError("simulated renderer bug")
+
+        monkeypatch.setattr(hist, "render_report_markdown", boom)
+        hist.save_run(str(tmp_path), TITLE, 1, self._report(), [], run_ts=_ts(1))
+
+        written = self._files(tmp_path)
+        assert not any(name.endswith("_review.md") for name in written), written
+        # Scoped to the derived documents: an empty corrections.log is normal
+        # for a run with no corrections, and is not what this pins.
+        derived = {n: size for n, size in written.items() if n.endswith(".md")}
+        assert derived and all(size > 0 for size in derived.values()), written
+
+    def test_a_broken_worklist_builder_is_survivable_too(self, tmp_path, monkeypatch):
+        """The worklist write has the same shape and arrived later, so it is
+        pinned separately rather than assumed to be covered.
+        """
+
+        def boom(report):
+            raise KeyError("simulated builder bug")
+
+        monkeypatch.setattr(hist, "build_worklist", boom)
+        paths = hist.save_run(
+            str(tmp_path), TITLE, 1, self._report(), self._corrections(), run_ts=_ts(1)
+        )
+
+        assert paths["worklist_path"] is None
+        assert paths["markdown_path"] is not None
+        assert paths["corrections_path"] is not None
+        assert not any(name.endswith("_worklist.md") for name in self._files(tmp_path))
+
+    def test_the_traceback_is_logged_rather_than_swallowed(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Catching broadly is only defensible because the failure is still
+        reported — the report JSON is already safe on disk by this point.
+        """
+
+        def boom(report):
+            raise ValueError("simulated renderer bug")
+
+        monkeypatch.setattr(hist, "render_report_markdown", boom)
+        with caplog.at_level(logging.ERROR):
+            hist.save_run(str(tmp_path), TITLE, 1, self._report(), [], run_ts=_ts(1))
+
+        assert "simulated renderer bug" in caplog.text
+        assert "Traceback" in caplog.text
+
+    def test_a_healthy_run_still_writes_every_file(self, tmp_path):
+        paths = hist.save_run(
+            str(tmp_path), TITLE, 1, self._report(), self._corrections(), run_ts=_ts(1)
+        )
+
+        for key in (
+            "report_path",
+            "markdown_path",
+            "worklist_path",
+            "corrections_path",
+        ):
+            assert paths[key] is not None, key
+            assert Path(paths[key]).stat().st_size > 0, key

@@ -91,6 +91,39 @@ def _existing_run_dir(history_root, article_title):
     return path if path.is_dir() else None
 
 
+def _write_generated(path, build, label):
+    """Write ``build()``'s output to ``path``. Returns ``path``, or None.
+
+    ``build`` is called *before* the file is opened, and every exception it
+    raises is caught. Both matter, and neither used to be true: the renderers
+    were called inside the ``with open(...)`` block with only ``OSError``
+    caught, so a bug in one left a zero-byte file on disk *and* propagated out
+    of ``save_run`` — taking the corrections log, written further down, with
+    it. A malformed finding in one section cost the run every artifact but the
+    report JSON.
+
+    The report JSON is already written by this point, which is what makes
+    catching broadly the right call rather than a way of hiding bugs: the run's
+    actual results are safe on disk, the traceback goes to the log, and what is
+    lost is a file derived from data the author still has. Losing the run for
+    it is the worse trade.
+    """
+    try:
+        text = build()
+    except Exception:
+        log.exception(f"Could not render {label}; {path} not written")
+        return None
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        log.warning(f"Could not write {label} to {path}: {e}")
+        return None
+
+    return path
+
+
 def save_run(
     history_root, article_title, run_number, report, corrections_log, run_ts=None
 ):
@@ -126,23 +159,19 @@ def save_run(
             "worklist_path": None,
         }
 
-    try:
-        with open(markdown_path, "w", encoding="utf-8") as f:
-            f.write(render_report_markdown(report))
-    except OSError as e:
-        log.warning(f"Could not write markdown review to {markdown_path}: {e}")
-        markdown_path = None
+    markdown_path = _write_generated(
+        markdown_path, lambda: render_report_markdown(report), "markdown review"
+    )
 
     # The same worklist that opens the review, on its own. The review is 200KB
     # of evidence and the worklist is the dozen things to go and do; an author
     # working through them wants the second open in front of them, not scrolled
     # to inside the first. One builder feeds both, so they cannot disagree.
-    try:
-        with open(worklist_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(render_worklist(build_worklist(report))).rstrip() + "\n")
-    except OSError as e:
-        log.warning(f"Could not write worklist to {worklist_path}: {e}")
-        worklist_path = None
+    worklist_path = _write_generated(
+        worklist_path,
+        lambda: "\n".join(render_worklist(build_worklist(report))).rstrip() + "\n",
+        "worklist",
+    )
 
     try:
         lines = [
