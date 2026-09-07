@@ -808,11 +808,41 @@ A finding raised only once is not thereby wrong. Most findings are single-run,
 and single-run findings include real ones. It means the evidence for it is one
 sample, which is what the report now says.
 
+**What this run may have missed.** Everything above annotates findings that are
+*present*. The reverse — what earlier runs caught and this one did not — is
+invisible by construction, and on measured history it is the larger set: a run
+of the dc-environment draft reproduced 3 of 26 completeness findings, so each
+run also misses many its predecessors found. The report now lists them, under
+that heading, above the worklist.
+
+Ordinarily "present last time, absent now" would be ambiguous — it might have
+been fixed. Here it cannot be. Comparability already pins the draft to the same
+text, so nothing in that list was resolved between runs; each entry is either
+noise in the earlier runs or a miss in this one, and the report says it cannot
+tell you which.
+
+Two thresholds keep it readable, both set by counting what they would actually
+print on the same cluster with each run in turn treated as the current one:
+
+| prior runs (N) | 1 | 2 | 3 | 4 |
+|---|---:|---:|---:|---:|
+| raised by >=1 prior run | 130 | 239 | 329 | 424 |
+| raised by >=half | 130 | 239 | 35 | 54 |
+| raised by **all** | 130 | **15** | **4** | **4** |
+
+So a finding is listed only when **every** comparable prior run raised it, and
+only when there are **at least two** of them — at N=1 every rule degenerates to
+"everything the other run found". The list caps at ten with the remainder
+counted, and the full set is in the report JSON. A `fact-check / confirmed`
+entry means a claim earlier runs verified went unchecked this time: a gap in
+coverage rather than a problem missed.
+
 **In the report JSON**, findings carry `reproduced_in` / `reproduced_of`, and a
 `reproducibility` block records the fingerprint, the comparable runs, the skipped
-ones with reasons, and per-section totals. When nothing comparable was found the
-per-finding fields are **absent rather than zero** — a measurement that was never
-taken must not read as a measurement that came back empty.
+ones with reasons, per-section totals, and `dropped` (the block above). When
+nothing comparable was found the per-finding fields are **absent rather than
+zero** — a measurement that was never taken must not read as a measurement that
+came back empty.
 
 **To get the measurement**, run the same draft twice before revising it. The
 second run reports against the first at no extra cost. Editing the draft resets

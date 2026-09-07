@@ -61,6 +61,13 @@ How to weigh the findings:
 - Prefer corroborated findings when they conflict with single-run ones. Do not
   dismiss a single-run finding for being single-run: most real findings appear
   once. Judge it on the argument it makes, and say so if you decline it.
+- "What this run may have missed" is NOT a findings list. Those are passages
+  every earlier run of this same draft flagged and this one did not, carried
+  as pointers with no diagnosis attached. Do not revise against them as though
+  a reviewer had made the case. Read the passage, and if you can see the
+  problem yourself, address it and say which one you acted on; otherwise leave
+  it and note that it wants another run. Inventing the missing critique is the
+  failure mode here.
 
 Rules for the metadata update:
 - PRIMARY CLAIM: leave unchanged UNLESS a finding directly challenges the core

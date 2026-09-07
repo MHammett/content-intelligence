@@ -470,6 +470,11 @@
     "comparable_run_count": 0,
     "degraded_runs": 0,
     "draft_fingerprint": "c049f40691239b96",
+    "dropped": {
+      "eligible_sections": [],
+      "findings": [],
+      "total": 0
+    },
     "runs": [],
     "runs_truncated": 0,
     "section_denominators": {
