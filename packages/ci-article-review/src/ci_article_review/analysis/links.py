@@ -1,11 +1,11 @@
 """URL extraction, HTTP status validation, and Wayback Machine archive checks."""
 
-import concurrent.futures
 import logging
 import re
 
 import requests
 
+from ci_core.concurrency import run_all_bounded
 from ci_core.http import (
     DEFAULT_HEADERS,
     impersonating_get,
@@ -39,6 +39,24 @@ _TRAILING_PUNCT = re.compile(r"[.,!?:;]+$")
 #: ceiling — only a silently-dropping one waits it out.
 _HEAD_TIMEOUT = 20
 _MAX_PARALLEL = 10
+
+
+def _check_timeout(http_timeout, wayback_timeout):
+    """Wall-clock safety net for one URL's full check.
+
+    The timeouts inside ``_check_one`` are the real bound; this only catches
+    what they don't. They are socket timeouts — a connect budget and an
+    inter-read gap — so a server that dribbles bytes indefinitely satisfies
+    every one of them forever, and that is the shape a wall-clock backstop
+    exists for.
+
+    Sized from the worst path through one check: HEAD, then a GET retry on
+    403/405, then a TLS-impersonated GET, then the archive fallback's own
+    lookup and snapshot fetch — five http_timeout-bounded steps — plus the
+    separate Wayback availability check on its own budget. One extra step's
+    worth of headroom, then 30s of scheduling slack.
+    """
+    return 6 * http_timeout + wayback_timeout + 30
 
 
 def extract_urls(text):
@@ -266,32 +284,37 @@ def validate_links(
     if not urls:
         return []
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(len(urls), _MAX_PARALLEL)
-    ) as pool:
-        futures = {
-            pool.submit(
-                _check_one,
-                url,
-                check_wayback,
-                http_timeout,
-                wayback_timeout,
-                wayback_stale_days,
-            ): url
-            for url in urls
-        }
-        # Collect results preserving original URL order
-        results_map = {}
-        for future in concurrent.futures.as_completed(futures):
-            url = futures[future]
-            try:
-                results_map[url] = future.result()
-            except Exception as exc:
-                results_map[url] = {
+    # One daemon thread per URL, at most _MAX_PARALLEL of them fetching at
+    # once — never a ThreadPoolExecutor. See :mod:`ci_core.concurrency`: a pool
+    # worker still inside a fetch at interpreter exit is joined by
+    # concurrent.futures' atexit hook with a bare, untimed t.join(), which is
+    # how finished ci-review processes were found alive two days later. A URL
+    # whose fetch outlives its own socket timeouts is abandoned here instead.
+    jobs = [
+        (
+            url,
+            lambda url=url: _check_one(
+                url, check_wayback, http_timeout, wayback_timeout, wayback_stale_days
+            ),
+            _check_timeout(http_timeout, wayback_timeout),
+        )
+        for url in urls
+    ]
+    outcomes = run_all_bounded(jobs, max_parallel=_MAX_PARALLEL)
+
+    # Original URL order, one entry per URL either way.
+    results = []
+    for url in urls:
+        value, error = outcomes[url]
+        if error is None:
+            results.append(value)
+        else:
+            results.append(
+                {
                     "url": url,
                     "status_code": None,
                     "ok": False,
-                    "error": str(exc),
+                    "error": str(error),
                 }
-
-    return [results_map[url] for url in urls if url in results_map]
+            )
+    return results

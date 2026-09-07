@@ -38,9 +38,11 @@ ci-core = { workspace = true }
 asyncio_mode = "strict"
 addopts = "--import-mode=importlib"
 markers = [
-    # Tests whose wall-clock cost is inherent, not accidental — currently just
-    # the one that proves a `concurrent.futures` atexit join really does hold
-    # the interpreter open, which can only be shown by waiting one out.
+    # Tests whose wall-clock cost is inherent, not accidental: the one that
+    # proves a `concurrent.futures` atexit join really does hold the interpreter
+    # open (only showable by waiting one out), and the one that proves
+    # `call_all` exits cleanly when a model has no computed backstop (needs a
+    # subprocess, which must pay litellm'''s ~6s import before it can start).
     #
     # Not skipped by default: a green run means the whole suite passed. Use
     # `-m "not slow"` to deselect them while iterating. See README "Running the

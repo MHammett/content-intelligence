@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+import subprocess
+import sys
+import textwrap
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import litellm
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -364,3 +371,155 @@ class TestCallAll:
             )
 
         assert "perplexity" not in called
+
+
+# ---------------------------------------------------------------------------
+# The un-backstopped-model hang
+# ---------------------------------------------------------------------------
+
+
+class TestModelWithNoComputedBackstop:
+    """The gap between which models get *called* and which get a *budget*.
+
+    ``call_all`` keeps a model when ``enabled`` is anything other than the
+    literal ``False``; ``timeout_model.compute_all`` skips a model when
+    ``enabled`` is merely falsy. Three reachable config values fall in that gap
+    — ``0``, ``""``, and ``None`` — and ``enabled:`` written with no value at
+    all is exactly how YAML produces the third.
+
+    A model in the gap was called with a None budget. The old code passed that
+    straight to ``run_with_timeout``, whose documented contract for a None
+    timeout is to wait for the call, from inside a ``ThreadPoolExecutor``
+    worker that ``concurrent.futures`` then joins untimed at interpreter exit.
+    So a one-character config slip reproduced the original two-day hang in full:
+    the run finished its work, printed its output, and never exited.
+    """
+
+    def _config(self, enabled):
+        return {
+            "models": {"claude": {"model": "anthropic/x", "enabled": enabled}},
+            "api_keys": {},
+        }
+
+    @pytest.mark.parametrize("enabled", [0, "", None])
+    def test_the_gap_is_real_for_every_falsy_enabled_value(self, enabled):
+        """Pins the cause, so the fix can't be argued away as hypothetical."""
+        from ci_core.config_helpers import normalize_model_configs
+        from ci_core.llm import timeout_model
+
+        cfg = normalize_model_configs(self._config(enabled)["models"])
+        active = {k: v for k, v in cfg.items() if v.get("enabled", True) is not False}
+        backstops = timeout_model.compute_all(1000, active, 1200)
+
+        assert "claude" in active, "call_all would call this model"
+        assert "claude" not in backstops, "but compute_all gives it no budget"
+
+    def test_such_a_model_is_bounded_rather_than_awaited_forever(self):
+        from ci_style_profile import callers as C
+
+        never_returns = threading.Event()  # deliberately never set
+
+        with (
+            patch.object(
+                C, "call_one", side_effect=lambda *a, **kw: never_returns.wait()
+            ),
+            patch.object(C, "_TASK_CEILING_SECONDS", 2),
+        ):
+            started = time.monotonic()
+            results = C.call_all(
+                system_prompt="s", user_prompt="u", user_config=self._config(None)
+            )
+            elapsed = time.monotonic() - started
+
+        assert results["claude"]["failed"] is True
+        assert "backstop" in results["claude"]["error"]
+        # Bounded by the task ceiling it fell back to, not by the call.
+        assert elapsed < 10, (
+            f"call_all waited {elapsed:.1f}s on a model with no computed "
+            f"backstop — it is treating 'no budget' as 'no limit'"
+        )
+
+    def test_the_missing_budget_is_reported_not_silently_papered_over(self, caplog):
+        """The fallback fixes the hang; the warning fixes the config.
+
+        Quietly substituting a ceiling would leave a user whose model was never
+        meant to be disabled wondering why it now takes 20 minutes to fail.
+        """
+        from ci_style_profile import callers as C
+
+        with (
+            patch.object(C, "call_one", side_effect=lambda *a, **kw: {"content": "x"}),
+            caplog.at_level(logging.WARNING, logger="ci_style_profile.callers"),
+        ):
+            C.call_all(
+                system_prompt="s", user_prompt="u", user_config=self._config(None)
+            )
+
+        assert any("no computed backstop" in r.getMessage() for r in caplog.records), (
+            f"expected a warning naming the missing backstop, got: {caplog.messages}"
+        )
+
+
+class TestCallAllProcessExit:
+    """``call_all`` must not hold the interpreter open. Needs a subprocess.
+
+    Every in-process assertion above passes against the broken version too —
+    the defect is in interpreter *exit*, which nothing running inside the
+    interpreter can observe. This is the only test here that can see it.
+    """
+
+    # Measured on this machine, 2026-09-05: the subprocess costs 7.2-8.3s, of
+    # which 5.9s is importing ci_style_profile.callers (litellm) before a line
+    # of the test runs. An earlier 8s limit was therefore timing the import, and
+    # failed in a full-suite run while passing in isolation.
+    #
+    # There is no tight bound worth drawing here, because the two outcomes this
+    # separates are not close: fixed, the process exits at import cost plus the
+    # 1s ceiling; broken, it never exits at all (measured at >90s before being
+    # killed, and unbounded in principle — the call it is waiting on never
+    # returns). 30s is ~3.6x the observed worst case and still decisively
+    # short of "forever".
+    MUST_EXIT_WITHIN = 30
+
+    @pytest.mark.slow
+    def test_a_model_with_no_backstop_does_not_hold_the_process_open(self):
+        script = textwrap.dedent(
+            """
+            import threading, sys
+            from unittest.mock import patch
+            import ci_style_profile.callers as C
+
+            never = threading.Event()
+
+            cfg = {
+                "models": {"claude": {"model": "anthropic/x", "enabled": None}},
+                "api_keys": {},
+            }
+
+            with patch.object(C, "call_one", side_effect=lambda *a, **kw: never.wait()), \\
+                 patch.object(C, "_TASK_CEILING_SECONDS", 1):
+                res = C.call_all(system_prompt="s", user_prompt="u", user_config=cfg)
+
+            print("failed" if res["claude"]["failed"] else "ok")
+            print("exiting")
+            """
+        )
+        t0 = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        elapsed = time.monotonic() - t0
+
+        assert proc.returncode == 0, proc.stderr
+        assert "failed" in proc.stdout
+        assert "exiting" in proc.stdout
+        assert elapsed < self.MUST_EXIT_WITHIN, (
+            f"call_all's process took {elapsed:.1f}s to exit with a call that "
+            f"never returns still running. Before the migration this never "
+            f"exited at all: the None budget made run_with_timeout wait "
+            f"forever inside a pool worker, and concurrent.futures' atexit "
+            f"hook joined that worker with a bare, untimed t.join()."
+        )
