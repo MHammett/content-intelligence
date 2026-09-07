@@ -79,12 +79,19 @@ class TestReviseLoopCoversEverySection:
         ), f"README does not tell the author to paste through SECTION {highest}"
 
     def test_no_stale_lower_range_survives_anywhere(self):
-        """Catches a half-finished update that leaves the old range behind."""
+        """Catches a half-finished update that leaves the old range behind.
+
+        Matched on a word boundary, not as a bare substring: once the highest
+        section reached two digits, "SECTION 1 through SECTION 1" became a
+        prefix of the *current* range and every correct file failed as stale.
+        """
         highest = max(_rendered_section_numbers())
-        stale = [f"SECTION 1 through SECTION {n}" for n in range(1, highest)]
+        stale = [
+            re.compile(rf"SECTION 1 through SECTION {n}") for n in range(1, highest)
+        ]
         for path in (REVISE_PROMPT, README):
             text = path.read_text(encoding="utf-8")
-            found = [s for s in stale if s in text]
+            found = [p.pattern for p in stale if p.search(text)]
             assert not found, f"{path.name} still references {found}"
 
     def test_section_9_is_called_out_specifically(self):
