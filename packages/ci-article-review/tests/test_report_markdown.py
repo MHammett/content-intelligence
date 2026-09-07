@@ -3008,3 +3008,191 @@ class TestMalformedEntriesInRemainingSectionsAreSkippedNotFatal:
     def test_all_additional_findings_malformed_reports_none_readable(self):
         md = render_report_markdown(_base_report(section_8_additional=["a"]))
         assert "No additional-findings entry in this run could be read." in md
+
+
+class TestMalformedFindingsAreSkippedNotFatal:
+    """A findings list is meant to hold records, but a salvaged model response
+    can leave a bare string among them. Both renderers used to raise
+    ``AttributeError: 'str' object has no attribute 'get'`` on the first one,
+    and ``history.save_run`` guards the markdown write against ``OSError``
+    only — so one unreadable entry cost the run its entire
+    ``run_N_*_review.md``. Skipping is the smaller loss; saying so is what
+    keeps it from being a silent one.
+    """
+
+    NOTE = "malformed"
+
+    # -- Section 2 ---------------------------------------------------------
+
+    def test_a_bare_string_among_fact_check_findings_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "confirmed": [{"claim": "The bridge opened in 1992."}, "salvaged"],
+                }
+            )
+        )
+        assert "The bridge opened in 1992." in md
+
+    def test_the_readable_findings_beside_it_still_render(self):
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "confirmed": ["salvaged", {"claim": "A survives."}],
+                    "contradicted": [{"claim": "B survives."}, "salvaged"],
+                }
+            )
+        )
+        assert "A survives." in md
+        assert "B survives." in md
+
+    def test_the_skipped_entries_are_counted_and_the_field_named(self):
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "confirmed": ["a"],
+                    "unverifiable": ["b", "c"],
+                }
+            )
+        )
+        assert "3 malformed entries skipped" in md
+        assert "`confirmed` (1)" in md
+        assert "`unverifiable` (2)" in md
+
+    def test_a_single_skipped_entry_is_described_in_the_singular(self):
+        md = render_report_markdown(
+            _base_report(section_2_fact_check={"confirmed": ["a"]})
+        )
+        assert "1 malformed entry skipped" in md
+        assert "That finding arrived" in md
+
+    def test_the_note_points_at_the_report_json_that_still_holds_the_entry(self):
+        md = render_report_markdown(
+            _base_report(section_2_fact_check={"confirmed": ["a"]})
+        )
+        assert "`_report.json`" in md
+
+    def test_a_bare_string_among_additional_observations_is_handled_too(self):
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "additional_observations": [
+                        "salvaged",
+                        {"passage": "An observation that survives."},
+                    ]
+                }
+            )
+        )
+        assert "An observation that survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`additional_observations` (1)" in md
+
+    def test_the_note_sits_above_the_counts_it_qualifies(self):
+        """Evidence coverage counts the verdicts that survived. A reader who
+        meets that number first has already read a total that is short.
+        """
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "confirmed": ["a", {"claim": "x", "supporting_quote": "q"}]
+                }
+            )
+        )
+        assert md.index(self.NOTE) < md.index("verdict(s) arrived with a verbatim")
+
+    def test_a_clean_fact_check_gains_no_note(self):
+        md = render_report_markdown(
+            _base_report(section_2_fact_check={"confirmed": [{"claim": "a"}]})
+        )
+        assert self.NOTE not in md
+
+    def test_a_fact_check_that_is_not_a_mapping_does_not_raise(self):
+        """The same salvage failure one level up. "_No fact-check results._"
+        would describe a pass that never ran, which is not what happened.
+        """
+        md = render_report_markdown(_base_report(section_2_fact_check="salvaged"))
+        assert "cannot read" in md
+        assert "_No fact-check results._" not in md
+
+    # -- Section 9 ---------------------------------------------------------
+
+    def _citation(self, claim):
+        return {
+            "claim": claim,
+            "resolved": True,
+            "url": "https://example.gov/a",
+            "verification": "checksum",
+        }
+
+    def test_a_bare_string_among_citations_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[self._citation("A cited claim."), "salvaged"]
+            )
+        )
+        assert "A cited claim." in md
+
+    def test_skipped_citations_are_counted_and_the_field_named(self):
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[self._citation("A cited claim."), "salvaged"]
+            )
+        )
+        assert "1 malformed entry skipped" in md
+        assert "`section_9_citations` (1)" in md
+
+    def test_the_totals_describe_only_what_could_be_read(self):
+        """The percentage, the table and the tier headings all derive from the
+        same list, so the drop has to happen once, before any of them.
+        """
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[self._citation("A cited claim."), "salvaged"]
+            )
+        )
+        assert "1 of 1 claim(s) (100%) were checked" in md
+
+    def test_every_citation_being_unreadable_is_not_reported_as_none_attempted(self):
+        """Resolution ran; its output was unreadable. Saying "not attempted"
+        would be a false claim about the run, and the emptied list would divide
+        by zero on the way to the percentage.
+        """
+        md = render_report_markdown(_base_report(section_9_citations=["a", "b"]))
+        assert "2 malformed entries skipped" in md
+        assert "No citation entry in this run could be read" in md
+        assert "_No citation resolution attempted._" not in md
+
+    def test_a_genuinely_empty_citation_list_still_says_none_attempted(self):
+        md = render_report_markdown(_base_report(section_9_citations=[]))
+        assert "_No citation resolution attempted._" in md
+        assert self.NOTE not in md
+
+    def test_a_clean_citation_list_gains_no_note(self):
+        md = render_report_markdown(
+            _base_report(section_9_citations=[self._citation("A cited claim.")])
+        )
+        assert self.NOTE not in md
+
+    # -- The loss this prevents -------------------------------------------
+
+    def test_the_run_still_gets_its_markdown_review_file(self, tmp_path):
+        """The regression that motivates all of the above. ``save_run`` catches
+        ``OSError`` around the markdown write and nothing else, so an
+        ``AttributeError`` from the renderer propagated out and the run lost
+        ``run_N_*_review.md`` entirely.
+        """
+        from pathlib import Path
+
+        from ci_article_review import history as hist
+
+        report = _base_report(
+            section_2_fact_check={"confirmed": ["salvaged", {"claim": "Survives."}]},
+            section_9_citations=["salvaged", self._citation("Also survives.")],
+        )
+        paths = hist.save_run(str(tmp_path), "Test Article", 1, report, [])
+
+        assert paths["markdown_path"] is not None
+        written = Path(paths["markdown_path"]).read_text(encoding="utf-8")
+        assert "Survives." in written
+        assert "Also survives." in written
+        assert "malformed" in written
