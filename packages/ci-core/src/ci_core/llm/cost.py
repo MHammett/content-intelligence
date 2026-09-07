@@ -87,10 +87,48 @@ def _price_for_model(model_id):
     return _UNKNOWN_PRICE if price is None else price
 
 
+def call_log_entry(pass_name, result, default_model=""):
+    """Build one ``api_call_log`` entry from a provider result.
+
+    Three callers — citation verification and the two SEO passes — each wrote
+    this dict out by hand, byte-identical apart from the pass name. When
+    ``discarded_attempts`` was added so retried attempts could be billed, all
+    three silently kept dropping it, because there was nowhere for the new field
+    to be added once. This is that place.
+
+    Deliberately tolerant of a partial result: a provider adapter that failed
+    early may carry nothing but ``failed`` and an error string.
+    """
+    entry = {
+        "pass": pass_name,
+        "model": result.get("model", default_model),
+        "failed": bool(result.get("failed")),
+        "tokens": result.get("tokens", {}),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "error": result.get("error") if result.get("failed") else None,
+    }
+    # Attempts the provider billed for and this call then threw away. Absent on
+    # the overwhelming majority of calls, so only present when it happened.
+    if result.get("discarded_attempts"):
+        entry["discarded_attempts"] = result["discarded_attempts"]
+    return entry
+
+
 def _entry_cost(entry):
-    """Return (input_cost_usd, output_cost_usd) for one api_call_log entry."""
-    if entry.get("failed"):
-        return 0.0, 0.0
+    """Return (input_cost_usd, output_cost_usd) for one api_call_log entry.
+
+    Cost follows the tokens the provider reported, not whether the pipeline
+    could use the answer. A ``failed`` short-circuit used to return zero here,
+    which is right for a call that never produced anything — a transport error
+    or a timeout reports ``{"prompt": 0, "completion": 0}`` and costs nothing on
+    its own. It was wrong for the one failure that does produce output: a
+    response whose JSON will not parse is complete, generated and billed, and
+    the client returns it with real token counts and ``failed: True``. Those
+    were priced at $0.00.
+
+    Leaning on the token counts covers both cases without a flag: nothing
+    generated means nothing to bill.
+    """
     tokens = entry.get("tokens") or {}
     prompt_tok = tokens.get("prompt", 0) or 0
     completion_tok = tokens.get("completion", 0) or 0
@@ -121,11 +159,26 @@ def calculate(api_call_log):
       total_output_usd  float
       by_pass           list   — [{pass, model, input_usd, output_usd, total_usd}]
       pricing_known     bool   — False when any model fell back to unknown pricing
+      discarded_calls   int    — retried attempts whose output was thrown away
+      uncosted_calls    int    — of those, how many carried no usage to price
+
+    Discarded attempts are real spend. A retry replaces the failed attempt's
+    result with the next one's, and the provider still billed for what it had
+    already generated. Where the attempt carried usage — a malformed-JSON
+    response is complete, merely unparseable — it is priced here against the same
+    model. Where it did not, a stalled stream having no usage to read, it is
+    counted in ``uncosted_calls`` so the caller can say the total is a floor
+    rather than an exact figure. Seven attempts were discarded unrecorded on
+    2026-09-03 under a summary line reading "(exact)".
     """
     by_pass = []
     total_in = 0.0
     total_out = 0.0
     pricing_known = True
+    discarded_calls = 0
+    uncosted_calls = 0
+    replayed_usd = 0.0
+    incurred_usd = 0.0
 
     for entry in api_call_log or []:
         in_usd, out_usd = _entry_cost(entry)
@@ -134,6 +187,20 @@ def calculate(api_call_log):
             # Check prefix match
             if not any(model_id.startswith(k) for k in _PRICING):
                 pricing_known = False
+
+        discarded = entry.get("discarded_attempts") or {}
+        if discarded:
+            discarded_calls += discarded.get("count", 0)
+            uncosted_calls += discarded.get("count", 0) - discarded.get("costed", 0)
+            d_in, d_out = _entry_cost(
+                {
+                    "model": entry.get("model", ""),
+                    "tokens": discarded.get("tokens", {}),
+                }
+            )
+            in_usd += d_in
+            out_usd += d_out
+
         by_pass.append(
             {
                 "pass": entry.get("pass", ""),
@@ -145,6 +212,10 @@ def calculate(api_call_log):
         )
         total_in += in_usd
         total_out += out_usd
+        if entry.get("replayed"):
+            replayed_usd += in_usd + out_usd
+        else:
+            incurred_usd += in_usd + out_usd
 
     return {
         "total_usd": round(total_in + total_out, 4),
@@ -152,4 +223,11 @@ def calculate(api_call_log):
         "total_output_usd": round(total_out, 4),
         "by_pass": by_pass,
         "pricing_known": pricing_known,
+        "discarded_calls": discarded_calls,
+        "uncosted_calls": uncosted_calls,
+        # A replay re-reports the captured run's token counts. Splitting them
+        # from what this process actually bought is what lets the summary say
+        # "$0.0000" only when that is true.
+        "replayed_usd": round(replayed_usd, 4),
+        "incurred_usd": round(incurred_usd, 4),
     }

@@ -36,6 +36,7 @@ while still exercising prompt assembly, the parallel dispatch, timeout wiring,
 result re-keying, the API call log, consolidation, citations, cost and the save.
 """
 
+import copy
 import json
 import os
 
@@ -43,6 +44,8 @@ from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
+
+from ci_article_review.report_markdown import render_report_markdown
 
 import pytest
 
@@ -107,7 +110,14 @@ _DOMAIN_DATA = {
                 "observation": "Borderline stock phrase.",
             }
         ],
-        "additional_observations": [],
+        "additional_observations": [
+            {
+                "passage": "Local officials were not consulted.",
+                "category": "red_team",
+                "observation": "The claim names an omission without evidence of it.",
+                "confidence": "high",
+            }
+        ],
     },
     "completeness": {
         "flags": [
@@ -119,7 +129,14 @@ _DOMAIN_DATA = {
             }
         ],
         "low_confidence": [],
-        "additional_observations": [],
+        "additional_observations": [
+            {
+                "passage": "The grid served 41 percent of load from nuclear.",
+                "category": "fact_check",
+                "observation": "No source given for the 41 percent figure.",
+                "confidence": "low",
+            }
+        ],
     },
     "argument_integrity": {
         "flags": [
@@ -131,7 +148,14 @@ _DOMAIN_DATA = {
             }
         ],
         "low_confidence": [],
-        "additional_observations": [],
+        "additional_observations": [
+            {
+                "passage": "Local officials were not consulted.",
+                "category": "red_team",
+                "observation": "Naming who was not consulted invites a response.",
+                "confidence": "medium",
+            }
+        ],
     },
     "red_team": {
         "most_vulnerable_claim": {
@@ -250,6 +274,10 @@ _VOLATILE_KEYS = {
     "timeout_budget_seconds",
     "registry_date",
     "registry_age_days",
+    # Derived from today's date against a registry stamp, so it changes on its
+    # own: "ok" becomes "notice" at 60 days and "warning" at 120, and this test
+    # would start failing on a calendar boundary rather than on a code change.
+    "registry_staleness",
     "prior_date",
 }
 
@@ -600,3 +628,70 @@ class TestProviderStagger:
             f"Staggered sleeps {sorted(slept)} do not match the offsets the "
             f"dispatch implies for {dict(per_provider)}: {expected}"
         )
+
+
+class TestADomainWithNoReviewerReachesTheReport:
+    """The drafter exclusion can empty a domain; the run must not hide it.
+
+    `standard` assigns one model to voice_style, so declaring that model as the
+    drafter excludes it and leaves the domain with no reviewer — measured
+    2026-09-05 as the only preset/drafter pair that does this. Two repairs cover
+    it, backfill at assignment time and substitution after the calls, and the
+    report names the domain when neither could. All three run here against the
+    real pipeline, because every other test of them supplies the assignments by
+    hand and so cannot catch the wiring going missing.
+    """
+
+    def _config(self, **pipeline_overrides):
+        cfg = copy.deepcopy(_CONFIG)
+        cfg["pipeline"].update({"drafting_model": "openai", **pipeline_overrides})
+        return cfg
+
+    def _patch(self, cfg):
+        return [patch("ci_article_review.pipeline.merge_configs", return_value=cfg)]
+
+    def test_a_substitute_provider_reviews_it_instead(self, tmp_path):
+        """The normal outcome: another configured model takes the domain."""
+        with _stubbed_run(
+            tmp_path, extra_patches=self._patch(self._config())
+        ) as report:
+            assignments = report["ensemble"]["assignments"]
+            voice = [a for a in assignments if a.endswith(":voice_style")]
+            assert voice, f"voice_style was never reviewed: {assignments}"
+            assert not voice[0].startswith("openai:"), "the drafter reviewed itself"
+            assert report["domains_not_run"] == []
+
+    def test_with_both_repairs_off_the_report_says_it_was_not_reviewed(self, tmp_path):
+        """The fallback signal, for the run neither repair can fix.
+
+        Both are off here, not just substitution. Backfill runs earlier — at
+        assignment time — so leaving it on repairs the domain before
+        substitution is ever consulted, and the unreviewed case this asserts on
+        never arises.
+        """
+        cfg = self._config(
+            substitute_failed_domains=False, backfill_narrowed_domains=False
+        )
+        with _stubbed_run(tmp_path, extra_patches=self._patch(cfg)) as report:
+            assert not [
+                a
+                for a in report["ensemble"]["assignments"]
+                if a.endswith(":voice_style")
+            ]
+            (detail,) = report["domains_not_run"]
+            assert detail["domain"] == "voice_style"
+            assert detail["section"] == "SECTION 3: Voice and AI-Speak"
+            assert "openai drafted this article" in detail["reason"]
+
+            markdown = render_report_markdown(report)
+            assert "Domains not reviewed (1)" in markdown
+            assert "Not reviewed this run" in markdown
+            # The section it actually applies to, not just the header block.
+            section_3 = markdown.split("## SECTION 3:")[1].split("## SECTION 4:")[0]
+            assert "Not reviewed this run" in section_3
+
+    def test_an_ordinary_run_gains_neither_signal(self, tmp_path):
+        """No drafter declared — nothing is excluded, so nothing is reported."""
+        with _stubbed_run(tmp_path) as report:
+            assert report["domains_not_run"] == []
+            assert "Domains not reviewed" not in render_report_markdown(report)

@@ -27,6 +27,14 @@ found the page does not actually support the claim it was cited for. Those are
 among the most actionable findings a run produces, and they are invisible in
 SECTIONS 1-8.
 
+Do NOT paste the WORKLIST block. It sits above SECTION 1 in the same file (and
+in `run_N_<timestamp>_worklist.md` on its own), so it is the first thing you
+meet when you open the review — but it is your list, not the model's. It is a
+set of documents nobody has read yet, named down to bulletin numbers and URLs,
+and handing that to a model asks it to fill in what those documents say. That
+is the failure this whole pipeline exists to catch. Start the paste at
+"## SECTION 1".
+
 ──────────────────────────────────────────────────────────────────────────────
 
 You previously helped me with a draft article. I ran it through a multi-model
@@ -63,9 +71,14 @@ Rules for the metadata update:
   to what the source actually says, or drop it) while `not_addressed` usually
   means the wrong URL was checked (fix the citation, not the sentence).
   "Source URL identified, but the fetch was refused" names a document that
-  exists but did not load for an automated fetch — usually a 403, and usually
-  still readable in a browser or via the archive copy listed beside it; those
-  are worth opening by hand rather than treating as unsourced. "Pointer only",
+  exists but did not load — a 404, an unreachable host, or a 403 that survived
+  a browser-shaped retry, which in practice means a subscription gate or a
+  JS/CAPTCHA challenge rather than a bot policy. Some are still readable to a
+  logged-in person, or via the archive copy listed beside it; those are worth
+  opening by hand rather than treating as unsourced. A citation whose entry
+  carries a "Reader access" line was read successfully — that line describes
+  friction the reader may meet, not a weaker verification, and the archive link
+  beside it is the durable half of the pairing. "Pointer only",
   "Fetched, but could not be read", and "No source identified"
   establish nothing either way — do not treat them as either confirmation or
   refutation; flag them in your summary as needing a human check. In

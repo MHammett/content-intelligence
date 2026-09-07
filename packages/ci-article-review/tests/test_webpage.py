@@ -70,15 +70,35 @@ class TestExtractArticle:
 
 
 class TestTrafilaturaPaths:
+    #: Long enough to clear the landslide guard for this sample page, whose
+    #: heuristic body is 245 characters. On a real article trafilatura's output
+    #: is comparable to the heuristic's rather than a fraction of it — measured
+    #: 1.09x to 1.45x across four live pages — so a realistic stand-in must be
+    #: too, or it trips a guard meant for pages that are not articles at all.
+    _TRAFILATURA_BODY = "# From Trafilatura\n\nClean extracted body. " + ("word " * 30)
+
     def test_uses_trafilatura_when_present(self):
         fake = types.ModuleType("trafilatura")
-        fake.extract = MagicMock(
-            return_value="# From Trafilatura\n\nClean extracted body."
-        )
+        fake.extract = MagicMock(return_value=self._TRAFILATURA_BODY)
         with patch.dict(sys.modules, {"trafilatura": fake}):
             _, body = webpage.extract_article(SAMPLE_HTML)
-        assert body == "# From Trafilatura\n\nClean extracted body."
+        assert body == self._TRAFILATURA_BODY.strip()
         fake.extract.assert_called_once()
+
+    def test_the_heuristic_wins_when_trafilatura_keeps_almost_nothing(self):
+        """A page whose content is repeated blocks rather than one article:
+        trafilatura finds a single block and calls the rest boilerplate.
+
+        Measured 2026-09-04 on a six-person team page — 439 characters kept of
+        36,717, covering one colleague — while the page had been cited for two
+        claims about a different person entirely.
+        """
+        fake = types.ModuleType("trafilatura")
+        fake.extract = MagicMock(return_value="One short block.")
+        with patch.dict(sys.modules, {"trafilatura": fake}):
+            _, body = webpage.extract_article(SAMPLE_HTML)
+        assert "Rural broadband has lagged for decades" in body
+        assert body != "One short block."
 
     def test_falls_back_when_trafilatura_absent(self):
         # Force `import trafilatura` to raise ImportError.

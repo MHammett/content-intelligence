@@ -8,7 +8,20 @@ only aggregate counts are printed to the console. This module fills that
 gap, following the SECTION 1-8 structure documented in
 ``handoff_templates/review_report.md`` (section 9, citations, was added to
 the pipeline after that template was written).
+
+The no-dependency rule below is about the *provider adapters* — importing
+``analysis.seo_suggest`` or ``adapters.citation.wayback`` would pull ``requests``
+and the model clients in behind them, so their constants are duplicated here and
+kept in step by a test. ``adapters.citation.disposition`` is exempt because it is
+a leaf: a tuple, a lookup and a pure function, importing nothing itself.
 """
+
+from .adapters.citation.disposition import DISPOSITIONS, disposition
+
+# ``worklist`` is a second exempt import, for the same reason: it reads the same
+# plain report dict, imports only the stdlib and the leaf module above, and so
+# pulls nothing in behind it.
+from .worklist import build_worklist, render_worklist
 
 #: Order the SEO METADATA fields render in, matching publication.md's block.
 #: Duplicated from ``analysis.seo_suggest.FIELD_ORDER`` rather than imported so
@@ -16,6 +29,18 @@ the pipeline after that template was written).
 #: the suggestion module would pull the provider adapters in behind it. A test
 #: asserts the two stay in step.
 _SEO_FIELD_ORDER = ("meta_description", "og_title", "og_description", "schema_type")
+
+#: Archive outcome vocabulary, duplicated from ``adapters.citation.wayback``'s
+#: ``ARCHIVE_*`` constants rather than imported, for the same reason as
+#: ``_SEO_FIELD_ORDER`` above: this module is a dependency-free renderer over a
+#: plain dict, and importing the adapter would pull ``requests`` in behind it. A
+#: test asserts the two sets stay in step.
+_ARCHIVE_SUBMITTED = "submitted"
+_ARCHIVE_ARCHIVED = "archived"
+_ARCHIVE_PENDING = "pending"
+_ARCHIVE_CAPTURE_FAILED = "capture_failed"
+_ARCHIVE_SUBMIT_FAILED = "submit_failed"
+_ARCHIVE_NOT_ATTEMPTED = "not_attempted"
 
 
 def _wayback_summary(wb):
@@ -52,6 +77,43 @@ def _wayback_summary(wb):
     return f"Archived — latest snapshot {age_str}{flag}: {wb.get('snapshot_url', '')}"
 
 
+def _render_alternates(urls, indent="  "):
+    """The other URLs tried for the same claim: a count first, then the list.
+
+    ``_kv_lines`` dumped this as a raw Python list repr, which for a
+    grounded-model citation is two or three 271-character opaque redirect URLs
+    run together on a single line — 546 of the 2,682 characters in the Honda
+    run's one content-mismatch entry, sitting above the line the author acts on.
+
+    The URLs stay, because a reader auditing a tier has to be able to see which
+    sources were tried. What changes is that the count leads, so the fact ("two
+    other sources were checked") is legible without reading 546 characters of
+    tracking URL, and each URL is its own subordinate line rather than part of a
+    wrapped blob with quotes and brackets in it.
+
+    Saying none of *them* supported the claim is safe in both places the
+    resolver sets this field: the checksum branch records the attempts that
+    failed *before* the one that succeeded, and the mismatch branch records
+    every attempt other than the best one. Neither list ever holds a supporting
+    source.
+
+    The wording has to stop there, though. The resolver's own note says "none
+    supported it either", which is true where it is written — under a refuted
+    claim — and false under the five real checksum entries that also carry this
+    field, where the primary source did support the claim. This renderer is
+    shared by every tier, so it says only what is true of the alternates.
+    """
+    urls = [u for u in (urls or []) if u]
+    if not urls:
+        return []
+    lines = [
+        f"{indent}- Alternates checked: {len(urls)} other source(s) cited for "
+        f"this claim were also fetched; none of them supported it."
+    ]
+    lines.extend(f"{indent}  - {u}" for u in urls)
+    return lines
+
+
 def _kv_lines(d, exclude=()):
     """Render remaining key/value pairs of a flag dict as indented bullets."""
     lines = []
@@ -60,6 +122,9 @@ def _kv_lines(d, exclude=()):
             continue
         if key == "wayback" and isinstance(value, dict):
             lines.append(f"  - Wayback: {_wayback_summary(value)}")
+            continue
+        if key == "alternates_checked" and isinstance(value, (list, tuple)):
+            lines.extend(_render_alternates(value))
             continue
         label = key.replace("_", " ").capitalize()
         lines.append(f"  - {label}: {value}")
@@ -95,6 +160,12 @@ def _render_section_1(consensus_flags):
                     "type",
                     "passage",
                     "passage_reference",
+                    # Fact-check findings reach Section 1 now, and their quoted
+                    # text lives in "claim" rather than "passage" — which is
+                    # already the heading directly above, so printing it again
+                    # under every source repeated the passage five or six times
+                    # per entry.
+                    "claim",
                 ),
             ):
                 lines.append(f"  {kv}")
@@ -185,6 +256,156 @@ def _render_model_failures(report):
     return lines
 
 
+_SEVERITY_HEADING = {
+    "critical": "Changed what the models were asked",
+    "degrading": "Context the models would have used",
+    "advisory": "Run bookkeeping",
+}
+
+
+def _render_handoff_gaps(report):
+    """Which handoff fields were missing, what each cost, and the line to paste.
+
+    Sits in the header rather than among the numbered sections, for the same
+    reason the failed-passes block does: an incomplete handoff is not a finding
+    about the article, it is context for reading every finding below. A reader
+    who reaches SECTION 5 without knowing that `PRIMARY CLAIM` was empty will
+    read a generic completeness flag as a fact about the draft rather than as
+    an artefact of what the pass was told.
+
+    The proposed values are **proposals**. The run was not conducted against
+    them and never will be — ``handoff_gaps.assess`` runs after the last model
+    call precisely so that it cannot be. Pasting one into the handoff and
+    re-running is what makes it real.
+    """
+    gaps = report.get("handoff_gaps") or []
+    if not gaps:
+        return []
+
+    lines = [f"## ⚠ Handoff metadata gaps ({len(gaps)})", ""]
+    lines.append(
+        "These fields were absent from the handoff. Each entry says what the "
+        "absence cost *this* run, and what to write instead. Nothing proposed "
+        "here was used in the review — a value you have not accepted is not a "
+        "value the pipeline may act on. Paste the fix into the handoff and "
+        "re-run to get the review these sections could not give you."
+    )
+    lines.append("")
+
+    for severity in ("critical", "degrading", "advisory"):
+        in_tier = [g for g in gaps if g.get("severity") == severity]
+        if not in_tier:
+            continue
+        lines.append(f"### {_SEVERITY_HEADING[severity]}")
+        lines.append("")
+        for gap in in_tier:
+            flag = (
+                " — left as its template placeholder" if gap.get("placeholder") else ""
+            )
+            lines.append(f"**`{gap.get('label', gap.get('field', ''))}`**{flag}")
+            lines.append("")
+            lines.append(gap.get("impact", ""))
+            lines.append("")
+            suggestion = gap.get("suggestion")
+            if suggestion:
+                basis = gap.get("suggestion_basis")
+                lines.append(
+                    f"*Proposed, not used in this run. From {basis}. Paste it "
+                    f"into the handoff if you agree with it:*"
+                    if basis
+                    else "*Proposed, not used in this run. Paste it into the "
+                    "handoff if you agree with it:*"
+                )
+                lines.append("")
+                lines.append("```")
+                lines.extend(suggestion.splitlines())
+                lines.append("```")
+                lines.append("")
+            elif gap.get("guidance"):
+                lines.append(f"*What to add: {gap['guidance']}*")
+                lines.append("")
+    return lines
+
+
+def _metadata_gap_note(report, domain):
+    """One line naming the handoff fields this section was built without, or []."""
+    missing = [
+        g.get("label", g.get("field", ""))
+        for g in (report.get("handoff_gaps") or [])
+        if domain in (g.get("domains") or [])
+    ]
+    if not missing:
+        return []
+    fields = ", ".join(f"`{m}`" for m in missing)
+    return [
+        f"> **Built without {fields}** — those handoff fields were missing or "
+        f"unfilled this run (see *Handoff metadata gaps* above). Findings here "
+        f"reflect what the pass was told, not only what is in the draft.",
+        "",
+    ]
+
+
+def _render_degradations(report):
+    """Knock-on effects of a failed pass — what it cost a *different* section.
+
+    ``report["degradations"]`` has had a producer and a console reader since it
+    was added, and no reader for the report itself: the entry that says
+    "Sections 2 and 9 are working from an incomplete claim list" scrolled past
+    in the terminal and never reached ``run_N_*_review.md`` — the file the
+    author keeps, re-reads, and pastes into a chat model. Of the two places it
+    could be said, it was only ever said in the one that disappears.
+
+    Sits with the failure blocks for the same reason the console prints it
+    there: "perplexity:fact_check failed" and "9 claims verified" are
+    separately unremarkable, and it is the link between them that tells a
+    reader which numbers below to distrust.
+    """
+    degradations = report.get("degradations") or []
+    if not degradations:
+        return []
+
+    lines = [f"## ⚠ Knock-on effects of failed passes ({len(degradations)})", ""]
+    for entry in degradations:
+        # ``section`` is a comma-joined title string; older reports predate the
+        # key entirely. Neither is worth failing a render over.
+        where = entry.get("section")
+        caused_by = entry.get("caused_by") or []
+        heading = where or "Affected sections"
+        lines.append(f"**{heading}**")
+        if caused_by:
+            lines.append(f"- Caused by: {', '.join(caused_by)}")
+        lines.append("")
+        lines.append(entry.get("detail", ""))
+        lines.append("")
+    return lines
+
+
+def _render_domains_not_run(report):
+    """Header block naming domains no model reviewed, or [].
+
+    Sits beside the failed-passes block rather than inside it because the two
+    say different things about how to read the report. A failed pass narrows
+    the pool a section was built from. This removes the section's basis
+    entirely, and it is the one a reader is least equipped to notice on their
+    own — there is no error, no warning count, and no missing model name
+    anywhere in the report to prompt the question.
+    """
+    details = report.get("domains_not_run") or []
+    if not details:
+        return []
+
+    lines = [f"## ⚠ Domains not reviewed ({len(details)})", ""]
+    for detail in details:
+        section = detail.get("section") or detail.get("domain")
+        lines.append(
+            f"- **{detail.get('domain')}** — {detail.get('reason')}. "
+            f"{section} is empty because nothing ran, not because the draft "
+            f"is clean."
+        )
+    lines.append("")
+    return lines
+
+
 def _missing_models_note(report, domain):
     """One line naming the models that failed on ``domain``, or []."""
     missing = [
@@ -200,6 +421,41 @@ def _missing_models_note(report, domain):
         f"caught is missing here, not absent from the draft.",
         "",
     ]
+
+
+def _not_run_note(report, domain):
+    """One line saying ``domain`` had no reviewer at all, or [].
+
+    The empty section is the whole problem. "_No flags._" under a heading reads
+    as a clean result, and for a domain nothing ran it is the opposite — an
+    absence of evidence presented in the same words the report uses for
+    evidence of absence. Measured 2026-09-05: rendering the never-ran case and
+    the clean case produced byte-identical markdown.
+    """
+    for detail in report.get("domains_not_run") or []:
+        if detail.get("domain") != domain:
+            continue
+        return [
+            f"> **Not reviewed this run** — {detail.get('reason')}. This "
+            f"section is empty because nothing ran, not because the draft is "
+            f"clean.",
+            "",
+        ]
+    return []
+
+
+def _domain_notes(report, domain):
+    """Every caveat that belongs above ``domain``'s section.
+
+    One call site per section so a new caveat reaches all of them at once, and
+    so the two cases cannot both be claimed: a domain with a failed pass has a
+    result entry, which is exactly what keeps it out of ``domains_not_run``.
+    """
+    return (
+        _missing_models_note(report, domain)
+        + _not_run_note(report, domain)
+        + _metadata_gap_note(report, domain)
+    )
 
 
 #: How an out-of-scope claim's category reads to someone who did not write the
@@ -281,7 +537,7 @@ def _render_out_of_scope(items):
 
 def _render_section_2(fact_check, report=None):
     lines = ["## SECTION 2: Factual Verification", ""]
-    lines.extend(_missing_models_note(report or {}, "fact_check"))
+    lines.extend(_domain_notes(report or {}, "fact_check"))
     if not fact_check:
         lines.append("_No fact-check results._")
         return lines
@@ -406,18 +662,58 @@ def _render_section_8(additional):
     if not additional:
         lines.append("_None._")
         return lines
+    lines.append(
+        "_Most-corroborated first, then by the flagging model's stated "
+        "confidence. Confidence is self-reported and not comparable between "
+        "providers, so it only breaks ties between observations no other model "
+        "raised._"
+    )
+    lines.append("")
     for obs in additional:
         passage = obs.get("passage", "")
         category = obs.get("category", "?")
-        source = obs.get("source_model", "?")
+        models = obs.get("models") or [obs.get("source_model", "?")]
         domain = obs.get("source_domain", "?")
-        lines.append(f'- [{category}] "{passage}" — flagged by {source}:{domain}')
+        if len(models) > 1:
+            who = f"{', '.join(models)} — {len(models)} models agree"
+        else:
+            who = f"{models[0]}:{domain}"
+        lines.append(f'- [{category}] "{passage}" — flagged by {who}')
         for kv in _kv_lines(
-            obs, exclude=("passage", "category", "source_model", "source_domain")
+            obs,
+            exclude=(
+                "passage",
+                "category",
+                "source_model",
+                "source_domain",
+                # Rendered in the bullet above; repeating them reads as data the
+                # model supplied rather than as bookkeeping this pass added.
+                "models",
+                "model_count",
+            ),
         ):
             lines.append(kv)
     lines.append("")
     return lines
+
+
+#: Retrieval fields ``_render_archive_pair`` renders itself, beside the URLs
+#: they are about. Appended to each caller's own exclude list so nothing is said
+#: twice, and so the access story stays next to the links it governs. (``url``
+#: and ``final_url`` are excluded by the callers directly — the pair block has
+#: rendered those since the redirector fix.)
+#:
+#: ``verified_via`` is here because it is an enum — ``tls_impersonation`` told a
+#: reader nothing, and the resolver already writes the sentence that does: one
+#: per retrieval route, ``reader_access`` for an escalated fetch and
+#: ``archive_provenance`` for one read from the archive. ``archive_provenance``
+#: stays in the dump below, where it has always rendered, so each route states
+#: itself exactly once.
+#:
+#: A plain direct fetch says nothing at all, which is the point: it is the
+#: unremarkable case, and a line on every entry reporting that nothing happened
+#: would bury the entries where something did.
+_PAIR_RENDERED_FIELDS = ("verified_via", "reader_access")
 
 
 def _citation_pair(citation):
@@ -433,18 +729,100 @@ def _citation_pair(citation):
     Returns ``(live_url, archive_url_or_None)``.
     """
     wayback = citation.get("wayback") or {}
-    return citation.get("url", ""), wayback.get("snapshot_url")
+    # The resolved URL when the citation came in through a redirector. A
+    # grounded model cites as `vertexaisearch.cloud.google.com/
+    # grounding-api-redirect/AUZIY...` — 271 opaque characters that name no
+    # publication, and that the reader is being asked to go and check. The page
+    # behind it was fetched and read by this pass, so its address is known.
+    live = citation.get("final_url") or citation.get("url", "")
+    return live, wayback.get("snapshot_url")
+
+
+#: Verdicts from ``resolver._verify_archive_matches``. Duplicated rather than
+#: imported for the same reason as ``_ARCHIVE_*`` — see the note there.
+_MATCH_IDENTICAL = "identical"
+_MATCH_DIFFERS = "differs"
+_MATCH_UNCHECKED = "unchecked"
+
+
+def _archive_match_lines(citation, indent):
+    """Whether the archived copy was confirmed to say what the live page said.
+
+    The report tells the author to *cite both* the live URL and the archive
+    copy. That is a recommendation they act on, and nothing used to establish
+    that the two say the same thing — a snapshot of a paywall, a cookie wall, a
+    bot block, or a much older version of the page renders exactly like a good
+    one. The pairing now carries the result of actually checking.
+
+    Silent when nothing was checked and nothing is wrong to report, so an
+    ordinary verified citation does not grow a line saying so twice.
+    """
+    verdict = citation.get("archive_match")
+    if not verdict:
+        return []
+    detail = citation.get("archive_match_detail") or ""
+    if verdict == _MATCH_IDENTICAL:
+        return [
+            f"{indent}- Archive verified: the snapshot's text is identical to "
+            f"the live page this run checked, so the pairing below is safe to "
+            f"publish."
+        ]
+    if verdict == _MATCH_DIFFERS:
+        return [f"{indent}- **Archive does NOT match the live page.** {detail}"]
+    return [
+        f"{indent}- Archive not verified against the live page — {detail} The "
+        f"snapshot may or may not contain the document."
+    ]
+
+
+def _capture_note(citation):
+    """Suffix for the Archive line saying what this run's submission produced.
+
+    Only ever describes the snapshot's own timestamp, because that is the only
+    thing actually known. Save Page Now does not always make a new capture: on
+    2026-09-05 a live save of an IANA page redirected to a snapshot dated
+    2026-08-31, five days old. The first version of this line said "captured
+    this run" for any submission that came back with a URL, which would have
+    reported that five-day-old copy as fresh — the same species of overstatement
+    as calling a submission "archived".
+
+    An existing snapshot returned instead of a new capture is worth saying out
+    loud rather than papering over: it tells the author archive.org declined to
+    re-capture, which is why a page they just asked to archive still carries an
+    older date.
+    """
+    wb = citation.get("wayback") or {}
+    if wb.get("archive_outcome") != _ARCHIVE_ARCHIVED:
+        return ""
+    age = wb.get("snapshot_age_days")
+    if age == 0:
+        return " — snapshot dated today"
+    if age:
+        plural = "day" if age == 1 else "days"
+        return (
+            f" — archive.org returned an existing snapshot {age} {plural} old "
+            f"rather than making a new capture"
+        )
+    return ""
 
 
 def _render_archive_pair(citation, indent="  "):
     """Lines pairing a citation's live URL with its archive copy.
 
     Says which state applies rather than silently omitting the archive line,
-    because "no snapshot yet" and "never submitted" need different follow-up
-    from the author.
+    because the states need different follow-up from the author.
 
-    The two negative states are the ones worth being careful about, and they are
-    three, not two:
+    The distinction this function exists to hold, and which it previously did
+    not: **"submitted" is not "archived".** The old wording — "submitted to the
+    Wayback Machine this run; the snapshot URL appears on the next run once
+    archive.org has captured it" — asserted a future that nothing checked. A
+    capture archive.org accepted and then dropped rendered identically to one it
+    completed, and the author had no way to tell, this run or any later one.
+    Only ``archived`` says a snapshot exists, and it is only ever set alongside
+    the URL of that snapshot.
+
+    The negative states are the ones worth being careful about, and there are
+    five, not two:
 
     * ``archived: None`` — a lookup was made and did not complete (the circuit
       breaker tripped, or the request failed). NOT the same as "there is no
@@ -457,6 +835,10 @@ def _render_archive_pair(citation, indent="  "):
       "NOT CHECKED" would imply a lookup that could succeed next time; none was
       attempted and none will be.
     * ``archived: False`` — archive.org answered and has no snapshot.
+    * submission failed — archive.org refused the request outright.
+    * capture failed — archive.org took the job and then could not capture it.
+      This is the one that used to be invisible, and the one that repeats
+      silently run after run if nobody names it.
 
     The missing-key branch has to come before the null one: ``{}.get("archived")
     is None`` is True, so an absent dict would otherwise fall into "NOT CHECKED".
@@ -471,21 +853,79 @@ def _render_archive_pair(citation, indent="  "):
     if not live:
         return []
     out = [f"{indent}- Live: {live}"]
-    wayback = citation.get("wayback") or {}
+    # Immediately under the URL, not down in the key/value dump: this is what
+    # the author needs while deciding what to paste into the article.
+    friction = citation.get("reader_access")
+    if friction:
+        out.append(f"{indent}- Reader access: {friction}")
+    wb = citation.get("wayback") or {}
+    outcome = wb.get("archive_outcome")
+    detail = wb.get("archive_outcome_detail")
+
     if archive:
         stale = (
             " (STALE — re-archive before relying on it)"
-            if wayback.get("snapshot_stale")
+            if wb.get("snapshot_stale")
             else ""
         )
-        out.append(f"{indent}- Archive: {archive}{stale}")
+        out.append(f"{indent}- Archive: {archive}{stale}{_capture_note(citation)}")
+        if wb.get("snapshot_is_error_capture"):
+            # A snapshot exists, and it is a capture of an error page. "Archived"
+            # would be true and useless: what is preserved is the refusal, not
+            # the document. Our own captures cannot produce this (capture_all=0),
+            # but a pre-existing snapshot is outside our control.
+            out.append(
+                f"{indent}- **This snapshot is a capture of an HTTP "
+                f"{wb.get('snapshot_status')} response, not of the document.** "
+                f"Something is archived at that URL; the source is not. Archive "
+                f"it by hand or re-source the claim."
+            )
+        out.extend(_archive_match_lines(citation, indent))
         out.append(f"{indent}- Cite both: {live} (archived: {archive})")
-    elif wayback.get("submitted"):
+    elif outcome == _ARCHIVE_SUBMIT_FAILED:
         out.append(
-            f"{indent}- Archive: submitted to the Wayback Machine this run; the "
-            f"snapshot URL appears on the next run once archive.org has captured it."
+            f"{indent}- Archive: SUBMISSION FAILED — archive.org did not accept "
+            f"the request to capture this URL ({detail or 'no reason given'}). "
+            f"It is NOT archived. Archive it by hand, or re-run."
         )
-    elif not wayback:
+    elif outcome == _ARCHIVE_NOT_ATTEMPTED:
+        # "re-run once archiving succeeds" would be a promise nothing is going
+        # to keep for an internal address, and a misleading one for a host that
+        # would not resolve — same reasoning as the unresolved-citation branch
+        # at the bottom of this function.
+        out.append(
+            f"{indent}- Archive: NOT SUBMITTED — {detail or 'no reason recorded'}. "
+            f"This URL is not archived and nothing in this run tried to archive "
+            f"it."
+        )
+    elif outcome == _ARCHIVE_CAPTURE_FAILED:
+        out.append(
+            f"{indent}- Archive: CAPTURE FAILED — archive.org accepted the "
+            f"request and then could not capture the page "
+            f"({detail or 'no reason given'}). It is NOT archived, and "
+            f"re-running will most likely fail the same way. Archive it by hand."
+        )
+    elif outcome == _ARCHIVE_PENDING:
+        out.append(
+            f"{indent}- Archive: SUBMITTED, OUTCOME UNKNOWN — archive.org was "
+            f"still capturing this URL when the report was written"
+            f"{f' ({detail})' if detail else ''}. Nothing here establishes that "
+            f"the capture succeeded; the next run reads the job's outcome and "
+            f"says which way it went."
+        )
+    elif outcome == _ARCHIVE_SUBMITTED or wb.get("submitted"):
+        # Deliberately does not say archive.org "accepted" anything: this branch
+        # also covers a request that timed out or was abandoned, where even the
+        # acceptance is unestablished. Everything asserted here is something the
+        # run actually observed.
+        out.append(
+            f"{indent}- Archive: SUBMITTED, OUTCOME UNKNOWN — a capture request "
+            f"went out for this URL and no snapshot came back"
+            f"{f' ({detail})' if detail else ''}. That it was asked for is all "
+            f"this establishes — treat the URL as unarchived until a snapshot "
+            f"appears."
+        )
+    elif not wb:
         out.append(
             f"{indent}- Archive: NOT LOOKED UP — archive.org was never asked "
             f"about this URL, because the fetch failed in a way an archived copy "
@@ -493,17 +933,32 @@ def _render_archive_pair(citation, indent="  "):
             f"would hand to a third party. Re-running will not ask either. This "
             f"says nothing about whether the page is archived — check by hand."
         )
-    elif wayback.get("archived") is None:
+    elif wb.get("archived") is None:
         out.append(
             f"{indent}- Archive: NOT CHECKED — the archive.org lookup did not "
             f"complete this run. This says nothing about whether the page is "
             f"archived; re-run to find out."
         )
     elif citation.get("resolved"):
-        out.append(
-            f"{indent}- Archive: none. This citation is only as durable as the "
-            f"live URL — re-run once archiving succeeds, or archive it by hand."
-        )
+        # A citation that only came back because the fetch escalated is the one
+        # case where "as durable as the live URL" understates the problem: the
+        # live URL already refused a client once. Saying the absence out loud is
+        # the point — an escalated citation with no archive beside it is the
+        # weakest thing this section can produce, and it should not read like
+        # the ordinary not-yet-archived case.
+        if citation.get("verified_via") == "tls_impersonation":
+            out.append(
+                f"{indent}- Archive: NONE — and this is the citation that most "
+                f"needed one. The source refused an ordinary automated request, "
+                f"so the live URL is both the only copy and the fragile kind. "
+                f"Archive it by hand before publishing, or re-source the claim."
+            )
+        else:
+            out.append(
+                f"{indent}- Archive: none. This citation is only as durable as "
+                f"the live URL — re-run once archiving succeeds, or archive it "
+                f"by hand."
+            )
     else:
         # Unresolved: the live URL did not yield readable content this run, and
         # archive.org confirmed it has no snapshot either. Neither half of the
@@ -518,6 +973,41 @@ def _render_archive_pair(citation, indent="  "):
             f"readable copy was obtained from anywhere. Unresolved citations are "
             f"not submitted for archiving; archive it by hand if you keep it."
         )
+
+    # The escalation warning above lives in the `resolved` branch, which only
+    # citations that were never submitted ever reach — and an escalated citation
+    # is resolved, so `_submit_missing_archives` always submits it. That made the
+    # warning nearly unreachable in a real run: it fired only for the rare
+    # escalated-and-non-public combination, and the common case (submitted,
+    # capture pending or failed) quietly got the milder wording meant for
+    # ordinary citations. An escalated source with no snapshot is in the same
+    # weak position however the archiving ended, so say it there too — once,
+    # only when the branch above did not already say it.
+    if (
+        citation.get("verified_via") == "tls_impersonation"
+        and not archive
+        and outcome
+        and outcome != _ARCHIVE_ARCHIVED
+    ):
+        out.append(
+            f"{indent}- This is the citation that most needed an archive: the "
+            f"source refused an ordinary automated request, so the live URL is "
+            f"both the only copy and the fragile kind. Archive it by hand before "
+            f"publishing, or re-source the claim."
+        )
+
+    # A capture that failed on an earlier run and is being retried. Worth a line
+    # of its own: a URL that never archives across several runs looks like bad
+    # luck one report at a time, and like a page archive.org cannot capture once
+    # you can see the reason repeating.
+    prior = wb.get("prior_capture_failure")
+    if prior and outcome != _ARCHIVE_ARCHIVED:
+        run = prior.get("run_number")
+        where = f" (run {run})" if run else ""
+        out.append(
+            f"{indent}- Archive history: a previous capture of this URL "
+            f"failed{where} — {prior.get('reason') or 'no reason given'}."
+        )
     return out
 
 
@@ -530,34 +1020,323 @@ def _render_archive_pair(citation, indent="  "):
 #: refused (403, 404, DNS), which is a different fact about the claim than never
 #: having had a URL at all — and it is usually actionable, because a publisher
 #: that refuses an automated fetch will often serve the same page to a person.
-_DISPOSITIONS = (
-    ("checksum", "Read, and supports the claim"),
-    ("content_mismatch", "Read, and does NOT support the claim"),
-    ("unverifiable", "Fetched, but could not be read"),
-    ("fetch_failed", "Source URL identified, but the fetch was refused"),
-    ("pointer", "Pointer only — nothing retrieved"),
-    ("no_source", "No source identified"),
-)
+#: Re-exported from the citation adapters so this renderer and the console run
+#: summary classify identically. They used to do it separately and disagreed.
+_DISPOSITIONS = DISPOSITIONS
 
 #: The two dispositions where a document was genuinely retrieved *and* its text
 #: read by the relevance check. "Checked" means these and only these — the
 #: verdict then splits them. Conflating "checked" with "supports" is the same
 #: mistake this section exists to stop a reader making, one level up.
-_READ_DISPOSITIONS = ("checksum", "content_mismatch")
 
 
-def _disposition(citation):
-    """Which ``_DISPOSITIONS`` bucket a citation belongs in.
+_disposition = disposition
 
-    Anything that never reached a verification tier is one of the two "nothing
-    was read" buckets, regardless of ``resolved``: ``fetch_failed`` when a URL
-    was identified and the fetch did not succeed, ``no_source`` when there was
-    no URL to try.
+
+#: How each re-ask answer reads to someone deciding what to do about the claim.
+_REASK_LEAD = {
+    "correct_claim": "says the source is right and the claim was wrong",
+    "different_source": "stands by the claim and proposes a different source",
+    "withdraw": "withdraws the claim",
+    "stand": "maintains the claim and disputes the refutation",
+}
+
+#: Re-ask answers in which the asserting model faulted the *claim* rather than
+#: the citation. Both mean the draft is what has to change: ``correct_claim``
+#: supplies replacement wording, ``withdraw`` says the claim should go.
+#:
+#: The other two deliberately do not belong here. ``different_source`` stands by
+#: the claim and blames the URL, which is precisely the citation problem the
+#: default guidance describes; ``stand`` disputes the refutation outright and
+#: concedes nothing. Reading either as "the claim was wrong" would put words in
+#: the model's mouth in the one block where the section is trying to stop
+#: exactly that kind of substitution.
+_REASK_CONCEDES = frozenset({"correct_claim", "withdraw"})
+
+
+def _render_reask(reask):
+    """What the asserting model said when handed its own refutation.
+
+    Rendered as the model's answer, never as a resolution. The verdict above it
+    is unchanged and stays unchanged: this is the author being told what the
+    model would do about it, and a ``stand`` is reported as plainly as a
+    ``withdraw`` so that "the model disagrees" is visible rather than absorbed.
     """
-    tier = citation.get("verification")
-    if tier in {k for k, _ in _DISPOSITIONS}:
-        return tier
-    return "fetch_failed" if citation.get("url") else "no_source"
+    if not reask:
+        return []
+    action = reask.get("action", "")
+    who = reask.get("asked_model", "the asserting model")
+    lead = _REASK_LEAD.get(action, "responded")
+    lines = [f"  - **Asked {who} again** — {lead}."]
+    if reask.get("reason"):
+        lines.append(f"    - Its reason: {reask['reason']}")
+    if action == "correct_claim" and reask.get("corrected_claim"):
+        lines.append(f'    - Proposed wording: "{reask["corrected_claim"]}"')
+    if action == "different_source" and reask.get("source_url"):
+        lines.append(f"    - Proposed source: {reask['source_url']}")
+
+    check = reask.get("source_check")
+    if check:
+        # The proposal was put through the same resolution the original URL
+        # failed. Reporting the proposal without this would hand the author a
+        # URL on the strength of the model having named it, which is the tier
+        # confusion the whole section exists to prevent.
+        verification = check.get("verification")
+        if verification == "checksum":
+            outcome = "fetched, read, and it does support the claim"
+        elif verification == "content_mismatch":
+            verdict = check.get("relevance_verdict") or "does not support"
+            outcome = f"fetched and read, and it does NOT support the claim ({verdict})"
+        elif verification == "unverifiable":
+            outcome = "fetched, but its content could not be read or assessed"
+        else:
+            outcome = "could not be resolved"
+        lines.append(f"    - That proposed source was checked: {outcome}.")
+        # The run already archived this URL if it needed archiving, so the
+        # author gets the durable address here rather than being sent to find
+        # it. Only offered when the pairing is safe — the same three states the
+        # reference list withholds.
+        snapshot = check.get("snapshot_url")
+        if snapshot and not check.get("snapshot_is_error_capture"):
+            if check.get("archive_match") == _MATCH_DIFFERS:
+                lines.append(
+                    f"    - Archive of that source: {snapshot} — **does not "
+                    f"match the live page**; check before citing it."
+                )
+            elif check.get("archive_match") == _MATCH_IDENTICAL:
+                lines.append(
+                    f"    - Archive of that source: {snapshot} (verified "
+                    f"identical to the live page)."
+                )
+            else:
+                lines.append(f"    - Archive of that source: {snapshot}")
+    elif action == "different_source":
+        lines.append("    - That proposed source was NOT checked. Treat it as a lead.")
+    return lines
+
+
+def _render_mismatch_entry(citation):
+    """One content-mismatch entry, with the actionable content at the top.
+
+    Fields used to render in whatever order the resolver happened to write them,
+    which put a 546-character ``content_summary``, a 271-character opaque
+    redirect URL and two more of them under ``alternates_checked`` above the one
+    line an author acts on. On the Honda run the re-ask's proposed correction —
+    the draft says "January 1, 2003" where the source says "1998 or 2002" — was
+    the last line of a 2,682-character entry.
+
+    The order is now: what the check found, what to do about it, then the
+    evidence it rests on. The verdict still leads, so ``_render_reask``'s framing
+    survives the move: the reader meets the finding before the asserting model's
+    answer to it, and the answer is never presented as having settled anything.
+
+    Nothing is dropped, because the point of the section is that a reader can
+    audit a tier instead of trusting it — the checksum, the relevance quote, the
+    archive pairing and the alternate URLs all still render. ``note`` is the sole
+    suppression, and only in the specific case where it restates the relevance
+    reason printed two lines above it: the resolver builds it as verdict +
+    reason + alternates count, and all three of those now have their own lines.
+    A ``note`` that says anything else is kept, so the test is on the string
+    rather than on the disposition.
+    """
+    c = citation
+    lines = [f'- "{c.get("claim", "")}"']
+
+    verdict = c.get("relevance_verdict")
+    if verdict:
+        lines.append(f"  - Relevance verdict: {verdict}")
+    reason = c.get("relevance_reason")
+    if reason:
+        lines.append(f"  - Relevance reason: {reason}")
+
+    lines.extend(_render_reask(c.get("reask")))
+    lines.extend(_render_archive_pair(c))
+
+    exclude = [
+        "claim",
+        "resolved",
+        "reask",
+        "url",
+        "final_url",
+        "relevance_verdict",
+        "relevance_reason",
+        *_PAIR_RENDERED_FIELDS,
+    ]
+    if reason and reason in (c.get("note") or ""):
+        exclude.append("note")
+    lines.extend(_kv_lines(c, exclude=tuple(exclude)))
+    return lines
+
+
+def _html_escape(value):
+    """Escape a URL for use inside an HTML attribute and as link text.
+
+    Four replacements rather than ``html.escape`` so this module keeps the
+    zero-import property the comments above rely on. Ampersand first, or it
+    would double-escape the entities the other replacements introduce.
+
+    Query strings routinely carry ``&`` (``?a=1&b=2``), and pasting that raw
+    into an ``href`` produces a link that silently drops everything after the
+    first parameter — a broken citation that looks fine in the editor.
+    """
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _publishable_archive(citation, archive):
+    """The archive URL only when the pairing is safe to publish unreviewed.
+
+    Withholds exactly the three states the per-entry list flags: a snapshot that
+    captured an error page rather than the document, one whose text does not
+    match the live page, and one that could not be checked this run. A
+    copy-paste block is acted on without re-reading the reasoning above it, so
+    anything questionable must not be in it — the markdown list above still
+    names them, with why.
+    """
+    if not archive:
+        return None
+    wb = citation.get("wayback") or {}
+    if wb.get("snapshot_is_error_capture"):
+        return None
+    if citation.get("archive_match") in (_MATCH_DIFFERS, _MATCH_UNCHECKED):
+        return None
+    return archive
+
+
+def _html_reference_block(entries):
+    """The same reference list as pasteable HTML.
+
+    The markdown above is paste-ready for a markdown-authored article; a
+    WordPress block editor wants anchors. Same sources, same order, and every
+    source appears — one that has no publishable archive copy is still a
+    reference the article cites, so it goes in as a plain link rather than
+    being dropped from the list the author pastes.
+    """
+    if not entries:
+        return []
+    lines = ["```html", "<ol>"]
+    withheld = 0
+    for live, archive, c in entries:
+        safe = _publishable_archive(c, archive)
+        if archive and not safe:
+            withheld += 1
+        href = _html_escape(live)
+        if safe:
+            lines.append(
+                f'  <li><a href="{href}">{href}</a> '
+                f'(<a href="{_html_escape(safe)}">archived</a>)</li>'
+            )
+        else:
+            lines.append(f'  <li><a href="{href}">{href}</a></li>')
+    lines.append("</ol>")
+    lines.append("```")
+    lines.append("")
+    carrying = sum(1 for live, a, c in entries if _publishable_archive(c, a))
+    note = f"{carrying} of {len(entries)} carry an archive link."
+    if withheld:
+        note += (
+            f" {withheld} archived source(s) are linked live-only here because "
+            f"the snapshot was not confirmed to match the page — see the list "
+            f"above for which and why."
+        )
+    lines.append(note)
+    lines.append("")
+    return lines
+
+
+def _render_reference_list(citations):
+    """Every cited address once, with its archive copy, ready to publish.
+
+    The pairing already existed per citation, but only inside the diagnostic
+    entries — spread over five disposition buckets and interleaved with claim
+    text, verification tiers and relevance notes. That is the right shape for
+    deciding whether to trust a citation and the wrong shape for the job the
+    author actually has next, which is putting both addresses into the article.
+    Getting a reference list out of it meant reading the whole section and
+    transcribing by hand, and a source backing three claims appeared three
+    times.
+
+    So: one entry per address, in the order first cited, deduplicated, split by
+    whether an archive copy exists. Sources with no snapshot are listed rather
+    than dropped — the author needs to know which references the article cannot
+    carry an archive link for, and silence would read as "all of them are fine".
+
+    Where the archive was checked against the live page (see
+    ``resolver._verify_archive_matches``) an unconfirmed pairing is marked. It
+    is the only part of this list that is a judgement rather than a fact, and it
+    is the one the author would otherwise publish blind.
+    """
+    paired, live_only, seen = [], [], set()
+    for c in citations:
+        live, archive = _citation_pair(c)
+        if not live or live in seen:
+            continue
+        seen.add(live)
+        (paired if archive else live_only).append((live, archive, c))
+
+    if not paired and not live_only:
+        return []
+
+    lines = [
+        f"### Reference list — live and archived addresses "
+        f"({len(paired) + len(live_only)} source(s))",
+        "",
+        "Each source once, in the order first cited. Paste-ready: the archive "
+        "address is what keeps the citation readable after the live page moves, "
+        "changes, or starts refusing readers.",
+        "",
+    ]
+
+    if paired:
+        for i, (live, archive, c) in enumerate(paired, 1):
+            lines.append(f"{i}. {live}")
+            wb = c.get("wayback") or {}
+            note = ""
+            if wb.get("snapshot_is_error_capture"):
+                note = (
+                    f"  — **do not publish this pairing**: the snapshot captured "
+                    f"an HTTP {wb.get('snapshot_status')} response, not the document"
+                )
+            elif c.get("archive_match") == _MATCH_DIFFERS:
+                note = "  — **archive does not match the live page**; check before publishing"
+            elif c.get("archive_match") == _MATCH_UNCHECKED:
+                note = "  — archive not verified against the live page this run"
+            elif wb.get("snapshot_stale"):
+                note = "  — snapshot is stale; re-archive before relying on it"
+            lines.append(f"   archived: {archive}{note}")
+        lines.append("")
+
+    if live_only:
+        lines.append(
+            f"**No archive copy ({len(live_only)})** — publishable only as a "
+            f"live link, and only as durable as that link:"
+        )
+        for live, _archive, c in live_only:
+            wb = c.get("wayback")
+            if not isinstance(wb, dict):
+                why = "archive.org was never asked about this URL"
+            elif wb.get("archived") is None:
+                why = "the archive.org lookup did not complete this run"
+            elif wb.get("archive_outcome") == _ARCHIVE_CAPTURE_FAILED:
+                why = "archive.org tried to capture it and could not"
+            elif wb.get("archive_outcome") in (_ARCHIVE_PENDING, _ARCHIVE_SUBMITTED):
+                why = "submitted for archiving this run; no snapshot yet"
+            elif wb.get("archive_outcome") == _ARCHIVE_NOT_ATTEMPTED:
+                why = "not submitted for archiving"
+            else:
+                why = "archive.org has no snapshot of this URL"
+            lines.append(f"- {live} — {why}")
+        lines.append("")
+
+    lines.append("For pasting into an HTML editor:")
+    lines.append("")
+    lines.extend(_html_reference_block(paired + live_only))
+    return lines
 
 
 def _render_section_9(citations, out_of_scope=()):
@@ -628,6 +1407,10 @@ def _render_section_9(citations, out_of_scope=()):
         lines.append(f"| {label} | {len(grouped[key])} |")
     lines.append("")
 
+    # The deliverable, before the diagnostics. Everything below this point helps
+    # the author decide what to trust; this is what they act on once they have.
+    lines.extend(_render_reference_list(citations))
+
     # Relate the fact-check pass's own verdict to whether anything was retrieved.
     # These are independent — one is model judgment, the other is retrieval — and
     # a reader who sees "Bucket: confirmed" beside a claim with no URL reasonably
@@ -688,7 +1471,14 @@ def _render_section_9(citations, out_of_scope=()):
             drift = c["content_changed_since"]
             when = f" on {drift['prior_date']}" if drift.get("prior_date") else ""
             lines.append(f'- "{c.get("claim", "")}"')
-            lines.append(f"  - URL: {c.get('url', '')}")
+            # Where the fetch landed, not the address the model cited. A
+            # grounded-model citation arrives as a `grounding-api-redirect`
+            # wrapper that names no publication and expires within days; this
+            # block is telling the author to go and re-check a source, so it
+            # has to name one they can open. Every other URL in the section
+            # goes through `_citation_pair` for this reason -- the drift block
+            # predates it and kept reading `url` directly.
+            lines.append(f"  - URL: {_citation_pair(c)[0]}")
             lines.append(
                 f"  - Last matched in run {drift.get('prior_run')} of "
                 f"'{drift.get('prior_article')}'{when} — content has since changed. "
@@ -714,7 +1504,15 @@ def _render_section_9(citations, out_of_scope=()):
             lines.append(f'- "{c.get("claim", "")}"')
             lines.extend(_render_archive_pair(c))
             for kv in _kv_lines(
-                c, exclude=("claim", "resolved", "content_changed_since")
+                c,
+                exclude=(
+                    "claim",
+                    "resolved",
+                    "url",
+                    "final_url",
+                    "content_changed_since",
+                )
+                + _PAIR_RENDERED_FIELDS,
             ):
                 lines.append(kv)
         lines.append("")
@@ -740,16 +1538,65 @@ def _render_section_9(citations, out_of_scope=()):
         # wrong or the extraction missed the relevant part — a citation problem,
         # not a factual one. Collapsing them would overstate the first and bury
         # the second.
+        #
+        # "Much more often", though, is not "always", and this guidance used to
+        # be written as though it were: with nothing marked `contradicts` it told
+        # the reader, unconditionally, to go and check the URL. On the Honda run
+        # the single `not_addressed` entry carried a re-ask in which the
+        # asserting model read its own refutation and concluded the *claim* was
+        # wrong — the draft said the clock advanced to "January 1, 2003" where
+        # the source says "1998 or 2002" — and attached the corrected wording.
+        # The header pointed the reader away from the one actionable finding in
+        # the block.
+        #
+        # So the guidance is conditional on what the entries actually contain,
+        # and each sentence is scoped to the entries it is true of. The
+        # all-`not_addressed` wording is kept verbatim for the case it was
+        # written for: on the dc-environment run that was 47 of 49 refutations,
+        # and the advice is right there.
         contradicted = [
             c for c in mismatch if c.get("relevance_verdict") == "contradicts"
         ]
+        # Identity, not equality: two citations can compare equal as dicts, and
+        # `in` on a list of dicts would fold them together and undercount.
+        contradicted_ids = {id(c) for c in contradicted}
+        conceded = [
+            c
+            for c in mismatch
+            if id(c) not in contradicted_ids
+            and (c.get("reask") or {}).get("action") in _REASK_CONCEDES
+        ]
+        remaining = len(mismatch) - len(contradicted) - len(conceded)
         if contradicted:
             lines.append(
                 f"⚠ {len(contradicted)} of these came back `contradicts` — the "
                 "source says something that conflicts with the claim. Treat those "
                 "as a possible factual error, not a citation error."
             )
-        else:
+        if conceded:
+            n = len(conceded)
+            lines.append(
+                f"⚠ The model that asserted the claim was handed its own "
+                f"refutation for {n} of these and concluded the claim — not the "
+                f"citation — was wrong. What it proposes is near the top of "
+                f"{'that entry' if n == 1 else 'those entries'}. Do not read "
+                f"{'it' if n == 1 else 'them'} as "
+                f"{'a citation problem' if n == 1 else 'citation problems'}."
+            )
+        if remaining and (contradicted or conceded):
+            lead = (
+                "The one remaining entry is"
+                if remaining == 1
+                else f"The remaining {remaining} entries are"
+            )
+            lines.append(
+                f"{lead} `not_addressed` or `inconclusive` with no re-ask that "
+                "faulted the claim: the page did not cover it. That usually means "
+                "the wrong URL was checked, or the relevant part of the page did "
+                "not extract — verify the source is the one intended before "
+                "treating it as a problem with the claim."
+            )
+        elif remaining:
             lines.append(
                 "None came back `contradicts`. Every entry here is "
                 "`not_addressed` or `inconclusive`: the page did not cover the "
@@ -759,10 +1606,7 @@ def _render_section_9(citations, out_of_scope=()):
             )
         lines.append("")
         for c in mismatch:
-            lines.append(f'- "{c.get("claim", "")}"')
-            lines.extend(_render_archive_pair(c))
-            for kv in _kv_lines(c, exclude=("claim", "resolved")):
-                lines.append(kv)
+            lines.extend(_render_mismatch_entry(c))
         lines.append("")
 
     if unverifiable:
@@ -780,7 +1624,11 @@ def _render_section_9(citations, out_of_scope=()):
         for c in unverifiable:
             lines.append(f'- "{c.get("claim", "")}"')
             lines.extend(_render_archive_pair(c))
-            for kv in _kv_lines(c, exclude=("claim", "resolved")):
+            for kv in _kv_lines(
+                c,
+                exclude=("claim", "resolved", "url", "final_url")
+                + _PAIR_RENDERED_FIELDS,
+            ):
                 lines.append(kv)
         lines.append("")
 
@@ -796,18 +1644,24 @@ def _render_section_9(citations, out_of_scope=()):
         )
         lines.append(
             "_A specific URL was named for these claims and the fetch did not "
-            "succeed: refused (403), missing (404), or unreachable. A 403 is a "
-            "statement about automated access, not about the document — these are "
-            "often readable in a browser, and academic publishers in particular "
-            "refuse every automated tier. Where an archive copy exists it is "
-            "listed below, and for a refused URL that copy may be the only "
-            "readable version. Nothing here is evidence either way._"
+            "succeed: refused (403), missing (404), or unreachable. A 403 here "
+            "is the hard kind — a 403 this run could get past was retried as a "
+            "browser and read, so what is left refused that too, which in "
+            "practice means a subscription gate or a JS/CAPTCHA challenge rather "
+            "than a bot policy. Some are still readable to a logged-in person. "
+            "Where an archive copy exists it is listed below, and for these URLs "
+            "that copy may be the only readable version. Nothing here is "
+            "evidence either way._"
         )
         lines.append("")
         for c in fetch_failed:
             lines.append(f'- "{c.get("claim", "")}"')
             lines.extend(_render_archive_pair(c))
-            for kv in _kv_lines(c, exclude=("claim", "resolved")):
+            for kv in _kv_lines(
+                c,
+                exclude=("claim", "resolved", "url", "final_url")
+                + _PAIR_RENDERED_FIELDS,
+            ):
                 lines.append(kv)
         lines.append("")
 
@@ -824,7 +1678,11 @@ def _render_section_9(citations, out_of_scope=()):
         for c in pointer:
             lines.append(f'- "{c.get("claim", "")}"')
             lines.extend(_render_archive_pair(c))
-            for kv in _kv_lines(c, exclude=("claim", "resolved")):
+            for kv in _kv_lines(
+                c,
+                exclude=("claim", "resolved", "url", "final_url")
+                + _PAIR_RENDERED_FIELDS,
+            ):
                 lines.append(kv)
         lines.append("")
 
@@ -843,11 +1701,160 @@ def _render_section_9(citations, out_of_scope=()):
         lines.append("")
         for c in no_source:
             lines.append(f'- "{c.get("claim", "")}"')
-            for kv in _kv_lines(c, exclude=("claim", "resolved")):
+            for kv in _kv_lines(c, exclude=("claim", "resolved", "url", "final_url")):
                 lines.append(kv)
         lines.append("")
 
     return lines
+
+
+#: Domains whose loss costs more than their own section, and what it costs.
+#: fact_check is the only source of claims: nothing reaches citation resolution
+#: without it, so Sections 2 and 9 both go with it.
+_DOMAIN_STAKES = {
+    "fact_check": (
+        "it is the only source of claims, so Section 2 and Section 9 both depend on it"
+    ),
+}
+
+
+def _render_ensemble_width(report):
+    """How wide the ensemble was, in the report the author reads.
+
+    Reduced cost is meant to mean reduced functionality. The defect was that it
+    meant it silently: the only record of how narrow a run had become was the
+    API call table, and reading width off that means knowing
+    `_THOROUGHNESS_PRESETS` by heart and subtracting the models the preset
+    disabled. At `economy` that is five domains on three distinct models, every
+    one of them single-model — a report that reads exactly like a six-model run
+    that happened to agree less.
+
+    Consensus is the part that actually changes meaning. Section 1 needs
+    ``consensus_min_models`` distinct sources, so on a run where every domain
+    has one model, a consensus flag can only come from two domains agreeing —
+    and where the whole voter pool is smaller than the minimum, Section 1 cannot
+    flag anything at all, however much the models agree.
+
+    Returns [] for reports written before the width block existed, so they
+    render exactly as they did before.
+    """
+    ensemble = report.get("ensemble") or {}
+    width = ensemble.get("width")
+    if not width:
+        return []
+
+    models_by_domain = width.get("models_by_domain") or {}
+    if not models_by_domain:
+        return []
+
+    distinct = width.get("distinct_models") or []
+    single = width.get("domains_single_model") or []
+    min_models = width.get("consensus_min_models")
+    total_domains = len(width.get("domains_expected") or models_by_domain)
+
+    preset = ensemble.get("cost_preset")
+    thoroughness = ensemble.get("thoroughness", "standard")
+    preset_line = (
+        f"`{preset}` (thoroughness `{thoroughness}`)"
+        if preset
+        else f"thoroughness `{thoroughness}`"
+    )
+
+    lines = ["## Ensemble Width", ""]
+    lines.append(
+        "_What this run actually bought. A cost preset trades models for money; "
+        "these are the numbers that trade moves, and they change how everything "
+        "below should be read._"
+    )
+    lines.append("")
+    lines.append(f"- **Preset:** {preset_line}")
+    lines.append(
+        f"- **Distinct models that ran:** {len(distinct)}"
+        + (f" — {', '.join(distinct)}" if distinct else "")
+    )
+    lines.append(
+        f"- **Domains run by a single model:** {len(single)} of {total_domains}"
+        + (f" — {', '.join(single)}" if single else "")
+    )
+    lines.append("")
+
+    lines.append("| Domain | Models that ran |")
+    lines.append("| --- | --- |")
+    for domain, models in models_by_domain.items():
+        cell = ", ".join(models) if models else "**none — did not run**"
+        lines.append(f"| {domain} | {cell} |")
+    lines.append("")
+
+    # A single-model domain has no internal corroboration: whatever that one
+    # model missed is missing from the section, and nothing in the section says
+    # so. Worth naming the domains where that costs more than their own section.
+    for domain in single:
+        stake = _DOMAIN_STAKES.get(domain)
+        if stake:
+            lines.append(
+                f"**{domain} ran on one model.** Nothing corroborates it, and "
+                f"{stake}. A single provider failing there empties those "
+                f"sections without failing the run."
+            )
+            lines.append("")
+
+    # A domain nothing reviewed is deliberately NOT narrated here. The
+    # "Domains not reviewed" header block and the per-section note above it
+    # already say so, and say it better: they carry the reason and they sit
+    # directly above the empty section, where the reader meets the problem.
+    # Repeating it inside a block about width would give one fact two voices
+    # that could drift apart.
+
+    lines.extend(_consensus_meaning(width, min_models))
+
+    backfilled = width.get("backfilled") or []
+    if backfilled:
+        lines.append(
+            "**Backfilled for corroboration.** These domains lost a model the "
+            "preset names and were given a second one from what was available, "
+            "so no finding in them rests on a single pass:"
+        )
+        lines.append("")
+        for entry in backfilled:
+            lines.append(f"- {entry}")
+        lines.append("")
+
+    return lines
+
+
+def _consensus_meaning(width, min_models):
+    """State what this ensemble's width does to Section 1, in the report."""
+    if not min_models:
+        return []
+
+    pool = width.get("voter_pool") or 0
+    lt = " (including LanguageTool)" if width.get("languagetool_voted") else ""
+
+    if not width.get("consensus_reachable"):
+        return [
+            f"**SECTION 1 CANNOT FLAG ANYTHING.** Consensus requires "
+            f"{min_models} distinct sources agreeing on a passage, and this run "
+            f"had {pool}{lt}. An empty Section 1 here means the run could not "
+            f"reach consensus, not that the models found nothing to agree on.",
+            "",
+        ]
+
+    if width.get("consensus_needs_cross_domain"):
+        return [
+            f"**Consensus is reachable only across domains.** Section 1 needs "
+            f"{min_models} distinct sources on the same passage, and every "
+            f"domain here ran a single model — so no passage can reach it from "
+            f"within one domain. It takes two different domains flagging the "
+            f"same passage, out of a pool of {pool}{lt}. A thin Section 1 is "
+            f"the expected shape at this width, not a verdict on the draft.",
+            "",
+        ]
+
+    return [
+        f"Section 1 needs {min_models} distinct sources on a passage; this run "
+        f"had a pool of {pool}{lt}.",
+        "",
+    ]
 
 
 def _render_model_currency(report):
@@ -1156,6 +2163,65 @@ def _render_seo_field(field):
     return lines
 
 
+def _render_provenance(report):
+    """Which provider drafted the article, and whether it marks its text.
+
+    Declared, never measured, and the block says so on every render. A
+    statistical watermark is recovered with the provider's secret key; without
+    it, marked and unmarked text are statistically indistinguishable by design.
+    So this reports what the handoff said, and an author who reads it as a
+    detection result has been misled by us rather than by the tool they used.
+
+    Silent for a provider that does not mark, and silent for a report written
+    before this block existed -- there is nothing to say, and a line saying
+    nothing is a line that trains people to skip the section.
+    """
+    prov = report.get("provenance")
+    if not prov or not prov.get("marked"):
+        return []
+
+    lines = ["## Authorship Provenance", ""]
+    declared = prov.get("drafted_with")
+    lines.append(f"- Drafted with: **{declared}**")
+
+    status = prov.get("status")
+    if status == "partial":
+        lines.append(
+            "- This provider marks text on some surfaces; the API path was "
+            "unconfirmed when the registry was last checked. Treat the mark as "
+            "present rather than absent."
+        )
+    else:
+        since = prov.get("since")
+        lines.append(
+            "- This provider embeds a statistical watermark in generated text"
+            + (f", since {since}." if since else ".")
+        )
+    if prov.get("scope"):
+        lines.append(f"- Scope: {prov['scope']}")
+
+    lines.append(
+        f"- Basis: {prov.get('basis')}. Nothing in this pipeline can detect a "
+        "statistical watermark — that needs the provider's key."
+    )
+
+    if prov.get("registry_staleness") in ("notice", "warning"):
+        age = prov.get("registry_age_days")
+        lines.append(
+            f"- NOTE: the watermarking registry was last verified "
+            f"{prov.get('registry_date')} ({age} days ago). These facts move "
+            "quickly; re-check configs/watermarking.yaml before relying on this."
+        )
+    if prov.get("note"):
+        lines.append("")
+        lines.append(f"_{prov['note']}_")
+    if prov.get("source"):
+        lines.append("")
+        lines.append(f"Source: {prov['source']}")
+    lines.append("")
+    return lines
+
+
 def render_report_markdown(report):
     """Render a review report dict into a readable markdown document.
 
@@ -1173,7 +2239,16 @@ def render_report_markdown(report):
 
     corrections = report.get("lt_corrections_applied", [])
     if report.get("lt_skipped"):
-        lines.append("LanguageTool: skipped (no credentials configured)")
+        # Name the actual reason. Both skip paths land here, and asserting "no
+        # credentials configured" at a reader who had turned the pass off in
+        # config sends them to fix something that is not broken — the same
+        # wrong-message bug the console summary was already corrected for.
+        why = (
+            "grammar_pass is set to false in the pipeline config"
+            if report.get("lt_skipped_reason") == "disabled"
+            else "no LanguageTool credentials configured"
+        )
+        lines.append(f"LanguageTool: skipped ({why})")
     elif report.get("lt_failed"):
         lines.append("LanguageTool: FAILED — draft not grammar-corrected")
     else:
@@ -1181,6 +2256,8 @@ def render_report_markdown(report):
     lines.append("")
 
     lines.extend(_render_model_failures(report))
+    lines.extend(_render_domains_not_run(report))
+    lines.extend(_render_degradations(report))
 
     if report.get("truncated_results"):
         lines.append(
@@ -1189,6 +2266,17 @@ def render_report_markdown(report):
             f"{', '.join(report['truncated_results'])}"
         )
         lines.append("")
+
+    if report.get("empty_results"):
+        lines.append(
+            "WARNING — model passes that returned a well-formed but completely "
+            "empty result. These did not fail and were not truncated, so the "
+            "sections they feed are simply short a model: "
+            f"{', '.join(report['empty_results'])}"
+        )
+        lines.append("")
+
+    lines.extend(_render_handoff_gaps(report))
 
     delta = report.get("delta")
     if delta:
@@ -1210,8 +2298,20 @@ def render_report_markdown(report):
     # Run metadata, like the failed-passes block above it — how old the models
     # behind this report are is context for reading it, not a finding about the
     # article, so it sits in the header rather than among the sections.
-    lines.extend(_render_model_currency(report))
+    lines.extend(_render_ensemble_width(report))
 
+    lines.extend(_render_model_currency(report))
+    lines.extend(_render_provenance(report))
+
+    lines.append("---")
+    lines.append("")
+
+    # The worklist comes before the findings because it is the only part of this
+    # file the author acts on directly; everything below it is the evidence it
+    # points back at. It is deliberately not a "## SECTION N" heading, so the
+    # paste-into-a-chat-model revision loop does not sweep it up — see
+    # worklist.HEADING for why that matters.
+    lines.extend(render_worklist(build_worklist(report)))
     lines.append("---")
     lines.append("")
 
@@ -1221,14 +2321,14 @@ def render_report_markdown(report):
         _render_flags_section(
             "SECTION 3: Voice and AI-Speak",
             report.get("section_3_voice", []),
-            note=_missing_models_note(report, "voice_style"),
+            note=_domain_notes(report, "voice_style"),
         )
     )
     lines.extend(
         _render_flags_section(
             "SECTION 4: Argument Integrity",
             report.get("section_4_argument", []),
-            note=_missing_models_note(report, "argument_integrity"),
+            note=_domain_notes(report, "argument_integrity"),
         )
     )
     lines.extend(
@@ -1236,13 +2336,13 @@ def render_report_markdown(report):
             "SECTION 5: Completeness and Framing",
             report.get("section_5_completeness", []),
             passage_key="passage_reference",
-            note=_missing_models_note(report, "completeness"),
+            note=_domain_notes(report, "completeness"),
         )
     )
     lines.extend(
         _render_section_6(
             report.get("section_6_red_team", {}),
-            note=_missing_models_note(report, "red_team"),
+            note=_domain_notes(report, "red_team"),
         )
     )
     lines.extend(_render_section_7(report.get("section_7_low_confidence", [])))

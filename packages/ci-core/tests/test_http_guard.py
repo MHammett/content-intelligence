@@ -93,3 +93,40 @@ class TestIsPublicHostKeepsItsBooleanContract:
     def test_the_default_is_still_fail_closed(self):
         with patch.object(http.socket, "getaddrinfo", side_effect=OSError("no DNS")):
             assert http.is_public_host("https://h/x") is False
+
+
+class TestClassifyHostDoesNotFailOpen:
+    """Validating nothing is not the same as validating a public address.
+
+    The loop returned HOST_PUBLIC after falling through without checking a
+    single address — so an empty ``getaddrinfo`` result, or addresses that do
+    not parse as IPs, were reported as safe to fetch. That is the one direction
+    an SSRF guard must not fail in.
+    """
+
+    def test_an_empty_resolution_is_unresolvable_not_public(self):
+        from unittest.mock import patch
+
+        with patch("ci_core.http.socket.getaddrinfo", return_value=[]):
+            assert http.classify_host("https://x.example/") == http.HOST_UNRESOLVABLE
+
+    def test_addresses_that_do_not_parse_are_unresolvable_not_public(self):
+        from unittest.mock import patch
+
+        infos = [(2, 1, 6, "", ("not-an-ip", 0))]
+        with patch("ci_core.http.socket.getaddrinfo", return_value=infos):
+            assert http.classify_host("https://x.example/") == http.HOST_UNRESOLVABLE
+
+    def test_a_real_public_address_is_still_public(self):
+        from unittest.mock import patch
+
+        infos = [(2, 1, 6, "", ("93.184.216.34", 0))]
+        with patch("ci_core.http.socket.getaddrinfo", return_value=infos):
+            assert http.classify_host("https://x.example/") == http.HOST_PUBLIC
+
+    def test_one_unparseable_address_does_not_mask_a_private_one(self):
+        from unittest.mock import patch
+
+        infos = [(2, 1, 6, "", ("not-an-ip", 0)), (2, 1, 6, "", ("127.0.0.1", 0))]
+        with patch("ci_core.http.socket.getaddrinfo", return_value=infos):
+            assert http.classify_host("https://x.example/") == http.HOST_NON_PUBLIC

@@ -686,3 +686,143 @@ class TestReportedDirectoryMatchesWhatWasWritten:
         """No markdown path (e.g. the save failed) still prints a useful guess."""
         out = self._run(None, capsys)
         assert "data-centers-dont-have" in out
+
+
+class TestTheHardExitStaysOutOfMain:
+    """`os._exit` must sit in `cli()`, never in `main()`.
+
+    `main()` is called in-process by this suite. An unconditional hard exit
+    inside it killed pytest 36% of the way through a run, and because
+    `os._exit(0)` sets a success code the truncated run reported green — a
+    suite that stops early while claiming to pass being considerably worse
+    than the shutdown hang the exit exists to fix.
+    """
+
+    def _source(self, name):
+        import inspect
+
+        from ci_article_review import pipeline
+
+        return inspect.getsource(getattr(pipeline, name))
+
+    def test_main_does_not_hard_exit(self):
+        body = self._source("main")
+        assert "exit_without_waiting_for_foreign_threads" not in body
+        assert "os._exit" not in body
+
+    def test_cli_does(self):
+        assert "exit_without_waiting_for_foreign_threads" in self._source("cli")
+
+    def test_main_returns_rather_than_ending_the_process(self, monkeypatch):
+        """A bad invocation must raise SystemExit for a caller to handle, not
+        take the interpreter with it."""
+        import pytest
+
+        from ci_article_review import pipeline
+
+        monkeypatch.setattr("sys.argv", ["ci-review"])
+        with pytest.raises(SystemExit):
+            pipeline.main()
+
+    def test_the_console_script_points_at_cli(self):
+        from pathlib import Path
+
+        import tomllib
+
+        from ci_article_review import pipeline
+
+        root = Path(pipeline.__file__).parents[2] / "pyproject.toml"
+        scripts = tomllib.loads(root.read_text(encoding="utf-8"))["project"]["scripts"]
+        assert scripts["ci-review"].endswith(":cli"), (
+            "ci-review must enter through cli(), or a real run gets main()'s "
+            "normal shutdown and can hang on a foreign thread pool"
+        )
+
+
+class TestReviewContextReachesTheModels:
+    """What the pipeline measured before the ensemble, given to the ensemble.
+
+    Link validation, readability and the prior run were all computed and then
+    withheld. Six models were asked to fact-check claims whose sources this
+    process already knew were dead, and run 20 of an article opened exactly as
+    cold as run 1 — the prior report was not even loaded until after Pass 2 had
+    finished.
+    """
+
+    _PRE = {
+        "links": [
+            {"url": "https://ok.example/", "ok": True},
+            {"url": "https://gone.example/", "ok": False, "status": "404"},
+        ],
+        "readability": {
+            "word_count": 385,
+            "flesch_kincaid_grade": 6.4,
+            "reading_level": "Fairly Easy",
+            "avg_sentence_length": 12.0,
+            "longest_paragraph_words": 111,
+        },
+    }
+    _PRIOR = {
+        "run_number": 19,
+        "section_1_consensus": [
+            {"passage": "A flagged passage.", "models": ["a:red_team", "b:red_team"]}
+        ],
+    }
+
+    def _ctx(self, pre=None, prior=None):
+        from ci_article_review.pipeline import _build_review_context
+
+        return _build_review_context(pre if pre is not None else self._PRE, prior)
+
+    def test_dead_links_are_named(self):
+        ctx = self._ctx()
+        assert "https://gone.example/" in ctx
+        assert "404" in ctx
+
+    def test_working_links_are_not_listed(self):
+        assert "https://ok.example/" not in self._ctx()
+
+    def test_readability_is_included(self):
+        ctx = self._ctx()
+        assert "Flesch-Kincaid grade 6.4" in ctx
+        assert "longest paragraph 111 words" in ctx
+
+    def test_prior_consensus_is_replayed_with_its_model_count(self):
+        ctx = self._ctx(prior=self._PRIOR)
+        assert "run 19" in ctx
+        assert "A flagged passage." in ctx
+        assert "flagged by 2 model(s)" in ctx
+
+    def test_it_is_labelled_as_measurement_not_as_a_verdict(self):
+        """A model treating these as another reviewer's findings would be
+        double-counting them into consensus."""
+        assert "measured by this pipeline" in self._ctx()
+
+    def test_nothing_measured_yields_nothing(self):
+        """No empty scaffolding on a run with links off and no prior."""
+        assert self._ctx(pre={}, prior=None) == ""
+
+    def test_the_prior_findings_list_is_capped(self):
+        from ci_article_review.pipeline import _PRIOR_FINDINGS_SHOWN
+
+        prior = {
+            "run_number": 2,
+            "section_1_consensus": [
+                {"passage": f"passage {i}", "models": ["a:x"]} for i in range(40)
+            ],
+        }
+        ctx = self._ctx(prior=prior)
+        assert ctx.count("flagged by") == _PRIOR_FINDINGS_SHOWN
+
+    def test_it_lands_before_the_draft_in_the_prompt(self):
+        """After the metadata, before the article — so the task is framed
+        before the model starts reading."""
+        from ci_article_review.pipeline import _build_user_prompt
+
+        prompt = _build_user_prompt("BODY", {"title": "T"}, self._ctx())
+        assert prompt.index("PIPELINE OBSERVATIONS") < prompt.index("BODY")
+
+    def test_no_context_leaves_the_prompt_unchanged(self):
+        from ci_article_review.pipeline import _build_user_prompt
+
+        assert "PIPELINE OBSERVATIONS" not in _build_user_prompt("BODY", {"title": "T"})

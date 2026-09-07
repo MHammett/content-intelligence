@@ -87,8 +87,8 @@ class TestArchiveSubmissionSkipsNonPublicUrls:
         ]
         with (
             patch(
-                "ci_article_review.adapters.citation.resolver.is_public_host",
-                return_value=False,
+                "ci_article_review.adapters.citation.resolver.classify_host",
+                return_value="non_public",
             ),
             patch(
                 "ci_article_review.adapters.citation.resolver.wayback.submit"
@@ -96,6 +96,43 @@ class TestArchiveSubmissionSkipsNonPublicUrls:
         ):
             resolver._submit_missing_archives(results)
         mock_submit.assert_not_called()
+        # ...and it says so, rather than leaving a citation that looks like one
+        # nobody needed to archive. The refusal is deliberate and permanent for
+        # this URL, so the report must not tell the author to re-run.
+        wb = results[0]["wayback"]
+        assert wb["archive_outcome"] == "not_attempted"
+        assert "not public" in wb["archive_outcome_detail"]
+
+    def test_an_unresolvable_host_is_not_reported_as_an_internal_address(self):
+        """Two reasons not to submit, and they need different follow-up.
+
+        ``is_public_host`` answers False for both, so a transient DNS failure
+        used to drop the citation from the batch with nothing recorded — found
+        by a live run 2026-09-05, where one citation silently skipped submission
+        and the report showed it exactly as it shows a URL nobody needed to
+        archive.
+        """
+        results = [
+            {
+                "resolved": True,
+                "url": "https://nonexistent.invalid/page",
+                "wayback": {"archived": False},
+            }
+        ]
+        with (
+            patch(
+                "ci_article_review.adapters.citation.resolver.classify_host",
+                return_value="unresolvable",
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.submit"
+            ) as mock_submit,
+        ):
+            resolver._submit_missing_archives(results)
+        mock_submit.assert_not_called()
+        wb = results[0]["wayback"]
+        assert wb["archive_outcome"] == "not_attempted"
+        assert "did not resolve" in wb["archive_outcome_detail"]
 
 
 class TestVerifierPromptIsolatesUntrustedContent:

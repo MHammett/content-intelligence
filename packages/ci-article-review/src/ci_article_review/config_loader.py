@@ -1,3 +1,5 @@
+import difflib
+import logging
 import re
 from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
@@ -16,6 +18,8 @@ from ci_core.env_provenance import (
     snapshot as _snapshot_dotenv,
 )
 from ci_core.redact import mask_secret
+
+log = logging.getLogger("config_loader")
 
 # Resolved once so the snapshot below and the actual load agree on exactly
 # which file (if any) is in play -- see ci_core.env_provenance for why this
@@ -210,6 +214,7 @@ def load_publication_config(publication_name, config_dir="configs"):
         raise ValueError(f"{path} is empty or not a valid YAML mapping.")
     config = _resolve_env_recursive(config, env=_EFFECTIVE_ENV)
     _validate_publication_config(config, publication_name)
+    _validate_publication_keys(config, publication_name)
     return config
 
 
@@ -245,6 +250,98 @@ def _validate_publication_config(config, publication_name):
             + "\n".join(f"  {m}" for m in missing)
             + "\nSee configs/publication.example.yaml for the expected structure."
         )
+
+
+#: Every top-level key a publication config may carry. Authoritative, not
+#: advisory: an unrecognised key is now an error, so this list and the keys the
+#: pipeline actually reads have to stay in step. ``TestKnownKeysCoverWhatIsRead``
+#: fails if code starts reading one that is missing here.
+KNOWN_PUB_KEYS = frozenset(
+    {
+        "api_keys",
+        "audience",
+        "author_name",
+        "citation_sources",
+        "custom_domains",
+        "fact_check_scope",
+        "languagetool",
+        "publication_description",
+        "publication_name",
+        "rank_math",
+        "seo_rules",
+        "style_profile",
+        "style_rules",
+        "voice_profile",
+        "wordpress",
+    }
+)
+
+#: Escape hatch for keys that are deliberately not ours — a note to a
+#: colleague, a value some other tool reads out of the same file. Anything
+#: under this prefix is passed over without validation.
+#:
+#: Borrowed from OpenAPI's ``x-`` specification extensions, which exist for
+#: exactly this problem: a strict schema that still has to be extensible.
+#: Spelled ``x_`` rather than ``x-`` only to match the snake_case these configs
+#: already use. (RFC 6648 deprecated ``X-`` for *protocol headers*; that is a
+#: different argument about wire formats and does not reach config schemas,
+#: where the OpenAPI convention is current.)
+_EXTENSION_PREFIX = "x_"
+
+#: How close a spelling has to be before it is called a probable typo rather
+#: than an unknown key. ``difflib`` rather than a hand-rolled edit distance:
+#: stdlib, and a ratio cutoff is the standard way to spell "close enough to be
+#: a typo, far enough not to be a different word".
+_TYPO_CUTOFF = 0.85
+
+
+def _unknown_key_message(key, publication_name):
+    """The error text for one unrecognised key, typo-aware."""
+    close = difflib.get_close_matches(key, KNOWN_PUB_KEYS, n=1, cutoff=_TYPO_CUTOFF)
+    if close:
+        return (
+            f"  {key!r} — did you mean {close[0]!r}? As written, the pipeline "
+            f"reads {close[0]!r} as absent and silently falls back to its "
+            f"default."
+        )
+    return f"  {key!r} — not a key this pipeline reads."
+
+
+def _validate_publication_keys(config, publication_name):
+    """Reject top-level keys the pipeline does not read.
+
+    A key that is *almost* right is the expensive one, and it used to cost
+    nothing to get wrong: ``authorname`` reads as absent, the pipeline falls
+    back to no author, and citation verification loses first-person checking
+    with no error, no warning and no missing-field message anywhere. A plain
+    unknown key — ``byline`` — is the same failure without even a near spelling
+    to catch it.
+
+    **This rejects, so the list above must stay complete.** Two things keep it
+    honest: a test cross-checks it against the keys the source actually reads,
+    and every shipped example config is validated by the suite. A key that is
+    deliberately not the pipeline's belongs under ``x_`` (see
+    ``_EXTENSION_PREFIX``), which is never validated.
+    """
+    unknown = [
+        key
+        for key in config
+        if key not in KNOWN_PUB_KEYS and not str(key).startswith(_EXTENSION_PREFIX)
+    ]
+    if not unknown:
+        return
+    listed = "\n".join(
+        _unknown_key_message(k, publication_name) for k in sorted(unknown)
+    )
+    plural = "" if len(unknown) == 1 else "s"
+    raise ValueError(
+        f"Publication config '{publication_name}' has {len(unknown)} key{plural} "
+        f"the pipeline does not read:\n"
+        f"{listed}\n"
+        f"\nValid keys: {', '.join(sorted(KNOWN_PUB_KEYS))}\n"
+        f"\nIf a key is deliberately not this pipeline's, prefix it with "
+        f"'{_EXTENSION_PREFIX}' and it will be ignored without complaint."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +438,60 @@ def _load_presets_from_yaml(config_dir=None):
         ) from exc
 
 
+#: Cost presets that no longer exist, and what now runs in their place.
+#:
+#: `standard` was retired 2026-09-05 because `wide` dominated it on every axis
+#: measured over three isolated runs each: 33% more strongly-corroborated
+#: consensus flags, 74% more fact-check claims, findings that survive a rerun
+#: 67% of the time against 50%, and all of it at 55% of the cost. Keeping a tier
+#: that costs more for less is worse than the churn of retiring it.
+#:
+#: Mapped rather than deleted. A hard removal turns an existing
+#: `cost_preset: standard` into a crash at config-load, and a config that has
+#: been working for months is the worst place to discover a naming decision.
+#: The substitution is not silent: it is a real behaviour change (six models
+#: instead of five, twelve calls instead of seven, roughly half the cost), so it
+#: warns every run until the config is updated.
+_RETIRED_PRESETS = {"standard": "wide"}
+
+
+def resolve_preset_name(preset_name):
+    """Map a retired preset name to its replacement.
+
+    Returns ``(name, note)`` — ``note`` is None for a live preset, or the
+    deprecation message to warn with when the name has been retired.
+    """
+    replacement = _RETIRED_PRESETS.get(preset_name)
+    if not replacement:
+        return preset_name, None
+    return replacement, (
+        f"cost_preset {preset_name!r} has been retired and is running as "
+        f"{replacement!r}. That is a real change, not a rename: {replacement!r} "
+        f"runs six models over twelve calls where {preset_name!r} ran five over "
+        f"seven, and costs roughly half as much. Measured 2026-09-05 — see "
+        f"configs/presets.yaml. Update cost_preset to {replacement!r} to silence "
+        f"this."
+    )
+
+
+def retired_preset_names():
+    """Preset names that still parse but no longer name a tier of their own."""
+    return list(_RETIRED_PRESETS)
+
+
+def preset_names(config_dir=None):
+    """Every cost preset defined in the packaged presets.yaml, in file order.
+
+    The CLI's ``--cost-preset`` choices come from here rather than a list
+    repeated in the argument parser. That duplicate meant a preset added to
+    presets.yaml — the file whose own header says to edit it — loaded, resolved
+    and applied correctly, then got rejected by argparse as an invalid choice.
+    File order is preserved because it runs cheapest to most expensive, which is
+    the order the ``--help`` output should show.
+    """
+    return list(_load_presets_from_yaml(config_dir))
+
+
 def _apply_cost_preset(pipeline_cfg, models_raw, user_set=None):
     """Apply a cost_preset to pipeline and models config.
 
@@ -351,6 +502,10 @@ def _apply_cost_preset(pipeline_cfg, models_raw, user_set=None):
     if not preset_name:
         return pipeline_cfg, models_raw
 
+    preset_name, retired_note = resolve_preset_name(preset_name)
+    if retired_note:
+        log.warning(retired_note)
+
     presets = _load_presets_from_yaml()
     preset = presets.get(preset_name)
     if not preset:
@@ -358,6 +513,9 @@ def _apply_cost_preset(pipeline_cfg, models_raw, user_set=None):
         raise ValueError(f"Unknown cost_preset {preset_name!r}. Valid values: {valid}")
 
     new_pipeline = dict(pipeline_cfg)
+    # The name that actually ran, so the report's Ensemble Width block names the
+    # preset whose models are in the call log rather than the retired alias.
+    new_pipeline["cost_preset"] = preset_name
     # Set thoroughness from the preset unless the user asked for one by name.
     #
     # "Did the user set it" cannot be answered from ``pipeline_cfg``, because by

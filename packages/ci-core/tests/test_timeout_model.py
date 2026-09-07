@@ -83,9 +83,24 @@ class TestComputeTimeout:
     def test_grounded_model_high_even_without_effort(self):
         # Gemini has no reasoning_effort knob, but grounded latency is captured by
         # its model multiplier — it must exceed a fast model's timeout.
+        #
+        # The comparison used to be against grok, on the assumption that grok was
+        # the fast one. It is not: measured 2026-09-03 in a single run, grok-4.6
+        # took up to 377.61s against gemini-2.5-pro's 28.65s. gpt-5.4 at
+        # multiplier 1.0 is the actual baseline.
         gem = tm.compute_timeout(ANCHOR, "gemini-2.5-pro", None, CEILING)
-        grok = tm.compute_timeout(ANCHOR, "grok-4.20-0309-reasoning", None, CEILING)
-        assert gem > grok
+        fast = tm.compute_timeout(ANCHOR, "gpt-5.4", None, CEILING)
+        assert gem > fast
+
+    def test_grok_is_budgeted_as_the_slow_model_it_measures_as(self):
+        """Its cell was a placeholder set from a ceiling a call had just hit;
+        the note beside it said the true time was 'cut off, not measured'. Five
+        uncensored completions at 2,182 chars — 17.58s to 377.61s — are what it
+        is set from now."""
+        grok = tm.compute_timeout(2182, "grok-4.6", None, CEILING)
+        assert grok > 377.61, "the slowest measured grok call must fit"
+        gem = tm.compute_timeout(2182, "gemini-2.5-pro", None, CEILING)
+        assert grok > gem
 
     def test_model_prefix_longest_match(self):
         # "mistral-medium-3-5" must match its own entry, not a shorter prefix.

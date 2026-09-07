@@ -52,6 +52,11 @@ def _array_of(**properties):
 _STR = {"type": "string"}
 _NULLABLE_STR = {"type": ["string", "null"]}
 
+#: URLs the model actually opened while checking a claim. Array rather than a
+#: single string because a grounded model consults several, and the resolver
+#: already accepts an ordered candidate list.
+_URL_ARRAY = {"type": "array", "items": {"type": "string"}}
+
 #: Every domain carries this: findings outside its own remit.
 _ADDITIONAL_OBSERVATIONS = _array_of(
     category=_STR, passage=_STR, observation=_STR, confidence=_CONFIDENCE
@@ -116,11 +121,40 @@ FACT_CHECK = _obj(
         supporting_quote=_STR,
         confidence=_CONFIDENCE,
     ),
-    unverifiable=_array_of(claim=_STR, checked=_STR, reason=_STR),
-    primary_source_needed=_array_of(claim=_STR, best_candidate_source=_STR),
+    # `sources_checked` and `best_candidate_url` were added 2026-09-04. The
+    # schema previously asked for a URL only in the three buckets where the
+    # model had already concluded the source supports the claim, and asked for
+    # prose in the two where it had not — which are precisely the claims
+    # SECTION 9 could still go and resolve.
+    #
+    # The cost of that was measured: perplexity filled `source_url` on 3 of 3
+    # `confirmed` findings and on 0 of 14 in these two buckets, while holding 15
+    # relevant citations it had just retrieved. Across all six models, 50
+    # `unverifiable` findings carried no URL at all — gemini's `checked` field
+    # read "Google Search" — and `best_candidate_source` came back as prose like
+    # "the publication's own post archive or sitemap.xml".
+    #
+    # Asking the model which pages it read is claim-level attribution from the
+    # only party that knows it. An earlier attempt to recover this took the
+    # first entry of the provider's response-level citation list and attached it
+    # to every claim in the response, which stamped one energy report onto 44
+    # unrelated claims; see `_collect_citation_claims`. This asks instead of
+    # guessing.
+    unverifiable=_array_of(
+        claim=_STR,
+        checked=_STR,
+        sources_checked=_URL_ARRAY,
+        reason=_STR,
+    ),
+    primary_source_needed=_array_of(
+        claim=_STR,
+        best_candidate_source=_STR,
+        best_candidate_url=_NULLABLE_STR,
+    ),
     # Not a verdict — a statement that no verdict was ever available. See
-    # ``fact_check_scope`` for why that is worth a bucket of its own rather than
-    # a sixth flavour of "unverifiable".
+    # ``fact_check_scope`` for why that is worth a bucket of its own rather
+    # than a sixth flavour of "unverifiable". No URL fields here for the
+    # same reason the bucket exists: there is no page to name.
     out_of_scope=_array_of(claim=_STR, claim_type=_CLAIM_TYPE, reason=_STR),
     additional_observations=_ADDITIONAL_OBSERVATIONS,
 )

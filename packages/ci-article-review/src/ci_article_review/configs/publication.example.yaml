@@ -1,4 +1,19 @@
+# Unrecognised top-level keys are an error, so a typo cannot silently read as
+# an absent setting. If you need a key that is deliberately not this
+# pipeline's -- a note, or a value some other tool reads out of this file --
+# prefix it with x_ and it is ignored without complaint.
 publication_name: your_publication_name
+
+# Optional. Who "I" refers to in your drafts, by name. Citation verification
+# needs it to check a first-person claim against a source page: told nothing,
+# the verifier binds "I" to whoever it finds on the page; told only not to
+# guess, it reports a page that does name you as not addressing the claim.
+#
+# Set it here once for a single-author publication. A guest or co-authored
+# piece overrides it per article with the handoff's "Author:" line, which
+# wins when both are present. This default is the only source for --raw-draft
+# and --url, which carry no handoff metadata at all.
+author_name: Your Name
 
 publication_description: |
   One paragraph: what the publication covers, who the reader is,

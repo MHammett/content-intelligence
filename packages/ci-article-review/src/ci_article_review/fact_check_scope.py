@@ -62,9 +62,10 @@ default — a raw draft is protected without configuring anything.
 
 from __future__ import annotations
 
-import html
 import logging
 import re
+
+from . import passage_match
 
 log = logging.getLogger(__name__)
 
@@ -286,37 +287,32 @@ def _split_reason(entry):
 #: A marking that short is a mistake worth failing closed on.
 _MIN_MATCH_CHARS = 12
 
-#: Token-overlap threshold above which a claim is treated as restating a marked
-#: passage. Same value and same reasoning as ``pipeline._CLAIM_SIMILARITY``:
-#: high on purpose, because a wrong merge here silently removes a claim from
+#: Token-overlap threshold for a claim that paraphrases a marked passage rather
+#: than quoting it. Same value and reasoning as ``pipeline._CLAIM_SIMILARITY``:
+#: high on purpose, because a wrong match here silently removes a claim from
 #: verification.
 _SIMILARITY = 0.9
 
-_STOPWORDS = frozenset(
-    "the a an of in to and is are was were that for on at by its with as from "
-    "it this these those be been has have had i my me we our you your".split()
-)
-
 
 def _normalise(text):
-    """Lowercase, unescape entities, drop markers and punctuation, collapse space.
+    """Normalise for matching, via ``passage_match``.
 
-    HTML unescaping is not cosmetic: one provider returns claims with ``&#39;``
-    where the draft has an apostrophe, so without it a model's own quote of the
-    draft fails to match the draft.
+    Not a second normaliser: ``passage_match.normalise`` already folds the four
+    spellings one apostrophe arrives in — straight, curly, a mis-decoded C1
+    control byte, and the ``&#39;`` entity, all four seen for one sentence in a
+    single run — and a private copy here would drift from it. Punctuation is
+    deliberately kept, since containment is tested on the string.
     """
-    plain = html.unescape(strip_markers(str(text or "")))
-    plain = re.sub(r"[^a-z0-9 ]+", " ", plain.lower())
-    return " ".join(plain.split())
+    return passage_match.normalise(text)
 
 
-def _content_words(normalised):
-    return frozenset(w for w in normalised.split() if w not in _STOPWORDS)
+def _content_words(text):
+    return passage_match.tokenise(text)
 
 
 def _exclusion(passage, reason, origin):
     text = str(passage or "").strip()
-    normalised = _normalise(text)
+    normalised = _normalise(strip_markers(text))
     return {
         "passage": text,
         "reason": reason or "",
@@ -327,13 +323,28 @@ def _exclusion(passage, reason, origin):
 
 
 def _matches(claim_norm, claim_words, exclusion):
-    """Whether a claim restates the passage ``exclusion`` covers.
+    """Whether a claim falls inside the passage ``exclusion`` covers.
 
-    Containment in either direction, because the two real cases pull opposite
-    ways: an author marks a paragraph and a model quotes one sentence of it, or
-    an author marks a sentence and a model quotes the paragraph around it. Then
-    a token-overlap pass for the case neither containment catches — a model
-    paraphrasing rather than quoting.
+    **This is deliberately not ``passage_match.same_passage``,** and the
+    difference is the point rather than an oversight. That function answers "are
+    these two quotations of the same claim", and it refuses on purpose to merge
+    a sentence into the paragraph containing it — because its caller counts
+    matches as agreement between models, and fusing a paragraph's four separate
+    assertions into one group manufactured a 27-flag consensus that no two
+    models had expressed.
+
+    The question here is the opposite one: "does this claim fall inside a region
+    the author marked". An author marks a paragraph and a model quotes one
+    sentence of it — that is the ordinary case, and the containment
+    ``same_passage`` rejects is exactly what has to succeed. Getting it wrong
+    costs nothing like the same: an over-broad marking excludes a claim the
+    author chose to exclude, which the report then lists by name.
+
+    Containment is tested in both directions, because the two real cases pull
+    opposite ways: an author marks a paragraph and a model quotes a sentence of
+    it, or an author marks a sentence and a model quotes the paragraph around
+    it. The token-overlap pass then catches a model paraphrasing rather than
+    quoting.
     """
     passage_norm = exclusion["_normalised"]
     if not claim_norm or not passage_norm:
@@ -584,9 +595,19 @@ class ScopeRules:
                     {
                         "model": item.get("source_model", ""),
                         "bucket": bucket,
+                        # `checked` last: a confirmation demoted by
+                        # `_demote_unsourced_confirmations` arrives here as
+                        # `unverifiable` with the source the model originally
+                        # offered moved into `checked`. Without this the record
+                        # would say a verdict was withdrawn and name nothing —
+                        # losing "Manual Calculation", which is the most telling
+                        # part of that particular finding.
                         "source": item.get("source", "")
-                        or item.get("best_candidate_source", ""),
-                        "source_url": item.get("source_url", ""),
+                        or item.get("best_candidate_source", "")
+                        or item.get("checked", ""),
+                        "source_url": item.get("source_url", "")
+                        or item.get("best_candidate_url", "")
+                        or "",
                     }
                 )
             result[bucket] = kept

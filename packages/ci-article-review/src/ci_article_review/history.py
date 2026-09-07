@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .report_markdown import render_report_markdown
+from .worklist import build_worklist, render_worklist
 
 log = logging.getLogger(__name__)
 
@@ -101,18 +102,29 @@ def save_run(
         d = _run_dir(history_root, article_title)
     except OSError as e:
         log.error(f"Cannot create history directory: {e}")
-        return {"report_path": None, "corrections_path": None, "markdown_path": None}
+        return {
+            "report_path": None,
+            "corrections_path": None,
+            "markdown_path": None,
+            "worklist_path": None,
+        }
 
     report_path = d / f"run_{run_number}_{ts_str}_report.json"
     corrections_path = d / f"run_{run_number}_{ts_str}_corrections.log"
     markdown_path = d / f"run_{run_number}_{ts_str}_review.md"
+    worklist_path = d / f"run_{run_number}_{ts_str}_worklist.md"
 
     try:
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, default=str)
     except OSError as e:
         log.error(f"Could not write report to {report_path}: {e}")
-        return {"report_path": None, "corrections_path": None, "markdown_path": None}
+        return {
+            "report_path": None,
+            "corrections_path": None,
+            "markdown_path": None,
+            "worklist_path": None,
+        }
 
     try:
         with open(markdown_path, "w", encoding="utf-8") as f:
@@ -120,6 +132,17 @@ def save_run(
     except OSError as e:
         log.warning(f"Could not write markdown review to {markdown_path}: {e}")
         markdown_path = None
+
+    # The same worklist that opens the review, on its own. The review is 200KB
+    # of evidence and the worklist is the dozen things to go and do; an author
+    # working through them wants the second open in front of them, not scrolled
+    # to inside the first. One builder feeds both, so they cannot disagree.
+    try:
+        with open(worklist_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(render_worklist(build_worklist(report))).rstrip() + "\n")
+    except OSError as e:
+        log.warning(f"Could not write worklist to {worklist_path}: {e}")
+        worklist_path = None
 
     try:
         lines = [
@@ -135,12 +158,14 @@ def save_run(
             "report_path": str(report_path),
             "corrections_path": None,
             "markdown_path": str(markdown_path) if markdown_path else None,
+            "worklist_path": str(worklist_path) if worklist_path else None,
         }
 
     return {
         "report_path": str(report_path),
         "corrections_path": str(corrections_path),
         "markdown_path": str(markdown_path) if markdown_path else None,
+        "worklist_path": str(worklist_path) if worklist_path else None,
     }
 
 

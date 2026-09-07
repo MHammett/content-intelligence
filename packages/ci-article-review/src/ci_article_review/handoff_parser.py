@@ -74,13 +74,26 @@ METADATA_HEADERS = [
 ]
 
 
-_OPTIONAL_FIELD_IMPACT = {
-    "sources_cited": "fact_check and red_team",
-    "uncertain_sections": "fact_check and red_team",
-    "out_of_scope": "fact_check and citation resolution",
-    "known_gaps": "completeness",
-    "target_audience": "voice_style and completeness",
-}
+#: Which domains each optional field reaches. Read from ``handoff_gaps`` rather
+#: than restated here: the report's gap section and this debug line answer the
+#: same question, and when they were two hand-maintained lists they disagreed —
+#: this one said ``target_audience`` reached "voice_style and completeness",
+#: while the prompt templates show four domains reasoning about audience.
+#:
+#: ``out_of_scope`` is deliberately absent. Every other field here is one whose
+#: absence costs the run something on every draft, which is what makes a debug
+#: line about it useful. Most articles have nothing that no source can settle,
+#: so an empty OUT OF SCOPE FOR FACT-CHECK section is the normal case rather
+#: than a gap, and reporting it as one would be noise on most runs. The signal
+#: that the section *should* have been filled in is not its emptiness — it is
+#: the fact-check models classifying claims out of scope on their own, which
+#: Section 2 reports directly. See :mod:`ci_article_review.fact_check_scope`.
+_OPTIONAL_FIELD_IMPACT = (
+    "sources_cited",
+    "uncertain_sections",
+    "known_gaps",
+    "target_audience",
+)
 
 
 def _note_empty_optional_fields(results):
@@ -90,9 +103,16 @@ def _note_empty_optional_fields(results):
     but a rename or malformed header from a chat model produces the exact
     same empty string as a deliberate omission — so at least leave a debug
     trail of which review domains lose context as a result.
+
+    The author-facing version of this — what each absence actually cost, and
+    the line to paste to close it — is built by ``handoff_gaps.assess`` and
+    rendered into the report itself. This stays a debug line.
     """
-    for field, domains in _OPTIONAL_FIELD_IMPACT.items():
+    from .handoff_gaps import FIELD_DOMAINS
+
+    for field in _OPTIONAL_FIELD_IMPACT:
         if not results.get(field):
+            domains = " and ".join(FIELD_DOMAINS.get(field, ()))
             log.debug(
                 f"No '{field}' section found (or it was empty). "
                 f"{domains} review will have less context as a result."
@@ -154,6 +174,12 @@ def parse_metadata_only(text):
     run_number = _extract_field(text, "Pipeline run:")
     # Optional. Names the model that drafted the article so the pipeline can
     # keep it out of voice_style — see _drafting_model() in pipeline.py.
+    # Optional. Who first-person wording in the draft refers to, for citation
+    # verification: an "I have a family." claim cannot be checked against a page
+    # without knowing whose family. Falls back to the publication's own
+    # author_name when absent, so single-author publications need not repeat it
+    # per article; set it here for a guest or co-authored piece.
+    author = _extract_field(text, "Author:")
     drafted_with = _extract_field(text, "Drafted with:")
     # Optional. Pins the history directory so revising the title does not fork
     # the article's history — see _history_key() in pipeline.py.
@@ -178,6 +204,7 @@ def parse_metadata_only(text):
         "out_of_scope": section("OUT OF SCOPE FOR FACT-CHECK"),
         "known_gaps": section("KNOWN GAPS"),
         "additional_context": section("ADDITIONAL CONTEXT FOR REVIEW MODELS"),
+        "author": author,
         "drafted_with": drafted_with,
         "history_key": history_key,
     }
@@ -222,6 +249,12 @@ def parse_draft_submission(text):
     run_number = _extract_field(text, "Pipeline run:")
     # Optional. Names the model that drafted the article so the pipeline can
     # keep it out of voice_style — see _drafting_model() in pipeline.py.
+    # Optional. Who first-person wording in the draft refers to, for citation
+    # verification: an "I have a family." claim cannot be checked against a page
+    # without knowing whose family. Falls back to the publication's own
+    # author_name when absent, so single-author publications need not repeat it
+    # per article; set it here for a guest or co-authored piece.
+    author = _extract_field(text, "Author:")
     drafted_with = _extract_field(text, "Drafted with:")
     # Optional. Pins the history directory so revising the title does not fork
     # the article's history — see _history_key() in pipeline.py.
@@ -261,6 +294,7 @@ def parse_draft_submission(text):
         "out_of_scope": section("OUT OF SCOPE FOR FACT-CHECK"),
         "known_gaps": section("KNOWN GAPS"),
         "additional_context": section("ADDITIONAL CONTEXT FOR REVIEW MODELS"),
+        "author": author,
         "drafted_with": drafted_with,
         "history_key": history_key,
         "draft": _REQUIRED_FIELDS["draft"][1],

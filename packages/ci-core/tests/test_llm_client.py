@@ -733,7 +733,15 @@ class TestReasoningParameters:
 
         assert seen["reasoning"] == {"effort": "xhigh", "summary": "auto"}
 
-    def test_openai_without_reasoning_sends_temperature(self):
+    def test_openai_without_reasoning_sends_no_temperature(self):
+        """gpt-5.x refuses it at any effort, including none.
+
+        This asserted the opposite, against a mock that accepts anything —
+        which is how the bug survived. Live standard-preset run, 2026-09-04:
+        every openai call with no reasoning effort came back HTTP 400,
+        "Unsupported parameter: 'temperature' is not supported with this
+        model", in under a second.
+        """
         seen = {}
 
         def _capture(**kwargs):
@@ -744,7 +752,7 @@ class TestReasoningParameters:
             _call("openai")
 
         assert "reasoning" not in seen
-        assert seen["temperature"] == 0.2
+        assert "temperature" not in seen
 
     def test_claude_effort_maps_to_reasoning_effort(self):
         seen = {}
@@ -1161,9 +1169,14 @@ class TestWebSearch:
         assert seen["reasoning"] == {"effort": "high", "summary": "auto"}
         assert seen["tools"] == [{"type": "web_search_preview"}]
 
-    def test_search_without_reasoning_still_sends_temperature(self):
-        """A non-reasoning model accepts it, and dropping it everywhere would
-        quietly loosen determinism on the models that do honour it."""
+    def test_search_without_reasoning_sends_no_temperature_either(self):
+        """The premise of the old version — "a non-reasoning model accepts it" —
+        is not true of gpt-5.x, which is the only family this path serves.
+
+        Determinism on the models that *do* honour a temperature is unaffected:
+        they go through the Chat Completions path, which reads
+        ``_SENDS_TEMPERATURE`` and still sets one.
+        """
         seen = {}
 
         def _capture(**kwargs):
@@ -1173,7 +1186,7 @@ class TestWebSearch:
         with patch.object(client.litellm, "responses", side_effect=_capture):
             _call("openai", provider_config={"web_search": True})
 
-        assert seen["temperature"] == 0.2
+        assert "temperature" not in seen
 
 
 # ---------------------------------------------------------------------------
@@ -1611,3 +1624,221 @@ class TestCacheBreakpoint:
             "prompt_cache_key"
         ]
         assert "secret" not in key
+
+
+class TestNarrowedPunctuationRepair:
+    """Perplexity narrows General Punctuation to its low byte, so U+2019 lands
+    in the response as a C0 control character. It arrives by two different
+    routes and each needs its own repair point — see ci_core.text_repair.
+
+    Search-result snippets come out of litellm's parse of the provider
+    envelope, so they carry a real control character and are repaired at the
+    stream boundary. The model's own answer JSON carries an *escape* instead,
+    which is still plain text at that point and only becomes a control
+    character when the answer is parsed.
+    """
+
+    def test_search_result_snippets_are_repaired_at_the_stream(self):
+        stream = _completion_stream(
+            citations=["https://example.org/a"],
+            search_results=[
+                {"title": "A", "snippet": "the site" + chr(0x19) + "s owner"}
+            ],
+        )
+        with patch.object(client.litellm, "completion", return_value=stream):
+            result = _call("perplexity")
+
+        assert result["search_results"][0]["snippet"] == "the site’s owner"
+
+    def test_answer_json_is_repaired_through_the_parse(self):
+        body = '{"flags": ["Laboratory' + chr(92) + 'u0019s congressional report"]}'
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream(text=body)
+        ):
+            result = _call("perplexity")
+
+        assert result["data"]["flags"] == ["Laboratory’s congressional report"]
+
+    def test_a_clean_response_is_left_alone(self):
+        body = '{"flags": ["nothing — wrong here"]}'
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream(text=body)
+        ):
+            result = _call("perplexity")
+
+        assert result["data"]["flags"] == ["nothing — wrong here"]
+
+
+class TestOpenAIGroundingIsDetectedFromSearchEvents:
+    """A grounded openai call reported itself ungrounded.
+
+    Measured 2026-09-04 against the live API: `web_search` on, 8,661 prompt
+    tokens consumed, the right answer returned — and `grounding_available:
+    None`, `citations: []`. Two separate reasons:
+
+    * OpenAI streams through `litellm.responses`, whose consumer hardcoded
+      `citations: []`. A first attempt at this read annotations off the *Chat
+      Completions* chunks, a path openai never takes.
+    * Even in the right place there was nothing to read. OpenAI attaches
+      `url_citation` annotations to cited spans of prose, and every review
+      domain asks for a JSON schema, so there is no prose to cite. The
+      annotations array comes back empty on a search that demonstrably ran.
+
+    What the stream does carry is `response.web_search_call.*`. Those events
+    hold an item_id and a sequence number — no query, no URLs — but they answer
+    the question `grounding_available` actually asks: did this call consult
+    live sources.
+    """
+
+    class _Event:
+        def __init__(self, type_, **kw):
+            self.type = type_
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    def _drain(self, events):
+        return client._consume_responses_stream(iter(events), 60, 60)
+
+    def test_a_search_event_marks_the_call_grounded(self):
+        out = self._drain(
+            [
+                self._Event("response.web_search_call.in_progress"),
+                self._Event("response.web_search_call.completed"),
+                self._Event("response.output_text.delta", delta='{"ok":true}'),
+            ]
+        )
+        assert out["web_search_used"] is True
+
+    def test_no_search_event_leaves_it_unset(self):
+        out = self._drain(
+            [self._Event("response.output_text.delta", delta='{"ok":true}')]
+        )
+        assert out["web_search_used"] is False
+
+    def test_the_event_type_is_read_as_its_wire_value(self):
+        """`type` is a str-subclass enum: `==` against the dotted name works,
+        but `str()` renders it "ResponsesAPIStreamEvents.WEB_SEARCH_CALL_..."
+        — which is how a first version of this silently detected nothing."""
+        import enum
+
+        class _Kind(str, enum.Enum):
+            SEARCHING = "response.web_search_call.searching"
+
+        out = self._drain([self._Event(_Kind.SEARCHING)])
+        assert out["web_search_used"] is True
+
+    def test_annotations_are_still_read_when_the_provider_sends_any(self):
+        part = self._Event(
+            "part", annotations=[{"type": "url_citation", "url": "https://eia.gov/x"}]
+        )
+        out = self._drain([self._Event("response.content_part.done", part=part)])
+        assert out["citations"] == ["https://eia.gov/x"]
+
+    def test_both_consumers_return_the_same_keys(self):
+        """So `_extras_from` needs no per-surface branch."""
+        responses = set(self._drain([]))
+        completion = set(client._consume_completion_stream(iter([]), 60, 60))
+        assert "web_search_used" in responses
+        assert "web_search_used" in completion
+
+
+class TestUrlCitationExtraction:
+    def test_dict_annotations(self):
+        assert client._url_citations(
+            [{"type": "url_citation", "url": "https://eia.gov/a"}]
+        ) == ["https://eia.gov/a"]
+
+    def test_object_annotations(self):
+        class _Ann:
+            type = "url_citation"
+            url = "https://eia.gov/a"
+
+        assert client._url_citations([_Ann()]) == ["https://eia.gov/a"]
+
+    def test_an_annotation_with_no_url_is_not_a_citation(self):
+        assert client._url_citations([{"type": "file_citation", "file_id": "f"}]) == []
+
+    def test_nothing_at_all_is_handled(self):
+        assert client._url_citations(None) == []
+
+
+class TestOpenAINeverReceivesTemperature:
+    """gpt-5.x rejects `temperature` outright, at any reasoning effort.
+
+    The Responses-API path sent one whenever no reasoning effort was set, under
+    a comment that correctly said the model would refuse it. `_SENDS_TEMPERATURE`
+    has excluded openai all along; that path never consulted it.
+
+    The maximum preset masked this — openai runs at xhigh there and took the
+    other branch — so it only showed on economy, standard and balanced, where
+    every openai call died with HTTP 400 in under a second. Found on a live
+    standard run, 2026-09-04.
+    """
+
+    def test_openai_is_not_in_the_temperature_allowlist(self):
+        assert "openai" not in client._SENDS_TEMPERATURE
+
+    def test_the_responses_path_sends_no_temperature_without_an_effort(self):
+        import inspect
+
+        source = inspect.getsource(client)
+        start = source.index("litellm.responses(**kwargs)")
+        window = source[max(0, start - 3000) : start]
+        assert 'kwargs["temperature"]' not in window, (
+            "the Responses-API path sets a temperature again — gpt-5.x returns "
+            "HTTP 400 for it regardless of reasoning effort"
+        )
+
+    def test_a_provider_that_accepts_one_still_gets_it(self):
+        """The fix must not strip temperature from the providers that want it."""
+        for provider in ("gemini", "mistral", "grok", "perplexity"):
+            assert provider in client._SENDS_TEMPERATURE, provider
+
+
+class TestClaudeOutputCeiling:
+    """`claude` had a flat 4096-token cap that config could not raise.
+
+    Measured 2026-09-05 on a standard-preset run (135514 chars, effort=none):
+    `claude:argument_integrity` stopped at exactly 4096 output tokens and came
+    back PARTIAL, salvage keeping the complete findings and discarding the rest,
+    while every other provider finished. `cfg["max_tokens"]` was ignored on all
+    three branches, so there was no way to raise it without editing the client.
+    """
+
+    def _seen(self, **provider_config):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call("claude", provider_config=provider_config)
+        return seen
+
+    def test_the_no_effort_default_clears_the_measured_truncation(self):
+        assert self._seen()["max_tokens"] == 8000
+
+    def test_high_effort_keeps_its_larger_budget(self):
+        assert self._seen(effort="high")["max_tokens"] == 16000
+
+    def test_a_thinking_budget_still_leaves_room_for_the_answer(self):
+        """The budget is spent before the response starts, so the ceiling has to
+        exceed it or the model thinks and then has nothing left to answer with."""
+        seen = self._seen(thinking_budget=10000)
+        assert seen["max_tokens"] == 14096
+        assert seen["thinking"]["budget_tokens"] == 10000
+
+    def test_config_can_raise_the_ceiling_on_every_branch(self):
+        """The point of the fix: a domain that still truncates is now a config
+        change rather than a client edit."""
+        assert self._seen(max_tokens=32000)["max_tokens"] == 32000
+        assert self._seen(effort="high", max_tokens=32000)["max_tokens"] == 32000
+        assert (
+            self._seen(thinking_budget=10000, max_tokens=32000)["max_tokens"] == 32000
+        )
+
+    def test_the_default_stays_well_under_the_provider_ceiling(self):
+        """claude-haiku-4-5 reports max_output_tokens 64000. Raising the default
+        to the ceiling would trade one silent failure for a cost surprise."""
+        assert self._seen()["max_tokens"] <= 16000

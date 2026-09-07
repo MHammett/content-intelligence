@@ -185,16 +185,31 @@ and infers only the title and body — it cannot supply an author's
 
 ## The revision loop
 
-The pipeline is built for a round trip between this tool and whatever chat model you drafted with. Each run writes two files side by side in `pipeline_history/<article-slug>/`:
+The pipeline is built for a round trip between this tool and whatever chat model you drafted with. Each run writes three files side by side in `pipeline_history/<article-slug>/`:
 
 - `run_N_<timestamp>_report.json` — the full machine-readable report
 - `run_N_<timestamp>_review.md` — the same findings rendered as readable prose, SECTION 1 through SECTION 9
+- `run_N_<timestamp>_worklist.md` — the things the run could not settle *and a person can*, as ranked actions
 
-The markdown one is the artifact you actually work from. The end of every run prints its path:
+The markdown one is the artifact you actually work from. The end of every run prints both paths:
 
 ```
 Readable review (paste into chat): pipeline_history/my-article/run_1_20260809_143022_review.md
+Your worklist (do NOT paste; these are yours): pipeline_history/my-article/run_1_20260809_143022_worklist.md
 ```
+
+### The worklist
+
+A run ends with gaps: a source that 403'd, a page that fetched but would not extract, a bulletin the fact-check pass could name but not link. The report describes those honestly and stops. The worklist turns them into errands, and it is also rendered at the top of `review.md`.
+
+It is grouped by the kind of action rather than by report section, because you work through it in one pass — open a page, find a copy, track down a document, confirm what only you can confirm. Each item says what is needed, why the run could not get it, and the most specific next step there is: the publisher's real URL (recovered from the failure message, since the stored one is often an expiring search redirect), what archive.org did or did not answer, the document's own bulletin number.
+
+Two things it does deliberately:
+
+- **It collapses by target and ranks what is left.** Eight claims behind one refused URL are one page to open, not eight items. A list nobody finishes is worse than a short one that gets cleared, so it caps — and counts what it held back rather than dropping it.
+- **It separates what is yours forever from what is a missing tool.** `[you]` is judgement, a paywall, or your own observation. `[tool gap]` is something a tool could do and this pipeline cannot — rendering JavaScript, reading a scanned PDF, fetching with a real browser session. Those are totalled at the bottom as a roadmap.
+
+**Do not paste the worklist into the revision model.** It is a list of documents nobody has read yet, which is an invitation to invent them — that is why it is not numbered as a SECTION and sits outside the range step 3 asks for.
 
 **The loop:**
 
@@ -213,6 +228,77 @@ Readable review (paste into chat): pipeline_history/my-article/run_1_20260809_14
 6. Repeat until the findings are ones you're content to ship, then publish with `--publish`.
 
 `--raw-draft` on its own works too — it just uses the whole file as the article body and skips the metadata context, which means the review models lose the author-supplied framing. Pair it with `--metadata` whenever you have that context to give.
+
+---
+
+## Authorship markers
+
+Step 4 of the loop above is where machine typography enters the article. The draft goes out to a chat model, comes back revised, and gets pasted into a file — and what comes back is not punctuated like something typed on a keyboard. Measured across `pipeline_history/` and `handoff_templates/`: 2,258 em dashes, 1,782 curly apostrophes, and 376 non-breaking hyphens, a character no one types on purpose. The author's own drafts carry four em dashes and nothing else.
+
+`ci-markers` reports that residue and optionally removes it.
+
+```powershell
+uv run ci-markers revised_draft.md                    # what is in there
+uv run ci-markers revised_draft.md --fix              # remove the invisible residue
+uv run ci-markers revised_draft.md --fix --aggressive # also flatten typography to ASCII
+```
+
+**What this is not.** There is no recoverable watermark in the text this pipeline handles, and this tool does not remove one. The review models never write the article, the revise step rewrites whatever the draft model produced, and a scan of the whole corpus found no zero-width character anywhere. Stripping typography is cosmetic. It also will not fool a classifier, which keys on sentence rhythm and word choice far more than on punctuation — prose style is `banned_phrases` territory in the publication config, not a character-level problem.
+
+**Two tiers, because they are different decisions.** The default `--fix` changes no glyph: it removes characters that render as nothing and normalises the spaces that only pretend to be one. `--aggressive` also flattens em dashes, curly quotes and known lookalike letters, which visibly changes the prose — an author who uses em dashes is entitled to keep using them, so that stays opt-in.
+
+**Built for the marker that does not exist yet.** Detection keys on Unicode *classes*, not a list of bad characters: format characters, private-use and unassigned code points, separators, orphaned variation selectors, and scripts mixed inside a single word. Anything built from those is caught without a change to the code. The one trap worth naming is that variation selectors are category `Mn`, not `Cf` — a scanner that sweeps format characters and stops there misses `U+E0100`–`U+E01EF` entirely, which is the channel currently used to hide bytes in text. For a marker built from none of that, `--inventory` counts every distinct non-ASCII code point and judges nothing; diff it between drafts and a character that was not there last week shows up on its own.
+
+| Flag | Purpose |
+|---|---|
+| `--fix` | Rewrite each file with its markers removed. Without this the tool only reports — it never writes |
+| `--aggressive` | With `--fix`, also flatten typography to ASCII and substitute known confusables. Changes visible text |
+| `--inventory` | Also list every distinct non-ASCII code point, with no verdicts |
+| `--stdin` | Read from stdin, write sanitized text to stdout, report to stderr, so it composes in a pipe |
+| `--json` | Machine-readable output |
+| `--verbose`, `-v` | DEBUG logging |
+
+Findings are grouped by what they mean, and two of the groups are not markers at all:
+
+- **Invisible** — renders as nothing; never innocent in prose. Removed by `--fix`.
+- **Decode damage** — a replacement character or an unassigned code point, meaning bytes were lost upstream. **Reported and never removed**, by either tier: deleting the scar leaves the wound. Finding these is what surfaced a citation fetch storing a PDF's raw binary as a source's content summary.
+- **Mixed-script words** — a Cyrillic `а` inside an otherwise-Latin word. A whole Cyrillic word is a quotation and is left alone.
+- **Lookalike spaces** and **typography** — cosmetic.
+
+The exit code suits a publish gate: `1` when a file contains an invisible character, a mixed-script word, or decode damage; `0` when it is clean or the only findings are cosmetic. An em dash should not fail a build.
+
+---
+
+## Authorship provenance
+
+Since August 2026, Anthropic embeds a statistical watermark in Claude's text output. It is applied at the model level, so it is present worldwide rather than only in the EU, and it covers the API and Claude Code, not just claude.ai. Google ships SynthID-Text across the Gemini consumer products.
+
+That mark lives in word choice, not in characters, and **nothing in this repo can detect it**. Detection means re-running a keyed pseudorandom function over the token stream; without the provider's secret key, marked and unmarked text are statistically indistinguishable — that is the scheme's design guarantee, not a gap in the tooling. A heuristic pretending otherwise would be unfalsifiable, wrong in ways nobody here could measure.
+
+So the report states provenance rather than pretending to detect. You already declare the drafting model with `Drafted with:` in the handoff, where the pipeline uses it to keep a model from reviewing its own prose. That same declaration now reaches `report.json` and the `review.md` header:
+
+```
+## Authorship Provenance
+
+- Drafted with: **claude**
+- This provider embeds a statistical watermark in generated text, since 2026-08-02.
+- Scope: API, Claude Code, and consumer surfaces; applied at model level, worldwide
+- Basis: declared in the handoff, not measured from the text. Nothing in this
+  pipeline can detect a statistical watermark — that needs the provider's key.
+```
+
+The block is silent when the declared provider does not mark text, and silent when nothing was declared. A line that says nothing trains people to skip the section.
+
+Which providers mark text is a dated table in `packages/ci-core/src/ci_core/configs/watermarking.yaml`, following the same pattern as `model_registry.yaml`: bump `registry_date` when you re-check it against provider documentation, and the report starts warning once the table goes stale. It *will* go stale — every signatory to the EU Code of Practice is still shipping changes.
+
+Two rules in that table are deliberate:
+
+- **An unlisted or unverified provider records as `unknown`, never as `no`.** Reporting an unverified provider as clean is the one error worth engineering against, so absence of evidence is recorded as absence of evidence.
+- **`partial` counts as marked.** A provider that marks on some surfaces but not confirmably on its API — Gemini, at the time of writing — is a reason to assume the mark is present, not a reason to assume it is absent.
+
+Recording this in `report.json` matters more than printing it. By the time anyone asks whether a piece published months ago carries a mark, the chat thread that produced it is long gone.
+
+If you need actual detection rather than bookkeeping, Anthropic runs a third-party detection API — in private preview at the time of writing, with media and fact-checkers among the eligible categories.
 
 ---
 
@@ -289,7 +375,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--publication NAME` | Publication config to use (`configs/NAME.yaml`) — **required** |
 | `--publish-live` | Publish live instead of as a WordPress draft |
 | `--config-dir DIR` | Config directory (default `configs`) |
-| `--cost-preset PRESET` | Override `cost_preset` for this run: `economy` / `standard` / `balanced` / `thorough` / `maximum`. Doesn't modify `user.yaml`. |
+| `--cost-preset PRESET` | Override `cost_preset` for this run: `economy` / `wide` / `balanced` / `thorough` / `maximum`. Doesn't modify `user.yaml`. (`standard` was retired 2026-09-05; it still runs, as `wide`, with a warning.) |
 | `--api-key PROVIDER[.FIELD]=VALUE` | Override one credential field for this run only — highest tier of the credential precedence (CLI > publication config > `.env`/`user.yaml` > OS environment variable). Repeatable. `PROVIDER=VALUE` is shorthand for `api_key` (`openai`, `gemini`, `mistral`, `grok`, `perplexity`, `claude`); multi-field credentials need `PROVIDER.FIELD` (`languagetool.username`, `archive_org.secret_key`, etc.). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#api-key-precedence). |
 | `--wp-user USERNAME` | Override the WordPress username for this run only (`--publish` mode) — same precedence idea as `--api-key`, applied to `publication.wordpress`. |
 | `--wp-password APPLICATION_PASSWORD` | Override the WordPress application password for this run only (`--publish` mode). |
@@ -437,6 +523,23 @@ fact_check_scope:
   trust_model_classification: true
 ```
 
+### This is not the same fix as `author_name`
+
+Both answer the same measured incident from opposite ends, and they are meant to
+be used together.
+
+Setting `author_name` in the publication config (or an `Author:` line in the
+handoff) tells citation verification who "I" is, so a first-person claim a public
+page *can* settle gets checked properly instead of binding "I" to whoever the
+page happens to name. Marking a passage out of scope covers the claims no page
+will ever settle, whatever name it is given — `"I have a side job."` is not on
+anyone's team page.
+
+So set `author_name` first: it is one line and it fixes the larger group. Reach
+for a scope marking for what is left. The fact-check prompt is told to judge
+`first_person` by whether a source *could* settle the claim rather than by the
+pronoun, so a role a bio page states stays in the normal buckets.
+
 ### What exclusion actually does
 
 | Pass | Effect |
@@ -489,10 +592,17 @@ content-intelligence/
 │   │   │   ├── fact_check_scope.py    claims no source can settle — author markings,
 │   │   │   │                          model classification, and what they exclude
 │   │   │   ├── handoff_parser.py      parses Template A and Template C documents
+│   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
+│   │   │   ├── passage_match.py       decides when two quoted passages are the same passage
 │   │   │   ├── voice_pattern_report.py  recurring voice patterns across articles (ci-voice-patterns)
+│   │   │   ├── markers.py           reports/strips machine-authorship markers in a
+│   │   │   │                        draft (ci-markers); --fix removes, default only reports
 │   │   │   ├── report_markdown.py     renders the readable run_N_*_review.md from the report
+│   │   │   ├── worklist.py            turns what the run could not settle into ranked
+│   │   │   │                          actions — run_N_*_worklist.md, and the block that
+│   │   │   │                          opens the review
 │   │   │   ├── check.py               connectivity/credential check for all services
 │   │   │   ├── discover.py            live model discovery — queries provider APIs
 │   │   │   ├── live_model_check.py    caches that discovery and reports, in the run
@@ -506,7 +616,9 @@ content-intelligence/
 │   │   │   │   ├── cms/wordpress.py          WordPress REST API publisher
 │   │   │   │   └── citation/
 │   │   │   │       ├── resolver.py           primary source resolution, checksums, confidence tiers
+│   │   │   │       ├── disposition.py        the one vocabulary for what happened to a citation
 │   │   │   │       ├── draft_citations.py    traces a claim to the citation the draft cites for it
+│   │   │   │       ├── reask.py             hands a refuted citation back to the model that asserted it
 │   │   │   │       ├── wayback.py            Wayback archive check + Save Page Now submission
 │   │   │   │       ├── topic_match.py        keyword gating for pointer-only adapters
 │   │   │   │       └── sources/              10 adapters: census, crossref, eia, epa, ferc,
@@ -547,8 +659,12 @@ content-intelligence/
 │   │   │   │   │                      {prompt, completion, cached}
 │   │   │   │   ├── cost.py            token-based cost estimation, incl. cache hits
 │   │   │   │   ├── timeout_model.py   sliding-scale timeout from size × model × effort
-│   │   │   │   └── model_registry.py  current/superseded model detection
+│   │   │   │   ├── model_registry.py  current/superseded model detection
+│   │   │   │   └── watermarking.py    which providers mark generated text;
+│   │   │   │                          provenance bookkeeping, not detection
 │   │   │   ├── extract.py        HTML/PDF -> readable text, claim-centred excerpts
+│   │   │   ├── text_repair.py    undoes Perplexity's low-byte narrowing of
+│   │   │   │                     General Punctuation (U+2019 arriving as 0x19)
 │   │   │   ├── http.py           USER_AGENT + DEFAULT_HEADERS for all outbound calls
 │   │   │   ├── concurrency.py    run_with_timeout — the wall-clock backstop both
 │   │   │   │                     applications run their provider calls under
@@ -558,8 +674,12 @@ content-intelligence/
 │   │   │   │                     a .env value (python-dotenv's override=False)
 │   │   │   ├── console.py        force_utf8_stdio — every CLI calls it first, so a
 │   │   │   │                     cp1252 Windows console cannot kill a report mid-print
+│   │   │   ├── text_markers.py  detects invisible characters, mixed-script words and
+│   │   │   │                     decode damage in article text, by Unicode class rather
+│   │   │   │                     than a denylist; inventory() censuses the rest
 │   │   │   ├── config_helpers.py load_yaml, resolve_env_recursive, normalize_model_configs
-│   │   │   ├── configs/          pricing.yaml, timeouts.yaml, model_registry.yaml
+│   │   │   ├── configs/          pricing.yaml, timeouts.yaml, model_registry.yaml,
+│   │   │   │                     watermarking.yaml
 │   │   │   ├── config.py         pydantic settings (no production consumer yet)
 │   │   │   ├── db.py             async SQLAlchemy engine/session (no production consumer yet)
 │   │   │   ├── models.py         ORM models (no production consumer yet)

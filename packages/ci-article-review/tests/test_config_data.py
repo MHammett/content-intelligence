@@ -44,7 +44,7 @@ class TestPresetsAreValid:
         from ci_article_review.config_loader import _load_presets_from_yaml
 
         presets = _load_presets_from_yaml()
-        expected = {"economy", "standard", "balanced", "thorough", "maximum"}
+        expected = {"economy", "wide", "balanced", "thorough", "maximum"}
         assert expected <= set(presets), (
             f"presets.yaml is missing: {sorted(expected - set(presets))}. "
             "These are the choices offered by --cost-preset."
@@ -78,10 +78,10 @@ class TestPresetsAreValid:
 
 
 class TestPresetsStructure:
-    _EXPECTED = {"economy", "standard", "balanced", "thorough", "maximum"}
+    _EXPECTED = {"economy", "wide", "balanced", "thorough", "maximum"}
     _VALID_THOROUGHNESS = {"standard", "thorough", "maximum"}
 
-    def test_all_five_presets_present(self):
+    def test_all_live_presets_present(self):
         data = _load("presets.yaml")
         assert self._EXPECTED.issubset(set(data.keys()))
 
@@ -96,13 +96,31 @@ class TestPresetsStructure:
                 f"{name}: no models"
             )
 
-    def test_no_grok_reasoning_effort(self):
-        # Grok reasoning is model-selection based; reasoning_effort is not a valid Grok param.
+    #: Grok models that accept reasoning_effort. Before grok-4.6 (2026-08-12)
+    #: Grok reasoning was model-selection only and the parameter is not valid,
+    #: which is what this guard originally banned outright.
+    _GROK_TAKES_EFFORT = {"grok-4.6"}
+
+    def test_grok_reasoning_effort_only_on_models_that_accept_it(self):
+        """Was a blanket ban, on the grounds that no Grok took the parameter.
+
+        grok-4.6 does. Verified live 2026-09-05: litellm forwards it to xAI with
+        no client-side reject and none of the `allowed_openai_params` hatch
+        mistral needs, and grok honours it — ~380 completion tokens at low
+        against ~1060 at high on one prompt. The ban is therefore narrowed to
+        the models it is actually true of rather than dropped, because sending
+        the parameter to grok-4.3 would still be a 400 for no gain.
+        """
         data = _load("presets.yaml")
         for name, body in data.items():
             grok = body.get("models", {}).get("grok") or {}
-            assert "reasoning_effort" not in grok, (
-                f"{name}: grok has reasoning_effort — use grok-4.20-0309-reasoning instead"
+            if "reasoning_effort" not in grok:
+                continue
+            assert grok.get("model") in self._GROK_TAKES_EFFORT, (
+                f"{name}: grok {grok.get('model')!r} predates reasoning_effort"
+            )
+            assert grok["reasoning_effort"] in ("low", "medium", "high", "xhigh"), (
+                f"{name}: grok reasoning_effort={grok['reasoning_effort']!r} invalid"
             )
 
     def test_mistral_reasoning_effort_is_high_or_none_only(self):
@@ -211,10 +229,14 @@ class TestCostPresetSetsThoroughness:
         "preset,expected",
         [
             ("economy", "standard"),
-            ("standard", "standard"),
+            ("wide", "thorough"),
             ("balanced", "thorough"),
             ("thorough", "thorough"),
             ("maximum", "maximum"),
+            # Retired, and therefore carrying its replacement's thoroughness
+            # rather than its own former `standard`. This pair is the whole
+            # behaviour change the retirement warning exists to announce.
+            ("standard", "thorough"),
         ],
     )
     def test_each_preset_brings_its_own_thoroughness(self, preset, expected):
@@ -248,3 +270,157 @@ class TestCostPresetSetsThoroughness:
             f"maximum scheduled {len(assignments)} calls, not 30 — the preset's "
             f"thoroughness is not reaching the assignment builder"
         )
+
+
+class TestRetiredPresets:
+    """A retired preset name keeps working, loudly.
+
+    `standard` was retired 2026-09-05: `wide` beat it on every axis measured
+    over three isolated runs each, at 55% of the cost. Deleting the name outright
+    would turn a `cost_preset: standard` that had been working for months into a
+    crash at config-load, so it maps to its replacement instead -- and warns,
+    because six models over twelve calls is not what `standard` used to do.
+    """
+
+    def test_the_retired_name_is_gone_from_the_live_tiers(self):
+        from ci_article_review.config_loader import preset_names
+
+        assert "standard" not in preset_names()
+        assert "wide" in preset_names()
+
+    def test_it_resolves_to_its_replacement(self):
+        from ci_article_review.config_loader import resolve_preset_name
+
+        name, note = resolve_preset_name("standard")
+        assert name == "wide"
+        assert note and "retired" in note
+
+    def test_a_live_preset_resolves_to_itself_without_a_note(self):
+        from ci_article_review.config_loader import resolve_preset_name
+
+        assert resolve_preset_name("wide") == ("wide", None)
+
+    def test_an_existing_config_still_runs_and_warns(self, caplog):
+        import logging
+
+        from ci_article_review.config_loader import _apply_cost_preset
+
+        models = {m: {"model": "x"} for m in ("openai", "gemini", "mistral")}
+        with caplog.at_level(logging.WARNING):
+            pipe, resolved = _apply_cost_preset(
+                {"cost_preset": "standard"}, models, user_set={}
+            )
+
+        assert "retired" in caplog.text
+        assert "wide" in caplog.text
+        # The models really are wide's, not a no-op pass-through.
+        assert resolved["openai"]["model"] == "gpt-5.6-luna"
+        assert pipe["thoroughness"] == "thorough"
+
+    def test_the_report_names_the_preset_that_actually_ran(self):
+        """Otherwise Ensemble Width would print a tier whose models are absent."""
+        from ci_article_review.config_loader import _apply_cost_preset
+
+        pipe, _models = _apply_cost_preset(
+            {"cost_preset": "standard"}, {"openai": {"model": "x"}}, user_set={}
+        )
+        assert pipe["cost_preset"] == "wide"
+
+    def test_a_genuinely_unknown_preset_still_raises(self):
+        import pytest
+
+        from ci_article_review.config_loader import _apply_cost_preset
+
+        with pytest.raises(ValueError, match="Unknown cost_preset"):
+            _apply_cost_preset({"cost_preset": "nonsense"}, {}, user_set={})
+
+    def test_the_cli_still_accepts_the_retired_name(self):
+        """A saved script or shell alias must not break on a naming decision."""
+        from ci_article_review.pipeline import build_parser
+
+        args = build_parser().parse_args(
+            ["--draft", "d.md", "--publication", "p", "--cost-preset", "standard"]
+        )
+        assert args.cost_preset == "standard"
+
+    def test_the_cli_help_advertises_only_live_tiers(self):
+        from ci_article_review.pipeline import build_parser
+
+        for action in build_parser()._actions:
+            if action.dest == "cost_preset":
+                assert "standard" not in (action.metavar or "")
+                assert "wide" in (action.metavar or "")
+                break
+        else:
+            raise AssertionError("no --cost-preset argument found")
+
+
+class TestAuthorNameIsADeclaredPublicationKey:
+    """`author_name` was read by the pipeline before anything declared it.
+
+    ``pipeline`` falls back to ``pub_config["author_name"]`` to tell citation
+    verification who "I" is. That key appeared in no example config, no
+    scaffolding, and no documentation — it worked only for the one config that
+    happened to set it by hand. A second user had no way to discover it.
+    """
+
+    def _example(self):
+        from pathlib import Path
+
+        import yaml
+
+        for parent in Path(__file__).resolve().parents:
+            candidate = (
+                parent
+                / "packages"
+                / "ci-article-review"
+                / "src"
+                / "ci_article_review"
+                / "configs"
+                / "publication.example.yaml"
+            )
+            if candidate.is_file():
+                return yaml.safe_load(candidate.read_text(encoding="utf-8"))
+        raise AssertionError("publication.example.yaml not found")
+
+    def test_the_example_config_declares_it(self):
+        """setup.py copies this file verbatim, so this is the scaffolding too."""
+        assert "author_name" in self._example()
+
+    def test_it_is_documented_in_the_configuration_reference(self):
+        from pathlib import Path
+
+        for parent in Path(__file__).resolve().parents:
+            doc = parent / "docs" / "CONFIGURATION.md"
+            if doc.is_file():
+                assert "author_name" in doc.read_text(encoding="utf-8")
+                return
+        raise AssertionError("docs/CONFIGURATION.md not found")
+
+    def test_the_pipeline_reads_the_key_the_example_declares(self):
+        """Guards the two drifting apart — the whole failure being fixed."""
+        from pathlib import Path
+
+        for parent in Path(__file__).resolve().parents:
+            src = (
+                parent
+                / "packages"
+                / "ci-article-review"
+                / "src"
+                / "ci_article_review"
+                / "pipeline.py"
+            )
+            if src.is_file():
+                assert 'pub_config.get("author_name")' in src.read_text(
+                    encoding="utf-8"
+                )
+                return
+        raise AssertionError("pipeline.py not found")
+
+
+# The near-miss *warning* these lines used to cover is gone: an unrecognised
+# publication key is now an error, not a log line, and the near-miss spelling
+# is folded into that error as a "did you mean" hint. One case here was
+# deliberately reversed rather than moved — an unrelated custom key such as
+# `author_bio` used to be explicitly allowed and is now rejected, with `x_` as
+# the way to keep one on purpose. See tests/test_publication_config_strictness.py.

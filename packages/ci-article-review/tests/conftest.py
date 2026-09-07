@@ -5,7 +5,8 @@ import hashlib
 import pytest
 
 from ci_article_review import live_model_check
-from ci_article_review.adapters.citation import wayback
+from ci_article_review.adapters.citation import resolver, wayback
+from ci_article_review.analysis import links
 
 
 @pytest.fixture(scope="session")
@@ -72,3 +73,28 @@ def neutralise_wayback_pacing(monkeypatch):
     wayback.reset_rate_limit_state()
     yield
     wayback.reset_rate_limit_state()
+
+
+@pytest.fixture(autouse=True)
+def block_tls_impersonation(monkeypatch):
+    """No test reaches the network through the escalation tier unless it says so.
+
+    ``impersonating_get`` is the one fetch in the codebase that is not routed
+    through a patched ``safe_get``, so a test that stubs the honest fetch into a
+    403 gets a *real* curl_cffi request to whatever URL the fixture named. Two
+    of them did: the 403 cases in ``TestKnownUrlWaybackFallback`` called out to
+    example.com on every run of the suite, quietly, and passed either way
+    because a failed escalation falls through to the archive fallback they were
+    actually testing.
+
+    That is the same class of problem ``neutralise_wayback_pacing`` above
+    exists for, so it gets the same treatment: off by default, everywhere, with
+    the tests that are *about* escalation opting in by patching it themselves.
+    A test doing so still wins — ``mock.patch`` sets and restores around this.
+
+    Both import sites are patched, not ``ci_core.http``: each does
+    ``from ci_core.http import impersonating_get`` at module load, so rebinding
+    the source module would leave the copies they already hold.
+    """
+    monkeypatch.setattr(resolver, "impersonating_get", lambda url, timeout=30: None)
+    monkeypatch.setattr(links, "impersonating_get", lambda url, timeout=30: None)

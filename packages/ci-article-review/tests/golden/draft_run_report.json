@@ -24,6 +24,40 @@
       "error": null,
       "failed": false,
       "headroom_seconds": "<volatile>",
+      "model": "gemini-test-model",
+      "pass": "gemini:argument_integrity",
+      "status": "ok",
+      "timeout_budget_seconds": "<volatile>",
+      "tokens": {
+        "completion": 200,
+        "prompt": 1000
+      },
+      "truncated": false
+    },
+    {
+      "char_count": 329,
+      "effort": "none",
+      "elapsed_seconds": "<volatile>",
+      "error": null,
+      "failed": false,
+      "headroom_seconds": "<volatile>",
+      "model": "gemini-test-model",
+      "pass": "gemini:red_team",
+      "status": "ok",
+      "timeout_budget_seconds": "<volatile>",
+      "tokens": {
+        "completion": 200,
+        "prompt": 1000
+      },
+      "truncated": false
+    },
+    {
+      "char_count": 329,
+      "effort": "none",
+      "elapsed_seconds": "<volatile>",
+      "error": null,
+      "failed": false,
+      "headroom_seconds": "<volatile>",
       "model": "mistral-test-model",
       "pass": "mistral:argument_integrity",
       "status": "ok",
@@ -100,6 +134,20 @@
       },
       {
         "input_usd": 0.0025,
+        "model": "gemini-test-model",
+        "output_usd": 0.002,
+        "pass": "gemini:argument_integrity",
+        "total_usd": 0.0045
+      },
+      {
+        "input_usd": 0.0025,
+        "model": "gemini-test-model",
+        "output_usd": 0.002,
+        "pass": "gemini:red_team",
+        "total_usd": 0.0045
+      },
+      {
+        "input_usd": 0.0025,
         "model": "mistral-test-model",
         "output_usd": 0.002,
         "pass": "mistral:argument_integrity",
@@ -127,26 +175,195 @@
         "total_usd": 0.0045
       }
     ],
+    "discarded_calls": 0,
+    "incurred_usd": 0.0315,
     "pricing_known": false,
-    "total_input_usd": 0.0125,
-    "total_output_usd": 0.01,
-    "total_usd": 0.0225
+    "replayed_usd": 0.0,
+    "total_input_usd": 0.0175,
+    "total_output_usd": 0.014,
+    "total_usd": 0.0315,
+    "uncosted_calls": 0
   },
   "delta": null,
+  "domains_not_run": [],
+  "empty_result_details": [],
+  "empty_results": [],
   "ensemble": {
     "assignments": [
+      "gemini:argument_integrity",
       "gemini:fact_check",
+      "gemini:red_team",
       "mistral:argument_integrity",
       "mistral:red_team",
       "openai:completeness",
       "openai:voice_style"
     ],
     "consensus_threshold": 2.0,
-    "thoroughness": "standard"
+    "cost_preset": null,
+    "thoroughness": "standard",
+    "width": {
+      "backfilled": [
+        "gemini \u2192 argument_integrity \u2014 the preset names mistral, claude here; claude could not run",
+        "gemini \u2192 red_team \u2014 the preset names mistral, grok here; grok could not run"
+      ],
+      "consensus_min_models": 2,
+      "consensus_needs_cross_domain": false,
+      "consensus_reachable": true,
+      "distinct_models": [
+        "gemini",
+        "mistral",
+        "openai"
+      ],
+      "domains_expected": [
+        "fact_check",
+        "voice_style",
+        "completeness",
+        "argument_integrity",
+        "red_team"
+      ],
+      "domains_single_model": [
+        "fact_check",
+        "voice_style",
+        "completeness"
+      ],
+      "languagetool_voted": false,
+      "models_by_domain": {
+        "argument_integrity": [
+          "gemini",
+          "mistral"
+        ],
+        "completeness": [
+          "openai"
+        ],
+        "fact_check": [
+          "gemini"
+        ],
+        "red_team": [
+          "gemini",
+          "mistral"
+        ],
+        "voice_style": [
+          "openai"
+        ]
+      },
+      "voter_pool": 3
+    }
   },
   "generated": "<volatile>",
+  "handoff_gaps": [
+    {
+      "domains": [
+        "argument_integrity",
+        "completeness"
+      ],
+      "field": "pre_draft_analysis",
+      "guidance": "Fill in at least `Steelmanned position:` and `Strawmanned position:` \u2014 your own argument at its strongest, and the weak link you expect to be challenged on. Nothing in the draft can be read to infer these, which is why no candidate is proposed.",
+      "impact": "`PRE-DRAFT ANALYSIS SUMMARY` was empty. It is a system-prompt variable for argument_integrity and completeness, and both ran this run. Without it they do not know which objections you already weighed, so findings you have considered and rejected come back as new ones \u2014 and will come back again on every re-run until the field is filled.",
+      "label": "PRE-DRAFT ANALYSIS SUMMARY",
+      "placeholder": false,
+      "sections": [
+        "SECTION 4: Argument Integrity",
+        "SECTION 5: Completeness and Framing"
+      ],
+      "severity": "degrading",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [
+        "completeness"
+      ],
+      "field": "known_gaps",
+      "guidance": "List what you know is missing and why you left it out \u2014 the pass then judges whether the omission is acceptable instead of simply reporting it. Write \"None identified by author.\" if nothing is.",
+      "impact": "`KNOWN GAPS` was empty, so the completeness pass could not tell a gap you had already accepted from one you had missed. Omissions you made deliberately are reported back as findings, and will be reported again on every re-run until the field says otherwise.",
+      "label": "KNOWN GAPS",
+      "placeholder": false,
+      "sections": [
+        "SECTION 5: Completeness and Framing"
+      ],
+      "severity": "degrading",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [
+        "fact_check",
+        "red_team"
+      ],
+      "field": "sources_cited",
+      "guidance": "List the sources the draft cites, or write \"None provided.\" if there genuinely are none.",
+      "impact": "`SOURCES ALREADY CITED` was empty, so the fact_check and red_team passes ran without the list of what you had already sourced. The draft carries no citation block either \u2014 that block is found by its heading (Sources, References, Citations, Works Cited, Notes or Bibliography), so bracketed markers alone do not make one \u2014 which leaves fact_check with no record of what you already sourced from any direction.",
+      "label": "SOURCES ALREADY CITED",
+      "placeholder": false,
+      "sections": [
+        "SECTION 2: Factual Verification",
+        "SECTION 6: Red Team Findings"
+      ],
+      "severity": "degrading",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [
+        "fact_check",
+        "red_team"
+      ],
+      "field": "uncertain_sections",
+      "guidance": "Name the passages you are not confident about. These passes are told to focus there. Write \"None identified by author.\" if you are confident throughout.",
+      "impact": "`UNCERTAIN SECTIONS` was empty, so nothing told the fact_check and red_team passes where to concentrate. Scrutiny was spread evenly over the draft instead of aimed at the passages you are least sure of \u2014 the budget went where the models chose, not where you wanted it.",
+      "label": "UNCERTAIN SECTIONS",
+      "placeholder": false,
+      "sections": [
+        "SECTION 2: Factual Verification",
+        "SECTION 6: Red Team Findings"
+      ],
+      "severity": "degrading",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [
+        "voice_style"
+      ],
+      "field": "drafted_with",
+      "guidance": "Name the model you drafted with (claude, openai, gemini, mistral, grok or perplexity) and it is dropped from the voice pass. Omit the line only if you wrote the piece yourself.",
+      "impact": "No `Drafted with:` line and no `pipeline.drafting_model` in user.yaml, so no model was excluded from voice_style. If one of the models below drafted this article, it reviewed its own prose for AI phrasing \u2014 which is asking it to notice its own habits, and its vote in SECTION 3 should be read accordingly.",
+      "label": "Drafted with:",
+      "placeholder": false,
+      "sections": [
+        "SECTION 3: Voice and AI-Speak"
+      ],
+      "severity": "advisory",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [],
+      "field": "additional_context",
+      "guidance": "Add anything that changes how the draft should be judged: prior articles, known reader objections, intended use.",
+      "impact": "`ADDITIONAL CONTEXT FOR REVIEW MODELS` was empty. All 5 domains that ran read this field, so prior articles this piece builds on, objections your readers have raised before, and where the piece has to survive were all absent from every prompt. Commonly left blank; worth filling when the piece has history the draft does not restate.",
+      "label": "ADDITIONAL CONTEXT FOR REVIEW MODELS",
+      "placeholder": false,
+      "sections": [],
+      "severity": "advisory",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [],
+      "field": "history_key",
+      "guidance": null,
+      "impact": "No `History key:`, so this run filed itself under the title (`a-grid-piece-with-a-sufficiently-long-title`). Revise the headline before the next run and that run starts a fresh history directory: it loses this run as its delta baseline, and ci-voice-patterns counts the two as separate articles when deciding whether a phrasing habit recurs.",
+      "label": "History key:",
+      "placeholder": false,
+      "sections": [],
+      "severity": "advisory",
+      "suggestion": "History key: a-grid-piece-with-a-sufficiently-long-title",
+      "suggestion_basis": "a slug of the current title \u2014 set it once and keep it fixed however far the headline moves"
+    }
+  ],
   "lt_corrections_applied": [],
-  "lt_failed": true,
+  "lt_failed": false,
   "lt_skipped": true,
   "lt_skipped_reason": "disabled",
   "model_currency": {
@@ -227,11 +444,70 @@
     }
   },
   "primary_claim": "Geography determines the answer.",
+  "provenance": {
+    "basis": "declared in the handoff, not measured from the text",
+    "drafted_with": null,
+    "marked": false,
+    "method": null,
+    "note": "No drafting model declared, so nothing can be said either way.",
+    "provider": null,
+    "registry_age_days": "<volatile>",
+    "registry_date": "<volatile>",
+    "registry_staleness": "<volatile>",
+    "scope": null,
+    "since": null,
+    "source": null,
+    "status": "unknown"
+  },
   "publication": "testpub",
   "run_number": 1,
   "section_1_consensus": [
     {
       "flags": [
+        {
+          "attack_vector": "Demand the record.",
+          "domain": "red_team",
+          "passage": "Local officials were not consulted.",
+          "risk": "Unsourced negative claim about named parties.",
+          "source_model": "gemini",
+          "type": "highest_credibility_risk"
+        },
+        {
+          "attack_vector": "Demand the record.",
+          "domain": "red_team",
+          "passage": "Local officials were not consulted.",
+          "risk": "Unsourced negative claim about named parties.",
+          "source_model": "mistral",
+          "type": "highest_credibility_risk"
+        },
+        {
+          "checked": "county board minutes",
+          "claim": "Local officials were not consulted.",
+          "domain": "fact_check",
+          "reason": "no public record found",
+          "source_model": "gemini",
+          "type": "unverifiable"
+        }
+      ],
+      "languagetool_also_flagged": false,
+      "models": [
+        "gemini:fact_check",
+        "gemini:red_team",
+        "mistral:red_team"
+      ],
+      "passage": "Local officials were not consulted.",
+      "weight_sum": 3.6
+    },
+    {
+      "flags": [
+        {
+          "attack_vector": "The figure is stale.",
+          "domain": "red_team",
+          "passage": "The 2019 figure was 33 percent.",
+          "source_model": "gemini",
+          "supporting_evidence_for_attack": "A newer table exists.",
+          "type": "most_vulnerable_claim"
+        },
         {
           "attack_vector": "The figure is stale.",
           "domain": "red_team",
@@ -253,10 +529,11 @@
       "languagetool_also_flagged": false,
       "models": [
         "gemini:fact_check",
+        "gemini:red_team",
         "mistral:red_team"
       ],
       "passage": "The 2019 figure was 33 percent.",
-      "weight_sum": 2.6
+      "weight_sum": 3.6
     },
     {
       "flags": [
@@ -273,20 +550,37 @@
           "domain": "red_team",
           "passage": "The grid is complex.",
           "risk": "Reads as condescending to practitioners.",
+          "source_model": "gemini",
+          "type": "highest_audience_risk"
+        },
+        {
+          "audience_segment": "utility analysts",
+          "domain": "red_team",
+          "passage": "The grid is complex.",
+          "risk": "Reads as condescending to practitioners.",
           "source_model": "mistral",
           "type": "highest_audience_risk"
         }
       ],
       "languagetool_also_flagged": false,
       "models": [
+        "gemini:red_team",
         "mistral:red_team",
         "openai:completeness"
       ],
       "passage": "The grid is complex.",
-      "weight_sum": 2.3
+      "weight_sum": 3.3
     },
     {
       "flags": [
+        {
+          "domain": "argument_integrity",
+          "logical_problem": "Asserts complexity without supporting the inference.",
+          "passage": "It is important to note that the grid is complex.",
+          "source_model": "gemini",
+          "steelman_considered": "Read as preamble, it still carries weight.",
+          "why_it_survived": "The conclusion depends on it."
+        },
         {
           "domain": "argument_integrity",
           "logical_problem": "Asserts complexity without supporting the inference.",
@@ -306,11 +600,12 @@
       ],
       "languagetool_also_flagged": false,
       "models": [
+        "gemini:argument_integrity",
         "mistral:argument_integrity",
         "openai:voice_style"
       ],
       "passage": "It is important to note that the grid is complex.",
-      "weight_sum": 2.4
+      "weight_sum": 3.4
     }
   ],
   "section_2_fact_check": {
@@ -325,7 +620,10 @@
       {
         "claim": "The grid served 41 percent of load from nuclear.",
         "confidence": "high",
-        "source": "EIA State Profile, https://example.org/eia-profile"
+        "grounding": true,
+        "source": "EIA State Profile, https://example.org/eia-profile",
+        "source_model": "gemini",
+        "source_weight": 1.5
       }
     ],
     "contradicted": [],
@@ -335,20 +633,29 @@
         "claim": "The 2019 figure was 33 percent.",
         "confidence": "medium",
         "current_value": "38 percent as of 2025",
-        "source": "https://example.org/updated-table"
+        "grounding": true,
+        "source": "https://example.org/updated-table",
+        "source_model": "gemini",
+        "source_weight": 1.5
       }
     ],
     "primary_source_needed": [
       {
         "best_candidate_source": "https://example.org/water-report",
-        "claim": "Cooling draws 3 million gallons annually."
+        "claim": "Cooling draws 3 million gallons annually.",
+        "grounding": true,
+        "source_model": "gemini",
+        "source_weight": 1.5
       }
     ],
     "unverifiable": [
       {
         "checked": "county board minutes",
         "claim": "Local officials were not consulted.",
-        "reason": "no public record found"
+        "grounding": true,
+        "reason": "no public record found",
+        "source_model": "gemini",
+        "source_weight": 1.5
       }
     ]
   },
@@ -365,7 +672,16 @@
     {
       "logical_problem": "Asserts complexity without supporting the inference.",
       "passage": "It is important to note that the grid is complex.",
+      "source_model": "gemini",
+      "source_weight": 1.0,
+      "steelman_considered": "Read as preamble, it still carries weight.",
+      "why_it_survived": "The conclusion depends on it."
+    },
+    {
+      "logical_problem": "Asserts complexity without supporting the inference.",
+      "passage": "It is important to note that the grid is complex.",
       "source_model": "mistral",
+      "source_weight": 1.2,
       "steelman_considered": "Read as preamble, it still carries weight.",
       "why_it_survived": "The conclusion depends on it."
     }
@@ -380,21 +696,43 @@
     }
   ],
   "section_6_red_team": {
-    "additional_observations": [],
-    "highest_audience_risk": {
-      "audience_segment": "utility analysts",
-      "passage": "The grid is complex.",
-      "risk": "Reads as condescending to practitioners."
+    "gemini": {
+      "_weight": 1.0,
+      "additional_observations": [],
+      "highest_audience_risk": {
+        "audience_segment": "utility analysts",
+        "passage": "The grid is complex.",
+        "risk": "Reads as condescending to practitioners."
+      },
+      "highest_credibility_risk": {
+        "attack_vector": "Demand the record.",
+        "passage": "Local officials were not consulted.",
+        "risk": "Unsourced negative claim about named parties."
+      },
+      "most_vulnerable_claim": {
+        "attack_vector": "The figure is stale.",
+        "passage": "The 2019 figure was 33 percent.",
+        "supporting_evidence_for_attack": "A newer table exists."
+      }
     },
-    "highest_credibility_risk": {
-      "attack_vector": "Demand the record.",
-      "passage": "Local officials were not consulted.",
-      "risk": "Unsourced negative claim about named parties."
-    },
-    "most_vulnerable_claim": {
-      "attack_vector": "The figure is stale.",
-      "passage": "The 2019 figure was 33 percent.",
-      "supporting_evidence_for_attack": "A newer table exists."
+    "mistral": {
+      "_weight": 1.1,
+      "additional_observations": [],
+      "highest_audience_risk": {
+        "audience_segment": "utility analysts",
+        "passage": "The grid is complex.",
+        "risk": "Reads as condescending to practitioners."
+      },
+      "highest_credibility_risk": {
+        "attack_vector": "Demand the record.",
+        "passage": "Local officials were not consulted.",
+        "risk": "Unsourced negative claim about named parties."
+      },
+      "most_vulnerable_claim": {
+        "attack_vector": "The figure is stale.",
+        "passage": "The 2019 figure was 33 percent.",
+        "supporting_evidence_for_attack": "A newer table exists."
+      }
     }
   },
   "section_7_low_confidence": [
@@ -405,13 +743,43 @@
       "source_model": "openai"
     }
   ],
-  "section_8_additional": [],
+  "section_8_additional": [
+    {
+      "category": "fact_check",
+      "confidence": "low",
+      "in_domain": false,
+      "model_count": 1,
+      "models": [
+        "openai"
+      ],
+      "observation": "No source given for the 41 percent figure.",
+      "passage": "The grid served 41 percent of load from nuclear.",
+      "source_domain": "completeness",
+      "source_model": "openai"
+    },
+    {
+      "category": "red_team",
+      "confidence": "high",
+      "in_domain": false,
+      "model_count": 3,
+      "models": [
+        "gemini",
+        "mistral",
+        "openai"
+      ],
+      "observation": "The claim names an omission without evidence of it.",
+      "passage": "Local officials were not consulted.",
+      "source_domain": "voice_style",
+      "source_model": "openai"
+    }
+  ],
   "section_9_citations": [
     {
       "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
       "checksum_basis": "extracted_text",
       "claim": "Cooling draws 3 million gallons annually.",
       "resolved": true,
+      "source_model": "gemini",
       "source_name": "fact-check model",
       "url": "https://example.org/resolved",
       "verification": "checksum",
@@ -425,6 +793,7 @@
       "checksum_basis": "extracted_text",
       "claim": "Local officials were not consulted.",
       "resolved": true,
+      "source_model": "gemini",
       "source_name": "fact-check model",
       "url": "https://example.org/resolved",
       "verification": "checksum",
@@ -438,6 +807,7 @@
       "checksum_basis": "extracted_text",
       "claim": "The 2019 figure was 33 percent.",
       "resolved": true,
+      "source_model": "gemini",
       "source_name": "fact-check model",
       "url": "https://example.org/resolved",
       "verification": "checksum",
@@ -451,6 +821,7 @@
       "checksum_basis": "extracted_text",
       "claim": "The grid served 41 percent of load from nuclear.",
       "resolved": true,
+      "source_model": "gemini",
       "source_name": "fact-check model",
       "url": "https://example.org/resolved",
       "verification": "checksum",

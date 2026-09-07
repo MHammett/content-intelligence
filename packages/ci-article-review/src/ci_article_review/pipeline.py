@@ -55,6 +55,8 @@ from .config_loader import (
     load_publication_config,
     merge_configs,
     parse_api_key_overrides,
+    preset_names,
+    retired_preset_names,
     validate_publication_name,
 )
 from .handoff_parser import (
@@ -65,11 +67,16 @@ from .handoff_parser import (
 )
 from . import history as hist
 from . import consolidation
+from . import handoff_gaps
 from ci_core import redact
 from ci_core.config_helpers import normalize_model_configs
 from ci_core import llm
 from . import schemas
-from ci_core.concurrency import run_all_with_timeout
+from ci_core.concurrency import (
+    exit_without_waiting_for_foreign_threads,
+    run_all_with_timeout,
+)
+from ci_core.http import impersonation_available
 from ci_core.llm.model_registry import check_model_currency
 from ci_core.llm import timeout_model
 from . import live_model_check
@@ -83,6 +90,9 @@ from . import fact_check_scope
 from .adapters.citation import draft_citations
 from .adapters.citation import wayback
 from . import ensemble_capture
+from .passage_match import same_passage
+from .adapters.citation.disposition import DISPOSITIONS
+from .adapters.citation.disposition import disposition as citation_disposition
 
 log = logging.getLogger("pipeline")
 
@@ -147,6 +157,34 @@ _THOROUGHNESS_PRESETS: dict[str, dict[str, list[str]]] = {
 }
 
 
+#: How many models a domain needs before backfill stops topping it up.
+#:
+#: Two, because that is what corroboration costs: one model flagging a passage
+#: is a finding, two is agreement, and consolidation's ``consensus_min_models``
+#: (also 2) will not promote anything to Section 1 below it. Topping a domain
+#: up past this buys a third voter for a passage that already had a second —
+#: measured 2026-09-05 as +30% cost at `thorough` with one key missing, for
+#: zero change in how many domains were left uncorroborated. Restoring the
+#: preset's full width is the more faithful reading of the preset and the more
+#: expensive one; this is the cheaper reading of the same intent.
+_BACKFILL_TARGET_MODELS = 2
+
+
+def _preset_domains(thoroughness: str) -> list[str]:
+    """The built-in domains a thoroughness preset asks for, in preset order.
+
+    The expected set of domains has to come from the preset, not from what the
+    run produced. A domain whose every model was excluded is never assigned, so
+    it never reaches ``raw_results`` and has no result key that could be found
+    empty — which makes the domain that lost *everything* the one case a
+    results-derived set cannot see. ``docs/CONFIGURATION.md`` documents the
+    shape under "Drafting model": at ``standard`` thoroughness ``voice_style``
+    is a single model, and drafting with that model empties the domain.
+    """
+    preset = _THOROUGHNESS_PRESETS.get(thoroughness, _THOROUGHNESS_PRESETS["standard"])
+    return list(preset)
+
+
 def _model_has_credentials(model_name: str, api_keys: dict, model_cfg: dict) -> bool:
     """Return True if the model has credentials to run."""
     if model_name == "gemini":
@@ -164,11 +202,70 @@ def _model_has_credentials(model_name: str, api_keys: dict, model_cfg: dict) -> 
 #: skeleton. Asking the model that wrote the draft to find those is asking it
 #: to notice its own defaults, and it under-reports them.
 #:
-#: Deliberately just this one. A model re-reading its own reasoning in
-#: argument_integrity has a similar conflict, but a far weaker one: that prompt
-#: asks whether the logic holds, not whether the prose carries the model's own
-#: fingerprints. Widening this list costs real review coverage, so it should
-#: only grow on evidence that a domain is actually compromised.
+#: Deliberately just this one, and as of 2026-09-05 measured rather than
+#: argued. The re-examination was prompted by the citation re-ask (407b82b),
+#: where every provider asked to reconsider its own refuted assertion defended
+#: it or over-corrected. That result does not transfer here: _build_user_prompt
+#: never passes ``drafted_with`` to anyone, so a reviewer is never told who
+#: wrote the draft. The re-ask measured defensiveness about a claim explicitly
+#: attributed to the model; this asks whether a model shares the blind spot
+#: that produced prose it is not told is its own. Different mechanism, so it
+#: needed its own evidence.
+#:
+#: The three dc-environment runs of 2026-06-22 predate this exclusion, so
+#: claude — which drafts every article here (pipeline.drafting_model) — ran all
+#: five domains on its own draft beside the five other models: same text, same
+#: run, same prompt. Flags emitted, as a ratio to the median of the peers that
+#: ran that domain in that run:
+#:
+#:     voice_style          0.57  0.44  0.50    below parity in all three
+#:     argument_integrity      -  1.67  0.80    at or above parity
+#:     completeness         0.89  1.75  0.83    at or above parity
+#:     red_team             3.00  3.00  3.00    well above parity
+#:
+#: voice_style is the only domain where the drafter trails, and it trails by
+#: about half. In both runs where claude ran both domains, its voice ratio sits
+#: below its argument ratio. The cheap explanations do not hold: claude spent
+#: ~7,500 completion tokens on voice_style, more than gemini, grok, perplexity
+#: or openai spent, and was never truncated, so it is not being terse; its
+#: voice flags average 629 characters against a 410-818 peer range, so it is
+#: not folding many observations into few; and voice_style and
+#: argument_integrity share one schema and one code path
+#: (_build_flags_section), so it is not a counting artifact.
+#:
+#: So the narrow scope stands on evidence now. argument_integrity is not
+#: compromised — the drafter is one of its stronger contributors — and cutting
+#: it would drop an above-parity reviewer to fix something that does not show
+#: up in the data.
+#:
+#: If widening is ever reconsidered, the coverage cost is known: simulated over
+#: every preset × drafter pair, adding argument_integrity leaves that domain
+#: unassigned in exactly one configuration — economy with a mistral drafter,
+#: since economy disables claude and grok and leaves mistral alone on it. The
+#: current list has the same shape already: an openai drafter leaves
+#: voice_style unassigned at economy and standard. Neither is a blank section
+#: any more. _warn_on_domains_left_unreviewed names the domain, and since
+#: 03382fc _domains_with_nothing_usable takes the preset's domain set as what
+#: the run should have covered, so a never-assigned domain is visible to the
+#: substitution pass and buys one call from a provider that is not the drafter.
+#: The cost of widening at a cheap preset is that substitute call, not an
+#: empty section.
+#:
+#: Substitution does not reach every run, though: it is skipped on a replay,
+#: skipped when substitute_failed_domains is false, finds nothing when no other
+#: configured model can take the domain, and stops after one substitute that
+#: also fails. There the section really is empty, so _domains_never_attempted
+#: names it in the report — a header block and a note above the section — and
+#: the worst case of widening is a labelled empty section rather than one that
+#: reads as a clean result.
+#:
+#: Caveat, so the next reader weighs this correctly: every draft in
+#: pipeline_history/ was written by claude, so the peer panel is the control
+#: and there is no true cross-review arm. This shows the drafter is
+#: domain-specifically low on voice_style against five models reading the same
+#: text; it cannot separate that from claude simply being weaker at the voice
+#: task. The decision is the same either way. n = 3 runs on one draft — the
+#: direction is unanimous, but a second article would strengthen it.
 _DRAFTER_EXCLUDED_DOMAINS: tuple[str, ...] = ("voice_style",)
 
 
@@ -191,6 +288,22 @@ def _history_key(handoff: dict) -> str:
     return (handoff.get("history_key") or "").strip() or handoff.get("title", "")
 
 
+def _declared_drafter(handoff: dict, pipeline_cfg: dict) -> str:
+    """The drafting model as declared, verbatim, or "" if undeclared.
+
+    Split out from :func:`_drafting_model` because the two callers need
+    different things from the same declaration. Excluding a self-review needs a
+    provider this pipeline can match against, so an unrecognised name has to
+    become None there. Reporting provenance needs the string the author
+    actually wrote, including one that matches no provider -- "drafted with
+    gpt-4o" is still worth printing, and silently reporting it as "undeclared"
+    would be a lie about what the handoff said.
+    """
+    return (handoff.get("drafted_with") or "").strip() or (
+        pipeline_cfg.get("drafting_model") or ""
+    ).strip()
+
+
 def _drafting_model(handoff: dict, pipeline_cfg: dict) -> str | None:
     """Return the model that drafted the article, or None if undeclared.
 
@@ -204,9 +317,7 @@ def _drafting_model(handoff: dict, pipeline_cfg: dict) -> str | None:
     cost of a typo here is a review pass that should have been dropped, and
     failing the whole run over it would be worse.
     """
-    declared = (handoff.get("drafted_with") or "").strip() or (
-        pipeline_cfg.get("drafting_model") or ""
-    ).strip()
+    declared = _declared_drafter(handoff, pipeline_cfg)
     if not declared:
         return None
 
@@ -237,10 +348,15 @@ def _warn_on_domains_left_unreviewed(assignments, drafting_model: str | None) ->
 
     At ``maximum`` thoroughness every model runs every domain, so this cannot
     happen. At ``standard`` it can: voice_style is one model, and if that model
-    drafted the article the domain empties. Silently shipping a report whose
-    voice section is empty because nobody ran it — indistinguishable, in the
-    output, from nobody finding anything — is the failure worth being loud
-    about.
+    drafted the article the domain empties.
+
+    The earliest of three signals, and the only one that fires before any money
+    is spent — it runs at assignment time, so a misconfiguration is visible
+    while the run can still be stopped. ``_substitute_for_empty_domains`` then
+    repairs the domain if another provider can take it, and
+    ``_domains_never_attempted`` puts it in the report if nothing did. A log
+    line alone was not enough: the report is what gets read, and there an empty
+    voice section is otherwise indistinguishable from nobody finding anything.
     """
     if drafting_model is None:
         return
@@ -290,6 +406,8 @@ def _build_assignments(
     api_keys: dict,
     drafting_model: str | None = None,
     skips: list[str] | None = None,
+    backfill: bool = True,
+    backfills: list[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Return list of (model_name, domain) pairs to execute.
 
@@ -306,6 +424,12 @@ def _build_assignments(
        that model only runs those domains regardless of the preset.
     5. Drop the drafting model from the domains it cannot judge.
     6. Deduplicate (model, domain) pairs.
+    7. Backfill any domain left narrower than its own preset entry asked for,
+       from the models that are still available (``backfill=False`` to skip).
+
+    Pass a list as ``backfills`` to find out what step 7 added: one line per
+    substituted-in (model, domain) pair, naming the preset entry it is standing
+    in for.
 
     Pass a list as ``skips`` to find out what steps 2-5 dropped: every model the
     preset (or an explicit ``prompts:`` entry) asked for but that contributes
@@ -370,6 +494,57 @@ def _build_assignments(
             if pair not in seen and domain in _DOMAIN_PROMPTS:
                 seen.add(pair)
                 assignments.append(pair)
+
+    # Backfill — restore the width the preset asked for, from the models that
+    # are actually available.
+    #
+    # A disabled or uncredentialled model does not only remove itself; it can
+    # take a domain's whole second opinion with it. At `economy` (grok and
+    # claude both off) the `standard` map loses argument_integrity's second
+    # model and red_team's second model, because both are mistral-paired — and
+    # perplexity, which economy configures as a cheap grounded model, that map
+    # never assigns anything at all. Five single-model domains and three
+    # distinct models, with the cheapest available second opinion sitting idle.
+    #
+    # A domain is topped up only to _BACKFILL_TARGET_MODELS, and never past
+    # what its own preset entry asked for, so a run with every model available
+    # is untouched and a thick preset pays almost nothing for this.
+    # Rebalancing the fixed lists instead would fix one arrangement of disabled
+    # models; this fixes whichever arrangement a given run actually has.
+    if backfill:
+        for domain, model_list in preset.items():
+            target = min(len(model_list), _BACKFILL_TARGET_MODELS)
+            short = target - len([m for m, d in assignments if d == domain])
+            for _ in range(short):
+                # Recomputed per pick: the previous pick changes both who is
+                # already on this domain and how loaded each candidate is.
+                tried = {m for m, d in assignments if d == domain}
+                load: dict[str, int] = {}
+                for assigned_model, _assigned_domain in assignments:
+                    load[assigned_model] = load.get(assigned_model, 0) + 1
+                pool = _substitute_candidates(
+                    domain, tried, model_configs, api_keys, drafting_model
+                )
+                if not pool:
+                    break
+                # Fewest domains already carried first, so the width bought here
+                # is distinct-model coverage rather than a third and fourth
+                # domain piled onto whichever model happens to sort first. The
+                # sort is stable, so ties keep _substitute_candidates' ordering
+                # — which puts a search-grounded model first for fact_check.
+                pool.sort(key=lambda m: load.get(m, 0))
+                chosen = pool[0]
+                # Named before the pick is recorded, so the line says which of
+                # the preset's own models is being stood in for.
+                absent = [m for m in model_list if (m, domain) not in seen]
+                seen.add((chosen, domain))
+                assignments.append((chosen, domain))
+                if backfills is not None:
+                    backfills.append(
+                        f"{chosen} → {domain} — the preset names "
+                        f"{', '.join(model_list)} here; "
+                        f"{', '.join(absent)} could not run"
+                    )
 
     _warn_on_domains_left_unreviewed(assignments, drafting_model)
 
@@ -582,7 +757,78 @@ def _web_search_enabled(setting, domain: str) -> bool:
     return bool(setting)
 
 
-def _build_user_prompt(draft: str, handoff: dict) -> str:
+#: Most persistent prior findings to replay to the models, and how much of each
+#: passage to quote. A cap because this rides on every one of the run's calls.
+_PRIOR_FINDINGS_SHOWN = 8
+_PRIOR_PASSAGE_CHARS = 160
+
+
+def _build_review_context(pre_analysis: dict, prior_report: dict | None) -> str:
+    """What the pipeline already measured, in a form the review models can use.
+
+    Everything here was computed before the ensemble ran and then withheld from
+    it. Link validation knows which cited sources are dead; readability has
+    measured the prose; the prior run knows which passages were flagged and
+    survived the author's revision. Six models were asked to review the draft
+    while the process holding all three said nothing.
+
+    The concrete cost of that: on the 2026-09-04 test draft the link checker
+    reported a confirmed 404 and a timeout, then fact_check was asked to verify
+    claims resting on those sources with no mention that one was gone. And a
+    run 20 of an article opened as cold as run 1, so a passage flagged by four
+    models three runs running looked new every time.
+
+    Labelled as measurement rather than opinion, because it is: these are
+    observations about the artefact, not another reviewer's findings, and a
+    model that treats them as a verdict to agree with would be double-counting.
+    """
+    lines: list[str] = []
+
+    broken = [r for r in (pre_analysis.get("links") or []) if not r.get("ok")]
+    if broken:
+        lines.append(
+            f"- Link check: {len(broken)} of {len(pre_analysis['links'])} cited "
+            f"URLs could not be read. A claim resting on one of these has no "
+            f"working source behind it right now:"
+        )
+        for r in broken[:6]:
+            why = r.get("status") or r.get("error") or "unreachable"
+            lines.append(f"    {r.get('url', '')} — {why}")
+
+    read = pre_analysis.get("readability") or {}
+    if read:
+        lines.append(
+            f"- Readability (measured): {read.get('word_count')} words, "
+            f"Flesch-Kincaid grade {read.get('flesch_kincaid_grade')} "
+            f"({read.get('reading_level')}), average sentence "
+            f"{read.get('avg_sentence_length')} words, longest paragraph "
+            f"{read.get('longest_paragraph_words')} words."
+        )
+
+    if prior_report:
+        prior = prior_report.get("section_1_consensus") or []
+        run = prior_report.get("run_number")
+        if prior:
+            lines.append(
+                f"- Prior run ({'run ' + str(run) if run else 'previous'}) "
+                f"reached consensus on {len(prior)} passage(s). These were "
+                f"raised before; judge the current draft on its own terms, but "
+                f"say so if a flagged problem is still present:"
+            )
+            for entry in prior[:_PRIOR_FINDINGS_SHOWN]:
+                passage = (entry.get("passage") or "")[:_PRIOR_PASSAGE_CHARS]
+                models = len({m.split(":")[0] for m in entry.get("models") or []})
+                lines.append(f'    "{passage}" — flagged by {models} model(s)')
+
+    if not lines:
+        return ""
+    return (
+        "PIPELINE OBSERVATIONS (measured by this pipeline before the review, "
+        "not written by the author):\n" + "\n".join(lines) + "\n"
+    )
+
+
+def _build_user_prompt(draft: str, handoff: dict, review_context: str = "") -> str:
     parts = [f"ARTICLE TITLE: {handoff['title']}\n"]
     if handoff.get("target_audience"):
         parts.append(f"TARGET AUDIENCE: {handoff['target_audience']}\n")
@@ -605,6 +851,8 @@ def _build_user_prompt(draft: str, handoff: dict) -> str:
         )
     if handoff.get("additional_context"):
         parts.append(f"ADDITIONAL CONTEXT:\n{handoff['additional_context']}\n")
+    if review_context:
+        parts.append(review_context)
     parts.append(f"\nDRAFT:\n{draft}")
     return "\n".join(parts)
 
@@ -686,19 +934,22 @@ def _claim_key(claim: str) -> frozenset:
 def _is_duplicate_claim(key: frozenset, seen_keys: list) -> bool:
     """True if ``key`` restates a claim already collected.
 
-    Exact match after normalisation catches the common case — the same sentence
-    with a trailing period, or a leading "The". The Jaccard pass catches the rest:
-    five models independently paraphrasing one fact.
+    Delegates to :func:`ci_article_review.passage_match.same_passage`, the one
+    place that decides whether two quotations point at the same spot in the
+    draft. ``key`` is already a set of content words (see :func:`_claim_key`),
+    so the containment test runs on those rather than on raw tokens.
+
+    The Jaccard-only test this replaces missed the dominant case. Every model is
+    quoting one draft, so the usual duplicate is a nested quotation — a sentence
+    and the paragraph around it — which scores near zero on Jaccard while being
+    the same claim. Of the 45 claims collected on 2026-09-03, 36 pairs had a
+    containment of 1.00 against another claim and every one cleared the 0.9
+    threshold as "distinct", so the run put the same claim through citation
+    resolution several times over.
     """
     if not key:
         return False
-    for other in seen_keys:
-        if key == other:
-            return True
-        union = len(key | other)
-        if union and len(key & other) / union >= _CLAIM_SIMILARITY:
-            return True
-    return False
+    return any(same_passage(key, other) for other in seen_keys)
 
 
 def _record_fact_check_degradation(report: dict, results: dict) -> None:
@@ -746,6 +997,79 @@ def _record_fact_check_degradation(report: dict, results: dict) -> None:
             "detail": detail,
         }
     )
+
+
+def _record_impersonation_degradation(report: dict, pre_analysis: dict) -> None:
+    """Record that blocked links were never escalated, because the tier is absent.
+
+    ``impersonating_get`` returns ``None`` both when a block held and when
+    ``curl_cffi`` was never installed, and every caller treats ``None`` as "the
+    block held". That is the right default for a fetch and the wrong one for a
+    report: one of the two is a property of the source, the other is a property
+    of this machine, and only the second is fixable.
+
+    The cost of not saying so is measured. The escalation tier sat inert from
+    2026-08-12 to 2026-09-06 — the extra was in no dependency group, so no
+    ``uv run`` invocation had it — and nothing in any run said a word. Every
+    affected citation was reported exactly as if the source had refused a
+    browser, which is the one reading that makes the missing dependency
+    invisible.
+
+    Fires only when a link was actually blocked. A run with nothing to escalate
+    lost nothing by not being able to, and saying so would be noise.
+    """
+    if impersonation_available():
+        return
+    blocked = [
+        r
+        for r in (pre_analysis.get("links") or [])
+        if r.get("escalation_unavailable") or r.get("status_code") == 403
+    ]
+    if not blocked:
+        return
+    detail = (
+        f"{len(blocked)} cited link(s) returned HTTP 403 and were never put "
+        f"through the TLS-impersonation escalation: the optional 'unblock' "
+        f"extra (curl_cffi) is not installed. They are reported as blocked, "
+        f"which is indistinguishable in this report from a source that refuses "
+        f"browsers too — but the attempt was never made, so treat 'blocked' "
+        f"here as 'unknown'. Install with `uv sync --extra unblock` and re-run "
+        f"before concluding a source is unreachable."
+    )
+    log.warning("Links: %s", detail)
+    report.setdefault("degradations", []).append(
+        {
+            "section": "SECTION 9: Citations, link validation",
+            "caused_by": ["curl_cffi not installed (ci-core[unblock])"],
+            "detail": detail,
+        }
+    )
+
+
+def _claim_level_urls(item: dict) -> list[str]:
+    """URLs the model attributed to *this* claim, from the no-verdict buckets.
+
+    ``unverifiable.sources_checked`` is the list of pages it actually opened;
+    ``primary_source_needed.best_candidate_url`` is the primary source it found
+    but could not use to settle the claim. Both are per-claim, which is what
+    makes them safe to resolve — unlike a provider's response-level citation
+    list, where nothing says which claim a given URL was for.
+
+    Filtered to http(s) because models fill these with prose when they have no
+    URL: measured before the fields existed, ``best_candidate_source`` came back
+    as "the publication's own post archive or sitemap.xml" and ``checked`` as
+    "Google Search". Neither is fetchable, and passing them on would turn a
+    model's shrug into a broken-link finding.
+    """
+    out: list[str] = []
+    for value in (
+        *(item.get("sources_checked") or []),
+        item.get("best_candidate_url"),
+    ):
+        url = _extract_source_url(str(value or ""))
+        if url and url not in out:
+            out.append(url)
+    return out
 
 
 def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
@@ -838,11 +1162,33 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
             )
             if own and own not in known_urls:
                 known_urls = known_urls + [own]
+
+            # Claim-level URLs from the two buckets that reach no verdict.
+            #
+            # These are the claims most worth resolving — the model looked and
+            # could not settle it — and until the schema gained these fields
+            # they were the only ones carrying no URL at all: 50 `unverifiable`
+            # findings in the 2026-09-04 run, one of them from a perplexity pass
+            # holding 15 freshly retrieved citations with nowhere to put them.
+            #
+            # This is what separates it from the response-level fallback
+            # described above, which guessed the mapping and stamped one energy
+            # report onto 44 claims. Here the model states which pages it opened
+            # for *this* claim, and the resolver's relevance check still has to
+            # agree before any of it is reported as support.
+            for extra in _claim_level_urls(item):
+                if extra not in known_urls:
+                    known_urls = known_urls + [extra]
+
             claims.append(
                 {
                     "claim": claim,
                     "known_urls": known_urls,
                     "fact_check_bucket": bucket,
+                    # Which model asserted this. `_build_fact_check` tags every
+                    # merged item with it; it was being dropped here, which is
+                    # why a refuted claim had no one to hand back to.
+                    "source_model": item.get("source_model", ""),
                 }
             )
     log.info(
@@ -881,6 +1227,7 @@ def _run_domain(
     model_configs: dict,
     prompt_str: str | None = None,
     scope=None,
+    review_context: str = "",
 ) -> dict:
     """Call one model on one domain and return the adapter result dict.
 
@@ -911,7 +1258,7 @@ def _run_domain(
         # actually holds when a model ignores it.
         out_of_scope_passages=scope.prompt_block() if scope is not None else "",
     )
-    user = _build_user_prompt(draft, handoff)
+    user = _build_user_prompt(draft, handoff, review_context)
 
     # Off by default: it relocates the domain instruction from before the
     # article to after it, and this pipeline's output is the product. Turn it
@@ -1136,6 +1483,17 @@ def _run_reviews_in_parallel(runners, pipeline_cfg, model_configs, task_timeout)
 _PERMANENT_FAILURE_MARKERS = (
     "invalid api key",
     "invalid_api_key",
+    # Gemini says it the other way round, in both the prose and the reason
+    # code, so neither spelling above matched and a dead key was retried after
+    # the full recovery delay. Measured 2026-09-05: "API key not valid. Please
+    # pass a valid API key." with reason "API_KEY_INVALID".
+    "api key not valid",
+    "api_key_invalid",
+    # litellm normalises auth failures across providers to this exception, so
+    # the class name catches phrasings no one has written down yet. The entry
+    # below it has an underscore and matches the provider error *code*; this
+    # one matches the exception litellm raises.
+    "authenticationerror",
     "unauthorized",
     "not_authorized",
     "archived",
@@ -1217,6 +1575,210 @@ def _recover_failed_calls(
         len(originally_failed),
     )
     return raw_results
+
+
+#: Models that consult live sources without being asked to. gemini is sent
+#: `tools: [googleSearch]` on every call and perplexity is a search product, so
+#: neither can be un-grounded from config. openai, grok and claude ground only
+#: when `web_search` covers the domain — see `_is_grounded_for`, which is what
+#: callers should use.
+_SEARCH_GROUNDED_MODELS = ("gemini", "perplexity")
+
+
+def _is_grounded_for(model_name: str, domain: str, cfg: dict) -> bool:
+    """True if ``model_name`` would consult live sources for ``domain``.
+
+    There are two ways to be grounded and the static tuple above only knows
+    one. `maximum` sets `web_search: [fact_check]` on claude precisely so that
+    domain searches — its own comment counts the grounded models on fact_check
+    in the plural because of it — while a membership test against the tuple
+    reports claude as ungrounded. The effect was narrow but backwards: choosing
+    a fact_check substitute, an ungrounded model outranked one the config had
+    explicitly grounded, on the single domain where grounding is the reason the
+    ensemble is shaped the way it is.
+
+    Reading configuration rather than asserting from the model name is the same
+    correction `grounding_bonus` already made in consolidation, and for the same
+    reason: the guess and the configuration drift apart, and only one of them is
+    what the run will actually do.
+    """
+    if model_name in _SEARCH_GROUNDED_MODELS:
+        return True
+    # Callers normalise, but this runs on the path taken *after* calls have
+    # already failed, so the simple config form documented in user.example.yaml
+    # (`openai: gpt-5.5`) degrades to "not grounded" here rather than raising
+    # AttributeError at the least recoverable moment. `_prompt_override` on the
+    # same object already fails soft; matching that is deliberate.
+    if not isinstance(cfg, dict):
+        return False
+    return _web_search_enabled(cfg.get("web_search"), domain)
+
+
+def _domains_with_nothing_usable(raw_results, expected_domains=None):
+    """Domains the run should have covered and got no usable result from.
+
+    A domain with two models loses coverage when one fails. A domain with one
+    model loses the domain, and `fact_check` losing the domain loses the two
+    sections that justify the run: it is the only source of claims, so Section 2
+    is empty, no claim reaches citation resolution, and Section 9 is empty too.
+    Measured 2026-09-05: `gemini:fact_check` stalled before its first chunk,
+    the recovery pass retried the same model and it stalled again, and the run
+    exited 0 having spent $0.64 with both sections blank.
+
+    ``expected_domains`` is what the preset asked for. Without it this saw only
+    domains that were *attempted*, which misses the other way a domain ends up
+    empty: its only model was never assigned. Draft with openai at ``economy``
+    and ``voice_style`` has no reviewer at all — the edge case documented under
+    "Drafting model" in docs/CONFIGURATION.md — so there is no result key, and
+    the domain was invisible to the pass meant to repair exactly that.
+    """
+    covered: dict[str, bool] = {d: False for d in (expected_domains or ())}
+    for name, result in raw_results.items():
+        _model, _, domain = name.partition(":")
+        usable = bool(not result.get("failed") and result.get("data"))
+        covered[domain] = covered.get(domain, False) or usable
+    return sorted(domain for domain, usable in covered.items() if not usable)
+
+
+def _substitute_candidates(domain, tried, model_configs, api_keys, drafting_model):
+    """Configured models that could stand in for ``domain``, best first.
+
+    Drawn from the `maximum` preset, which lists every model, so this stays in
+    step with the presets rather than keeping a second ordering of its own.
+    Anything already tried for this domain is excluded — the point is a
+    *different* provider, since retrying the failed one is what the recovery
+    pass already did.
+    """
+    pool = _THOROUGHNESS_PRESETS["maximum"].get(domain, [])
+    if domain == "fact_check":
+
+        def _grounded(m):
+            return _is_grounded_for(m, domain, model_configs.get(m, {}))
+
+        pool = [m for m in pool if _grounded(m)] + [m for m in pool if not _grounded(m)]
+    out = []
+    for model_name in pool:
+        if model_name in tried:
+            continue
+        if _model_blocked_reason(
+            model_name, model_configs.get(model_name, {}), api_keys
+        ):
+            continue
+        allowed = _prompt_override(model_configs.get(model_name, {}))
+        if allowed is not None and domain not in allowed:
+            continue
+        if _drafter_is_excluded(model_name, domain, drafting_model):
+            continue
+        out.append(model_name)
+    return out
+
+
+def _substitute_for_empty_domains(
+    raw_results,
+    make_runner,
+    pipeline_cfg,
+    model_configs,
+    api_keys,
+    task_timeout,
+    drafting_model=None,
+    expected_domains=None,
+):
+    """Run a different provider for any domain that came back empty.
+
+    Only ever adds calls that would not otherwise have run, and only after
+    recovery has already retried the original model — so a clean run pays
+    nothing for this, and a run that would have produced an empty Section 2
+    pays for one substitute call instead of being re-run whole.
+
+    One substitute per domain. If that one also fails the domain stays empty
+    and the report says so: the alternative is a run that keeps buying calls
+    while a provider is having an outage.
+
+    ``expected_domains`` covers the domain that was never assigned a model in
+    the first place, which produces no result to be found empty — see
+    ``_domains_with_nothing_usable``.
+    """
+    if not pipeline_cfg.get("substitute_failed_domains", True):
+        return raw_results
+
+    empty = _domains_with_nothing_usable(raw_results, expected_domains)
+    if not empty:
+        return raw_results
+
+    for domain in empty:
+        tried = {
+            name.partition(":")[0]
+            for name in raw_results
+            if name.endswith(f":{domain}")
+        }
+        candidates = _substitute_candidates(
+            domain, tried, model_configs, api_keys, drafting_model
+        )
+        if not candidates:
+            log.warning(
+                "Domain %s produced nothing and no other configured model can "
+                "stand in for it — the report will show it as not run.",
+                domain,
+            )
+            continue
+        substitute = candidates[0]
+        log.info(
+            "Domain %s produced nothing from %s; substituting %s.",
+            domain,
+            ", ".join(sorted(tried)) or "no model",
+            substitute,
+        )
+        name, fn = make_runner(substitute, domain)
+        raw_results.update(
+            _run_reviews_for_names(
+                [name], [(name, fn)], pipeline_cfg, model_configs, task_timeout
+            )
+        )
+        if raw_results.get(name, {}).get("failed"):
+            log.warning(
+                "Substitute %s also failed for %s; leaving the domain empty.",
+                substitute,
+                domain,
+            )
+
+    return raw_results
+
+
+def _domains_never_attempted(results, expected_domains, drafting_model=None):
+    """Expected domains that made no model call at all, mapped to why.
+
+    Distinct from a domain whose models *failed*. A failure leaves a result
+    entry, so it reaches ``model_failure_details`` and the report says which
+    section was built short a model. A domain that was never attempted leaves
+    no entry anywhere — not in the results, not in the failure list, and not in
+    ``ensemble.assignments``, which consolidation derives from the results —
+    so its section renders exactly like one where every model ran and found
+    nothing.
+
+    Called after recovery and substitution have both had their chance, so what
+    it returns is what genuinely never ran: substitution repairs this case
+    whenever a candidate provider exists, and the domains left here are the
+    ones it could not reach — ``substitute_failed_domains: false``, a replay
+    (which makes no calls), or no other configured model able to take the
+    domain.
+    """
+    attempted = {domain for _model, domain in results}
+    not_run: dict[str, str] = {}
+    for domain in sorted(expected_domains or ()):
+        if domain in attempted:
+            continue
+        if drafting_model and domain in _DRAFTER_EXCLUDED_DOMAINS:
+            not_run[domain] = (
+                f"{drafting_model} drafted this article and is excluded from "
+                f"{domain}, and no other model was assigned"
+            )
+        else:
+            not_run[domain] = (
+                "every model the preset assigned to it was unavailable — "
+                "disabled, missing credentials, or narrowed out by a "
+                "prompts: override"
+            )
+    return not_run
 
 
 def _merge_recovered_results(prior_results, retried_results):
@@ -1368,7 +1930,13 @@ def run_draft_pipeline(
     if not grammar_enabled:
         log.info("Pass 1: Grammar pass disabled (grammar_pass: false) — skipping.")
         lt_result = {
-            "failed": True,
+            # Not a failure. A skip is a decision — either the config turned the
+            # pass off or there were no credentials to run it with — and marking
+            # it failed put `lt_failed: true` into every report of a run that
+            # had deliberately disabled grammar checking. The console and the
+            # markdown both test `skipped` first so they read correctly; only
+            # anything consuming the JSON was misled.
+            "failed": False,
             "skipped": True,
             # Both skip paths set skipped=True, and the summary used to print the
             # credentials message for either — telling an operator with working
@@ -1383,7 +1951,13 @@ def run_draft_pipeline(
             "Pass 1: No LanguageTool credentials configured — skipping grammar pass."
         )
         lt_result = {
-            "failed": True,
+            # Not a failure. A skip is a decision — either the config turned the
+            # pass off or there were no credentials to run it with — and marking
+            # it failed put `lt_failed: true` into every report of a run that
+            # had deliberately disabled grammar checking. The console and the
+            # markdown both test `skipped` first so they read correctly; only
+            # anything consuming the JSON was misled.
+            "failed": False,
             "skipped": True,
             "skipped_reason": "no_credentials",
             "change_log": [],
@@ -1433,7 +2007,10 @@ def run_draft_pipeline(
     # with no connection and no spend.
     link_check_enabled = pipeline_cfg.get("link_validation", True) and not offline
     if offline:
-        log.info("Offline: skipping link validation, Wayback and citation resolution")
+        log.info(
+            "Offline: skipping link validation, Wayback, citation resolution "
+            "and the SEO model calls"
+        )
     if link_check_enabled:
         from .analysis import links as links_analysis
 
@@ -1466,12 +2043,23 @@ def run_draft_pipeline(
     else:
         pre_analysis["links"] = []
 
-    if seo_suggestions is False:
+    # A calibration run is scoped to one model or domain on purpose and should
+    # not pay for the two SEO calls it did not ask for. Cheap (~$0.0006 on the
+    # 2026-09-05 runs) but billed, logged and printed, which makes a deliberately
+    # narrowed run's output and cost harder to read than it needs to be. Routed
+    # through the existing flag rather than a second suppression path.
+    if seo_suggestions is False or offline or only_model or only_domain:
         # CLI override for this run only — does not modify the publication
         # config on disk. Mirrors --cost-preset above. Assigned rather than
         # setdefault'd because a bare `seo_rules:` line in YAML parses to None,
         # not to an empty dict. Covers both SEO model calls: the flag is about
         # not paying for the SEO extras, not about one of the two.
+        #
+        # --offline suppresses these too. Both are live model calls over the
+        # network, and the flag promises "a run that makes no network calls at
+        # all". They were exempt, so `--replay --offline` billed two Mistral
+        # calls on every run while printing "Cost: $0.0000 — replayed from a
+        # capture, no model calls made" (measured 2026-09-03, reproduced twice).
         pub_config["seo_rules"] = {**(pub_config.get("seo_rules") or {})}
         pub_config["seo_rules"]["suggestions"] = False
         pub_config["seo_rules"]["content_review"] = False
@@ -1605,8 +2193,22 @@ def run_draft_pipeline(
             ", ".join(_DRAFTER_EXCLUDED_DOMAINS),
         )
     assignment_skips: list[str] = []
+    assignment_backfills: list[str] = []
     assignments = _build_assignments(
-        thoroughness, model_configs, api_keys, drafting_model, assignment_skips
+        thoroughness,
+        model_configs,
+        api_keys,
+        drafting_model,
+        assignment_skips,
+        # Off under a calibration filter, on the same reasoning that scopes
+        # the substitution pass below: `--only-model gemini` exists to price one
+        # cell, and topping gemini up to a second and third domain first is the
+        # opposite of what was asked for.
+        backfill=(
+            pipeline_cfg.get("backfill_narrowed_domains", True)
+            and not (only_model or only_domain)
+        ),
+        backfills=assignment_backfills,
     )
 
     # Custom publication-defined domains
@@ -1642,6 +2244,18 @@ def run_draft_pipeline(
     if only_domain:
         assignments = [a for a in assignments if a[1] == only_domain]
         custom_assignments = [a for a in custom_assignments if a[1] == only_domain]
+    # What the run should have covered, for the substitution pass below.
+    #
+    # Normally that is everything the preset asked for, so a domain whose only
+    # model was never assigned — the drafter-exclusion case — is repairable and
+    # not merely invisible. Under a calibration filter it is what actually got
+    # assigned: `--only-domain fact_check` deliberately skips the other four,
+    # and substituting for them would defeat the flag.
+    if only_model or only_domain:
+        expected_domains = {d for _m, d in assignments + custom_assignments}
+    else:
+        expected_domains = set(_preset_domains(thoroughness))
+
     if (only_model or only_domain) and not (assignments or custom_assignments):
         log.error(
             "No assignments match the calibration filters (--only-model=%r --only-domain=%r). "
@@ -1663,16 +2277,42 @@ def run_draft_pipeline(
         log.info(f"  Assigned: {model_name} → {domain}")
     for skip_line in assignment_skips:
         log.info(f"  Skipped: {skip_line}")
+    for backfill_line in assignment_backfills:
+        log.info(f"  Backfilled: {backfill_line}")
 
     # What this run will not try to verify. Built from the draft the models are
-    # about to see (markers live in the text, so it must be the corrected one),
-    # the handoff, and the publication config. Used twice: in the fact-check
-    # prompt below, and again on the merged results in `build_report`.
+    # about to see — inline markers live in the text, so it must be the
+    # corrected one — plus the handoff and the publication config. Used twice:
+    # in the fact-check prompt below, and again on the merged results in
+    # `build_report`.
     scope = fact_check_scope.ScopeRules.from_run(corrected_draft, handoff, pub_config)
 
-    # Build runner list — custom domains pass their prompt string directly
-    runners = [
-        (
+    # Loaded here rather than after the ensemble, which is where it used to sit.
+    # It is only a file read, and having it beforehand is what lets the review
+    # models be told which passages were already flagged and survived a
+    # revision — otherwise run 20 of an article opens exactly as cold as run 1.
+    prior_report, prior_report_path = hist.load_prior_report(
+        HISTORY_ROOT, _history_key(handoff), before_ts=run_start_ts
+    )
+
+    # Everything the pipeline measured before this point, handed to the models
+    # that are about to review the draft. Withholding it meant six models were
+    # asked to fact-check claims whose sources this process already knew were
+    # dead.
+    review_context = _build_review_context(pre_analysis, prior_report)
+    if review_context:
+        log.info(
+            "Review context: passing %d line(s) of pipeline observations to the "
+            "review models (link check, readability, prior findings).",
+            review_context.count("\n") - 1,
+        )
+
+    # Build runner list — custom domains pass their prompt string directly.
+    # Factored into a maker so a substitute call (below) is built exactly the
+    # same way as the calls the preset asked for, rather than by a second
+    # construction that could drift from this one.
+    def _make_runner(model_name, domain):
+        return (
             f"{model_name}:{domain}",
             lambda m=model_name, d=domain, ps=custom_prompts.get(domain): _run_domain(
                 m,
@@ -1685,9 +2325,12 @@ def run_draft_pipeline(
                 model_configs,
                 prompt_str=ps,
                 scope=scope,
+                review_context=review_context,
             ),
         )
-        for model_name, domain in all_assignments
+
+    runners = [
+        _make_runner(model_name, domain) for model_name, domain in all_assignments
     ]
 
     raw_results: dict[str, dict] = {}
@@ -1755,6 +2398,24 @@ def run_draft_pipeline(
     if not replay_results and pipeline_cfg.get("recovery_passes", 1) > 0:
         raw_results = _recover_failed_calls(
             raw_results, runners, pipeline_cfg, model_configs, task_timeout
+        )
+
+    # Recovery retries the model that failed. When that model is the only one
+    # assigned to a domain and it is failing rather than flaking, retrying it
+    # cannot bring the domain back — so a domain still empty at this point gets
+    # a different provider instead. Skipped on replay, which makes no calls.
+    if not replay_results:
+        raw_results = _substitute_for_empty_domains(
+            raw_results,
+            _make_runner,
+            pipeline_cfg,
+            model_configs,
+            api_keys,
+            task_timeout,
+            drafting_model=drafting_model,
+            # What the preset asked for, so a domain whose only model was never
+            # assigned is repairable too, not just one whose model failed.
+            expected_domains=expected_domains,
         )
 
     # Hold the raw ensemble output for capture. Written next to the report once
@@ -1827,6 +2488,14 @@ def run_draft_pipeline(
             "char_count": char_count,
             "status": status,
         }
+        if result.get("discarded_attempts"):
+            log_entry["discarded_attempts"] = result["discarded_attempts"]
+        if replay_results:
+            # These token counts came out of a capture file — they are the
+            # captured run's spend, not this one's. Marked so the cost summary
+            # can separate history from what this run actually bought; without
+            # it a replay reported the capture's total as its own.
+            log_entry["replayed"] = True
         if (not status_ok or truncated) and result.get("raw"):
             log_entry["raw_excerpt"] = _raw_excerpt(result["raw"])
         if not status_ok and result.get("error_body"):
@@ -1885,9 +2554,6 @@ def run_draft_pipeline(
         log.error("All review model calls failed. Aborting.")
         sys.exit(1)
 
-    prior_report, prior_report_path = hist.load_prior_report(
-        HISTORY_ROOT, _history_key(handoff), before_ts=run_start_ts
-    )
     if prior_report is None and run_number > 1:
         log.warning(
             f"No earlier report found for '{article_title}', but the handoff declares "
@@ -1926,7 +2592,31 @@ def run_draft_pipeline(
             report_baseline_warning = None
 
     # Tag ensemble config with thoroughness for the report
-    ensemble_cfg_tagged = {**ensemble_cfg, "thoroughness": thoroughness}
+    ensemble_cfg_tagged = {
+        **ensemble_cfg,
+        "thoroughness": thoroughness,
+        # The preset the operator actually chose, so the report names the thing
+        # they set rather than only the thoroughness it implies. The two are
+        # not interchangeable: `economy` and `standard` are both thoroughness
+        # `standard`, and they run very different ensembles.
+        "cost_preset": pipeline_cfg.get("cost_preset"),
+        # Preset order first, then anything else that ran (custom domains).
+        # Scoped by the calibration filter above, so `--only-domain fact_check`
+        # reports a one-domain run rather than four domains nobody reviewed.
+        "preset_domains": [
+            d for d in _preset_domains(thoroughness) if d in expected_domains
+        ]
+        + sorted(expected_domains - set(_preset_domains(thoroughness))),
+        "backfilled_assignments": assignment_backfills,
+    }
+
+    # What still never ran, after recovery and substitution have both tried.
+    # Passed to the report because nothing else in it records the difference
+    # between "no model reviewed this" and "every model reviewed it and the
+    # draft was clean" — both render as an empty section.
+    domains_not_run = _domains_never_attempted(
+        results, expected_domains, drafting_model
+    )
 
     log.info("Consolidating review report")
     report = consolidation.build_report(
@@ -1942,6 +2632,8 @@ def run_draft_pipeline(
         prior_report_path=prior_report_path,
         primary_claim=handoff.get("primary_claim", ""),
         fact_check_scope=scope,
+        domains_not_run=domains_not_run,
+        drafted_with=_declared_drafter(handoff, pipeline_cfg),
     )
 
     # Pass 3: Citation resolution — extract factual claims from fact-check results
@@ -1960,9 +2652,11 @@ def run_draft_pipeline(
         len(citation_sources),
     )
     from .adapters.citation.resolver import resolve_citations
+    from .adapters.citation import reask as citation_reask
 
     fact_check = report.get("section_2_fact_check") or {}
     _record_fact_check_degradation(report, results)
+    _record_impersonation_degradation(report, pre_analysis)
     claims = _collect_citation_claims(fact_check, corrected_draft)
     if offline:
         # Claim collection above still runs — it is pure parsing over the draft
@@ -1974,6 +2668,11 @@ def run_draft_pipeline(
             len(claims),
         )
         claims = []
+    citation_author = (
+        (handoff.get("author") or "").strip()
+        or (pub_config.get("author_name") or "").strip()
+        or None
+    )
     if claims:
         citation_results = resolve_citations(
             claims,
@@ -1981,6 +2680,18 @@ def run_draft_pipeline(
             api_keys,
             verification_call_log=api_call_log,
             history_root=HISTORY_ROOT,
+            # Who "I" is. A first-person claim cannot be checked against a page
+            # without it. Told nothing, the verifier bound "I" to the first
+            # person it found and offered a stranger's family as evidence; told
+            # only not to guess, it answered not_addressed against a page
+            # carrying the author's own bio. Both measured 2026-09-04 against
+            # fd-ix.com/about/team/, where the author is in fact listed.
+            #
+            # The handoff's own "Author:" line wins, so a guest or co-authored
+            # piece is not attributed to the publication's usual byline; the
+            # publication default covers everything else, including --raw-draft,
+            # which carries no metadata at all.
+            author=citation_author,
         )
         verified_count = sum(
             1 for r in citation_results if r.get("verification") == "checksum"
@@ -1991,15 +2702,76 @@ def run_draft_pipeline(
         unverifiable_count = sum(
             1 for r in citation_results if r.get("verification") == "unverifiable"
         )
+        # Fetched, read, and found not to support the claim. Counted explicitly
+        # rather than falling into the "unresolved" remainder below, which is
+        # meant to hold claims no adapter could even attempt.
+        refuted_count = sum(
+            1 for r in citation_results if r.get("verification") == "content_mismatch"
+        )
         log.info(
-            "Citations: %d claim(s), %d verified, %d pointer-only, "
-            "%d could not be verified, %d unresolved",
+            "Citations: %d claim(s), %d verified, %d read but NOT supporting "
+            "the claim, %d pointer-only, %d could not be read, %d unresolved",
             len(claims),
             verified_count,
+            refuted_count,
             pointer_count,
             unverifiable_count,
-            len(claims) - verified_count - pointer_count - unverifiable_count,
+            len(claims)
+            - verified_count
+            - pointer_count
+            - unverifiable_count
+            - refuted_count,
         )
+
+        # Pass 3b — hand each refutation back to the model that asserted it.
+        #
+        # `resolve_citations` returns results in claim order, so the asserting
+        # model is joined on here rather than threaded through the resolver's
+        # normalise/parallel path, which takes a claim string and knows nothing
+        # about who produced it.
+        for _claim, _result in zip(claims, citation_results):
+            if not _result.get("source_model"):
+                _result["source_model"] = _claim.get("source_model", "")
+
+        if not offline and pipeline_cfg.get("citation_reask", True):
+            asked = citation_reask.reask_refuted(
+                citation_results,
+                api_keys=api_keys,
+                model_configs=model_configs,
+                call_log=api_call_log,
+                limit=int(
+                    pipeline_cfg.get(
+                        "citation_reask_limit", citation_reask.DEFAULT_REASK_LIMIT
+                    )
+                ),
+                author=citation_author,
+            )
+            if asked:
+                # An alternative source the model proposed is a suggestion, not
+                # a citation. It goes back through the same resolution the
+                # original URL failed, so what reaches the report is what the
+                # page was found to say rather than what the model said it says.
+                pending = citation_reask.proposed_source_claims(citation_results)
+                if pending:
+                    log.info(
+                        "Citations: re-checking %d model-proposed source(s)",
+                        len(pending),
+                    )
+                    checked = resolve_citations(
+                        [entry for _r, entry in pending],
+                        citation_sources,
+                        api_keys,
+                        verification_call_log=api_call_log,
+                        history_root=HISTORY_ROOT,
+                        author=citation_author,
+                    )
+                    citation_reask.attach_source_checks(pending, checked)
+                log.info(
+                    "Citations: %d refuted claim(s) handed back to the asserting "
+                    "model, %d proposed a different source",
+                    asked,
+                    len(pending),
+                )
     else:
         citation_results = []
         log.info("Citations: no actionable claims to resolve")
@@ -2015,13 +2787,25 @@ def run_draft_pipeline(
     # Cost tracking
     cost_summary = cost_analysis.calculate(api_call_log)
     report["cost_summary"] = cost_summary
-    log.info(
-        "Estimated cost: $%.4f (%s)",
-        cost_summary["total_usd"],
-        "exact"
-        if cost_summary["pricing_known"]
-        else "estimated — some model prices unknown",
-    )
+    if not cost_summary["pricing_known"]:
+        cost_basis = "estimated — some model prices unknown"
+    elif cost_summary.get("uncosted_calls"):
+        # Retried attempts the provider billed for and this run cannot price,
+        # because a stalled stream reports no usage. The number is a floor.
+        cost_basis = (
+            f"at least — {cost_summary['uncosted_calls']} retried attempt(s) "
+            f"were billed by the provider with no usage reported"
+        )
+    else:
+        cost_basis = "exact"
+    log.info("Estimated cost: $%.4f (%s)", cost_summary["total_usd"], cost_basis)
+    if cost_summary.get("discarded_calls"):
+        log.info(
+            "Retries: %d attempt(s) discarded and re-run; %d of them had usage "
+            "the cost above includes.",
+            cost_summary["discarded_calls"],
+            cost_summary["discarded_calls"] - cost_summary.get("uncosted_calls", 0),
+        )
 
     # Attach pre-analysis
     report["pre_analysis"] = pre_analysis
@@ -2075,6 +2859,32 @@ def run_draft_pipeline(
     # and can be rendered by _print_draft_summary.
     report["model_currency"] = currency
 
+    # Which handoff fields were missing, what each one cost this run, and — where
+    # the run can infer a candidate — the line to paste into the handoff.
+    #
+    # Deliberately here, at the end: everything above has already been sent,
+    # scored and consolidated, so nothing this produces can reach a model
+    # prompt. That ordering is the safeguard, not a convenience. A proposed
+    # primary claim the author has not accepted must never be reviewed against
+    # as though they had — see handoff_gaps' module docstring.
+    gaps = handoff_gaps.assess(
+        handoff,
+        pub_config=pub_config,
+        draft=corrected_draft,
+        domains_ran=sorted({domain for (_model, domain) in results}),
+        pipeline_cfg=pipeline_cfg,
+        has_prior_run=prior_report is not None,
+        citations=report.get("section_9_citations") or (),
+    )
+    if gaps:
+        report["handoff_gaps"] = gaps
+        log.warning(
+            "Handoff metadata: %d field(s) missing (%s) — see the report's "
+            "'Handoff metadata gaps' section for what each one degraded.",
+            len(gaps),
+            ", ".join(g["label"] for g in gaps),
+        )
+
     # Mark a replayed run. Its cost figures are the captured run's, carried in
     # the api_call_log — real when they were incurred, but not spent again here.
     # Without this the report reads as though every replay cost money, and any
@@ -2104,6 +2914,8 @@ def run_draft_pipeline(
         log.info(f"Report saved: {paths['report_path']}")
     if paths.get("markdown_path"):
         log.info(f"Readable review: {paths['markdown_path']}")
+    if paths.get("worklist_path"):
+        log.info(f"Worklist: {paths['worklist_path']}")
 
     # Capture the raw ensemble beside the report so this run can be replayed.
     # Skipped on a replay: re-writing a capture from a capture adds nothing and
@@ -2124,7 +2936,11 @@ def run_draft_pipeline(
 
     elapsed_total = round(time.monotonic() - t_start, 1)
     _print_draft_summary(
-        report, delta_cfg, elapsed_total, markdown_path=paths.get("markdown_path")
+        report,
+        delta_cfg,
+        elapsed_total,
+        markdown_path=paths.get("markdown_path"),
+        worklist_path=paths.get("worklist_path"),
     )
 
     return report
@@ -2305,7 +3121,9 @@ def _print_live_model_check(live):
         print(f"  (model availability data {source}; oldest entry {age}h old)")
 
 
-def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=None):
+def _print_draft_summary(
+    report, delta_cfg, elapsed_total=None, markdown_path=None, worklist_path=None
+):
     print("\n" + "=" * 60)
     print(f"REVIEW COMPLETE: {report['article_title']}")
     print(f"Run #{report['run_number']} — {report['generated']}")
@@ -2337,6 +3155,26 @@ def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=No
                     print(f"    {detail['section']} is short one model.")
         else:
             print(f"  {', '.join(report['model_failures'])}")
+
+    if report.get("empty_results"):
+        print(
+            f"\nWARNING: {len(report['empty_results'])} model pass(es) returned "
+            f"nothing:"
+        )
+        for detail in report.get("empty_result_details") or []:
+            tokens = detail.get("completion_tokens")
+            spent = (
+                f" after spending {tokens} completion token(s)"
+                if isinstance(tokens, int)
+                else ""
+            )
+            print(f"  - {detail['pass']} returned an empty result{spent}.")
+            if detail.get("section"):
+                print(f"    {detail['section']} is short one model.")
+        print(
+            "  A well-formed empty response is not the same claim as "
+            "'reviewed and found nothing' — treat these as missing coverage."
+        )
 
     # Knock-on effects of those failures. Printed adjacent to the failure list
     # because the two are only useful together: "perplexity:fact_check failed"
@@ -2652,10 +3490,25 @@ def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=No
     if cost and report.get("replayed_from"):
         # Say plainly that this number was not spent here. A replay carries the
         # captured run's token counts, so the figure is real history, not a bill.
-        print(
-            f"\nCost: $0.0000 — replayed from a capture, no model calls made."
-            f"\n  (the capture's own run cost ${cost['total_usd']:.4f})"
-        )
+        incurred = cost.get("incurred_usd", 0.0)
+        replayed = cost.get("replayed_usd", cost["total_usd"])
+        if incurred:
+            # A replay skips the ensemble, not necessarily everything. Anything
+            # still live — the SEO passes, citation verification — is real spend,
+            # and saying "no model calls made" over the top of it was simply
+            # untrue (measured 2026-09-03: two billed Mistral calls under a
+            # "$0.0000" line). Use --offline to suppress those too.
+            print(
+                f"\nCost: ${incurred:.4f} — the ensemble was replayed, but this "
+                f"run still made live calls."
+                f"\n  (the replayed capture's own run cost ${replayed:.4f})"
+                f"\n  Add --offline to skip every pass that reaches the network."
+            )
+        else:
+            print(
+                f"\nCost: $0.0000 — replayed from a capture, no model calls made."
+                f"\n  (the capture's own run cost ${replayed:.4f})"
+            )
     elif cost:
         known_flag = (
             ""
@@ -2689,26 +3542,58 @@ def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=No
     citations = report.get("section_9_citations", [])
     if citations:
         resolved = [c for c in citations if c.get("resolved")]
-        verified = [c for c in resolved if c.get("verification") == "checksum"]
-        pointer = [c for c in resolved if c.get("verification") == "pointer"]
-        unverifiable = [c for c in resolved if c.get("verification") == "unverifiable"]
+        # Classified by the same function SECTION 9 uses, so the console and the
+        # readable report cannot drift apart again. Doing it separately here was
+        # the bug: "resolved" was treated as the dividing line and the remainder
+        # called "unresolved", which filed the five citations that were fetched,
+        # read, and found NOT to support their claim — they carry resolved=False
+        # — alongside the ones no adapter ever attempted, under a line that in
+        # the same breath reported "0 could not be verified" (2026-09-03).
+        by_disposition = {key: [] for key, _ in DISPOSITIONS}
+        for c in citations:
+            by_disposition[citation_disposition(c)].append(c)
+        verified = by_disposition["checksum"]
+        refuted = by_disposition["content_mismatch"]
+        unverifiable = by_disposition["unverifiable"]
+        pointer = by_disposition["pointer"]
+        # Every citation is in exactly one bucket, so this is a true remainder
+        # and the printed numbers always add up to the total.
+        unresolved = by_disposition["fetch_failed"] + by_disposition["no_source"]
         not_archived = [
             c for c in resolved if c.get("wayback", {}).get("archived") is False
         ]
-        submitted = [c for c in not_archived if c.get("wayback", {}).get("submitted")]
-        submission_failed = [
-            c
-            for c in not_archived
-            if c.get("wayback", {}).get("submitted") is False
-            and c.get("wayback", {}).get("submission_error")
-        ]
+        # Bucketed by what the run established about archiving, not by what it
+        # asked for. Counting `submitted` was the old summary's whole answer,
+        # and it could not tell a completed capture from one archive.org
+        # dropped. Note these are keyed off `resolved`, not `not_archived`: a
+        # capture that completed inline flips `archived` to True and would
+        # otherwise fall out of every bucket and be reported nowhere.
+        by_outcome = {}
+        for c in resolved:
+            outcome = c.get("wayback", {}).get("archive_outcome")
+            if outcome:
+                by_outcome.setdefault(outcome, []).append(c)
+        newly_archived = by_outcome.get(wayback.ARCHIVE_ARCHIVED, [])
+        capture_unknown = by_outcome.get(wayback.ARCHIVE_PENDING, []) + by_outcome.get(
+            wayback.ARCHIVE_SUBMITTED, []
+        )
+        capture_failed = by_outcome.get(wayback.ARCHIVE_CAPTURE_FAILED, [])
+        submission_failed = by_outcome.get(wayback.ARCHIVE_SUBMIT_FAILED, [])
+        not_submitted = by_outcome.get(wayback.ARCHIVE_NOT_ATTEMPTED, [])
         stale = [c for c in resolved if c.get("wayback", {}).get("snapshot_stale")]
         print(
             f"\nSection 9 — Citations: {len(citations)} claim(s) — "
-            f"{len(verified)} verified, {len(pointer)} pointer-only "
-            f"(not independently verified), {len(unverifiable)} could not be verified, "
-            f"{len(citations) - len(resolved)} unresolved"
+            f"{len(verified)} verified, {len(refuted)} read but NOT supporting "
+            f"the claim, {len(pointer)} pointer-only (not independently "
+            f"verified), {len(unverifiable)} could not be read, "
+            f"{len(unresolved)} unresolved"
         )
+        if refuted:
+            print(
+                f"  {len(refuted)} citation(s) were fetched and read, and the "
+                "source does not support the claim it was attached to. These "
+                "are the ones to act on — see Section 9."
+            )
         from_archive = [
             c for c in resolved if c.get("verified_via") == "wayback_fallback"
         ]
@@ -2730,21 +3615,33 @@ def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=No
                 f"  {len(from_archive)} resolved from an archive.org snapshot rather "
                 f"than the live source ({detail}) — content checked is the archived copy"
             )
-        if submitted:
+        if newly_archived:
             print(
-                f"  {len(submitted)} resolved URL(s) submitted for archiving "
-                "(check back later — archive.org processes asynchronously)"
+                f"  {len(newly_archived)} resolved URL(s) archived this run "
+                "— snapshot URL recorded against the citation"
+            )
+        if capture_unknown:
+            print(
+                f"  {len(capture_unknown)} resolved URL(s) submitted for archiving, "
+                "capture NOT confirmed — reported as pending, not as archived"
+            )
+        if capture_failed:
+            print(
+                f"  {len(capture_failed)} resolved URL(s) accepted by archive.org "
+                "and then failed to capture — still not archived"
             )
         if submission_failed:
             print(
                 f"  {len(submission_failed)} resolved URL(s) failed Wayback submission "
                 "— still not archived"
             )
+        if not_submitted:
+            print(
+                f"  {len(not_submitted)} resolved URL(s) were NOT submitted for "
+                "archiving (non-public address, or the host did not resolve)"
+            )
         not_attempted = [
-            c
-            for c in not_archived
-            if not c.get("wayback", {}).get("submitted")
-            and not c.get("wayback", {}).get("submission_error")
+            c for c in not_archived if not c.get("wayback", {}).get("archive_outcome")
         ]
         if not_attempted:
             print(
@@ -2788,6 +3685,14 @@ def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=No
     print(f"\nFull report: {report_dir}")
     if markdown_path:
         print(f"Readable review (paste into chat): {markdown_path}")
+    # Printed after the review and before the revise-loop instructions, which
+    # is the order the two are used in: the worklist is the author's own
+    # errands, and it is deliberately NOT part of what gets pasted into a
+    # chat model. Handing a model a list of documents nobody has read yet is
+    # an invitation to invent them.
+    if worklist_path:
+        print(f"Your worklist (do NOT paste; these are yours): {worklist_path}")
+    if markdown_path:
         _print_next_step(markdown_path)
     print("=" * 60)
 
@@ -2940,7 +3845,16 @@ def run_publish_pipeline(
             for t in pub_handoff["publication_parameters"].get("tags", "").split(",")
             if t.strip()
         ],
-        "author": pub_handoff["publication_parameters"].get("author"),
+        # "WordPress author:" is the current spelling; "Author:" is the
+        # original and still parsed, because existing publication handoffs
+        # use it. The rename exists because Template A's "Author:" means
+        # something else entirely — who "I" is, for citation verification —
+        # and a byline pasted into this field is a WordPress login that does
+        # not exist.
+        "author": (
+            pub_handoff["publication_parameters"].get("wordpress_author")
+            or pub_handoff["publication_parameters"].get("author")
+        ),
         "seo": pub_handoff.get("seo", {}),
     }
 
@@ -3041,7 +3955,13 @@ def build_parser():
     )
     parser.add_argument(
         "--cost-preset",
-        choices=["economy", "standard", "balanced", "thorough", "maximum"],
+        # From presets.yaml, not a list repeated here — see preset_names().
+        # Retired names are still accepted, so a saved script or alias does not
+        # break on a naming decision; they resolve (and warn) in
+        # _apply_cost_preset. metavar keeps them out of --help, which should
+        # advertise the tiers that exist rather than the ones that used to.
+        choices=preset_names() + retired_preset_names(),
+        metavar="{" + ",".join(preset_names()) + "}",
         help="Override cost_preset from user.yaml for this run only (useful for calibration sweeps)",
     )
     parser.add_argument(
@@ -3255,5 +4175,40 @@ def main():
         sys.exit(1)
 
 
+def cli():
+    """Console-script entry point: run, then leave without waiting.
+
+    The hard exit lives here and not at the end of ``main`` because
+    ``os._exit`` takes the whole process with it, and ``main`` is called
+    in-process by the test suite. Putting it inside ``main`` killed pytest
+    itself 36% of the way through a run — and since ``os._exit(0)`` sets a
+    success code, the truncated run reported green. A suite that stops early
+    while claiming to pass is a worse defect than the hang this exists to fix.
+
+    Every output file is written and closed before this runs. What is left is
+    leaving, and leaving is the part that failed: litellm schedules its
+    post-call logging onto its own ThreadPoolExecutor, whose non-daemon workers
+    ``threading._shutdown()`` then waits for. With one wedged in a syscall that
+    never returns, the run finishes and the process does not — measured
+    2026-09-03 at 19 threads and 0% CPU minutes after "REVIEW COMPLETE", and
+    previously at two days. See ci_core.concurrency for why nothing gentler
+    reaches it.
+
+    ``SystemExit`` is caught rather than left to propagate, so a run ending in
+    ``sys.exit(1)`` — a bad config, a missing handoff — takes the same exit
+    path as a successful one and cannot hang either.
+    """
+    code = 0
+    try:
+        main()
+    except SystemExit as exc:
+        if isinstance(exc.code, int):
+            code = exc.code
+        elif exc.code is not None:
+            print(exc.code, file=sys.stderr)
+            code = 1
+    exit_without_waiting_for_foreign_threads(code)
+
+
 if __name__ == "__main__":
-    main()
+    cli()

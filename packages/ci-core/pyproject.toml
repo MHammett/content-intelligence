@@ -38,7 +38,36 @@ dependencies = [
 [project.optional-dependencies]
 # Browser TLS fingerprint for citation links behind Cloudflare.
 # Optional: ci_core.http.impersonating_get degrades to None without it.
-unblock = ["curl_cffi>=0.7"]
+#
+# The floor is load-bearing, not cosmetic. `impersonate="chrome"` resolves to
+# whatever `curl_cffi.requests.impersonate.DEFAULT_CHROME` the installed
+# release ships, and a stale profile is fingerprinted by the very Cloudflare
+# deployments this tier exists to get past. Measured 2026-09-06 with sequential
+# fetches only, because concurrent requests to one Cloudflare host are
+# nondeterministic and cannot compare versions. Successes per attempt against
+# congress.gov/bill/117th-congress/house-bill/3684 and bianchihonda.com:
+#
+#   0.16.0  DEFAULT_CHROME=chrome146  ->  0/5 and 0/4
+#   0.16.1  DEFAULT_CHROME=chrome150  ->  1/1 (422,259 bytes)
+#   0.16.2  DEFAULT_CHROME=chrome150  ->  1/1
+#   0.16.3  DEFAULT_CHROME=chrome150  ->  2/2 and 4/5
+#
+# All nine 0.16.0 failures carried `cf-mitigated: challenge`; no success did.
+#
+# The working boundary is therefore 0.16.1, which bumped curl-impersonate to
+# 2.1.1. The floor is set one release higher because 0.16.3 fixes
+# `tls_signed_cert_timestamps not applied` (upstream PR #833) — a defect on the
+# fingerprint surface itself, so 0.16.1 and 0.16.2 clear these two hosts while
+# still sending a subtly wrong handshake.
+#
+# The previous `>=0.7` was not merely permissive: it resolved to 0.16.0 in
+# uv.lock, so `uv sync --extra unblock` installed the one version measured to
+# be challenged on every Cloudflare host tried.
+#
+# Re-measure before raising this, and expect to raise it: a profile that works
+# today ages out. `cf-mitigated: challenge` on a 403 is the tell that the
+# fingerprint was rejected — see docs/CITATIONS.md.
+unblock = ["curl_cffi>=0.16.3"]
 # ci_core.config / .db / .models / .logging. Implemented and tested, but with no
 # production consumer — nothing outside ci-core's own tests and alembic/env.py
 # imports them (see the README). They were hard dependencies of ci-core, which

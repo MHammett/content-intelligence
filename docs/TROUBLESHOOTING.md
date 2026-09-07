@@ -204,8 +204,17 @@ The content-relevance model call that normally gates the verified tier didn't ru
 **Section 9 — `content_mismatch`**  
 The source URL fetched and checksummed fine, but the relevance check found the page does not support the claim. The entry records a `contradicts`, `not_addressed`, or `inconclusive` verdict plus a one-sentence reason, and appears under *Unresolved* in the readable report. Worth more attention than an ordinary unresolved entry — `contradicts` in particular is a signal about the claim itself, not just about the citation.
 
+**Section 9 — a citation reads `SUBMITTED, OUTCOME UNKNOWN`**  
+The submission was accepted and no snapshot was established, so the report declines to call it archived. Without credentials this means archive.org took the request but did not redirect to a snapshot; with credentials it means the capture was still queued when the bounded same-run wait expired. Either way the next run follows it up — an authenticated one by reading the job status, an unauthenticated one by re-checking availability. Treat the URL as unarchived until a snapshot URL appears beside it.
+
+**Section 9 — a citation reads `CAPTURE FAILED`**  
+archive.org accepted the capture and then could not complete it, and the reason it gave is printed with the entry. This is the state that used to be invisible: it rendered identically to a successful capture, so the same URL could fail every run without anyone noticing. Re-running usually fails the same way — common causes are a robots/ownership block, a page too slow for the capture time limit, and a URL that does not resolve from archive.org's side. Archive it by hand or re-source the claim.
+
+**Section 9 — a citation reads `NOT SUBMITTED`**  
+Nothing tried to archive it, and the entry says which of the two reasons applied. A non-public address is a deliberate, permanent refusal — an internal hostname is never handed to archive.org — so re-running will not change it. A host that did not resolve is transient; the next run will try again.
+
 **Wayback submissions don't show up as archived**  
-Expected on the same run. Save Page Now captures run asynchronously on archive.org's side and can take seconds to minutes; the pipeline submits and moves on without polling. A later run's availability check picks up the snapshot. If submissions are failing outright rather than pending, you're likely hitting unauthenticated rate limits — configure `api_keys.archive_org` ([CONFIGURATION.md](CONFIGURATION.md#api-keys)).
+Check the `archive_outcome` on the entry before assuming it is a timing issue. Without credentials a successful capture reports its snapshot URL in the same run, so a citation that is *not* archived usually means a real failure rather than a pending one — see the three entries above. If submissions are failing outright, you're likely hitting unauthenticated rate limits — configure `api_keys.archive_org` ([CONFIGURATION.md](CONFIGURATION.md#api-keys)).
 
 **Custom domain prompt_file not found**  
 The `prompt_file` path in `custom_domains` must be relative to your project root or an absolute path. Run the check command to verify paths resolve before a full pipeline run. If the file doesn't exist, the custom domain is silently skipped with a warning in `pipeline_<YYYYMMDD>.log`.
@@ -214,7 +223,9 @@ The `prompt_file` path in `custom_domains` must be relative to your project root
 Two or more models reviewed the same claim and disagreed — one marked it confirmed, another marked it outdated or contradicted. This is expected when models have different training data cutoffs or search grounding. Manually verify the claim against a primary source before publishing. The contradiction is saved in the report under the `contradictions` key.
 
 **`Unknown cost_preset` error**  
-The `cost_preset` value in `pipeline:` isn't one of the five supported values. Valid values: `economy`, `standard`, `balanced`, `thorough`, `maximum`. Check for typos.
+The `cost_preset` value in `pipeline:` isn't one of the supported values. Valid values: `economy`, `wide`, `balanced`, `thorough`, `maximum`. Check for typos.
+
+`standard` was retired on 2026-09-05 and is not an error: it still runs, as `wide`, and warns once per run until you change it. That is a real behaviour change rather than a rename — `wide` runs six models over twelve calls where `standard` ran five over seven, at roughly half the cost. See [CONFIGURATION.md](CONFIGURATION.md#cost-presets) for the measurements behind the retirement.
 
 **cost_preset isn't applying expected models**  
 The preset overrides model names for configured providers only. If a provider has no entry in your `models:` section (you removed it or never added it), the preset has nothing to override. Add the provider's model entry back — the preset will then apply its model selection on top.

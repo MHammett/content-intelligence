@@ -268,8 +268,8 @@ The fix was to make the safe call the reachable one.
 
 ## What guards this design
 
-Two tests exist specifically to keep the above true, and both were written in
-response to real failures.
+Three tests exist specifically to keep the above true, and all three were
+written in response to real failures.
 
 **`test_pipeline_end_to_end.py`** runs the whole pipeline against stubs and
 compares the report to a committed golden file. PR #43 refactored the LLM layer
@@ -286,3 +286,32 @@ flags missing from the README, adapter counts, dead doc links, the module-vs-
 console-script invocation form, and the same checks over strings the code
 *prints*, since a wrong command in `ci-setup`'s output reaches users just as
 directly as one in the README.
+
+**`test_concurrency_doctrine.py`** fails when any shipped module uses a
+`concurrent.futures` executor. `concurrent.futures.thread` registers
+`_python_exit` through `threading._register_atexit`, and that hook joins every
+worker with a bare, untimed `t.join()` — so a pool worker still inside a call
+when the run ends blocks interpreter exit for exactly as long as that call keeps
+running. Measured 2026-08-16: six `ci-review` processes still alive, two of them
+two days after writing their report, each holding a file handle on its own log,
+which is also what made `git worktree remove` fail.
+
+That rationale was written down in `ci_core.concurrency` at the time, and it did
+not hold. Three more `ThreadPoolExecutor` uses appeared in ci-style-profile and
+one in ci-article-review, because a rule documented in one module's docstring is
+only read by people already editing that module. All four were migrated on
+2026-09-05 and the rule now runs in CI, with an allowlist (currently empty) as
+the only escape hatch — adding an entry means writing the reason next to it.
+
+Use `ci_core.concurrency` instead:
+
+| Need | Use |
+| --- | --- |
+| One call, one wall-clock budget | `run_with_timeout` |
+| N calls, all at once, per-call budgets + a group deadline | `run_all_with_timeout` |
+| N calls, at most K running at once — the `ThreadPoolExecutor(max_workers=K)` replacement | `run_all_bounded` |
+
+The difference that matters: `max_workers` caps how many threads *exist*, while
+`run_all_bounded` gives every job its own daemon thread and caps how many are
+*working*. A daemon parked on a semaphore cannot hold the interpreter open; a
+pool worker parked inside a call is joined untimed at exit.

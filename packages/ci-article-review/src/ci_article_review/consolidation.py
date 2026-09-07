@@ -21,15 +21,19 @@ Built-in default weights reflect observed capability fit:
 
   Model       fact_check  voice_style  completeness  argument  red_team
   ----------  ----------  -----------  ------------  --------  --------
-  gemini      1.5 *       1.0          1.0           1.0       1.0
-  perplexity  1.5 *       1.0          1.0           1.0       1.0
+  gemini      1.0         1.0          1.0           1.0       1.0
+  perplexity  1.0         1.0          1.0           1.0       1.0
   openai      1.0         1.2          1.2           1.0       1.0
   mistral     1.0         1.0          1.0           1.2       1.1
   grok        1.0         1.0          1.0           1.0       1.2
   claude      1.0         1.1          1.1           1.3       1.0
 
-  * Grounding bonus: search-grounded models receive a 1.5x weight for
-    fact_check because their claims are verifiable against live sources.
+  Grounding bonus: a fact-check call that actually consulted live sources has
+  its weight multiplied by 1.5 (``ensemble.grounding_bonus``), because a claim
+  checked against a retrieved document is worth more than one recalled. This is
+  read from the call's result, not from the model's name — the table above used
+  to carry a flat 1.5 for gemini and perplexity, which was wrong in both
+  directions the moment configuration changed. See ``_DEFAULT_GROUNDING_BONUS``.
 
 All weights are configurable in configs/user.yaml under the ``ensemble`` key.
 
@@ -49,6 +53,9 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .passage_match import group_passages, normalise, same_passage
+from ci_core.llm import watermarking
+
 log = logging.getLogger(__name__)
 
 
@@ -59,16 +66,41 @@ log = logging.getLogger(__name__)
 #: Built-in domain weights.  Configurable under ``ensemble.weights`` in user.yaml.
 #: The ``default`` key applies to all domains not explicitly listed.
 _DEFAULT_WEIGHTS = {
-    "gemini": {"default": 1.0, "fact_check": 1.5},
-    "perplexity": {"default": 1.0, "fact_check": 1.5},
+    "gemini": {"default": 1.0},
+    "perplexity": {"default": 1.0},
     "openai": {"default": 1.0, "voice_style": 1.2, "completeness": 1.2},
     "mistral": {"default": 1.0, "argument_integrity": 1.2, "red_team": 1.1},
     "grok": {"default": 1.0, "red_team": 1.2},
     "claude": {"default": 1.0, "argument_integrity": 1.3, "voice_style": 1.1},
 }
 
+#: Multiplier applied to a fact-check weight when the call actually consulted
+#: live sources.
+#:
+#: This used to be baked into the table above as a flat 1.5 for gemini and
+#: perplexity — a guess about which models ground, standing in for whether they
+#: did. On 2026-09-03 the guess was wrong in both directions at once: gemini
+#: took the bonus while reporting ``grounding_available: False`` (it has no
+#: ``web_search`` configured at all), and openai ran a real search — 84,634
+#: prompt tokens of it — on the flat 1.0. Reading the result instead of the
+#: model name makes the bonus self-correcting when configuration changes, which
+#: is the only way it stays true.
+_DEFAULT_GROUNDING_BONUS = 1.5
+
 #: Weighted sum required to call a passage consensus.
 _DEFAULT_CONSENSUS_THRESHOLD = 2.0
+
+#: Distinct models that must independently flag a passage before it can be
+#: called consensus, regardless of what the weights add up to.
+#:
+#: Weight alone was never sufficient. A single model emitting two red_team
+#: sub-findings on one passage (``most_vulnerable_claim`` and
+#: ``highest_credibility_risk``) contributed 1.1 + 1.1 = 2.2 and cleared the
+#: 2.0 threshold on its own — one model agreeing with itself, published in the
+#: section whose entire meaning is that several models agreed. Observed
+#: 2026-09-03 as item 14 of 15. LanguageTool counts as one of these, since it
+#: is a genuinely independent source.
+_DEFAULT_CONSENSUS_MIN_MODELS = 2
 
 #: Partial vote weight added when LanguageTool also flagged a passage.
 _DEFAULT_LT_WEIGHT = 0.5
@@ -90,24 +122,34 @@ _DOMAIN_SECTIONS = {
 }
 
 
-def _get_weight(model_name, domain, ensemble_cfg):
+def _get_weight(model_name, domain, ensemble_cfg, grounded=False):
     """Return effective weight for a (model, domain) pair.
 
     Checks user-configured weights first, then falls back to built-in defaults.
+
+    ``grounded`` says whether *this particular call* consulted live sources, and
+    earns a fact-check multiplier when it did. It is a separate axis from the
+    configured weight and multiplies whatever that resolves to, so a user who
+    tunes a model's fact-check weight still gets the bonus on top rather than
+    silently losing it.
     """
     user_weights = ensemble_cfg.get("weights", {})
     model_weights = user_weights.get(model_name, {})
 
     # User-configured domain-specific weight
     if domain in model_weights:
-        return float(model_weights[domain])
+        weight = float(model_weights[domain])
     # User-configured model default
-    if "default" in model_weights:
-        return float(model_weights["default"])
+    elif "default" in model_weights:
+        weight = float(model_weights["default"])
+    else:
+        # Built-in default
+        defaults = _DEFAULT_WEIGHTS.get(model_name, {"default": 1.0})
+        weight = float(defaults.get(domain, defaults.get("default", 1.0)))
 
-    # Built-in default
-    defaults = _DEFAULT_WEIGHTS.get(model_name, {"default": 1.0})
-    return float(defaults.get(domain, defaults.get("default", 1.0)))
+    if grounded and domain == "fact_check":
+        weight *= float(ensemble_cfg.get("grounding_bonus", _DEFAULT_GROUNDING_BONUS))
+    return weight
 
 
 # ---------------------------------------------------------------------------
@@ -116,13 +158,19 @@ def _get_weight(model_name, domain, ensemble_cfg):
 
 
 def _passage_key(passage):
-    """Normalise a passage for fuzzy cross-model matching.
+    """Normalise a passage for exact comparison between runs.
 
-    250 chars retains most of a typical factual claim while still tolerating
-    minor wording differences between models.  Consensus detection benefits from
-    the same precision — a false positive there is worse than a missed match.
+    Cross-model matching no longer goes through this — see
+    :mod:`ci_article_review.passage_match`, which handles the nesting this could
+    not. What is left is the run-over-run delta, where two reports are checked
+    for the same consensus flag surviving a revision, and exact normalised text
+    is the conservative test to apply.
+
+    The former ``[:250]`` truncation is gone. It merged any two passages sharing
+    a 250-character prefix into one key, and three of the fifteen consensus
+    passages in the 2026-09-03 run were longer than that.
     """
-    return " ".join(passage.lower().split())[:250]
+    return normalise(passage)
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +182,30 @@ def _extract_passages(model_name, domain, result):
     """Return list of (passage_text, flag_data_dict) pairs for consensus detection.
 
     Each domain has a different JSON schema:
-      fact_check         — outdated[].claim, contradicted[].claim
+      fact_check         — outdated[], contradicted[], unverifiable[],
+                           primary_source_needed[], all by .claim
       voice_style        — flags[].passage
       argument_integrity — flags[].passage
       completeness       — flags[].passage_reference
       red_team           — most_vulnerable_claim.passage etc.
+
+    Why fact_check reads four buckets and not two
+    ---------------------------------------------
+    It used to read ``outdated`` and ``contradicted`` only. Those are the two
+    buckets models almost never populate: in the 2026-09-03 maximum-preset run
+    both were empty across all six fact_check passes, while ``unverifiable``
+    held 50 claims and ``primary_source_needed`` 14. The result was that the
+    single most expensive domain in the run — $1.36 of $3.49, 39% of spend —
+    contributed nothing whatsoever to Section 1, and no two models could ever
+    be seen agreeing that a claim was unsourceable.
+
+    This is structural rather than particular to that draft: ``unverifiable`` is
+    the natural bucket for any claim a model cannot source, so it is the common
+    case on every run.
+
+    ``confirmed`` is deliberately still excluded. Section 1 is a list of things
+    to fix; a claim that checked out is not one, and feeding it here would put
+    non-problems in the section that drives the revision prompt.
     """
     if result.get("failed") or not result.get("data"):
         return []
@@ -147,34 +214,26 @@ def _extract_passages(model_name, domain, result):
     out = []
 
     if domain == "fact_check":
-        for item in data.get("outdated", []):
-            claim = item.get("claim", "")
-            if claim:
-                out.append(
-                    (
-                        claim,
-                        {
-                            **item,
-                            "domain": domain,
-                            "type": "outdated",
-                            "source_model": model_name,
-                        },
+        for bucket in (
+            "outdated",
+            "contradicted",
+            "unverifiable",
+            "primary_source_needed",
+        ):
+            for item in data.get(bucket, []):
+                claim = item.get("claim", "")
+                if claim:
+                    out.append(
+                        (
+                            claim,
+                            {
+                                **item,
+                                "domain": domain,
+                                "type": bucket,
+                                "source_model": model_name,
+                            },
+                        )
                     )
-                )
-        for item in data.get("contradicted", []):
-            claim = item.get("claim", "")
-            if claim:
-                out.append(
-                    (
-                        claim,
-                        {
-                            **item,
-                            "domain": domain,
-                            "type": "contradicted",
-                            "source_model": model_name,
-                        },
-                    )
-                )
 
     elif domain in ("voice_style", "argument_integrity"):
         for flag in data.get("flags", []):
@@ -270,66 +329,219 @@ def _confidence_multiplier(flag_data, multipliers):
 def _find_consensus(results, lt_flagged_passages, ensemble_cfg):
     """Weighted consensus detection across all model/domain results.
 
-    Returns (consensus_flags, single_source_flags).  consensus_flags are
+    Returns ``(consensus_flags, single_source_flags)``. ``consensus_flags`` are
     sorted by weight_sum descending so the strongest findings appear first.
+
+    ``single_source_flags`` — everything that did not clear the bar — is
+    deliberately **not** consumed by :func:`build_report`, and the phrasing here
+    used to imply otherwise. Nothing is lost by dropping it: sections 2-6 are
+    built from the raw results and already carry every flag whatever its weight,
+    so a sub-threshold finding still appears under its own domain. It is
+    returned because it makes the threshold directly testable — a test can
+    assert that a given flag fell short rather than inferring it from an
+    absence.
     """
     threshold = float(
         ensemble_cfg.get("consensus_threshold", _DEFAULT_CONSENSUS_THRESHOLD)
     )
     lt_weight = float(ensemble_cfg.get("lt_weight", _DEFAULT_LT_WEIGHT))
-
-    # passage_key → accumulated data
-    passage_map: dict[str, dict] = {}
+    min_models = int(
+        ensemble_cfg.get("consensus_min_models", _DEFAULT_CONSENSUS_MIN_MODELS)
+    )
 
     confidence_multipliers = _confidence_multipliers(ensemble_cfg)
 
+    entries = []
     for (model_name, domain), result in results.items():
-        weight = _get_weight(model_name, domain, ensemble_cfg)
+        weight = _get_weight(
+            model_name,
+            domain,
+            ensemble_cfg,
+            grounded=bool(result.get("grounding_available")),
+        )
         for passage, flag_data in _extract_passages(model_name, domain, result):
-            key = _passage_key(passage)
-            if not key:
-                continue
-            if key not in passage_map:
-                passage_map[key] = {
-                    "weight_sum": 0.0,
-                    "models": [],
-                    "flag_data": [],
+            entries.append(
+                {
                     "passage": passage,
+                    "flag": flag_data,
+                    "model": model_name,
+                    "source": f"{model_name}:{domain}",
+                    "weight": weight
+                    * _confidence_multiplier(flag_data, confidence_multipliers),
                 }
-            multiplier = _confidence_multiplier(flag_data, confidence_multipliers)
-            passage_map[key]["weight_sum"] += weight * multiplier
-            passage_map[key]["models"].append(f"{model_name}:{domain}")
-            passage_map[key]["flag_data"].append(flag_data)
-
-    lt_keys = {_passage_key(p) for p in lt_flagged_passages}
+            )
 
     consensus = []
     single_source = []
 
-    for key, entry in passage_map.items():
-        has_lt = key in lt_keys
-        effective_weight = entry["weight_sum"] + (lt_weight if has_lt else 0.0)
+    # Group by *place in the draft*, not by exact quoted string. Models quote
+    # the same sentence at different lengths, and keying on the string scattered
+    # one passage's votes across several buckets — which both inflated the
+    # section (7 of 15 items on 2026-09-03 were nested inside another item) and
+    # distorted its ranking, since it is sorted by weight_sum and the votes that
+    # should have summed did not.
+    for passage, group in group_passages(entries, lambda e: e["passage"]):
+        weight_sum = sum(e["weight"] for e in group)
+        has_lt = any(same_passage(passage, p) for p in lt_flagged_passages)
+        effective_weight = weight_sum + (lt_weight if has_lt else 0.0)
 
-        if effective_weight >= threshold:
+        # LanguageTool counts toward the distinct-source requirement: it is an
+        # independent opinion, which is the property being tested for.
+        voters = {e["model"] for e in group}
+        if has_lt:
+            voters = voters | {"languagetool"}
+
+        if effective_weight >= threshold and len(voters) >= min_models:
             consensus.append(
                 {
-                    "passage": entry["passage"],
-                    "models": sorted(set(entry["models"])),
+                    "passage": passage,
+                    "models": sorted({e["source"] for e in group}),
                     "weight_sum": round(effective_weight, 2),
                     "languagetool_also_flagged": has_lt,
-                    "flags": entry["flag_data"],
+                    "flags": [e["flag"] for e in group],
                 }
             )
         else:
-            single_source.extend(entry["flag_data"])
+            single_source.extend(e["flag"] for e in group)
 
     consensus.sort(key=lambda x: x["weight_sum"], reverse=True)
     return consensus, single_source
 
 
-# ---------------------------------------------------------------------------
-# Domain section builders
-# ---------------------------------------------------------------------------
+#: The fact-check lists whose items carry per-claim source attribution.
+#: `additional_observations` is deliberately absent: it is tagged separately by
+#: `_collect_additional_observations`, which sets `source_domain` too.
+_FACT_CHECK_ITEM_KEYS = (
+    "confirmed",
+    "outdated",
+    "contradicted",
+    "unverifiable",
+    "primary_source_needed",
+    # Not a verdict, but tagged like one for the same reason: which model made
+    # a scope call is a fact about that model's judgment, and the report names
+    # it. See :mod:`ci_article_review.fact_check_scope`.
+    "out_of_scope",
+)
+
+
+#: Source strings that name no document — the draft itself, or the model's own
+#: reasoning. Compared against the whole source (normalised), not searched
+#: within it, so "Manual Calculation" fails and "Furuno GT-8031 calculation
+#: notes" does not.
+#:
+#: Measured 2026-09-05 on the Honda draft: 4 of 19 `confirmed` findings cited no
+#: document at all. One named "Draft Article" — the pipeline confirming the
+#: draft against itself — and three named "Manual Calculation", where the model
+#: did the arithmetic and reported the result as a confirmed fact. All four had
+#: `source_url: "N/A"`.
+#:
+#: The arithmetic may well be right; that is not the point. `confirmed` is the
+#: strongest thing Section 2 says and the tier Section 9 counts as backed by a
+#: document. A model reasoning its way to a conclusion is what the other buckets
+#: already exist to represent.
+_SELF_REFERENTIAL_SOURCES = frozenset(
+    {
+        "draft",
+        "the draft",
+        "draft article",
+        "the draft article",
+        "article",
+        "the article",
+        "this article",
+        "manual calculation",
+        "calculation",
+        "own calculation",
+        "computed",
+        "derived",
+        "inference",
+        "deduction",
+        "own analysis",
+        "author",
+        "the author",
+        "internal consistency",
+        "common knowledge",
+        "n/a",
+        "na",
+        "none",
+        "unknown",
+    }
+)
+
+#: A URL field the model filled in to mean "there isn't one".
+_EMPTY_URL_VALUES = frozenset({"", "n/a", "na", "none", "null", "-"})
+
+
+def _normalise_source(text):
+    """Lowercase, strip punctuation, collapse whitespace."""
+    kept = [c if (c.isalnum() or c in " /") else " " for c in str(text or "").lower()]
+    return " ".join("".join(kept).split())
+
+
+def _names_a_document(part):
+    key = _normalise_source(part)
+    return bool(key) and key not in _SELF_REFERENTIAL_SOURCES
+
+
+def _has_external_source(item):
+    """Whether a `confirmed` finding points at anything outside the draft.
+
+    A URL settles it. Without one, the free-text source has to name something
+    that is not the draft or the model's own reasoning — an unlinked "Honda
+    ServiceNews B18010I" is a real document and stays confirmed. Models list
+    several sources separated by semicolons, and one real document among them
+    is enough.
+    """
+    url = str(item.get("source_url", "") or "").strip().lower()
+    if url and url not in _EMPTY_URL_VALUES:
+        return True
+    return any(
+        _names_a_document(part) for part in str(item.get("source", "")).split(";")
+    )
+
+
+def _demote_unsourced_confirmations(data):
+    """Move `confirmed` findings with no external source into `unverifiable`.
+
+    Returns a new data dict; the input is left alone. The claim is not dropped —
+    it moves to the bucket that means "nothing was found to check this against",
+    which is what actually happened, and keeps its original source text so a
+    reader can see what the model offered instead.
+    """
+    confirmed = data.get("confirmed") or []
+    if not confirmed:
+        return data
+
+    kept, demoted = [], []
+    for item in confirmed:
+        if _has_external_source(item):
+            kept.append(item)
+            continue
+        demoted.append(
+            {
+                "claim": item.get("claim", ""),
+                "checked": item.get("source", "") or "nothing external",
+                "sources_checked": [],
+                "reason": (
+                    "Reported as confirmed with no external source: "
+                    f"{item.get('source') or 'none given'}. A claim the model "
+                    "reasoned its way to is not a claim a document backs, so it "
+                    "is reported here rather than as confirmed."
+                ),
+            }
+        )
+    if not demoted:
+        return data
+
+    log.info(
+        "Fact check: %d confirmed finding(s) cited no external source and were "
+        "moved to unverifiable.",
+        len(demoted),
+    )
+    return {
+        **data,
+        "confirmed": kept,
+        "unverifiable": list(data.get("unverifiable") or []) + demoted,
+    }
 
 
 def _build_fact_check(results, ensemble_cfg, scope=None):
@@ -343,7 +555,7 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
     exists at once.
     """
     domain_results = [
-        (model, r)
+        (model, {**r, "data": _demote_unsourced_confirmations(r["data"])})
         for (model, d), r in results.items()
         if d == "fact_check" and not r.get("failed") and r.get("data")
     ]
@@ -351,20 +563,27 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
         return {}
     if len(domain_results) == 1:
         model_name, r = domain_results[0]
-        # Single source — return as-is but tag with source metadata. Only
-        # out_of_scope is tagged per item: the report names the model that made
-        # each scope call, because "grok judged this out of scope" is a claim
-        # about a model's judgment rather than about the draft.
+        grounding = bool(r.get("grounding_available"))
+        weight = _get_weight(model_name, "fact_check", ensemble_cfg, grounded=grounding)
+        tag = {
+            "source_model": model_name,
+            "source_weight": round(weight, 2),
+            "grounding": grounding,
+        }
+        # Individual items are tagged here exactly as the merge branch below
+        # tags them. This used to tag only `_sources`, so which model asserted a
+        # given claim was recorded when several models ran the domain and lost
+        # when one did — and `standard` thoroughness runs one. Anything keyed on
+        # the asserting model was therefore dead on precisely the cheaper preset:
+        # the citation re-ask had nobody to hand a refutation back to.
         merged = {
             **r["data"],
-            "out_of_scope": _tag_scope_items(r["data"].get("out_of_scope"), model_name),
+            **{
+                key: [{**item, **tag} for item in (r["data"].get(key) or [])]
+                for key in _FACT_CHECK_ITEM_KEYS
+            },
             "_sources": {
-                model_name: {
-                    "weight": round(
-                        _get_weight(model_name, "fact_check", ensemble_cfg), 2
-                    ),
-                    "grounding": r.get("grounding_available", False),
-                }
+                model_name: {"weight": round(weight, 2), "grounding": grounding}
             },
         }
         return _apply_scope(merged, scope)
@@ -381,8 +600,8 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
         "_sources": {},
     }
     for model_name, r in domain_results:
-        weight = _get_weight(model_name, "fact_check", ensemble_cfg)
-        grounding = r.get("grounding_available", False)
+        grounding = bool(r.get("grounding_available"))
+        weight = _get_weight(model_name, "fact_check", ensemble_cfg, grounded=grounding)
         tag = {
             "source_model": model_name,
             "source_weight": round(weight, 2),
@@ -393,14 +612,7 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
             "grounding": grounding,
         }
         data = r["data"]
-        for key in (
-            "confirmed",
-            "outdated",
-            "contradicted",
-            "unverifiable",
-            "primary_source_needed",
-            "out_of_scope",
-        ):
+        for key in _FACT_CHECK_ITEM_KEYS:
             for item in data.get(key, []) or []:
                 merged[key].append({**item, **tag})
         for obs in data.get("additional_observations", []):
@@ -408,16 +620,28 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
                 {**obs, "source_model": model_name}
             )
 
-    # Sort problem arrays: higher-weight model findings first
-    for key in ("outdated", "contradicted"):
+    # Sort problem arrays: higher-weight model findings first.
+    #
+    # This covered `outdated` and `contradicted` only — the two buckets models
+    # almost never fill. Both were empty across all six fact-check passes on
+    # 2026-09-03, so the sort did nothing at all, while the 50-item
+    # `unverifiable` list and the 14-item `primary_source_needed` list kept
+    # arbitrary model-iteration order. Those are the arrays a reader actually
+    # works through, and a grounded pass carries a 1.5x fact-check weight
+    # precisely so its findings lead.
+    #
+    # `confirmed` is sorted too: it is not a problem list, but a reader deciding
+    # how much to trust a verdict benefits from the same ordering.
+    for key in (
+        "outdated",
+        "contradicted",
+        "unverifiable",
+        "primary_source_needed",
+        "confirmed",
+    ):
         merged[key].sort(key=lambda x: x.get("source_weight", 1.0), reverse=True)
 
     return _apply_scope(merged, scope)
-
-
-def _tag_scope_items(items, model_name):
-    """Stamp each out_of_scope item with the model that classified it."""
-    return [{**item, "source_model": model_name} for item in (items or [])]
 
 
 def _apply_scope(merged, scope):
@@ -469,32 +693,15 @@ def _build_flags_section(domain, results, ensemble_cfg):
 def _build_completeness(results, ensemble_cfg):
     """Build completeness flags from all models that ran the domain.
 
-    Same as _build_flags_section but completeness flags use passage_reference
-    instead of passage, so they normalise slightly differently.
+    A thin alias for :func:`_build_flags_section`. It used to be a full copy of
+    it, justified by a docstring saying completeness "flags use
+    passage_reference instead of passage, so they normalise slightly
+    differently" — but neither function ever touched either field. Both copy the
+    flag dict through whole; the field only matters to ``_extract_passages``,
+    which is a different function. The stated difference did not exist in the
+    code, so the second copy was pure drift risk.
     """
-    domain_results = [
-        (model, r)
-        for (model, d), r in results.items()
-        if d == "completeness" and not r.get("failed") and r.get("data")
-    ]
-    if not domain_results:
-        return []
-
-    merged = []
-    multi = len(domain_results) > 1
-
-    for model_name, r in domain_results:
-        weight = _get_weight(model_name, "completeness", ensemble_cfg)
-        for flag in r["data"].get("flags", []):
-            entry = {**flag, "source_model": model_name}
-            if multi:
-                entry["source_weight"] = round(weight, 2)
-            merged.append(entry)
-
-    if multi:
-        merged.sort(key=lambda x: x.get("source_weight", 1.0), reverse=True)
-
-    return merged
+    return _build_flags_section("completeness", results, ensemble_cfg)
 
 
 def _build_red_team(results, ensemble_cfg):
@@ -533,11 +740,24 @@ def find_contradictions(results):
     Returns a list of contradiction dicts.  Each entry has:
       claim           str   — the disputed claim text
       confirmed_by    list  — model names that marked it confirmed
-      challenged_by   list  — model names that marked it outdated or contradicted
-      challenge_type  str   — "outdated" | "contradicted" | "mixed"
+      challenged_by   list  — model names that challenged it
+      challenge_type  str   — "outdated" | "contradicted" | "unverifiable" | "mixed"
+
+    ``unverifiable`` counts as a challenge
+    --------------------------------------
+    It did not, and that silence was the whole output. One model calling a claim
+    *confirmed* while another cannot verify it at all is a disagreement about
+    evidence, and it is the disagreement this ensemble actually produces:
+    ``outdated`` and ``contradicted`` were empty across all six fact-check
+    passes on 2026-09-03, while five claims were confirmed by one model and
+    marked unverifiable by another. The report said ``contradictions: 0``.
+
+    What was hidden mattered. Among those five were "I have a side job." and
+    "I have a family." — unfalsifiable first-person statements that two models
+    reported as *confirmed*. Surfacing the disagreement is what makes that
+    visible.
     """
-    confirmed: dict[str, list] = {}  # passage_key → [{model, claim, ...}]
-    challenged: dict[str, list] = {}  # passage_key → [{model, claim, type, ...}]
+    stances = []
 
     for (model_name, domain), result in results.items():
         if domain != "fact_check" or result.get("failed") or not result.get("data"):
@@ -546,40 +766,50 @@ def find_contradictions(results):
         for item in data.get("confirmed", []):
             claim = item.get("claim", "")
             if claim:
-                key = _passage_key(claim)
-                confirmed.setdefault(key, []).append(
-                    {"model": model_name, "claim": claim, **item}
-                )
-        for item in data.get("contradicted", []):
-            claim = item.get("claim", "")
-            if claim:
-                key = _passage_key(claim)
-                challenged.setdefault(key, []).append(
+                stances.append(
                     {
                         "model": model_name,
                         "claim": claim,
-                        "type": "contradicted",
-                        **item,
+                        "stance": "confirmed",
+                        "type": "confirmed",
                     }
                 )
-        for item in data.get("outdated", []):
-            claim = item.get("claim", "")
-            if claim:
-                key = _passage_key(claim)
-                challenged.setdefault(key, []).append(
-                    {"model": model_name, "claim": claim, "type": "outdated", **item}
-                )
+        for bucket in ("contradicted", "outdated", "unverifiable"):
+            for item in data.get(bucket, []):
+                claim = item.get("claim", "")
+                if claim:
+                    stances.append(
+                        {
+                            "model": model_name,
+                            "claim": claim,
+                            "stance": "challenged",
+                            "type": bucket,
+                        }
+                    )
 
     contradictions = []
-    for key in set(confirmed) & set(challenged):
-        c_types = {e["type"] for e in challenged[key]}
-        challenge_type = c_types.pop() if len(c_types) == 1 else "mixed"
+    # Grouped by place in the draft rather than exact string, so a claim quoted
+    # at two lengths by two models is one disagreement rather than none.
+    for claim, group in group_passages(stances, lambda s: s["claim"]):
+        confirmed = [s for s in group if s["stance"] == "confirmed"]
+        challenged = [s for s in group if s["stance"] == "challenged"]
+        if not confirmed or not challenged:
+            continue
+
+        confirmed_by = sorted({s["model"] for s in confirmed})
+        challenged_by = sorted({s["model"] for s in challenged})
+        # One model listing a claim in two buckets is a malformed response, not
+        # a cross-model disagreement.
+        if confirmed_by == challenged_by and len(confirmed_by) == 1:
+            continue
+
+        types = {s["type"] for s in challenged}
         contradictions.append(
             {
-                "claim": challenged[key][0]["claim"],
-                "confirmed_by": sorted({e["model"] for e in confirmed[key]}),
-                "challenged_by": sorted({e["model"] for e in challenged[key]}),
-                "challenge_type": challenge_type,
+                "claim": claim,
+                "confirmed_by": confirmed_by,
+                "challenged_by": challenged_by,
+                "challenge_type": types.pop() if len(types) == 1 else "mixed",
             }
         )
 
@@ -589,6 +819,31 @@ def find_contradictions(results):
 # ---------------------------------------------------------------------------
 # Low-confidence and additional observations collectors
 # ---------------------------------------------------------------------------
+
+
+def _result_is_empty(result):
+    """True if a successful call returned a payload with nothing in it.
+
+    Schema-valid and empty is indistinguishable from "reviewed and found
+    nothing" without this — and the two are not the same claim. Every domain's
+    schema is a set of lists (``flags``, ``low_confidence``, the fact-check
+    buckets) plus, for red_team, a few dicts, so "no list has an entry and no
+    dict has a value" covers all of them without a per-domain table that would
+    drift as the schemas change.
+    """
+    data = result.get("data")
+    if not isinstance(data, dict) or not data:
+        return True
+    for value in data.values():
+        if isinstance(value, list) and value:
+            return False
+        if isinstance(value, dict) and any(
+            v not in (None, "", [], {}) for v in value.values()
+        ):
+            return False
+        if isinstance(value, str) and value.strip():
+            return False
+    return True
 
 
 def _collect_low_confidence(results):
@@ -643,9 +898,151 @@ def _collect_additional_observations(results):
     return out
 
 
+#: Stated confidence, strongest first. Used only to order Section 8, and only
+#: as the tiebreaker *under* corroboration.
+#:
+#: `_DEFAULT_CONFIDENCE_MULTIPLIERS` stays inert for the reason recorded there:
+#: self-reported confidence is not calibrated and is not comparable across
+#: providers. That argument is about using the level as a weight in a sum, and
+#: it holds. It does not reach ordering, and it does not reach the question this
+#: section actually needs answered - which of 55 observations to read first.
+#:
+#: The weighting was also never able to fire. It reads `confidence` off flags on
+#: their way into consensus, and the schema puts `confidence` on
+#: `additional_observations[]` plus three `fact_check` buckets, of which
+#: consensus reads two. Measured on the 2026-09-04 maximum run: 0 of 119
+#: consensus-bound findings carried a confidence, against 55 that did and never
+#: reached consensus at all. The signal was collected in one place and looked
+#: for in another.
+_CONFIDENCE_ORDER = {"high": 3, "medium": 2, "low": 1}
+
+
+def _confidence_rank(observation):
+    """Ordering rank for a stated confidence; 0 when absent or unrecognised."""
+    level = str(observation.get("confidence", "")).strip().lower()
+    return _CONFIDENCE_ORDER.get(level, 0)
+
+
+def _merge_additional_observations(observations):
+    """Group Section 8 by passage, then rank by corroboration and confidence.
+
+    Two models independently making the same observation is the strongest thing
+    this section can tell you, and it was invisible: observations were appended
+    in dict-iteration order, so an agreeing pair rendered as two unrelated
+    bullets somewhere in a list of 55 (measured on the 2026-09-04 maximum run).
+    Section 1 has grouped by passage since the identical problem was found
+    there; this is that same :func:`group_passages` pass applied to the section
+    that never received it.
+
+    Merged entries keep the fields of the most confident observation in the
+    group, so every existing consumer still reads what it read before, and gain
+    ``models`` and ``model_count``. Ranking is corroboration first, stated
+    confidence second - which also stops :mod:`voice_pattern_report` counting
+    one article's voice problem twice because two models both noticed it.
+    """
+    if not observations:
+        return []
+
+    merged = []
+    for passage, group in group_passages(observations, lambda o: o.get("passage", "")):
+        models = sorted({o.get("source_model", "?") for o in group})
+        best = max(group, key=_confidence_rank)
+        merged.append(
+            {**best, "passage": passage, "models": models, "model_count": len(models)}
+        )
+
+    merged.sort(key=lambda o: (o["model_count"], _confidence_rank(o)), reverse=True)
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def _ensemble_width(results, ensemble_cfg, lt_voted=False):
+    """How wide the ensemble behind this report actually was.
+
+    A cost preset buys fewer models, and that is the point of it — but until
+    now the only way to find out *how much* narrower a run was than the preset
+    it names was to count rows in the API call table and cross-reference them
+    against `_THOROUGHNESS_PRESETS` in the source. The numbers that change how
+    the sections should be read are: how many domains came down to a single
+    model, how many distinct models ran at all, and whether Section 1 can still
+    reach consensus with that many voters.
+
+    Measured 2026-09-05: at `economy` the `standard` map runs five domains on
+    three distinct models, every one of them single-model, because `economy`
+    disables grok and claude and both of the two-model domains are
+    mistral-paired. The report said none of that.
+
+    Voters are counted per *model*, not per call, because that is what
+    ``_find_consensus`` counts — two findings from one model are one voter, and
+    LanguageTool is a voter in its own right when it flagged anything.
+    """
+    ran = {
+        (model, domain)
+        for (model, domain), r in results.items()
+        if not r.get("failed") and not r.get("skipped")
+    }
+    models_by_domain: dict[str, list[str]] = {}
+    for model, domain in sorted(ran):
+        models_by_domain.setdefault(domain, []).append(model)
+
+    # The preset's domains, not the ones that produced results: a domain whose
+    # every model was excluded has no result to be counted and would otherwise
+    # vanish from a report about coverage.
+    expected = list(ensemble_cfg.get("preset_domains") or sorted(models_by_domain))
+    for domain in models_by_domain:
+        if domain not in expected:
+            expected.append(domain)
+
+    distinct_models = sorted({model for model, _ in ran})
+    min_models = int(
+        ensemble_cfg.get("consensus_min_models", _DEFAULT_CONSENSUS_MIN_MODELS)
+    )
+    # LanguageTool is an independent source and counts toward the minimum, so a
+    # run's true voter pool is the models plus LT when LT flagged something.
+    voter_pool = len(distinct_models) + (1 if lt_voted else 0)
+    multi_model_domains = [d for d in expected if len(models_by_domain.get(d, [])) > 1]
+
+    return {
+        "models_by_domain": {d: models_by_domain.get(d, []) for d in expected},
+        "distinct_models": distinct_models,
+        "domains_single_model": [
+            d for d in expected if len(models_by_domain.get(d, [])) == 1
+        ],
+        # Which domains nothing reviewed, and why, is reported at the top level
+        # as ``domains_not_run`` — with a reason, and with a note above the
+        # affected section. Not repeated here: one fact, one place.
+        "domains_expected": expected,
+        "consensus_min_models": min_models,
+        "voter_pool": voter_pool,
+        "languagetool_voted": bool(lt_voted),
+        # Can Section 1 flag anything at all? With fewer distinct sources than
+        # the minimum, no passage can clear it however many findings agree.
+        "consensus_reachable": voter_pool >= min_models,
+        # Every domain single-model means no passage can reach the minimum from
+        # within one domain — agreement has to come from two domains at once,
+        # which is a much narrower path than the same threshold implies at a
+        # preset where domains carry two models each.
+        "consensus_needs_cross_domain": (
+            min_models > 1 and not multi_model_domains and bool(distinct_models)
+        ),
+        "backfilled": list(ensemble_cfg.get("backfilled_assignments") or []),
+    }
+
+
+def _build_provenance(drafted_with):
+    """Provenance block: what drafted this, and does that provider mark text.
+
+    Kept in the report rather than only printed, so ``pipeline_history/``
+    accumulates a durable record of which articles carry a mark. By the time
+    anyone asks the question about a piece published months ago, the chat
+    thread that produced it is long gone.
+    """
+    status = watermarking.status_for(drafted_with)
+    return {"drafted_with": (drafted_with or "").strip() or None, **status}
 
 
 def build_report(
@@ -661,6 +1058,8 @@ def build_report(
     primary_claim="",
     prior_report_path=None,
     fact_check_scope=None,
+    domains_not_run=None,
+    drafted_with="",
 ):
     """Merge ensemble results into a structured report.
 
@@ -674,6 +1073,12 @@ def build_report(
     fact_check_scope:
         The run's ``ScopeRules``, or None to leave the fact-check section
         untouched. See :mod:`ci_article_review.fact_check_scope`.
+    domains_not_run:
+        ``{domain: reason}`` for domains the run should have covered but made no
+        call for. Supplied by the pipeline, which is what knows the presets and
+        the drafter exclusion; it cannot be recovered here, because every other
+        record in this report is derived from ``results`` and a domain that was
+        never attempted has no entry there to derive from.
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -703,7 +1108,9 @@ def build_report(
     section_7_low_confidence = _collect_low_confidence(results)
 
     # Section 8 — Cross-domain additional observations
-    section_8_additional = _collect_additional_observations(results)
+    section_8_additional = _merge_additional_observations(
+        _collect_additional_observations(results)
+    )
 
     # Cross-model contradictions — claims confirmed by one model, challenged by another
     contradictions = find_contradictions(results)
@@ -732,6 +1139,19 @@ def build_report(
         if r.get("failed") and not r.get("skipped")
     ]
 
+    # Domains that made no call at all. Kept separate from the failures above
+    # because the reader's question is different: a failed pass means the
+    # section is short a model, while this means the section has no model
+    # behind it and its emptiness carries no information about the draft.
+    domains_not_run_details = [
+        {
+            "domain": domain,
+            "section": _DOMAIN_SECTIONS.get(domain),
+            "reason": reason,
+        }
+        for domain, reason in sorted((domains_not_run or {}).items())
+    ]
+
     # Calls that succeeded but had to be salvaged from a truncated response —
     # some findings were recovered, but some were genuinely lost. Not a failure
     # (its findings are already merged into the sections above), but distinct
@@ -740,6 +1160,34 @@ def build_report(
         f"{model}:{domain}"
         for (model, domain), r in results.items()
         if r.get("truncated")
+    ]
+
+    # Calls that returned a well-formed response containing nothing at all.
+    # A third outcome beside "failed" and "truncated", and until now the only
+    # one with nowhere to be recorded: the call succeeded, so model_failures
+    # skipped it; nothing was cut off, so truncated_results skipped it; and the
+    # section it should have contributed to was quietly built one model short.
+    #
+    # Measured 2026-09-03: gemini:voice_style spent 1,763 completion tokens and
+    # returned empty arrays, perplexity:voice_style returned 14 tokens and did
+    # the same. Both logged OK. Section 3 was built from three models rather
+    # than five and said so nowhere.
+    empty_results = [
+        f"{model}:{domain}"
+        for (model, domain), r in results.items()
+        if not r.get("failed") and not r.get("skipped") and _result_is_empty(r)
+    ]
+    empty_result_details = [
+        {
+            "pass": f"{model}:{domain}",
+            "model": r.get("model") or model,
+            "domain": domain,
+            "section": _DOMAIN_SECTIONS.get(domain),
+            "completion_tokens": (r.get("tokens") or {}).get("completion"),
+            "elapsed_seconds": r.get("elapsed_seconds"),
+        }
+        for (model, domain), r in results.items()
+        if not r.get("failed") and not r.get("skipped") and _result_is_empty(r)
     ]
 
     # Delta from prior run
@@ -764,7 +1212,10 @@ def build_report(
         "article_title": article_title,
         "publication": publication_name,
         "lt_corrections_applied": lt_result.get("change_log", []) if lt_result else [],
-        "lt_failed": lt_result.get("failed", False) if lt_result else True,
+        # Absent is not failed. With no LanguageTool result at all there is
+        # nothing to report a failure about, and defaulting to True meant a run
+        # that never attempted the pass claimed it had tried and failed.
+        "lt_failed": bool(lt_result.get("failed")) if lt_result else False,
         "lt_skipped": lt_result.get("skipped", False) if lt_result else False,
         # "disabled" (grammar_pass: false) or "no_credentials" — the summary
         # named the wrong one for either, sending operators to configure
@@ -772,6 +1223,11 @@ def build_report(
         "lt_skipped_reason": lt_result.get("skipped_reason") if lt_result else None,
         "corrected_draft": corrected_draft,
         "primary_claim": primary_claim,
+        # Which provider drafted the article, and whether that provider marks
+        # its text output. Declared in the handoff, never measured: a
+        # statistical watermark cannot be detected without the provider's key,
+        # so this records what the author said rather than what the text shows.
+        "provenance": _build_provenance(drafted_with),
         "api_call_log": api_call_log,
         "delta": delta,
         "section_1_consensus": consensus_flags,
@@ -785,13 +1241,20 @@ def build_report(
         "contradictions": contradictions,
         "model_failures": model_failures,
         "model_failure_details": model_failure_details,
+        "domains_not_run": domains_not_run_details,
         "truncated_results": truncated_results,
+        "empty_results": empty_results,
+        "empty_result_details": empty_result_details,
         "ensemble": {
             "thoroughness": ensemble_cfg.get("thoroughness", "standard"),
+            "cost_preset": ensemble_cfg.get("cost_preset"),
             "consensus_threshold": float(
                 ensemble_cfg.get("consensus_threshold", _DEFAULT_CONSENSUS_THRESHOLD)
             ),
             "assignments": assignments,
+            "width": _ensemble_width(
+                results, ensemble_cfg, lt_voted=bool(lt_flagged_passages)
+            ),
         },
     }
 

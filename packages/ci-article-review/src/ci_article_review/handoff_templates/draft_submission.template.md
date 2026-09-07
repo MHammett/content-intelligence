@@ -3,6 +3,9 @@ Generated: YYYY-MM-DD
 Pipeline run: 1
 Article: [Your article title]
 Publication: [your publication config name, i.e. the NAME in configs/NAME.yaml]
+Author: [optional — who "I" refers to in the draft. Only needed when it is not
+         the publication's usual byline; citation verification uses it to check
+         first-person claims against a source page.]
 History key: [Optional but recommended. A short stable name for this piece, used
 as its history directory. Without it the title is the key, so revising the title
 starts a fresh history and the run loses its delta baseline. Set it once and

@@ -47,9 +47,21 @@ class TestPassageKey:
     def test_lowercased(self):
         assert _passage_key("Hello World") == _passage_key("hello world")
 
-    def test_truncated_at_250(self):
+    def test_not_truncated(self):
+        """The old 250-character cap merged any two passages sharing a prefix.
+
+        Three of the fifteen consensus passages in the 2026-09-03 run were
+        longer than 250 characters, so this was live, not theoretical: two
+        distinct findings on one long paragraph collapsed into a single key.
+        """
         long = "a" * 300
-        assert len(_passage_key(long)) == 250
+        assert len(_passage_key(long)) == 300
+
+    def test_two_passages_sharing_a_long_prefix_stay_distinct(self):
+        shared = "the pipeline checks every claim against a primary source " * 5
+        assert _passage_key(shared + "and then stops.") != _passage_key(
+            shared + "and then keeps going."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -613,3 +625,178 @@ class TestComputeDeltaDetection:
             "# Title\n\n## One\n\ncompletely different body wording here", prior, []
         )
         assert d["structure_changed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Regressions from the 2026-09-03 audit
+# ---------------------------------------------------------------------------
+
+
+class TestFactCheckReachesConsensus:
+    """The buckets models actually fill must feed Section 1.
+
+    Consensus read only ``outdated`` and ``contradicted``. Both were empty
+    across all six fact-check passes on 2026-09-03 while ``unverifiable`` held
+    50 claims, so the domain that cost 39% of the run contributed nothing.
+    """
+
+    def test_unverifiable_agreed_by_two_models_is_consensus(self):
+        results = {
+            ("gemini", "fact_check"): _ok(
+                {"unverifiable": [{"claim": "The grid is complex."}]}
+            ),
+            ("openai", "fact_check"): _ok(
+                {"unverifiable": [{"claim": "The grid is complex."}]}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert len(consensus) == 1
+        assert consensus[0]["passage"] == "The grid is complex."
+
+    def test_primary_source_needed_also_counts(self):
+        results = {
+            ("gemini", "fact_check"): _ok(
+                {"primary_source_needed": [{"claim": "The grid is complex."}]}
+            ),
+            ("openai", "fact_check"): _ok(
+                {"primary_source_needed": [{"claim": "The grid is complex."}]}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert len(consensus) == 1
+
+    def test_confirmed_is_not_a_finding(self):
+        """A claim that checked out is not something to fix, so it stays out of
+        the section that drives the revision prompt."""
+        results = {
+            ("gemini", "fact_check"): _ok(
+                {"confirmed": [{"claim": "The grid is complex."}]}
+            ),
+            ("openai", "fact_check"): _ok(
+                {"confirmed": [{"claim": "The grid is complex."}]}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert consensus == []
+
+
+class TestConsensusNeedsDistinctModels:
+    """Weight alone let one model agree with itself into Section 1."""
+
+    def test_one_model_flagging_twice_is_not_consensus(self):
+        # Two red_team sub-findings on one passage, the exact shape that put
+        # mistral alone into Section 1 at weight 2.2 against a 2.0 threshold.
+        results = {
+            ("mistral", "red_team"): _ok(
+                {
+                    "most_vulnerable_claim": {"passage": "The grid is complex."},
+                    "highest_credibility_risk": {"passage": "The grid is complex."},
+                }
+            ),
+        }
+        consensus, single = _find_consensus(results, [], {})
+        assert consensus == []
+        assert len(single) == 2
+
+    def test_two_models_still_reach_consensus(self):
+        results = {
+            ("mistral", "red_team"): _ok(
+                {"most_vulnerable_claim": {"passage": "The grid is complex."}}
+            ),
+            ("grok", "red_team"): _ok(
+                {"most_vulnerable_claim": {"passage": "The grid is complex."}}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert len(consensus) == 1
+
+    def test_languagetool_counts_as_a_second_source(self):
+        results = {
+            ("claude", "voice_style"): _ok(
+                {"flags": [_flag("It is important to note that the grid is complex.")]}
+            ),
+        }
+        consensus, _ = _find_consensus(
+            results,
+            ["It is important to note that the grid is complex."],
+            {"consensus_threshold": 1.0},
+        )
+        assert len(consensus) == 1
+        assert consensus[0]["languagetool_also_flagged"] is True
+
+
+class TestNestedQuotationsMerge:
+    """One passage quoted two ways is one finding, not two."""
+
+    def test_the_same_claim_quoted_two_ways_is_one_item(self):
+        shorter = "Citations get checked against primary sources every time."
+        longer = "Citations get checked against primary sources every single time."
+        results = {
+            ("claude", "voice_style"): _ok({"flags": [_flag(shorter)]}),
+            ("openai", "voice_style"): _ok({"flags": [_flag(longer)]}),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert len(consensus) == 1
+        # The fuller quotation represents the group.
+        assert consensus[0]["passage"] == longer
+
+    def test_a_sentence_inside_a_much_longer_quote_is_left_alone(self):
+        """Deliberate. Containment cannot separate a fuller quote of one claim
+        from a different claim in the same paragraph, and the caller treats
+        Section 1 as its strongest signal, so only near-identical quotations
+        merge. Merging these two cost a fabricated 27-flag consensus group on
+        the real 2026-09-03 draft."""
+        sentence = "Citations get checked against primary sources every time."
+        paragraph = (
+            sentence + " Arguments get stress-tested by a process built to find "
+            "the weak points I did not catch while writing, and drafts get "
+            "flagged wherever I overstated the evidence."
+        )
+        results = {
+            ("claude", "voice_style"): _ok({"flags": [_flag(sentence)]}),
+            ("openai", "voice_style"): _ok({"flags": [_flag(paragraph)]}),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert consensus == []
+
+    def test_different_sentences_of_one_paragraph_stay_separate(self):
+        """The guard against the opposite error: two models flagging different
+        sentences are not agreeing with each other."""
+        results = {
+            ("claude", "voice_style"): _ok(
+                {"flags": [_flag("The transmission queue is twelve years long.")]}
+            ),
+            ("openai", "voice_style"): _ok(
+                {"flags": [_flag("Local officials were never consulted at all.")]}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert consensus == []
+
+
+class TestEmptyResultsAreRecorded:
+    """A well-formed empty response is a third outcome, not a success."""
+
+    def test_an_empty_payload_is_flagged(self):
+        results = {
+            ("gemini", "voice_style"): _ok(
+                {"flags": [], "low_confidence": [], "additional_observations": []}
+            ),
+            ("openai", "voice_style"): _ok({"flags": [_flag("The grid is complex.")]}),
+        }
+        report = build_report(
+            "T", "pub", 1, "draft text", None, results, {}, [], primary_claim=""
+        )
+        assert report["empty_results"] == ["gemini:voice_style"]
+        assert report["model_failures"] == []
+        detail = report["empty_result_details"][0]
+        assert detail["section"] == "SECTION 3: Voice and AI-Speak"
+
+    def test_a_populated_pass_is_not_flagged(self):
+        results = {
+            ("openai", "voice_style"): _ok({"flags": [_flag("The grid is complex.")]}),
+        }
+        report = build_report(
+            "T", "pub", 1, "draft text", None, results, {}, [], primary_claim=""
+        )
+        assert report["empty_results"] == []

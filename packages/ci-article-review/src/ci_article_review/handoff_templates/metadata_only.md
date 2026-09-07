@@ -3,6 +3,9 @@ Generated: YYYY-MM-DD
 Pipeline run: [increment by 1 each time you re-run this article]
 Article: [Your article title — this is the history key, so keep it identical across re-runs of the same piece]
 Publication: [your publication config name, i.e. the NAME in configs/NAME.yaml]
+Author: [optional — who "I" refers to in the draft. Only needed when it is not
+         the publication's usual byline; citation verification uses it to check
+         first-person claims against a source page.]
 
 PRIMARY CLAIM
 [One or two sentences: the single thing this article argues. Not the topic —

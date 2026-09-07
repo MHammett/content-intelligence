@@ -1,6 +1,8 @@
 """US Census Bureau data resolver."""
 
 import requests
+
+from ci_core.http import DEFAULT_HEADERS
 import logging
 import os
 
@@ -20,7 +22,7 @@ def resolve(claim, api_key=None):
 
     try:
         url = f"{CENSUS_BASE}/{dataset['year']}/{dataset['name']}?get={dataset['variable']}&for=us:1&key={api_key}"
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, timeout=15, headers=DEFAULT_HEADERS)
         if resp.status_code == 200:
             data = resp.json()
             return {

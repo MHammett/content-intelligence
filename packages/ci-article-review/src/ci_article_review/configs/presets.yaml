@@ -23,12 +23,28 @@
 #   "low" and "medium" return 400. Standard models do not support reasoning_effort at all.
 # Grok note: grok-4.6 (released 2026-08-12, replacing 4.20-reasoning below) is the
 #   first Grok model with a real reasoning_effort parameter (low/medium/high/xhigh,
-#   default high) instead of reasoning being model-selection only. NOT turned on here
-#   yet — client.py already forwards reasoning_effort for grok generically, but
-#   whether litellm's xAI allowlist accepts it unverified is unconfirmed (mistral
-#   needed an explicit allowed_openai_params escape hatch for the same parameter; grok
-#   may need the same). Verify with a cheap ci-check run (a client-side reject fails in
-#   ~0.05s, same as the mistral case) before setting it in any tier below.
+#   default high) instead of reasoning being model-selection only.
+#
+#   VERIFIED 2026-09-05, which this note previously asked for. litellm passes
+#   reasoning_effort straight through to xAI: no client-side reject, no
+#   UnsupportedParamsError, and none of the allowed_openai_params escape hatch
+#   mistral needs. grok honours it, measured on one prompt, two samples each:
+#
+#       effort     completion tokens    latency
+#       (unset)      1100, 1180          ~20s
+#       low           345,  415           ~7s
+#       high         1025, 1101          ~18s
+#
+#   The reason this now appears in every tier below rather than nowhere: unset
+#   is NOT off. It resolves to the provider default, which for grok-4.6 is
+#   high — so leaving it blank was buying the most expensive setting by
+#   accident, and `balanced`, whose whole description is "light reasoning on
+#   key models", was running grok at high while carefully setting openai to low
+#   and claude to medium. Every tier now states what it wants.
+#
+#   grok-4.3 at `wide` is left unset deliberately: it predates the parameter,
+#   where reasoning was model-selection only, and sending one risks a 400 for
+#   no gain.
 #
 # 2026-08-18 model refresh: OpenAI's gpt-5.6 family (Sol/Terra/Luna, launched
 # 2026-07-09) replaces 5.5/5.4/5.4-mini at matching price tiers; Anthropic's
@@ -99,21 +115,31 @@ economy:
     claude:
       enabled: false
 
-standard:
-  thoroughness: standard
+# CANDIDATE B, under evaluation 2026-09-05. Same cheap models as `draft` plus
+# the two `draft` leaves off. Distinct model count, not per-domain width, is what
+# lets a passage reach three voters -- consensus counts models across domains --
+# so a four-model ensemble can corroborate at two and almost never at three.
+wide:
+  thoroughness: thorough
   models:
     openai:
-      model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
+      model: gpt-5.6-luna
     gemini:
       model: gemini-2.5-flash
     mistral:
-      model: mistral-large-latest
+      model: mistral-small-latest
     perplexity:
-      model: sonar-pro
+      model: sonar
     grok:
       model: grok-4.3
     claude:
       model: claude-haiku-4-5-20251001
+
+# `standard` was retired 2026-09-05. `wide` above dominated it on every axis
+# measured -- more corroborated consensus, more claims, more findings that
+# survive a rerun, at 55% of the cost -- and a tier that costs more for less is
+# not a rung on a cost/benefit ladder. An existing `cost_preset: standard` still
+# runs (as `wide`) and warns; see _RETIRED_PRESETS in config_loader.py.
 
 balanced:
   thoroughness: thorough
@@ -130,6 +156,9 @@ balanced:
       model: sonar-reasoning-pro
     grok:
       model: grok-4.6   # was grok-4.20-0309-reasoning; see the Grok note above
+      reasoning_effort: low   # this tier's stated intent. Unset meant the
+                              # provider default, which is high — the one
+                              # setting `balanced` is explicitly not asking for.
     claude:
       model: claude-sonnet-5   # was claude-sonnet-4-6; 2026-08-18 refresh
       effort: medium
@@ -168,6 +197,9 @@ thorough:
                                   # (stream_gap_timeout stays at the 60s default).
     grok:
       model: grok-4.6   # was grok-4.20-0309-reasoning; see the Grok note above
+      reasoning_effort: high   # what unset already resolved to; stated so the
+                               # tier says what it does. xhigh exists and is
+                               # unmeasured, so it is not reached for here.
     claude:
       model: claude-opus-5   # was claude-opus-4-8; 2026-08-18 refresh, same price
       effort: high
@@ -205,6 +237,9 @@ maximum:
       stream_read_timeout: 500   # see the thorough tier's note above
     grok:
       model: grok-4.6   # was grok-4.20-0309-reasoning; see the Grok note above
+      reasoning_effort: high   # what unset already resolved to; stated so the
+                               # tier says what it does. xhigh exists and is
+                               # unmeasured, so it is not reached for here.
       # xAI Live Search is real and works — asked for the newest litellm release
       # on PyPI, grok said "I do not know" without it and answered with a cited
       # version with it. NOT enabled here because litellm cannot currently send

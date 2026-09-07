@@ -36,6 +36,7 @@ from ci_core import redact
 from ci_core import llm
 
 from . import seo as seo_analysis
+from ci_core.llm import cost
 
 log = logging.getLogger(__name__)
 
@@ -337,14 +338,7 @@ def generate(text, handoff=None, pub_config=None, api_keys=None, seo_result=None
         log.warning("SEO suggestion call raised: %s", e)
         return {"status": "failed", "reason": f"suggestion call raised: {e}"}, None
 
-    call_log_entry = {
-        "pass": CALL_LOG_PASS,
-        "model": result.get("model", _SUGGESTION_MODEL),
-        "failed": bool(result.get("failed")),
-        "tokens": result.get("tokens", {}),
-        "elapsed_seconds": result.get("elapsed_seconds"),
-        "error": result.get("error") if result.get("failed") else None,
-    }
+    call_log_entry = cost.call_log_entry(CALL_LOG_PASS, result, _SUGGESTION_MODEL)
 
     if result.get("failed"):
         return _failed(
