@@ -243,7 +243,7 @@ uv run ci-markers revised_draft.md --fix              # remove the invisible res
 uv run ci-markers revised_draft.md --fix --aggressive # also flatten typography to ASCII
 ```
 
-**What this is not.** There is no recoverable watermark in the text this pipeline handles, and this tool does not remove one. The review models never write the article, the revise step rewrites whatever the draft model produced, and a scan of the whole corpus found no zero-width character anywhere. Stripping typography is cosmetic. It also will not fool a classifier, which keys on sentence rhythm and word choice far more than on punctuation — prose style is `banned_phrases` territory in the publication config, not a character-level problem.
+**What this is not.** There is no recoverable watermark in the text this pipeline handles, and this tool does not remove one. The review models never write the article, the revise step rewrites whatever the draft model produced, and a scan of the whole corpus found no zero-width character anywhere. Stripping typography is cosmetic. It also will not fool a classifier, which keys on sentence rhythm and word choice far more than on punctuation — prose style is `banned_phrases` territory in the publication config, not a character-level problem. Whether to run a commercial classifier *at all* was evaluated and declined; see [docs/AI-DETECTORS.md](docs/AI-DETECTORS.md) for the evidence and for what separates a heuristic classifier from the keyed watermark detection described under [Authorship provenance](#authorship-provenance) below.
 
 **Two tiers, because they are different decisions.** The default `--fix` changes no glyph: it removes characters that render as nothing and normalises the spaces that only pretend to be one. `--aggressive` also flattens em dashes, curly quotes and known lookalike letters, which visibly changes the prose — an author who uses em dashes is entitled to keep using them, so that stays opt-in.
 
@@ -726,5 +726,7 @@ content-intelligence/
 - **[docs/CITATIONS.md](docs/CITATIONS.md)** — How Section 9 resolves claims to primary sources: the three confidence tiers (verified / pointer-only / unresolved), what each one does and doesn't prove, and the Wayback Machine archiving behavior.
 
 - **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — Error messages and fixes for every service, plus pipeline behavior edge cases.
+
+- **[docs/AI-DETECTORS.md](docs/AI-DETECTORS.md)** — Why this pipeline does not call a commercial AI-text detector (GPTZero, Originality.ai, Pangram, Turnitin). Evidence on detector accuracy for LLM-assisted-then-edited prose, false positives on technical writing, API cost against this repo's own per-run numbers, and the specific findings that would reverse the decision.
 
 - **[docs/NAMING.md](docs/NAMING.md)** / **[docs/TERMINOLOGY.md](docs/TERMINOLOGY.md)** — Package naming convention, and the deliberate "voice" vs. "style" distinction.
