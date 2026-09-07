@@ -424,6 +424,22 @@ _FACT_CHECK_ITEM_KEYS = (
 )
 
 
+#: Every list in a fact_check payload, and the field that carries the item's
+#: text. Used by :func:`_coerce_fact_check_buckets` to know what a bare string
+#: found where an object belongs should be read *as*.
+#:
+#: `additional_observations` is here although it is absent from
+#: `_FACT_CHECK_ITEM_KEYS` above: it is tagged differently, but
+#: `_build_fact_check` spreads it with `{**obs}` in the same loop and dies on a
+#: malformed one exactly as the verdict buckets do. Its text field is
+#: `observation`, which is what `_collect_additional_observations` has always
+#: coerced a bare string into.
+_FACT_CHECK_BUCKET_FIELDS = {
+    **{key: "claim" for key in _FACT_CHECK_ITEM_KEYS},
+    "additional_observations": "observation",
+}
+
+
 #: Source strings that name no document — the draft itself, or the model's own
 #: reasoning. Compared against the whole source (normalised), not searched
 #: within it, so "Manual Calculation" fails and "Furuno GT-8031 calculation
@@ -542,6 +558,229 @@ def _demote_unsourced_confirmations(data):
         "confirmed": kept,
         "unverifiable": list(data.get("unverifiable") or []) + demoted,
     }
+
+
+# ---------------------------------------------------------------------------
+# Malformed fact-check buckets
+# ---------------------------------------------------------------------------
+
+
+def _coerce_fact_check_buckets(data, model_name):
+    """Force every fact-check bucket in ``data`` to a list of dicts.
+
+    Returns ``(data, notes)``. ``data`` is the same object, not a copy, when
+    nothing needed coercing — the overwhelming case. ``notes`` describes what
+    could not be read, one entry per bucket touched.
+
+    Why this exists
+    ---------------
+    Consolidation reads these buckets five times over — :func:`_extract_passages`
+    for Section 1, :func:`_build_fact_check` for Section 2, then
+    :func:`find_contradictions`, :meth:`ScopeRules.apply
+    <ci_article_review.fact_check_scope.ScopeRules.apply>` and the citation
+    collector downstream of it — and every one of them assumes a list of dicts
+    and calls ``item.get(...)`` or ``{**item}`` without checking. A bucket that
+    arrives as a dict iterates to its *keys*; one that arrives as a string
+    iterates to its *characters*. Either way the first reader raises
+    ``AttributeError``/``TypeError`` and report building dies with the whole
+    ensemble already paid for.
+
+    :data:`ci_article_review.schemas.FACT_CHECK` makes that unreachable for
+    every provider that enforces a schema. Gemini while grounded is the
+    exception — it 400s on schema-plus-search and so runs prompt-only on
+    ``fact_check`` (see the ``schemas`` module docstring) — which leaves one
+    live pass per run asking a model nicely for a shape and hoping.
+
+    What is kept, and what is not
+    -----------------------------
+    Dropping a malformed bucket silently would lose findings the run paid for;
+    raising would lose the whole report. So: keep every item that *is* readable,
+    and hand the caller a note, so the report can say which section is short and
+    why rather than the count simply being lower.
+
+    A bare string **inside a list** becomes ``{"claim": ...}``. The model put N
+    elements in an array, so element k is one finding, and this is the same
+    coercion :func:`_collect_low_confidence` and
+    :func:`_collect_additional_observations` have always applied to their own
+    buckets.
+
+    A bare string **as the bucket** is dropped, not wrapped. Nothing asserts
+    that ``"unverifiable": "none"`` is a finding, and inventing a claim out of
+    it would put a fabricated row in the section whose whole job is accuracy.
+    Losing a real finding is bad; printing one nobody made is worse.
+
+    A dict **as the bucket** is one finding returned unwrapped — a common enough
+    slip where nothing enforces the array — but only when it carries a
+    ``claim``. Every bucket in :data:`ci_article_review.schemas.FACT_CHECK`
+    requires that field and every reader keys on it, so a dict without one is
+    not a finding in any useful sense and is dropped with the rest.
+    """
+    if not isinstance(data, dict):
+        # Not a bucket problem, but the same cause and the same crash: the
+        # payload has to be a mapping before any bucket can be looked up at all.
+        return {}, [
+            {
+                "model": model_name,
+                "bucket": None,
+                "field": "claim",
+                "found": type(data).__name__,
+                "dropped": 0,
+                "repaired": 0,
+            }
+        ]
+
+    notes, replacements = [], {}
+    for bucket, text_field in _FACT_CHECK_BUCKET_FIELDS.items():
+        if bucket not in data:
+            continue  # Absent: every reader defaults it to [].
+        value = data[bucket]
+        if isinstance(value, list) and all(isinstance(i, dict) for i in value):
+            continue  # The shape the schema promises.
+        if value is None:
+            # A present-but-null bucket still has to be rewritten, even though
+            # nothing was lost and so nothing is recorded below. Half the
+            # readers spell this ``data.get(bucket) or []`` and half spell it
+            # ``data.get(bucket, [])``, and the second kind never reaches its
+            # default for a key that is present: ``find_contradictions`` and
+            # ``_extract_passages`` both raise on ``"confirmed": null``.
+            replacements[bucket] = []
+            continue
+
+        dropped = repaired = 0
+        if isinstance(value, list):
+            items = []
+            for item in value:
+                if isinstance(item, dict):
+                    items.append(item)
+                elif isinstance(item, str) and item.strip():
+                    items.append({text_field: item.strip()})
+                    repaired += 1
+                else:
+                    dropped += 1
+        elif isinstance(value, dict) and str(value.get(text_field, "") or "").strip():
+            items, repaired = [value], 1
+        else:
+            items, dropped = [], 1
+
+        replacements[bucket] = items
+        notes.append(
+            {
+                "model": model_name,
+                "bucket": bucket,
+                "field": text_field,
+                "found": type(value).__name__,
+                "dropped": dropped,
+                "repaired": repaired,
+            }
+        )
+
+    if not replacements:
+        return data, notes
+    return {**data, **replacements}, notes
+
+
+def _describe_malformed_bucket(note):
+    """One reader-facing phrase for a single :func:`_coerce_fact_check_buckets` note.
+
+    Names the provider and the bucket in every case: "the fact-check section is
+    short" is not actionable, and "gemini.unverifiable was a str rather than a
+    list" says which pass to re-run and which bucket to distrust.
+    """
+    if note["bucket"] is None:
+        return f"{note['model']} returned a {note['found']}, not an object"
+
+    where = f"{note['model']}.{note['bucket']}"
+    if note["found"] != "list":
+        kept = f", {note['repaired']} finding recovered" if note["repaired"] else ""
+        return f"{where} was a {note['found']} rather than a list{kept}"
+
+    parts = []
+    if note["dropped"]:
+        parts.append(f"{note['dropped']} unreadable item(s) dropped")
+    if note["repaired"]:
+        parts.append(f"{note['repaired']} bare string(s) read as {note['field']}s")
+    return f"{where}: {', '.join(parts)}"
+
+
+def _normalise_fact_check_results(results):
+    """Make every fact-check payload safe to consolidate, before anything reads it.
+
+    Returns ``(results, degradations)``. ``results`` is the same object when
+    nothing needed coercing; otherwise a shallow copy with only the offending
+    entries replaced, so the caller's dict — and the captured ensemble a
+    ``--replay`` reads off disk — are left alone.
+
+    Called once at the top of :func:`build_report` rather than inside each
+    reader, because there are five of them and the first to run is
+    :func:`_extract_passages`: fixing only :func:`_build_fact_check` would move
+    the crash into Section 1 rather than remove it.
+    """
+    notes, cleaned = [], {}
+    for key, result in results.items():
+        model_name, domain = key
+        if domain != "fact_check" or result.get("failed") or not result.get("data"):
+            continue
+        data, result_notes = _coerce_fact_check_buckets(result["data"], model_name)
+        notes.extend(result_notes)
+        # Identity, not ``result_notes``: a present-but-null bucket is rewritten
+        # and deliberately not reported, and gating the replacement on the notes
+        # would drop exactly that repair on the floor.
+        if data is not result["data"]:
+            cleaned[key] = {**result, "data": data}
+
+    if not cleaned:
+        return results, []
+    results = {**results, **cleaned}
+    if not notes:
+        return results, []  # Nulls rewritten; nothing lost, so nothing said.
+
+    detail = (
+        f"{_affected_sections(notes)} short findings this run paid for: "
+        f"{len(notes)} fact-check bucket(s) came back in a shape consolidation "
+        f"cannot read ({'; '.join(_describe_malformed_bucket(n) for n in notes)}"
+        f"). Whatever was readable was kept; the rest is missing from the "
+        f"report entirely and never reached citation resolution. Only a pass "
+        f"running without schema enforcement can return this, so a re-run may "
+        f"well come back clean — treat the counts below as a floor."
+    )
+    log.warning("Fact check: %s", detail)
+    return results, [
+        {
+            "section": ", ".join(_affected_section_titles(notes)),
+            "caused_by": sorted({f"{n['model']}:fact_check" for n in notes}),
+            "detail": detail,
+        }
+    ]
+
+
+#: Where a dropped item would have shown up, by the bucket it was dropped from.
+#: The verdict buckets feed Section 2 and, through it, citation resolution; four
+#: of the five also vote in Section 1. ``additional_observations`` feeds neither
+#: and has a section of its own.
+_BUCKET_SECTIONS = {
+    "additional_observations": ("SECTION 8: Additional Observations",),
+    None: (
+        "SECTION 1: Consensus",
+        "SECTION 2: Factual Verification",
+        "SECTION 9: Citations",
+    ),
+}
+
+
+def _affected_section_titles(notes):
+    """The report sections these notes cost something, in section order."""
+    titles = set()
+    for note in notes:
+        titles.update(_BUCKET_SECTIONS.get(note["bucket"], _BUCKET_SECTIONS[None]))
+    return sorted(titles)
+
+
+def _affected_sections(notes):
+    """ "Sections 1, 2 and 9 are" / "Section 8 is" — the sentence opener."""
+    numbers = [t.split(":")[0].split()[1] for t in _affected_section_titles(notes)]
+    if len(numbers) == 1:
+        return f"Section {numbers[0]} is"
+    return f"Sections {', '.join(numbers[:-1])} and {numbers[-1]} are"
 
 
 def _build_fact_check(results, ensemble_cfg, scope=None):
@@ -1082,6 +1321,12 @@ def build_report(
     """
     now = datetime.now(timezone.utc).isoformat()
 
+    # Before anything reads a fact-check bucket. Five readers below assume a
+    # list of dicts and none of them checks; one prompt-only pass returning a
+    # dict or a string where a list belongs used to kill report building here,
+    # after the ensemble had been paid for in full.
+    results, fact_check_degradations = _normalise_fact_check_results(results)
+
     # LanguageTool flagged passages used for consensus boosting
     lt_flagged_passages = []
     if lt_result and not lt_result.get("failed"):
@@ -1206,7 +1451,7 @@ def build_report(
     # Ensemble metadata for the report header
     assignments = sorted(f"{m}:{d}" for (m, d) in results)
 
-    return {
+    report = {
         "generated": now,
         "run_number": run_number,
         "article_title": article_title,
@@ -1257,6 +1502,13 @@ def build_report(
             ),
         },
     }
+    # Only when there is something to say. The key is absent on a clean run —
+    # ``_record_fact_check_degradation`` and ``_record_impersonation_degradation``
+    # both ``setdefault`` onto it later, and both the console summary and
+    # ``_render_degradations`` treat an empty list and a missing key alike.
+    if fact_check_degradations:
+        report["degradations"] = fact_check_degradations
+    return report
 
 
 # ---------------------------------------------------------------------------
