@@ -134,11 +134,19 @@ def _kv_lines(d, exclude=()):
 def _dicts(entries):
     """The dict entries of ``entries``, and how many were dropped.
 
-    A findings list is meant to hold records, but a salvaged model response can
-    leave a bare string among them — a response truncated mid-object and
-    recovered as text. Rendering used to raise ``AttributeError`` on the first
-    one. Skipping is the smaller loss, so the count comes back alongside the
-    survivors instead of being swallowed — see ``_skipped_note``.
+    A findings list is meant to hold records, but a model can return text where
+    a record was expected. Rendering used to raise ``AttributeError`` on the
+    first one. Skipping is the smaller loss, so the count comes back alongside
+    the survivors instead of being swallowed — see ``_skipped_note``.
+
+    Not a truncation artifact, though this said so until measured.
+    ``extract_json_with_salvage`` cuts only at complete-element boundaries and
+    deliberately refuses to cut inside an object, so a truncated response drops
+    whole entries rather than leaving partial ones — checked against five
+    truncation shapes, none of which produced a non-dict element. What reaches
+    here is a well-formed response whose elements are the wrong type, which a
+    response schema would normally prevent. Every provider here enforces one
+    except grounded gemini, which cannot; see ``ci_core.llm.schema``.
     """
     entries = entries or []
     kept = [e for e in entries if isinstance(e, dict)]
@@ -176,8 +184,8 @@ def _skipped_note(dropped_by_field):
     return [
         f"> **{total} malformed {'entry' if one else 'entries'} skipped** — "
         f"{where}. {'That finding' if one else 'Those findings'} arrived as "
-        f"something other than a record, which usually means a model response "
-        f"was truncated and salvaged as text. This section is short by "
+        f"something other than a record — a model returned text where a "
+        f"finding was expected. This section is short by "
         f"{total}; the raw {'entry is' if one else 'entries are'} in this run's "
         f"`_report.json` under {field_ref}.",
         "",
