@@ -368,6 +368,95 @@ should be fixed, not marked.
 
 ---
 
+## Marking claims out of scope for fact-checking
+
+Some claims have no external source and never will. Sending them to the fact-check
+pass and to citation resolution cannot produce a finding — only one of two wrong
+answers.
+
+Both were measured on real runs, 2026-09-05. `"I have a side job."` was resolved
+against a company team page, came back `not_addressed`, and every provider then
+advised **withdrawing a true first-person statement**. In the other direction,
+`"Divide by seven and you get 1,024. Exactly."` came back `confirmed` with the
+source `"Manual Calculation"` — the model did the arithmetic and reported the
+result as an established fact.
+
+### How to mark a passage
+
+**In the draft**, wrap it in HTML comments. This is the only method that works with
+`--raw-draft`, which carries no metadata at all, and the markers are invisible to a
+reader once published:
+
+```
+<!-- ci:no-verify: only I can confirm this -->
+I have a day job running network infrastructure. I have a side job. I have a family.
+<!-- /ci:no-verify -->
+```
+
+The reason after the colon is optional. A marker that is never closed is warned about
+and **ignored** — excluding more than you meant is invisible in the report, while
+excluding nothing is obvious the moment the claim turns up fact-checked, so an
+ambiguous marker fails toward checking.
+
+**In the handoff**, list them under `OUT OF SCOPE FOR FACT-CHECK`, one per line:
+
+```
+OUT OF SCOPE FOR FACT-CHECK
+- I have a side job — only I can confirm this
+- The 7,168-day figure is arithmetic from two dates already in the piece
+```
+
+**In the publication config**, for passages that recur across every article:
+
+```yaml
+fact_check_scope:
+  exclude_passages:
+    - passage: "This site is a real expense, and there's no way to recoup it"
+      reason: "standing statement about the author's own finances"
+```
+
+### What the models decide on their own
+
+The fact-check pass classifies claims itself, into one of six categories:
+`first_person`, `author_hypothesis`, `internal_arithmetic`, `subjective_judgment`,
+`future_prediction`, `other`. The models already made this distinction unprompted —
+one described a claim as "an author's hypothesis about the internal logic, not
+[verifiable]" while filing it as a finding anyway — so the output shape now has
+somewhere to put it.
+
+**An author marking outranks a model classification, and the author's categories
+bound what a model may rule out alone.** `exclude_types` is the list this
+publication accepts on a model's say-so; it defaults to the five specific
+categories and **not** `other`, so a model reaching for the catch-all is reported
+rather than obeyed. Turn model classification off entirely with
+`trust_model_classification: false`:
+
+```yaml
+fact_check_scope:
+  exclude_types: [first_person, internal_arithmetic]
+  trust_model_classification: true
+```
+
+### What exclusion actually does
+
+| Pass | Effect |
+|---|---|
+| `fact_check` verdicts | The claim moves to an `out_of_scope` bucket. It is not in `confirmed`, `unverifiable`, or any other. |
+| Section 9 citation resolution | The claim never enters the list. No source is fetched for it. |
+| `red_team`, `argument_integrity`, `voice_style`, `completeness` | **Unchanged.** Every pass still sees the whole draft. |
+
+That last row is the point. A first-person claim can still be an argumentative
+weakness or a credibility risk, and hiding it from every reviewer to spare it from
+one would cost more findings than it saves.
+
+**Nothing disappears.** Section 2 gets an *Out of scope for verification* block
+listing every excluded claim, who decided it, the category, and the reason. Where an
+exclusion overrode a verdict a model had already reached, that verdict is printed
+too — "the author marked this out of scope, and openai had it as `confirmed` citing
+<url>" — because that disagreement is the author's to judge. Section 9 opens by
+saying how many claims never entered resolution, so its total does not silently
+shrink.
+
 ## Project structure
 
 The repository is a [uv](https://docs.astral.sh/uv/) workspace. Code lives under
@@ -397,6 +486,8 @@ content-intelligence/
 │   │   │   ├── config_loader.py       config parsing and validation
 │   │   │   ├── consolidation.py       weighted ensemble consolidation → one report
 │   │   │   ├── ensemble_capture.py    saves/loads raw ensemble output for --replay
+│   │   │   ├── fact_check_scope.py    claims no source can settle — author markings,
+│   │   │   │                          model classification, and what they exclude
 │   │   │   ├── handoff_parser.py      parses Template A and Template C documents
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)

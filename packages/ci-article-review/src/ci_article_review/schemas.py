@@ -25,7 +25,14 @@ rule the prompt states. The genuinely optional field, ``note``, is nullable so
 the model can decline it without inventing one.
 """
 
+from ci_article_review.fact_check_scope import CLAIM_TYPES
+
 _CONFIDENCE = {"type": "string", "enum": ["high", "medium", "low"]}
+
+#: The categories a claim can be put out of scope under. Imported rather
+#: than restated so the prompt, the schema and the config filter that reads
+#: them cannot drift — the enum is what makes ``exclude_types`` meaningful.
+_CLAIM_TYPE = {"type": "string", "enum": list(CLAIM_TYPES)}
 
 
 def _obj(**properties):
@@ -111,6 +118,10 @@ FACT_CHECK = _obj(
     ),
     unverifiable=_array_of(claim=_STR, checked=_STR, reason=_STR),
     primary_source_needed=_array_of(claim=_STR, best_candidate_source=_STR),
+    # Not a verdict — a statement that no verdict was ever available. See
+    # ``fact_check_scope`` for why that is worth a bucket of its own rather than
+    # a sixth flavour of "unverifiable".
+    out_of_scope=_array_of(claim=_STR, claim_type=_CLAIM_TYPE, reason=_STR),
     additional_observations=_ADDITIONAL_OBSERVATIONS,
 )
 

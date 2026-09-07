@@ -79,6 +79,7 @@ from .analysis import seo_content
 from .analysis import seo_suggest
 from ci_core.llm import cost as cost_analysis
 from .analysis.webpage import build_handoff_from_url
+from . import fact_check_scope
 from .adapters.citation import draft_citations
 from .adapters.citation import wayback
 from . import ensemble_capture
@@ -655,6 +656,11 @@ _CITATION_CLAIM_BUCKETS = {
     "contradicted": "source",
     "unverifiable": None,
     "primary_source_needed": "best_candidate_source",
+    # Present so a claim classified out of scope but *not* excluded — a category
+    # this publication does not honour on a model's say-so — is still resolved,
+    # exactly as ``unverifiable`` is. The entries that ARE excluded are filtered
+    # out before this loop; see ``_collect_citation_claims``.
+    "out_of_scope": None,
 }
 
 
@@ -767,6 +773,13 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
     2026-08-12 run carried 29 near-duplicate pairs among 144 claims, one differing
     from its twin only by a trailing full stop. Each duplicate bought its own
     resolution fetch, its own verification call, and its own line in Section 9.
+
+    **Claims marked out of scope never reach this list.** Resolving a claim no
+    source can settle cannot produce a finding — only a false negative, since
+    the answer is always "the page does not say this". They are seeded into the
+    dedup set first so a *second* model's verdict on the same claim cannot let
+    it back in through another bucket. See
+    :mod:`ci_article_review.fact_check_scope`.
     """
     cited = draft_citations.DraftCitations(draft)
     if cited:
@@ -784,10 +797,28 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
     claims: list[dict] = []
     seen_keys: list[frozenset] = []
     anchored = 0
+
+    excluded = [
+        item
+        for item in fact_check.get("out_of_scope") or []
+        if item.get("excluded") and item.get("claim")
+    ]
+    for item in excluded:
+        seen_keys.append(_claim_key(item["claim"]))
+    if excluded:
+        log.info(
+            "Citations: %d claim(s) held out of resolution as out of scope for "
+            "verification (%s)",
+            len(excluded),
+            ", ".join(sorted({item.get("excluded_by", "?") for item in excluded})),
+        )
+
     for bucket, url_key in _CITATION_CLAIM_BUCKETS.items():
         for item in fact_check.get(bucket, []) or []:
             claim = item.get("claim", "")
             if not claim:
+                continue
+            if bucket == "out_of_scope" and item.get("excluded"):
                 continue
             key = _claim_key(claim)
             if _is_duplicate_claim(key, seen_keys):
@@ -849,6 +880,7 @@ def _run_domain(
     pipeline_cfg: dict,
     model_configs: dict,
     prompt_str: str | None = None,
+    scope=None,
 ) -> dict:
     """Call one model on one domain and return the adapter result dict.
 
@@ -873,6 +905,11 @@ def _run_domain(
         positive_rules="\n".join(f"- {r}" for r in style.get("positive_rules", [])),
         primary_claim=handoff.get("primary_claim", ""),
         pre_draft_analysis=handoff.get("pre_draft_analysis", ""),
+        # Only fact_check's prompt has this placeholder, so every other domain
+        # renders unchanged. Telling the model *and* filtering its output is
+        # deliberate: the instruction saves the search spend, the filter is what
+        # actually holds when a model ignores it.
+        out_of_scope_passages=scope.prompt_block() if scope is not None else "",
     )
     user = _build_user_prompt(draft, handoff)
 
@@ -1627,6 +1664,12 @@ def run_draft_pipeline(
     for skip_line in assignment_skips:
         log.info(f"  Skipped: {skip_line}")
 
+    # What this run will not try to verify. Built from the draft the models are
+    # about to see (markers live in the text, so it must be the corrected one),
+    # the handoff, and the publication config. Used twice: in the fact-check
+    # prompt below, and again on the merged results in `build_report`.
+    scope = fact_check_scope.ScopeRules.from_run(corrected_draft, handoff, pub_config)
+
     # Build runner list — custom domains pass their prompt string directly
     runners = [
         (
@@ -1641,6 +1684,7 @@ def run_draft_pipeline(
                 pipeline_cfg,
                 model_configs,
                 prompt_str=ps,
+                scope=scope,
             ),
         )
         for model_name, domain in all_assignments
@@ -1897,6 +1941,7 @@ def run_draft_pipeline(
         prior_report=prior_report,
         prior_report_path=prior_report_path,
         primary_claim=handoff.get("primary_claim", ""),
+        fact_check_scope=scope,
     )
 
     # Pass 3: Citation resolution — extract factual claims from fact-check results
@@ -2380,6 +2425,19 @@ def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=No
         sum(len(v) for v in fact.values() if isinstance(v, list)) if fact else 0
     )
     print(f"Section 2 — Fact check items: {fact_count}")
+    # Say it here as well as in the report. This count drops when claims are
+    # marked out of scope — several models' verdicts on one claim collapse into
+    # a single entry — and a smaller number with no explanation beside it reads
+    # as findings having gone missing, which is the failure the whole feature
+    # exists to avoid.
+    _out_of_scope = (fact or {}).get("out_of_scope") or []
+    _held = sum(1 for i in _out_of_scope if i.get("excluded"))
+    if _out_of_scope:
+        print(
+            f"  of which {len(_out_of_scope)} out of scope for verification "
+            f"({_held} also held out of Section 9) — see 'Out of scope for "
+            f"verification' in the review"
+        )
     print(f"Section 3 — Voice flags: {len(report['section_3_voice'])}")
     print(f"Section 4 — Argument flags: {len(report['section_4_argument'])}")
     print(f"Section 5 — Completeness flags: {len(report['section_5_completeness'])}")

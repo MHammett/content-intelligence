@@ -202,6 +202,83 @@ def _missing_models_note(report, domain):
     ]
 
 
+#: How an out-of-scope claim's category reads to someone who did not write the
+#: enum. Kept here rather than in ``fact_check_scope`` for the same reason
+#: ``_SEO_FIELD_ORDER`` is duplicated: this module stays a renderer over a plain
+#: dict. A test asserts every category has a phrase.
+_CLAIM_TYPE_PHRASES = {
+    "first_person": "a first-person statement only the author can confirm",
+    "author_hypothesis": "the author's own hypothesis, framed as such in the draft",
+    "internal_arithmetic": "arithmetic derived from figures already in the draft",
+    "subjective_judgment": "an evaluation or editorial stance, with no truth value",
+    "future_prediction": "a claim about the future, which no current source settles",
+    "other": "out of scope for a reason outside the standard categories",
+}
+
+
+def _render_out_of_scope(items):
+    """The claims that were never candidates for external verification.
+
+    Rendered by hand rather than through ``_kv_lines`` because the two fields
+    that matter most here are lists — which models made the call, and what
+    verdict an author marking overrode. ``_kv_lines`` would print those as raw
+    Python reprs, and the withdrawn verdict is the whole reason the entry is
+    worth reading: "the author marked this out of scope, and openai had it as
+    confirmed against <url>" is a disagreement the author should see, not a
+    detail to bury.
+    """
+    if not items:
+        return []
+    excluded = [i for i in items if i.get("excluded")]
+    reported = [i for i in items if not i.get("excluded")]
+
+    lines = [f"### Out of scope for verification ({len(items)})", ""]
+    lines.append(
+        f"_{len(excluded)} claim(s) were held out of the fact-check verdicts and "
+        f"out of Section 9 entirely — no source can settle them, so resolving one "
+        f"could only ever return 'the page does not say this'. Nothing here is a "
+        f"finding against the claim. Nothing here has been checked either._"
+    )
+    if reported:
+        lines.append("")
+        was_were = "was" if len(reported) == 1 else "were"
+        lines.append(
+            f"_{len(reported)} more {was_were} classified out of scope by a model "
+            f"but NOT excluded — this publication does not act on that category "
+            f"unprompted, so the claim stayed in verification. It is listed so "
+            f"you can see the judgment that was made and overruled._"
+        )
+    lines.append("")
+
+    for item in items:
+        lines.append(f'- "{item.get("claim", "")}"')
+        state = "excluded" if item.get("excluded") else "reported only, still checked"
+        lines.append(f"  - Status: {state}")
+        lines.append(f"  - Decided by: {item.get('excluded_by', 'unknown')}")
+        claim_type = item.get("claim_type") or ""
+        if claim_type:
+            phrase = _CLAIM_TYPE_PHRASES.get(claim_type, claim_type)
+            lines.append(f"  - Category: {claim_type} — {phrase}")
+        models = item.get("classified_by") or []
+        if models:
+            lines.append(f"  - Classified out of scope by: {', '.join(models)}")
+        if item.get("reason"):
+            lines.append(f"  - Reason: {item['reason']}")
+        for withdrawn in item.get("withdrawn_verdicts") or []:
+            source = (
+                withdrawn.get("source_url")
+                or withdrawn.get("source")
+                or "no source given"
+            )
+            lines.append(
+                f"  - Overrode a verdict: {withdrawn.get('model') or 'a model'} "
+                f"had this as `{withdrawn.get('bucket')}` citing {source}. "
+                f"The marking wins; the verdict is recorded here rather than used."
+            )
+    lines.append("")
+    return lines
+
+
 def _render_section_2(fact_check, report=None):
     lines = ["## SECTION 2: Factual Verification", ""]
     lines.extend(_missing_models_note(report or {}, "fact_check"))
@@ -229,6 +306,8 @@ def _render_section_2(fact_check, report=None):
             for kv in _kv_lines(item, exclude=("claim",)):
                 lines.append(kv)
         lines.append("")
+
+    lines.extend(_render_out_of_scope(fact_check.get("out_of_scope") or []))
 
     observations = fact_check.get("additional_observations", [])
     if observations:
@@ -481,7 +560,7 @@ def _disposition(citation):
     return "fetch_failed" if citation.get("url") else "no_source"
 
 
-def _render_section_9(citations):
+def _render_section_9(citations, out_of_scope=()):
     # The heading carries the framing deliberately. "Citations" alone reads as a
     # list of sources backing the article, which invites more confidence than
     # the tiers below have earned — in a real run 18 of 144 claims had a document
@@ -490,6 +569,18 @@ def _render_section_9(citations):
     # revision loop in handoff_templates/revise_after_review_prompt.md refers to
     # this section by name.
     lines = ["## SECTION 9: Citations — what was actually checked", ""]
+    held = [i for i in out_of_scope or () if i.get("excluded")]
+    if held:
+        # Before the "N of M were checked" line, not after: M is a smaller
+        # number than the fact-check pass raised, and a reader who works that
+        # out for themselves will read it as claims having gone missing.
+        lines.append(
+            f"**{len(held)} claim(s) never entered resolution** — they were "
+            f"marked out of scope for verification, so no source was fetched for "
+            f"them and they are not counted below. They are listed in Section 2 "
+            f"under *Out of scope for verification*, with the reason for each."
+        )
+        lines.append("")
     if not citations:
         lines.append("_No citation resolution attempted._")
         return lines
@@ -1156,7 +1247,12 @@ def render_report_markdown(report):
     )
     lines.extend(_render_section_7(report.get("section_7_low_confidence", [])))
     lines.extend(_render_section_8(report.get("section_8_additional", [])))
-    lines.extend(_render_section_9(report.get("section_9_citations", [])))
+    lines.extend(
+        _render_section_9(
+            report.get("section_9_citations", []),
+            (report.get("section_2_fact_check") or {}).get("out_of_scope") or [],
+        )
+    )
     lines.extend(_render_seo_suggestions(report.get("pre_analysis", {})))
     lines.extend(_render_seo_content_review(report.get("pre_analysis", {})))
 

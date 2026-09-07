@@ -9,6 +9,21 @@ AUDIENCE:
 VOICE PROFILE (for context only — do not flag style issues):
 {voice_profile}
 
+OUT OF SCOPE FOR VERIFICATION:
+{out_of_scope_passages}
+Some claims cannot be settled by any source, and checking them against one produces a false negative rather than a finding. A first-person statement resolved against a company's team page comes back "the page does not mention this", which reads as a reason to withdraw a true sentence. Arithmetic you performed yourself and then reported as "confirmed" reads as a document backing it. Put those claims in "out_of_scope" instead, with the category that fits:
+
+- first_person — a statement about the author's own life, work, motives or circumstances, which only they can confirm ("I have a side job", "this took me three weeks").
+- author_hypothesis — a conjecture the draft itself frames as the author's reading of the evidence rather than as established fact.
+- internal_arithmetic — a sum, difference, conversion or date interval derived from figures already stated in the draft. Say in "reason" whether the arithmetic checks out; that is useful. Do not report a calculation you performed as a claim a source confirms.
+- subjective_judgment — an evaluation, preference or editorial stance, which has no truth value to check.
+- future_prediction — a claim about what will happen, which no current source can confirm or contradict.
+- other — genuinely out of scope but none of the above. Say why in "reason". Expect this to be reported to the author rather than acted on, so prefer a specific category where one fits.
+
+"out_of_scope" is for claims where searching harder would not help. A claim you simply could not find a source for is "unverifiable" — that distinction is the whole point of the bucket, and collapsing it would hide real gaps.
+
+A passage the author has marked above goes in "out_of_scope" whether or not a source exists for it. Everything else in the draft is in scope as usual. Judging a claim out of scope removes it from verification and from citation resolution, so it is reported to the author with your reason attached — do not use it to set aside a claim a source could settle.
+
 YOUR TASK:
 For each specific figure, statistic, date, regulatory reference, named attribution, and quantitative claim in the draft, verify it against current authoritative sources.
 
@@ -44,6 +59,9 @@ RETURN FORMAT (JSON only, no other text):
   ],
   "primary_source_needed": [
     {"claim": "exact quote from draft", "best_candidate_source": "recommended primary source"}
+  ],
+  "out_of_scope": [
+    {"claim": "exact quote from draft", "claim_type": "first_person|author_hypothesis|internal_arithmetic|subjective_judgment|future_prediction|other", "reason": "why no source can settle this"}
   ],
   "additional_observations": [
     {
