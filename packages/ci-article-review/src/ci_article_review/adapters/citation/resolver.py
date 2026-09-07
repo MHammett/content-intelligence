@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 
 
-from ci_core.concurrency import run_all_with_timeout
+from ci_core.concurrency import run_all_bounded
 from ci_core.http import (
     HOST_NON_PUBLIC,
     HOST_PUBLIC,
@@ -177,20 +177,6 @@ _SUBMIT_TIMEOUT_SECONDS = 45
 #: credentials the unauthenticated path already answers synchronously, off the
 #: redirect, so there is nothing here to wait for either way.
 _CAPTURE_POLL_BUDGET_SECONDS = 45
-
-
-def _batch_ceiling(job_count, max_parallel, per_call_timeout, slack=60):
-    """Wall-clock ceiling for a semaphore-bounded batch of daemon-thread jobs.
-
-    Enough waves at ``max_parallel`` concurrency to clear every job at its own
-    per-call timeout, plus scheduling slack — a safety net for the batch as a
-    whole, on top of each call's own safety net. Not the primary timeout
-    mechanism for either; see the callers for why one is still worth having.
-    """
-    if job_count == 0:
-        return slack
-    waves = -(-job_count // max_parallel)  # ceil division, no math.ceil import
-    return waves * per_call_timeout + slack
 
 
 #: Adapter names already warned about, so a 40-claim run logs each once rather
@@ -1554,33 +1540,24 @@ def _submit_missing_archives(results, archive_org_creds=None, history_root=None)
             sub = {"submitted": False, "error": str(e)}
         _record_submission(entry, sub)
 
-    # Bounded to _MAX_SUBMIT_PARALLEL concurrent requests via the semaphore,
-    # same as the ThreadPoolExecutor form this replaces — a burst of unbounded
-    # submissions risks the IP-block the low bound exists to avoid. Every job
-    # still starts its own daemon thread immediately; most just wait on the
-    # semaphore. Daemon threads, not ThreadPoolExecutor, so a submission that
-    # outlives its own timeout AND the batch ceiling (e.g. a DNS resolution
-    # hanging past what requests' own timeout catches) is abandoned rather
-    # than left holding the run open — a ThreadPoolExecutor's own exit, and
-    # the atexit hook it registers regardless of how it's shut down, joins
-    # every worker with a bare, untimed t.join(), which is how finished
+    # Bounded to submit_parallel concurrent requests — a burst of unbounded
+    # submissions risks the IP-block the low bound exists to avoid.
+    # run_all_bounded starts a daemon thread per job immediately and holds most
+    # of them on a semaphore, charging each job's own budget only from the
+    # moment it acquires that semaphore. Never a ThreadPoolExecutor: its own
+    # exit, and the atexit hook it registers regardless of how it's shut down,
+    # join every worker with a bare, untimed t.join(), which is how finished
     # ci-review processes were previously found still alive two days later.
-    submit_semaphore = threading.Semaphore(min(len(targets), submit_parallel))
-
-    def _bounded_submit(entry):
-        with submit_semaphore:
-            _submit_one(entry)
-
+    # See :mod:`ci_core.concurrency`.
     jobs = [
         (
             entry["url"],
-            lambda entry=entry: _bounded_submit(entry),
+            lambda entry=entry: _submit_one(entry),
             _SUBMIT_TIMEOUT_SECONDS,
         )
         for entry in targets
     ]
-    ceiling = _batch_ceiling(len(targets), submit_parallel, _SUBMIT_TIMEOUT_SECONDS)
-    outcomes = run_all_with_timeout(jobs, global_timeout=ceiling)
+    outcomes = run_all_bounded(jobs, max_parallel=submit_parallel)
     for url, (_, error) in outcomes.items():
         if error is not None:
             log.warning(f"Wayback submission abandoned for {url}: {error}")
@@ -1670,8 +1647,6 @@ def _verify_archive_matches(results):
     if not targets:
         return
 
-    match_semaphore = threading.Semaphore(min(len(targets), _MAX_MATCH_PARALLEL))
-
     def _verify_one(entry):
         wb = entry["wayback"]
         snapshot_url = wb.get("snapshot_url")
@@ -1722,20 +1697,20 @@ def _verify_archive_matches(results):
                 f"citing the archive."
             )
 
-    def _bounded(entry):
-        with match_semaphore:
-            _verify_one(entry)
-
+    # Bounded to _MAX_MATCH_PARALLEL, on daemon threads, with each entry's
+    # budget charged only from when it acquires the semaphore. This batch is the
+    # one most exposed to getting that wrong: 4 wide on a 30s budget is ten
+    # waves for forty targets, so a deadline stamped at thread creation would
+    # have expired for most of them before they fetched anything.
     jobs = [
         (
             entry["wayback"]["snapshot_url"],
-            lambda e=entry: _bounded(e),
+            lambda e=entry: _verify_one(e),
             _MATCH_TIMEOUT_SECONDS,
         )
         for entry in targets
     ]
-    ceiling = _batch_ceiling(len(targets), _MAX_MATCH_PARALLEL, _MATCH_TIMEOUT_SECONDS)
-    outcomes = run_all_with_timeout(jobs, global_timeout=ceiling)
+    outcomes = run_all_bounded(jobs, max_parallel=_MAX_MATCH_PARALLEL)
     for url, (_, error) in outcomes.items():
         if error is not None:
             log.warning(f"Archive match verification abandoned for {url}: {error}")
@@ -1825,18 +1800,15 @@ def resolve_citations(
     call_log = verification_call_log if verification_call_log is not None else []
     checksum_index = build_checksum_index(history_root) if history_root else {}
 
-    # Bounded to _MAX_PARALLEL concurrent resolutions via the semaphore, same
-    # as the ThreadPoolExecutor form this replaces (each one opens a socket,
-    # per _MAX_PARALLEL's own docstring). Daemon threads, not
-    # ThreadPoolExecutor — see _submit_missing_archives just above for why
-    # that distinction is the whole point: an abandoned call here must not be
-    # able to hold the run open the way a ThreadPoolExecutor's atexit join
-    # would.
-    resolve_semaphore = threading.Semaphore(min(len(normalized), _MAX_PARALLEL))
-
-    def _bounded_resolve(claim, known_urls):
-        with resolve_semaphore:
-            return _resolve_one(
+    # Bounded to _MAX_PARALLEL concurrent resolutions (each one opens a socket,
+    # per _MAX_PARALLEL's own docstring). Daemon threads via run_all_bounded,
+    # never a ThreadPoolExecutor — see _submit_missing_archives just above for
+    # why that distinction is the whole point: an abandoned call here must not
+    # be able to hold the run open the way a pool's atexit join would.
+    jobs = [
+        (
+            str(idx),
+            lambda claim=claim, known_urls=known_urls: _resolve_one(
                 claim,
                 citation_sources,
                 known_urls,
@@ -1844,20 +1816,12 @@ def resolve_citations(
                 call_log,
                 checksum_index,
                 author,
-            )
-
-    jobs = [
-        (
-            str(idx),
-            lambda claim=claim, known_urls=known_urls: _bounded_resolve(
-                claim, known_urls
             ),
             _RESOLVE_TIMEOUT_SECONDS,
         )
         for idx, (claim, known_urls, _bucket) in enumerate(normalized)
     ]
-    ceiling = _batch_ceiling(len(normalized), _MAX_PARALLEL, _RESOLVE_TIMEOUT_SECONDS)
-    outcomes = run_all_with_timeout(jobs, global_timeout=ceiling)
+    outcomes = run_all_bounded(jobs, max_parallel=_MAX_PARALLEL)
 
     ordered: dict[int, dict] = {}
     for idx_str, (value, error) in outcomes.items():

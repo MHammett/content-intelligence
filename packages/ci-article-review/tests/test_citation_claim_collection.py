@@ -528,3 +528,67 @@ class TestClaimLevelUrlsFromTheNoVerdictBuckets:
         assert "sources_checked" in text
         assert "best_candidate_url" in text
         assert "Do not invent a URL" in text
+
+
+class TestImpersonationDegradation:
+    """A blocked link that was never escalated is not the same as one that was.
+
+    ``impersonating_get`` reports both as ``None`` on purpose, so the report is
+    the only place the difference can be stated. It went unstated for a month,
+    during which every affected citation read as "the source refuses browsers"
+    when the truth was "we never asked".
+    """
+
+    def _links(self, *statuses, unavailable=False):
+        out = []
+        for code in statuses:
+            r = {"url": f"https://x.test/{code}", "status_code": code, "ok": code < 400}
+            if unavailable and code == 403:
+                r["escalation_unavailable"] = True
+            out.append(r)
+        return out
+
+    def test_nothing_recorded_when_the_extra_is_installed(self):
+        report = {}
+        with patch.object(pipeline, "impersonation_available", return_value=True):
+            pipeline._record_impersonation_degradation(
+                report, {"links": self._links(403, 200)}
+            )
+        assert "degradations" not in report
+
+    def test_nothing_recorded_when_no_link_was_blocked(self):
+        """Nothing to escalate means nothing was lost by not escalating."""
+        report = {}
+        with patch.object(pipeline, "impersonation_available", return_value=False):
+            pipeline._record_impersonation_degradation(
+                report, {"links": self._links(200, 404)}
+            )
+        assert "degradations" not in report
+
+    def test_a_blocked_link_with_no_extra_is_recorded(self):
+        report = {}
+        with patch.object(pipeline, "impersonation_available", return_value=False):
+            pipeline._record_impersonation_degradation(
+                report, {"links": self._links(403, 403, 200, unavailable=True)}
+            )
+        (entry,) = report["degradations"]
+        assert "2 cited link(s)" in entry["detail"]
+        assert "curl_cffi" in entry["caused_by"][0]
+        assert "SECTION 9" in entry["section"]
+
+    def test_the_detail_says_blocked_means_unknown(self):
+        """The actionable part: do not conclude the source is unreachable."""
+        report = {}
+        with patch.object(pipeline, "impersonation_available", return_value=False):
+            pipeline._record_impersonation_degradation(
+                report, {"links": self._links(403)}
+            )
+        (entry,) = report["degradations"]
+        assert "unknown" in entry["detail"]
+        assert "uv sync --extra unblock" in entry["detail"]
+
+    def test_no_links_key_is_not_an_error(self):
+        report = {}
+        with patch.object(pipeline, "impersonation_available", return_value=False):
+            pipeline._record_impersonation_degradation(report, {})
+        assert "degradations" not in report

@@ -72,12 +72,17 @@ METADATA_HEADERS = [
 ]
 
 
-_OPTIONAL_FIELD_IMPACT = {
-    "sources_cited": "fact_check and red_team",
-    "uncertain_sections": "fact_check and red_team",
-    "known_gaps": "completeness",
-    "target_audience": "voice_style and completeness",
-}
+#: Which domains each optional field reaches. Read from ``handoff_gaps`` rather
+#: than restated here: the report's gap section and this debug line answer the
+#: same question, and when they were two hand-maintained lists they disagreed —
+#: this one said ``target_audience`` reached "voice_style and completeness",
+#: while the prompt templates show four domains reasoning about audience.
+_OPTIONAL_FIELD_IMPACT = (
+    "sources_cited",
+    "uncertain_sections",
+    "known_gaps",
+    "target_audience",
+)
 
 
 def _note_empty_optional_fields(results):
@@ -87,9 +92,16 @@ def _note_empty_optional_fields(results):
     but a rename or malformed header from a chat model produces the exact
     same empty string as a deliberate omission — so at least leave a debug
     trail of which review domains lose context as a result.
+
+    The author-facing version of this — what each absence actually cost, and
+    the line to paste to close it — is built by ``handoff_gaps.assess`` and
+    rendered into the report itself. This stays a debug line.
     """
-    for field, domains in _OPTIONAL_FIELD_IMPACT.items():
+    from .handoff_gaps import FIELD_DOMAINS
+
+    for field in _OPTIONAL_FIELD_IMPACT:
         if not results.get(field):
+            domains = " and ".join(FIELD_DOMAINS.get(field, ()))
             log.debug(
                 f"No '{field}' section found (or it was empty). "
                 f"{domains} review will have less context as a result."

@@ -27,6 +27,14 @@ found the page does not actually support the claim it was cited for. Those are
 among the most actionable findings a run produces, and they are invisible in
 SECTIONS 1-8.
 
+Do NOT paste the WORKLIST block. It sits above SECTION 1 in the same file (and
+in `run_N_<timestamp>_worklist.md` on its own), so it is the first thing you
+meet when you open the review — but it is your list, not the model's. It is a
+set of documents nobody has read yet, named down to bulletin numbers and URLs,
+and handing that to a model asks it to fill in what those documents say. That
+is the failure this whole pipeline exists to catch. Start the paste at
+"## SECTION 1".
+
 ──────────────────────────────────────────────────────────────────────────────
 
 You previously helped me with a draft article. I ran it through a multi-model

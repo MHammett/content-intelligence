@@ -250,6 +250,118 @@
     }
   },
   "generated": "<volatile>",
+  "handoff_gaps": [
+    {
+      "domains": [
+        "argument_integrity",
+        "completeness"
+      ],
+      "field": "pre_draft_analysis",
+      "guidance": "Fill in at least `Steelmanned position:` and `Strawmanned position:` \u2014 your own argument at its strongest, and the weak link you expect to be challenged on. Nothing in the draft can be read to infer these, which is why no candidate is proposed.",
+      "impact": "`PRE-DRAFT ANALYSIS SUMMARY` was empty. It is a system-prompt variable for argument_integrity and completeness, and both ran this run. Without it they do not know which objections you already weighed, so findings you have considered and rejected come back as new ones \u2014 and will come back again on every re-run until the field is filled.",
+      "label": "PRE-DRAFT ANALYSIS SUMMARY",
+      "placeholder": false,
+      "sections": [
+        "SECTION 4: Argument Integrity",
+        "SECTION 5: Completeness and Framing"
+      ],
+      "severity": "degrading",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [
+        "completeness"
+      ],
+      "field": "known_gaps",
+      "guidance": "List what you know is missing and why you left it out \u2014 the pass then judges whether the omission is acceptable instead of simply reporting it. Write \"None identified by author.\" if nothing is.",
+      "impact": "`KNOWN GAPS` was empty, so the completeness pass could not tell a gap you had already accepted from one you had missed. Omissions you made deliberately are reported back as findings, and will be reported again on every re-run until the field says otherwise.",
+      "label": "KNOWN GAPS",
+      "placeholder": false,
+      "sections": [
+        "SECTION 5: Completeness and Framing"
+      ],
+      "severity": "degrading",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [
+        "fact_check",
+        "red_team"
+      ],
+      "field": "sources_cited",
+      "guidance": "List the sources the draft cites, or write \"None provided.\" if there genuinely are none.",
+      "impact": "`SOURCES ALREADY CITED` was empty, so the fact_check and red_team passes ran without the list of what you had already sourced. The draft carries no citation block either \u2014 that block is found by its heading (Sources, References, Citations, Works Cited, Notes or Bibliography), so bracketed markers alone do not make one \u2014 which leaves fact_check with no record of what you already sourced from any direction.",
+      "label": "SOURCES ALREADY CITED",
+      "placeholder": false,
+      "sections": [
+        "SECTION 2: Factual Verification",
+        "SECTION 6: Red Team Findings"
+      ],
+      "severity": "degrading",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [
+        "fact_check",
+        "red_team"
+      ],
+      "field": "uncertain_sections",
+      "guidance": "Name the passages you are not confident about. These passes are told to focus there. Write \"None identified by author.\" if you are confident throughout.",
+      "impact": "`UNCERTAIN SECTIONS` was empty, so nothing told the fact_check and red_team passes where to concentrate. Scrutiny was spread evenly over the draft instead of aimed at the passages you are least sure of \u2014 the budget went where the models chose, not where you wanted it.",
+      "label": "UNCERTAIN SECTIONS",
+      "placeholder": false,
+      "sections": [
+        "SECTION 2: Factual Verification",
+        "SECTION 6: Red Team Findings"
+      ],
+      "severity": "degrading",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [
+        "voice_style"
+      ],
+      "field": "drafted_with",
+      "guidance": "Name the model you drafted with (claude, openai, gemini, mistral, grok or perplexity) and it is dropped from the voice pass. Omit the line only if you wrote the piece yourself.",
+      "impact": "No `Drafted with:` line and no `pipeline.drafting_model` in user.yaml, so no model was excluded from voice_style. If one of the models below drafted this article, it reviewed its own prose for AI phrasing \u2014 which is asking it to notice its own habits, and its vote in SECTION 3 should be read accordingly.",
+      "label": "Drafted with:",
+      "placeholder": false,
+      "sections": [
+        "SECTION 3: Voice and AI-Speak"
+      ],
+      "severity": "advisory",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [],
+      "field": "additional_context",
+      "guidance": "Add anything that changes how the draft should be judged: prior articles, known reader objections, intended use.",
+      "impact": "`ADDITIONAL CONTEXT FOR REVIEW MODELS` was empty. All 5 domains that ran read this field, so prior articles this piece builds on, objections your readers have raised before, and where the piece has to survive were all absent from every prompt. Commonly left blank; worth filling when the piece has history the draft does not restate.",
+      "label": "ADDITIONAL CONTEXT FOR REVIEW MODELS",
+      "placeholder": false,
+      "sections": [],
+      "severity": "advisory",
+      "suggestion": null,
+      "suggestion_basis": null
+    },
+    {
+      "domains": [],
+      "field": "history_key",
+      "guidance": null,
+      "impact": "No `History key:`, so this run filed itself under the title (`a-grid-piece-with-a-sufficiently-long-title`). Revise the headline before the next run and that run starts a fresh history directory: it loses this run as its delta baseline, and ci-voice-patterns counts the two as separate articles when deciding whether a phrasing habit recurs.",
+      "label": "History key:",
+      "placeholder": false,
+      "sections": [],
+      "severity": "advisory",
+      "suggestion": "History key: a-grid-piece-with-a-sufficiently-long-title",
+      "suggestion_basis": "a slug of the current title \u2014 set it once and keep it fixed however far the headline moves"
+    }
+  ],
   "lt_corrections_applied": [],
   "lt_failed": false,
   "lt_skipped": true,

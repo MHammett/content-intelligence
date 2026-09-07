@@ -67,6 +67,7 @@ from .handoff_parser import (
 )
 from . import history as hist
 from . import consolidation
+from . import handoff_gaps
 from ci_core import redact
 from ci_core.config_helpers import normalize_model_configs
 from ci_core import llm
@@ -75,6 +76,7 @@ from ci_core.concurrency import (
     exit_without_waiting_for_foreign_threads,
     run_all_with_timeout,
 )
+from ci_core.http import impersonation_available
 from ci_core.llm.model_registry import check_model_currency
 from ci_core.llm import timeout_model
 from . import live_model_check
@@ -986,6 +988,53 @@ def _record_fact_check_degradation(report: dict, results: dict) -> None:
         {
             "section": "SECTION 2: Factual Verification, SECTION 9: Citations",
             "caused_by": failed,
+            "detail": detail,
+        }
+    )
+
+
+def _record_impersonation_degradation(report: dict, pre_analysis: dict) -> None:
+    """Record that blocked links were never escalated, because the tier is absent.
+
+    ``impersonating_get`` returns ``None`` both when a block held and when
+    ``curl_cffi`` was never installed, and every caller treats ``None`` as "the
+    block held". That is the right default for a fetch and the wrong one for a
+    report: one of the two is a property of the source, the other is a property
+    of this machine, and only the second is fixable.
+
+    The cost of not saying so is measured. The escalation tier sat inert from
+    2026-08-12 to 2026-09-06 — the extra was in no dependency group, so no
+    ``uv run`` invocation had it — and nothing in any run said a word. Every
+    affected citation was reported exactly as if the source had refused a
+    browser, which is the one reading that makes the missing dependency
+    invisible.
+
+    Fires only when a link was actually blocked. A run with nothing to escalate
+    lost nothing by not being able to, and saying so would be noise.
+    """
+    if impersonation_available():
+        return
+    blocked = [
+        r
+        for r in (pre_analysis.get("links") or [])
+        if r.get("escalation_unavailable") or r.get("status_code") == 403
+    ]
+    if not blocked:
+        return
+    detail = (
+        f"{len(blocked)} cited link(s) returned HTTP 403 and were never put "
+        f"through the TLS-impersonation escalation: the optional 'unblock' "
+        f"extra (curl_cffi) is not installed. They are reported as blocked, "
+        f"which is indistinguishable in this report from a source that refuses "
+        f"browsers too — but the attempt was never made, so treat 'blocked' "
+        f"here as 'unknown'. Install with `uv sync --extra unblock` and re-run "
+        f"before concluding a source is unreachable."
+    )
+    log.warning("Links: %s", detail)
+    report.setdefault("degradations", []).append(
+        {
+            "section": "SECTION 9: Citations, link validation",
+            "caused_by": ["curl_cffi not installed (ci-core[unblock])"],
             "detail": detail,
         }
     )
@@ -2561,6 +2610,7 @@ def run_draft_pipeline(
 
     fact_check = report.get("section_2_fact_check") or {}
     _record_fact_check_degradation(report, results)
+    _record_impersonation_degradation(report, pre_analysis)
     claims = _collect_citation_claims(fact_check, corrected_draft)
     if offline:
         # Claim collection above still runs — it is pure parsing over the draft
@@ -2763,6 +2813,32 @@ def run_draft_pipeline(
     # and can be rendered by _print_draft_summary.
     report["model_currency"] = currency
 
+    # Which handoff fields were missing, what each one cost this run, and — where
+    # the run can infer a candidate — the line to paste into the handoff.
+    #
+    # Deliberately here, at the end: everything above has already been sent,
+    # scored and consolidated, so nothing this produces can reach a model
+    # prompt. That ordering is the safeguard, not a convenience. A proposed
+    # primary claim the author has not accepted must never be reviewed against
+    # as though they had — see handoff_gaps' module docstring.
+    gaps = handoff_gaps.assess(
+        handoff,
+        pub_config=pub_config,
+        draft=corrected_draft,
+        domains_ran=sorted({domain for (_model, domain) in results}),
+        pipeline_cfg=pipeline_cfg,
+        has_prior_run=prior_report is not None,
+        citations=report.get("section_9_citations") or (),
+    )
+    if gaps:
+        report["handoff_gaps"] = gaps
+        log.warning(
+            "Handoff metadata: %d field(s) missing (%s) — see the report's "
+            "'Handoff metadata gaps' section for what each one degraded.",
+            len(gaps),
+            ", ".join(g["label"] for g in gaps),
+        )
+
     # Mark a replayed run. Its cost figures are the captured run's, carried in
     # the api_call_log — real when they were incurred, but not spent again here.
     # Without this the report reads as though every replay cost money, and any
@@ -2792,6 +2868,8 @@ def run_draft_pipeline(
         log.info(f"Report saved: {paths['report_path']}")
     if paths.get("markdown_path"):
         log.info(f"Readable review: {paths['markdown_path']}")
+    if paths.get("worklist_path"):
+        log.info(f"Worklist: {paths['worklist_path']}")
 
     # Capture the raw ensemble beside the report so this run can be replayed.
     # Skipped on a replay: re-writing a capture from a capture adds nothing and
@@ -2812,7 +2890,11 @@ def run_draft_pipeline(
 
     elapsed_total = round(time.monotonic() - t_start, 1)
     _print_draft_summary(
-        report, delta_cfg, elapsed_total, markdown_path=paths.get("markdown_path")
+        report,
+        delta_cfg,
+        elapsed_total,
+        markdown_path=paths.get("markdown_path"),
+        worklist_path=paths.get("worklist_path"),
     )
 
     return report
@@ -2993,7 +3075,9 @@ def _print_live_model_check(live):
         print(f"  (model availability data {source}; oldest entry {age}h old)")
 
 
-def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=None):
+def _print_draft_summary(
+    report, delta_cfg, elapsed_total=None, markdown_path=None, worklist_path=None
+):
     print("\n" + "=" * 60)
     print(f"REVIEW COMPLETE: {report['article_title']}")
     print(f"Run #{report['run_number']} — {report['generated']}")
@@ -3542,6 +3626,14 @@ def _print_draft_summary(report, delta_cfg, elapsed_total=None, markdown_path=No
     print(f"\nFull report: {report_dir}")
     if markdown_path:
         print(f"Readable review (paste into chat): {markdown_path}")
+    # Printed after the review and before the revise-loop instructions, which
+    # is the order the two are used in: the worklist is the author's own
+    # errands, and it is deliberately NOT part of what gets pasted into a
+    # chat model. Handing a model a list of documents nobody has read yet is
+    # an invitation to invent them.
+    if worklist_path:
+        print(f"Your worklist (do NOT paste; these are yours): {worklist_path}")
+    if markdown_path:
         _print_next_step(markdown_path)
     print("=" * 60)
 
@@ -3694,7 +3786,16 @@ def run_publish_pipeline(
             for t in pub_handoff["publication_parameters"].get("tags", "").split(",")
             if t.strip()
         ],
-        "author": pub_handoff["publication_parameters"].get("author"),
+        # "WordPress author:" is the current spelling; "Author:" is the
+        # original and still parsed, because existing publication handoffs
+        # use it. The rename exists because Template A's "Author:" means
+        # something else entirely — who "I" is, for citation verification —
+        # and a byline pasted into this field is a WordPress login that does
+        # not exist.
+        "author": (
+            pub_handoff["publication_parameters"].get("wordpress_author")
+            or pub_handoff["publication_parameters"].get("author")
+        ),
         "seo": pub_handoff.get("seo", {}),
     }
 

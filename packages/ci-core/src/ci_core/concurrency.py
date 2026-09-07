@@ -40,6 +40,8 @@ import time
 __all__ = [
     "run_with_timeout",
     "run_all_with_timeout",
+    "run_all_bounded",
+    "batch_ceiling",
     "exit_without_waiting_for_foreign_threads",
 ]
 
@@ -207,3 +209,108 @@ def run_all_with_timeout(jobs, global_timeout):
         else:
             results[name] = (outcome.get("value"), None)
     return results
+
+
+def batch_ceiling(job_count, max_parallel, per_call_timeout, slack=60):
+    """Wall-clock ceiling for a semaphore-bounded batch of daemon-thread jobs.
+
+    Enough waves at ``max_parallel`` concurrency to clear every job at its own
+    per-call timeout, plus scheduling slack — a safety net for the batch as a
+    whole, on top of each call's own safety net. Not the primary timeout
+    mechanism for either; see the callers for why one is still worth having.
+    """
+    if job_count == 0:
+        return slack
+    if per_call_timeout is None:
+        raise ValueError(
+            "batch_ceiling needs a per-call timeout to size the batch from; "
+            "pass an explicit global_timeout instead when jobs carry no budget"
+        )
+    waves = -(-job_count // max_parallel)  # ceil division, no math.ceil import
+    return waves * per_call_timeout + slack
+
+
+def run_all_bounded(jobs, max_parallel, global_timeout=None, slack=60):
+    """:func:`run_all_with_timeout` with at most ``max_parallel`` calls in flight.
+
+    This is the replacement for ``ThreadPoolExecutor(max_workers=N)``. The two
+    differ in what ``N`` bounds: the executor's ``max_workers`` caps how many
+    *threads exist*, whereas here every job gets its own daemon thread up front
+    and the semaphore caps how many are *doing work* at once. That distinction
+    is the entire point — a thread parked on a semaphore is trivially cheap and,
+    being a daemon, cannot outlive the interpreter, while a pool worker parked
+    inside a call joins ``atexit`` with a bare, untimed ``t.join()``. See this
+    module's docstring for the two-day hang that behaviour produced.
+
+    ``max_parallel`` of 0 or None means "all at once" (the shape a caller writes
+    as ``max_workers=len(jobs)``); it is otherwise clamped to ``len(jobs)``.
+
+    ``jobs`` are the same ``(name, fn, timeout)`` triples
+    :func:`run_all_with_timeout` takes, and the return value is identical:
+    ``{name: (value, None)}`` or ``{name: (None, exc)}``.
+
+    A per-job ``timeout`` of None means "no budget of its own"; the group
+    deadline is still the backstop. When ``global_timeout`` is not given it is
+    sized by :func:`batch_ceiling` from the *largest* per-job budget, so the
+    slowest job gets its own timeout honoured rather than being masked as a
+    group-ceiling cancellation. Pass ``global_timeout`` explicitly when no job
+    carries a budget — there is nothing to size the batch from otherwise, and
+    an unbounded group deadline is the very thing this module exists to prevent.
+
+    A per-job budget is measured from when that job **acquires the semaphore**,
+    which is the only reading of it that means anything here. Time spent queued
+    behind earlier waves is not the job's to spend.
+
+    :func:`run_all_with_timeout` cannot do this on its own: it stamps each
+    deadline when the thread is created, which is right for an ungated fan-out
+    where every thread starts work immediately, and wrong the moment a semaphore
+    stands between the two. A job queued behind two waves would have spent its
+    entire budget before doing anything, and be reported as a timeout the
+    instant it was joined. Measured against 40 jobs, 8 at a time, each doing 1s
+    of work inside a 3s budget: 17 of the 40 failed spuriously. So the budget is
+    applied *inside* the semaphore here, and the group ceiling is what gets
+    handed down as the outer bound.
+
+    One consequence worth knowing: a job whose budget expires releases its slot
+    while its abandoned call is still running, so briefly more than
+    ``max_parallel`` calls can be in flight. That is the deliberate side of the
+    trade — the alternative is a wedged call holding a slot for the rest of the
+    batch, which is how one stuck citation stalls the other thirty-nine.
+    """
+    jobs = list(jobs)
+    if not jobs:
+        return {}
+
+    limit = (
+        len(jobs)
+        if not max_parallel or max_parallel <= 0
+        else min(max_parallel, len(jobs))
+    )
+    semaphore = threading.Semaphore(limit)
+
+    def _bounded(fn, timeout):
+        def _run():
+            with semaphore:
+                # The budget starts here, on acquire — see the docstring for
+                # why handing `timeout` to run_all_with_timeout instead would
+                # charge this job for every wave that ran ahead of it.
+                if timeout is None:
+                    return fn()
+                return run_with_timeout(fn, timeout)
+
+        return _run
+
+    if global_timeout is None:
+        budgeted = [t for _, _, t in jobs if t is not None]
+        global_timeout = batch_ceiling(
+            len(jobs), limit, max(budgeted) if budgeted else None, slack=slack
+        )
+
+    # Per-job budgets are already applied inside _bounded, so what is handed
+    # down here is None: the group ceiling is the only bound left for this layer
+    # to enforce. A TimeoutError raised inside a job surfaces through the normal
+    # error channel, so the returned shape is unchanged either way.
+    return run_all_with_timeout(
+        [(name, _bounded(fn, timeout), None) for name, fn, timeout in jobs],
+        global_timeout,
+    )

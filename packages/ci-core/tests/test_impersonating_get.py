@@ -10,6 +10,12 @@ attacker-chosen chain unchecked, exactly the gap ``safe_get`` exists to close.
 ``curl_cffi`` is an optional extra, so every test here installs a fake one
 rather than depending on it being present. That also lets the absent case be
 tested at all.
+
+The cost of that choice is worth stating plainly: because the fake is always
+used, **these tests pass whether or not the real dependency works**. They said
+nothing while the tier was inert for a month, and they would say nothing about
+a curl_cffi whose Chrome profile has aged into being fingerprinted. Only a live
+fetch answers that — see docs/CITATIONS.md, "Escalating past a bot block".
 """
 
 import sys
@@ -198,9 +204,13 @@ class TestFailuresAllLookTheSame:
             assert http.impersonating_get("https://example.com/doc") is None
 
     def test_the_optional_extra_being_absent_is_not_an_error(self):
-        """The dependency ships as ``ci-core[unblock]`` and is normally absent —
-        it is not installed in the main checkout today, which is why the link
-        checker's escalation tier has been dormant there."""
+        """The dependency ships as ``ci-core[unblock]``, so an end user who
+        did not ask for the extra has no curl_cffi and must still get a clean
+        degradation rather than an ImportError.
+
+        Development checkouts do have it — ``ci-core[unblock]`` is in the root
+        dev group as of 2026-09-06, because while it was absent the escalation
+        tier was inert in every ``uv run`` and nothing said so."""
         real_import = __import__
 
         def _no_curl_cffi(name, *args, **kwargs):
@@ -215,3 +225,66 @@ class TestFailuresAllLookTheSame:
         with _hosts({}), _fake_curl_cffi([_resp(302)]):
             # A 3xx carrying nowhere to go is an error status, not content.
             assert http.impersonating_get("https://example.com/doc") is None
+
+
+class TestAbsentIsNotTheSameAsBlocked:
+    """The two outcomes ``impersonating_get`` flattens into ``None``.
+
+    Keeping them apart is the whole point: a block that held is a fact about
+    the source, a missing extra is a fact about this machine, and only the
+    second is fixable by installing something. Reporting them identically is
+    what let the tier sit inert for a month.
+    """
+
+    def test_available_is_true_when_the_extra_imports(self):
+        with _fake_curl_cffi([]):
+            assert http.impersonation_available() is True
+
+    def test_available_is_false_when_the_extra_is_absent(self):
+        real_import = __import__
+
+        def _no_curl_cffi(name, *args, **kwargs):
+            if name == "curl_cffi":
+                raise ImportError("No module named 'curl_cffi'")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_no_curl_cffi):
+            assert http.impersonation_available() is False
+
+    def test_the_absent_extra_is_warned_about(self, caplog):
+        real_import = __import__
+
+        def _no_curl_cffi(name, *args, **kwargs):
+            if name == "curl_cffi":
+                raise ImportError("No module named 'curl_cffi'")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(http, "_unavailable_warned", False):
+            with patch("builtins.__import__", side_effect=_no_curl_cffi):
+                with caplog.at_level("WARNING", logger=http.log.name):
+                    assert http.impersonating_get("https://example.com/doc") is None
+        assert "unblock" in caplog.text
+        assert "curl_cffi" in caplog.text
+
+    def test_the_warning_is_emitted_once_not_per_url(self, caplog):
+        """A 15-link article printing this 15 times trains the reader to skip it."""
+        real_import = __import__
+
+        def _no_curl_cffi(name, *args, **kwargs):
+            if name == "curl_cffi":
+                raise ImportError("No module named 'curl_cffi'")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(http, "_unavailable_warned", False):
+            with patch("builtins.__import__", side_effect=_no_curl_cffi):
+                with caplog.at_level("WARNING", logger=http.log.name):
+                    for _ in range(5):
+                        http.impersonating_get("https://example.com/doc")
+        assert caplog.text.count("uv sync --extra unblock") == 1
+
+    def test_a_held_block_is_not_reported_as_a_missing_extra(self, caplog):
+        """curl_cffi present and the origin still refuses: no install advice."""
+        with _hosts({}), _fake_curl_cffi([_resp(403)]):
+            with caplog.at_level("WARNING", logger=http.log.name):
+                assert http.impersonating_get("https://example.com/doc") is None
+        assert "uv sync --extra unblock" not in caplog.text

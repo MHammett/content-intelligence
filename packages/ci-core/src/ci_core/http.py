@@ -7,11 +7,14 @@ the string from drifting back to per-package values.
 """
 
 import ipaddress
+import logging
 import socket
 from importlib import metadata
 from urllib.parse import urlparse
 
 import requests
+
+log = logging.getLogger(__name__)
 
 try:
     _VERSION = metadata.version("ci-core")
@@ -232,6 +235,7 @@ __all__ = [
     "is_public_host",
     "safe_get",
     "safe_head",
+    "impersonation_available",
 ]
 
 
@@ -254,6 +258,49 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Upgrade-Insecure-Requests": "1",
 }
+
+
+def impersonation_available():
+    """True when the optional ``unblock`` extra (``curl_cffi``) is importable.
+
+    Callers use this to tell two outcomes apart that ``impersonating_get``
+    deliberately reports the same way. It returns ``None`` both when a block
+    genuinely held and when there was never an escalation to attempt, because
+    every caller was written to treat ``None`` as "the block held" — which is
+    the right default for a *fetch*, and the wrong one for *reporting*, since
+    only one of the two is fixable by installing something.
+    """
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+#: Set once the missing-extra warning has been emitted. A 15-link article would
+#: otherwise print the same line 15 times, which trains the reader to skip it.
+_unavailable_warned = False
+
+
+def _warn_impersonation_unavailable():
+    """Say once, per process, that the escalation tier is not installed.
+
+    This is the line whose absence let the tier sit inert from 2026-08-12 to
+    2026-09-06: `curl_cffi` was in no dependency group, so no ``uv run``
+    invocation had it, ``impersonating_get`` returned ``None`` every time, and
+    the run looked exactly like one where every blocked host simply stayed
+    blocked. Nothing anywhere said the attempt had not been made.
+    """
+    global _unavailable_warned
+    if _unavailable_warned:
+        return
+    _unavailable_warned = True
+    log.warning(
+        "TLS-impersonation escalation is unavailable: the optional 'unblock' "
+        "extra (curl_cffi) is not installed, so blocked links fall straight "
+        "through to the archive fallback without an escalation attempt. "
+        "Install with: uv sync --extra unblock"
+    )
 
 
 def impersonating_get(url, timeout=30):
@@ -282,10 +329,25 @@ def impersonating_get(url, timeout=30):
     This does not defeat a genuine paywall or a JS/CAPTCHA challenge, and no
     attempt is made to: the three academic publishers in the measurement above
     return a challenge page to this too.
+
+    Whether this tier works at all depends on the installed ``curl_cffi``
+    version, because ``impersonate="chrome"`` resolves to whatever
+    ``DEFAULT_CHROME`` that release ships and Cloudflare fingerprints stale
+    profiles. Measured 2026-09-06: 0.16.0 (``chrome146``) was challenged on
+    congress.gov and bianchihonda.com; 0.16.1+ (``chrome150``) read both in
+    full. The extra pins a floor for this reason — see
+    ``packages/ci-core/pyproject.toml``.
+
+    Debugging a 403 that reaches here: this function returns ``None`` for every
+    failure, so check the response headers directly. ``cf-mitigated:
+    challenge`` means the fingerprint was rejected and the fix is a newer
+    curl_cffi; its absence means the origin refuses browsers too, which is a
+    subscription or JS gate and not worth chasing.
     """
     try:
         from curl_cffi import requests as _cffi
     except ImportError:
+        _warn_impersonation_unavailable()
         return None
     current = url
     try:

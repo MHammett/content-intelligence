@@ -1,3 +1,4 @@
+import difflib
 import logging
 import re
 from pathlib import Path
@@ -213,6 +214,7 @@ def load_publication_config(publication_name, config_dir="configs"):
         raise ValueError(f"{path} is empty or not a valid YAML mapping.")
     config = _resolve_env_recursive(config, env=_EFFECTIVE_ENV)
     _validate_publication_config(config, publication_name)
+    _validate_publication_keys(config, publication_name)
     return config
 
 
@@ -248,6 +250,97 @@ def _validate_publication_config(config, publication_name):
             + "\n".join(f"  {m}" for m in missing)
             + "\nSee configs/publication.example.yaml for the expected structure."
         )
+
+
+#: Every top-level key a publication config may carry. Authoritative, not
+#: advisory: an unrecognised key is now an error, so this list and the keys the
+#: pipeline actually reads have to stay in step. ``TestKnownKeysCoverWhatIsRead``
+#: fails if code starts reading one that is missing here.
+KNOWN_PUB_KEYS = frozenset(
+    {
+        "api_keys",
+        "audience",
+        "author_name",
+        "citation_sources",
+        "custom_domains",
+        "languagetool",
+        "publication_description",
+        "publication_name",
+        "rank_math",
+        "seo_rules",
+        "style_profile",
+        "style_rules",
+        "voice_profile",
+        "wordpress",
+    }
+)
+
+#: Escape hatch for keys that are deliberately not ours — a note to a
+#: colleague, a value some other tool reads out of the same file. Anything
+#: under this prefix is passed over without validation.
+#:
+#: Borrowed from OpenAPI's ``x-`` specification extensions, which exist for
+#: exactly this problem: a strict schema that still has to be extensible.
+#: Spelled ``x_`` rather than ``x-`` only to match the snake_case these configs
+#: already use. (RFC 6648 deprecated ``X-`` for *protocol headers*; that is a
+#: different argument about wire formats and does not reach config schemas,
+#: where the OpenAPI convention is current.)
+_EXTENSION_PREFIX = "x_"
+
+#: How close a spelling has to be before it is called a probable typo rather
+#: than an unknown key. ``difflib`` rather than a hand-rolled edit distance:
+#: stdlib, and a ratio cutoff is the standard way to spell "close enough to be
+#: a typo, far enough not to be a different word".
+_TYPO_CUTOFF = 0.85
+
+
+def _unknown_key_message(key, publication_name):
+    """The error text for one unrecognised key, typo-aware."""
+    close = difflib.get_close_matches(key, KNOWN_PUB_KEYS, n=1, cutoff=_TYPO_CUTOFF)
+    if close:
+        return (
+            f"  {key!r} — did you mean {close[0]!r}? As written, the pipeline "
+            f"reads {close[0]!r} as absent and silently falls back to its "
+            f"default."
+        )
+    return f"  {key!r} — not a key this pipeline reads."
+
+
+def _validate_publication_keys(config, publication_name):
+    """Reject top-level keys the pipeline does not read.
+
+    A key that is *almost* right is the expensive one, and it used to cost
+    nothing to get wrong: ``authorname`` reads as absent, the pipeline falls
+    back to no author, and citation verification loses first-person checking
+    with no error, no warning and no missing-field message anywhere. A plain
+    unknown key — ``byline`` — is the same failure without even a near spelling
+    to catch it.
+
+    **This rejects, so the list above must stay complete.** Two things keep it
+    honest: a test cross-checks it against the keys the source actually reads,
+    and every shipped example config is validated by the suite. A key that is
+    deliberately not the pipeline's belongs under ``x_`` (see
+    ``_EXTENSION_PREFIX``), which is never validated.
+    """
+    unknown = [
+        key
+        for key in config
+        if key not in KNOWN_PUB_KEYS and not str(key).startswith(_EXTENSION_PREFIX)
+    ]
+    if not unknown:
+        return
+    listed = "\n".join(
+        _unknown_key_message(k, publication_name) for k in sorted(unknown)
+    )
+    plural = "" if len(unknown) == 1 else "s"
+    raise ValueError(
+        f"Publication config '{publication_name}' has {len(unknown)} key{plural} "
+        f"the pipeline does not read:\n"
+        f"{listed}\n"
+        f"\nValid keys: {', '.join(sorted(KNOWN_PUB_KEYS))}\n"
+        f"\nIf a key is deliberately not this pipeline's, prefix it with "
+        f"'{_EXTENSION_PREFIX}' and it will be ignored without complaint."
+    )
 
 
 # ---------------------------------------------------------------------------

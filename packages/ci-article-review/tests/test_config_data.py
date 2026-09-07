@@ -353,3 +353,74 @@ class TestRetiredPresets:
                 break
         else:
             raise AssertionError("no --cost-preset argument found")
+
+
+class TestAuthorNameIsADeclaredPublicationKey:
+    """`author_name` was read by the pipeline before anything declared it.
+
+    ``pipeline`` falls back to ``pub_config["author_name"]`` to tell citation
+    verification who "I" is. That key appeared in no example config, no
+    scaffolding, and no documentation — it worked only for the one config that
+    happened to set it by hand. A second user had no way to discover it.
+    """
+
+    def _example(self):
+        from pathlib import Path
+
+        import yaml
+
+        for parent in Path(__file__).resolve().parents:
+            candidate = (
+                parent
+                / "packages"
+                / "ci-article-review"
+                / "src"
+                / "ci_article_review"
+                / "configs"
+                / "publication.example.yaml"
+            )
+            if candidate.is_file():
+                return yaml.safe_load(candidate.read_text(encoding="utf-8"))
+        raise AssertionError("publication.example.yaml not found")
+
+    def test_the_example_config_declares_it(self):
+        """setup.py copies this file verbatim, so this is the scaffolding too."""
+        assert "author_name" in self._example()
+
+    def test_it_is_documented_in_the_configuration_reference(self):
+        from pathlib import Path
+
+        for parent in Path(__file__).resolve().parents:
+            doc = parent / "docs" / "CONFIGURATION.md"
+            if doc.is_file():
+                assert "author_name" in doc.read_text(encoding="utf-8")
+                return
+        raise AssertionError("docs/CONFIGURATION.md not found")
+
+    def test_the_pipeline_reads_the_key_the_example_declares(self):
+        """Guards the two drifting apart — the whole failure being fixed."""
+        from pathlib import Path
+
+        for parent in Path(__file__).resolve().parents:
+            src = (
+                parent
+                / "packages"
+                / "ci-article-review"
+                / "src"
+                / "ci_article_review"
+                / "pipeline.py"
+            )
+            if src.is_file():
+                assert 'pub_config.get("author_name")' in src.read_text(
+                    encoding="utf-8"
+                )
+                return
+        raise AssertionError("pipeline.py not found")
+
+
+# The near-miss *warning* these lines used to cover is gone: an unrecognised
+# publication key is now an error, not a log line, and the near-miss spelling
+# is folded into that error as a "did you mean" hint. One case here was
+# deliberately reversed rather than moved — an unrelated custom key such as
+# `author_bio` used to be explicitly allowed and is now rejected, with `x_` as
+# the way to keep one on purpose. See tests/test_publication_config_strictness.py.

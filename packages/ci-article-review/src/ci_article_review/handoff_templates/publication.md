@@ -7,7 +7,11 @@ PUBLICATION PARAMETERS
 Status: draft [change to: publish-live only with explicit intent]
 WordPress category: [category slug]
 Tags: [comma-separated slugs]
-Author: [WordPress username, if multi-author site]
+WordPress author: [WordPress *login username*, if a multi-author site. Not a
+display name and not a byline — this is the account the post is filed under.
+The draft handoff's own "Author:" line is a different field entirely: that
+one names who "I" is for citation verification. "Author:" is still accepted
+here for existing documents.]
 
 SEO METADATA
 Focus keyword: [keyword or phrase | or: derive from primary claim]

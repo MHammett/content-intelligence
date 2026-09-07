@@ -1078,6 +1078,7 @@ Open `configs/your_publication_name.yaml`. Key fields:
 |---|---|
 | `publication_description` | One paragraph: what you cover, who reads it, what makes a piece unpublishable |
 | `audience.primary` | Who reads it, what they know, what makes them stop reading |
+| `author_name` | Optional — who "I" refers to in your drafts, by name. Citation verification needs it to check first-person claims against a source page. The handoff's `Author:` line overrides it per article; this is the only source for `--raw-draft` and `--url`. |
 | `style_profile` | Your characteristic style — see PLAYBOOK.md for how to develop this (the legacy key `voice_profile` is still accepted) |
 | `style_rules.banned_words` | Words you never want in your published writing |
 | `style_rules.banned_phrases` | Phrases you never want |
@@ -1092,6 +1093,10 @@ Open `configs/your_publication_name.yaml`. Key fields:
 | `wordpress.username` | Your WordPress login username |
 | `wordpress.application_password` | The application password from your WordPress profile |
 | `api_keys` | Optional — overrides specific providers' credentials from `user.yaml` for this publication only. See [API key precedence](#api-key-precedence). |
+
+Any top-level key not in this table is an error. That is deliberate: a misspelled key used to read as an absent setting, so `authorname` silently cost the run its author and nothing anywhere said so. The error names the key, suggests the intended spelling when it is close, and lists what is valid.
+
+If you need a key that is deliberately not this pipeline's -- a note to a colleague, or a value another tool reads out of the same file -- prefix it with `x_`. Anything under that prefix is passed over without validation, following the same idea as OpenAPI's `x-` specification extensions.
 
 **`seo_rules`** is optional — omit it to use the defaults. Add it when your publication has different SEO standards from the defaults:
 

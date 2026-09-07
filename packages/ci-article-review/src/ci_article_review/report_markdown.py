@@ -18,6 +18,11 @@ a leaf: a tuple, a lookup and a pure function, importing nothing itself.
 
 from .adapters.citation.disposition import DISPOSITIONS, disposition
 
+# ``worklist`` is a second exempt import, for the same reason: it reads the same
+# plain report dict, imports only the stdlib and the leaf module above, and so
+# pulls nothing in behind it.
+from .worklist import build_worklist, render_worklist
+
 #: Order the SEO METADATA fields render in, matching publication.md's block.
 #: Duplicated from ``analysis.seo_suggest.FIELD_ORDER`` rather than imported so
 #: this module stays a dependency-free renderer over a plain dict — importing
@@ -251,6 +256,130 @@ def _render_model_failures(report):
     return lines
 
 
+_SEVERITY_HEADING = {
+    "critical": "Changed what the models were asked",
+    "degrading": "Context the models would have used",
+    "advisory": "Run bookkeeping",
+}
+
+
+def _render_handoff_gaps(report):
+    """Which handoff fields were missing, what each cost, and the line to paste.
+
+    Sits in the header rather than among the numbered sections, for the same
+    reason the failed-passes block does: an incomplete handoff is not a finding
+    about the article, it is context for reading every finding below. A reader
+    who reaches SECTION 5 without knowing that `PRIMARY CLAIM` was empty will
+    read a generic completeness flag as a fact about the draft rather than as
+    an artefact of what the pass was told.
+
+    The proposed values are **proposals**. The run was not conducted against
+    them and never will be — ``handoff_gaps.assess`` runs after the last model
+    call precisely so that it cannot be. Pasting one into the handoff and
+    re-running is what makes it real.
+    """
+    gaps = report.get("handoff_gaps") or []
+    if not gaps:
+        return []
+
+    lines = [f"## ⚠ Handoff metadata gaps ({len(gaps)})", ""]
+    lines.append(
+        "These fields were absent from the handoff. Each entry says what the "
+        "absence cost *this* run, and what to write instead. Nothing proposed "
+        "here was used in the review — a value you have not accepted is not a "
+        "value the pipeline may act on. Paste the fix into the handoff and "
+        "re-run to get the review these sections could not give you."
+    )
+    lines.append("")
+
+    for severity in ("critical", "degrading", "advisory"):
+        in_tier = [g for g in gaps if g.get("severity") == severity]
+        if not in_tier:
+            continue
+        lines.append(f"### {_SEVERITY_HEADING[severity]}")
+        lines.append("")
+        for gap in in_tier:
+            flag = (
+                " — left as its template placeholder" if gap.get("placeholder") else ""
+            )
+            lines.append(f"**`{gap.get('label', gap.get('field', ''))}`**{flag}")
+            lines.append("")
+            lines.append(gap.get("impact", ""))
+            lines.append("")
+            suggestion = gap.get("suggestion")
+            if suggestion:
+                basis = gap.get("suggestion_basis")
+                lines.append(
+                    f"*Proposed, not used in this run. From {basis}. Paste it "
+                    f"into the handoff if you agree with it:*"
+                    if basis
+                    else "*Proposed, not used in this run. Paste it into the "
+                    "handoff if you agree with it:*"
+                )
+                lines.append("")
+                lines.append("```")
+                lines.extend(suggestion.splitlines())
+                lines.append("```")
+                lines.append("")
+            elif gap.get("guidance"):
+                lines.append(f"*What to add: {gap['guidance']}*")
+                lines.append("")
+    return lines
+
+
+def _metadata_gap_note(report, domain):
+    """One line naming the handoff fields this section was built without, or []."""
+    missing = [
+        g.get("label", g.get("field", ""))
+        for g in (report.get("handoff_gaps") or [])
+        if domain in (g.get("domains") or [])
+    ]
+    if not missing:
+        return []
+    fields = ", ".join(f"`{m}`" for m in missing)
+    return [
+        f"> **Built without {fields}** — those handoff fields were missing or "
+        f"unfilled this run (see *Handoff metadata gaps* above). Findings here "
+        f"reflect what the pass was told, not only what is in the draft.",
+        "",
+    ]
+
+
+def _render_degradations(report):
+    """Knock-on effects of a failed pass — what it cost a *different* section.
+
+    ``report["degradations"]`` has had a producer and a console reader since it
+    was added, and no reader for the report itself: the entry that says
+    "Sections 2 and 9 are working from an incomplete claim list" scrolled past
+    in the terminal and never reached ``run_N_*_review.md`` — the file the
+    author keeps, re-reads, and pastes into a chat model. Of the two places it
+    could be said, it was only ever said in the one that disappears.
+
+    Sits with the failure blocks for the same reason the console prints it
+    there: "perplexity:fact_check failed" and "9 claims verified" are
+    separately unremarkable, and it is the link between them that tells a
+    reader which numbers below to distrust.
+    """
+    degradations = report.get("degradations") or []
+    if not degradations:
+        return []
+
+    lines = [f"## ⚠ Knock-on effects of failed passes ({len(degradations)})", ""]
+    for entry in degradations:
+        # ``section`` is a comma-joined title string; older reports predate the
+        # key entirely. Neither is worth failing a render over.
+        where = entry.get("section")
+        caused_by = entry.get("caused_by") or []
+        heading = where or "Affected sections"
+        lines.append(f"**{heading}**")
+        if caused_by:
+            lines.append(f"- Caused by: {', '.join(caused_by)}")
+        lines.append("")
+        lines.append(entry.get("detail", ""))
+        lines.append("")
+    return lines
+
+
 def _render_domains_not_run(report):
     """Header block naming domains no model reviewed, or [].
 
@@ -322,7 +451,11 @@ def _domain_notes(report, domain):
     so the two cases cannot both be claimed: a domain with a failed pass has a
     result entry, which is exactly what keeps it out of ``domains_not_run``.
     """
-    return _missing_models_note(report, domain) + _not_run_note(report, domain)
+    return (
+        _missing_models_note(report, domain)
+        + _not_run_note(report, domain)
+        + _metadata_gap_note(report, domain)
+    )
 
 
 def _render_section_2(fact_check, report=None):
@@ -2026,6 +2159,7 @@ def render_report_markdown(report):
 
     lines.extend(_render_model_failures(report))
     lines.extend(_render_domains_not_run(report))
+    lines.extend(_render_degradations(report))
 
     if report.get("truncated_results"):
         lines.append(
@@ -2043,6 +2177,8 @@ def render_report_markdown(report):
             f"{', '.join(report['empty_results'])}"
         )
         lines.append("")
+
+    lines.extend(_render_handoff_gaps(report))
 
     delta = report.get("delta")
     if delta:
@@ -2069,6 +2205,15 @@ def render_report_markdown(report):
     lines.extend(_render_model_currency(report))
     lines.extend(_render_provenance(report))
 
+    lines.append("---")
+    lines.append("")
+
+    # The worklist comes before the findings because it is the only part of this
+    # file the author acts on directly; everything below it is the evidence it
+    # points back at. It is deliberately not a "## SECTION N" heading, so the
+    # paste-into-a-chat-model revision loop does not sweep it up — see
+    # worklist.HEADING for why that matters.
+    lines.extend(render_worklist(build_worklist(report)))
     lines.append("---")
     lines.append("")
 

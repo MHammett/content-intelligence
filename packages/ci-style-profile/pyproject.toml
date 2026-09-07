@@ -31,6 +31,14 @@ packages = ["src/ci_style_profile"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Duplicated from the root pyproject.toml, which is the inifile for the
+# repo-wide `pytest packages/` run. This one is what pytest reads when the
+# package's own tests are run directly, and a `slow` test lives here too
+# (test_callers.py's process-exit regression, which must pay litellm's import
+# cost in a subprocess before it can observe interpreter exit at all).
+markers = [
+    "slow: inherently wall-clock-bound; deselect with -m 'not slow'",
+]
 
 [tool.mypy]
 python_version = "3.10"

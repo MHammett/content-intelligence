@@ -300,16 +300,35 @@ A failed escalation costs nothing: anything that comes back unreadable — a cha
 
 Where the fetch landed somewhere other than the URL cited — the fact-check model supplies Vertex `grounding-api-redirect` URLs, so it usually does — the destination is recorded as `final_url`, **the archive lookup follows it**, and the paste-ready "Cite both" pairing names it. Asking archive.org about the redirect instead returns `archived: false`, which the report would state as "archive.org has no snapshot of this URL" while the real source is archived: a false absence printed beside the citations that most need the archive to be there.
 
-**This tier needs an optional dependency.** `impersonating_get` returns `None` — leaving the archive fallback to run exactly as before — unless `curl_cffi` is installed:
+**This tier needs an optional dependency.** `impersonating_get` returns `None` — leaving the archive fallback to run exactly as before — unless `curl_cffi` is installed. It is an optional extra because the degradation is safe and the wheel carries a compiled libcurl; end users who want the tier install it explicitly:
 
 ```bash
 uv sync --extra unblock
 ```
 
-Two things measured 2026-09-05 while verifying this against the Honda run:
+**In this repo it is no longer optional in practice.** `ci-core[unblock]` is in the root `[dependency-groups] dev`, alongside `ci-core[persistence]` and for the same reason: `uv run` re-syncs from the lockfile before every invocation, so while the extra appeared in no dependency group, *no `uv run` command ever had curl_cffi*. `impersonating_get` returned `None` unconditionally, and the escalation added to `analysis/links.py` on 2026-08-12 had never once fired — nor had `_impersonation_fallback_content` in the citation resolver. Nothing errors when this happens; the run simply resolves fewer citations, which is why it survived a month unnoticed. The unit tests do not catch it either: they install a fake `curl_cffi` and pass whether or not the real one is present. A plain `uv sync` now brings it in.
 
-- **The version matters more than the floor suggests.** curl_cffi 0.16.3 read `bianchihonda.com` and `congress.gov`; 0.16.0 was served a Cloudflare `cf-mitigated: challenge` on both. The extra's `>=0.7` constraint permits versions whose Chrome profile is stale enough to be fingerprinted, which defeats the point of the tier.
-- **Success is not deterministic.** Six concurrent requests to one Cloudflare-fronted host in a single run had four succeed and two challenged. A claim resolved this way in one run may be reported refused in the next — see the rerun-nondeterminism caveat that already applies to this pipeline.
+**A run now says when the tier is missing**, in both places it matters. `impersonating_get` returns `None` for a held block and for an absent `curl_cffi` alike — the right default for a fetch, the wrong one for a report, since only one of the two is fixable by installing something. So the run logs a one-time warning (once per process, not per link), flags each affected link with `escalation_unavailable`, and records a `degradations` entry that reaches `run_N_*_review.md`. The entry says to read those links as **unknown rather than blocked**: the attempt was never made. Use `ci_core.http.impersonation_available()` to tell the two apart in code.
+
+**The version floor is load-bearing.** `impersonate="chrome"` resolves to whatever `curl_cffi.requests.impersonate.DEFAULT_CHROME` the installed release ships, so an older release asks for an older Chrome profile — and a stale profile is fingerprinted by exactly the Cloudflare deployments this tier exists to get past. Measured 2026-09-06, sequential fetches only — concurrent requests to a single Cloudflare host cannot tell a version difference apart from luck:
+
+| curl_cffi | `DEFAULT_CHROME` | congress.gov | bianchihonda.com |
+| --- | --- | --- | --- |
+| 0.16.0 | `chrome146` | 0 of 5 | 0 of 4 |
+| 0.16.1 | `chrome150` | 1 of 1 (422,259 bytes) | not sampled |
+| 0.16.2 | `chrome150` | 1 of 1 | not sampled |
+| 0.16.3 | `chrome150` | 2 of 2 | 4 of 5 |
+
+Every one of 0.16.0's nine failures carried `cf-mitigated: challenge`; none of the successes did. 0.16.3's one miss on bianchihonda.com is the nondeterminism described below, not a version effect — the same host served the same build on the attempts either side of it.
+
+The working boundary is 0.16.1, which bumped curl-impersonate to 2.1.1. The extra pins `>=0.16.3` — one release higher — because 0.16.3 fixes `tls_signed_cert_timestamps not applied` (upstream PR #833), a defect on the fingerprint surface itself: 0.16.1 and 0.16.2 clear these hosts while still sending a subtly wrong handshake. The old `>=0.7` was not merely permissive, it resolved to 0.16.0 in `uv.lock`, so the documented `uv sync --extra unblock` installed the one version measured to be challenged everywhere it was tried. Expect to raise this floor again; a profile that works today ages out.
+
+**Reading a 403 from this tier.** The `cf-mitigated` response header separates the two causes, which need opposite responses:
+
+- **`cf-mitigated: challenge` present** — Cloudflare rejected the *fingerprint*. That is a curl_cffi version problem, not a property of the source: raise the floor and re-measure.
+- **header absent** — the origin refuses browsers too. That is a genuine subscription or JS gate, and no fingerprint will move it; the three academic publishers in the `ci_core/http.py` measurement are this case. Not worth chasing.
+
+**Success is not deterministic.** Six concurrent requests to one Cloudflare-fronted host in a single run had four succeed and two challenged. A claim resolved this way in one run may be reported refused in the next — see the rerun-nondeterminism caveat that already applies to this pipeline. It is also why the version comparison above is one sequential fetch per version: concurrent fetches to a single Cloudflare host cannot tell a version difference apart from luck.
 
 ### archive.org credentials (optional)
 

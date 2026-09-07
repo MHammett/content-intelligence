@@ -185,16 +185,31 @@ and infers only the title and body — it cannot supply an author's
 
 ## The revision loop
 
-The pipeline is built for a round trip between this tool and whatever chat model you drafted with. Each run writes two files side by side in `pipeline_history/<article-slug>/`:
+The pipeline is built for a round trip between this tool and whatever chat model you drafted with. Each run writes three files side by side in `pipeline_history/<article-slug>/`:
 
 - `run_N_<timestamp>_report.json` — the full machine-readable report
 - `run_N_<timestamp>_review.md` — the same findings rendered as readable prose, SECTION 1 through SECTION 9
+- `run_N_<timestamp>_worklist.md` — the things the run could not settle *and a person can*, as ranked actions
 
-The markdown one is the artifact you actually work from. The end of every run prints its path:
+The markdown one is the artifact you actually work from. The end of every run prints both paths:
 
 ```
 Readable review (paste into chat): pipeline_history/my-article/run_1_20260809_143022_review.md
+Your worklist (do NOT paste; these are yours): pipeline_history/my-article/run_1_20260809_143022_worklist.md
 ```
+
+### The worklist
+
+A run ends with gaps: a source that 403'd, a page that fetched but would not extract, a bulletin the fact-check pass could name but not link. The report describes those honestly and stops. The worklist turns them into errands, and it is also rendered at the top of `review.md`.
+
+It is grouped by the kind of action rather than by report section, because you work through it in one pass — open a page, find a copy, track down a document, confirm what only you can confirm. Each item says what is needed, why the run could not get it, and the most specific next step there is: the publisher's real URL (recovered from the failure message, since the stored one is often an expiring search redirect), what archive.org did or did not answer, the document's own bulletin number.
+
+Two things it does deliberately:
+
+- **It collapses by target and ranks what is left.** Eight claims behind one refused URL are one page to open, not eight items. A list nobody finishes is worse than a short one that gets cleared, so it caps — and counts what it held back rather than dropping it.
+- **It separates what is yours forever from what is a missing tool.** `[you]` is judgement, a paywall, or your own observation. `[tool gap]` is something a tool could do and this pipeline cannot — rendering JavaScript, reading a scanned PDF, fetching with a real browser session. Those are totalled at the bottom as a roadmap.
+
+**Do not paste the worklist into the revision model.** It is a list of documents nobody has read yet, which is an invitation to invent them — that is why it is not numbered as a SECTION and sits outside the range step 3 asks for.
 
 **The loop:**
 
@@ -469,6 +484,7 @@ content-intelligence/
 │   │   │   ├── consolidation.py       weighted ensemble consolidation → one report
 │   │   │   ├── ensemble_capture.py    saves/loads raw ensemble output for --replay
 │   │   │   ├── handoff_parser.py      parses Template A and Template C documents
+│   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
 │   │   │   ├── passage_match.py       decides when two quoted passages are the same passage
@@ -476,6 +492,9 @@ content-intelligence/
 │   │   │   ├── markers.py           reports/strips machine-authorship markers in a
 │   │   │   │                        draft (ci-markers); --fix removes, default only reports
 │   │   │   ├── report_markdown.py     renders the readable run_N_*_review.md from the report
+│   │   │   ├── worklist.py            turns what the run could not settle into ranked
+│   │   │   │                          actions — run_N_*_worklist.md, and the block that
+│   │   │   │                          opens the review
 │   │   │   ├── check.py               connectivity/credential check for all services
 │   │   │   ├── discover.py            live model discovery — queries provider APIs
 │   │   │   ├── live_model_check.py    caches that discovery and reports, in the run

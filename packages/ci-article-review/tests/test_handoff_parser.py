@@ -369,3 +369,48 @@ class TestAuthorIdentity:
         the only thing standing between the verifier and an unattributed 'I'."""
         got = build_handoff_from_raw_text("Just prose.", source_name="x")
         assert not got.get("author")
+
+
+class TestTheTwoAuthorLabelsAreDistinct:
+    """Template A's `Author:` and Template C's meant different things.
+
+    Template A names who "I" is, for citation verification. Template C named a
+    WordPress *login username*, for the post payload. Same label, and a byline
+    pasted into the second is an account that does not exist. Template C's
+    field is now `WordPress author:`; the old spelling still parses, because
+    existing publication handoffs use it.
+    """
+
+    def _params(self, author_line):
+        text = (
+            "PUBLICATION HANDOFF\n"
+            "Article: T\n"
+            "\n"
+            "PUBLICATION PARAMETERS\n"
+            f"{author_line}\n"
+            "\n"
+            "FINAL DRAFT\n"
+            "Body text.\n"
+        )
+        return parse_publication_handoff(text)["publication_parameters"]
+
+    def test_the_current_spelling_parses(self):
+        assert self._params("WordPress author: mikeh") == {"wordpress_author": "mikeh"}
+
+    def test_the_legacy_spelling_still_parses(self):
+        assert self._params("Author: mikeh") == {"author": "mikeh"}
+
+    def test_the_draft_template_author_is_a_different_field(self):
+        """Template A's Author: lands on the handoff, not in publish params."""
+        text = (
+            "DRAFT SUBMISSION HANDOFF\n"
+            "Article: T\n"
+            "Author: Mike Hammett\n"
+            "\n"
+            "PRIMARY CLAIM\n"
+            "A claim.\n"
+            "\n"
+            "DRAFT\n"
+            "Body.\n"
+        )
+        assert parse_draft_submission(text)["author"] == "Mike Hammett"
