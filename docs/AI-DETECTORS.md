@@ -16,6 +16,43 @@ existed as of this writing.
 
 ---
 
+## Scope: which instrument this is about
+
+Three different things get called "AI detection." This document rejects exactly
+one of them. Do not read it as rejecting the other two.
+
+| Instrument | What it does | Status here |
+|---|---|---|
+| **Heuristic classifier** — GPTZero, Originality.ai, Pangram, Turnitin, Copyleaks | Guesses authorship from surface style. No key, no ground truth | **Rejected. This document.** |
+| **Keyed watermark detection** — e.g. Anthropic's detection API | Re-runs a keyed pseudorandom function over the token stream. Actually reliable, by design | Different instrument. See README, "Authorship provenance" |
+| **Typographic residue** — `ci-markers` | Counts characters a keyboard does not produce. Deterministic, free, no guessing | Already shipped (PR #135) |
+
+The distinction that matters: a classifier *infers* from style and can be wrong
+in both directions; a keyed watermark detector *verifies* a signal that is
+provably there or not. The evidence below is about inference, and none of it
+transfers to verification.
+
+Two consequences worth holding onto:
+
+- **The README's "Authorship provenance" section is the right neighbour to this
+  one.** It records that Claude has carried a statistical watermark since
+  August 2026, that nothing in this repo can detect it without the provider's
+  key, and that Anthropic runs a third-party detection API — in private preview,
+  with media and fact-checkers among the eligible categories. If detection is
+  ever genuinely wanted here, **that is the door to knock on, not Pangram's.**
+  It answers a question a classifier can only guess at.
+- **`ci-markers` already occupies the "statistical, not rhetorical" slot** that a
+  detector was imagined to fill, and it does so without an API, a subscription,
+  or a false-positive rate. Its README section notes that stripping typography
+  "will not fool a classifier, which keys on sentence rhythm and word choice far
+  more than on punctuation." That is broadly right and now has a citation
+  (arXiv 2603.23146) — with one correction: punctuation patterns *are* among the
+  features classifiers key on, alongside formality, vocabulary distribution, and
+  sentence-length uniformity. The conclusion stands; the mechanism is slightly
+  wider than "far more than punctuation" implies.
+
+---
+
 ## The short version
 
 A detector answers *"was this text machine-generated?"* The
