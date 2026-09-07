@@ -1407,7 +1407,13 @@ def _render_section_9(citations):
             lines.extend(_render_archive_pair(c))
             for kv in _kv_lines(
                 c,
-                exclude=("claim", "resolved", "content_changed_since")
+                exclude=(
+                    "claim",
+                    "resolved",
+                    "url",
+                    "final_url",
+                    "content_changed_since",
+                )
                 + _PAIR_RENDERED_FIELDS,
             ):
                 lines.append(kv)

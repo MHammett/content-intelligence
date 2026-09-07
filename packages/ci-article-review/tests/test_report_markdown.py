@@ -1964,6 +1964,40 @@ class TestEscalatedCitationsRenderReaderFriction:
         assert "Verified via:" not in md
         assert "Reader access:" in md
 
+    def test_the_url_is_stated_once_in_the_read_and_supports_bucket(self):
+        """The pair block renders the URL; the key/value dump must not repeat it.
+
+        Every other bucket in the section excludes ``url``/``final_url`` for
+        this reason. The checksum bucket was missed when the redirector fix went
+        in, so the largest block in the section kept printing each link twice —
+        once as "Live:" and again as "Url:". At 271 characters of opaque Vertex
+        redirect per entry, that duplicate is most of what the reader sees.
+        """
+        md = "\n".join(report_markdown._render_section_9([self._cit()]))
+        lines = [line.strip() for line in md.splitlines()]
+
+        assert lines.count(f"- Live: {self.LIVE}") == 1
+        # The labels the duplicate arrived under, from the generic dump.
+        assert not [
+            line for line in lines if line.startswith(("- Url:", "- Final url:"))
+        ]
+
+    def test_a_redirector_never_reaches_the_read_and_supports_bucket(self):
+        """The payoff of resolving ``final_url``: the opaque URL is not published.
+
+        ``_render_archive_pair`` on its own has never emitted it, so asserting
+        there proves nothing about the report. This asserts on the assembled
+        section, which is where it was still reaching the reader.
+        """
+        redirect = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ"
+        citation = self._cit(url=redirect, final_url=self.LIVE)
+
+        md = "\n".join(report_markdown._render_section_9([citation]))
+
+        assert "### Read, and supports the claim (1)" in md
+        assert redirect not in md
+        assert md.count(f"- Live: {self.LIVE}") == 1
+
     def test_an_escalated_citation_sits_in_the_read_and_supports_bucket(self):
         """Escalation changes how the document was obtained, not what was
         established about it. A page read this way was read."""
