@@ -772,3 +772,23 @@ class TestReproducibilityAcrossRuns:
         assert block["comparable_run_count"] == 0
         assert block["skipped_count"] == 1
         assert block["skipped"][0]["reason"] == "different draft"
+
+    def test_identical_runs_report_nothing_missed(self, tmp_path):
+        """The dropped-findings block must not invent a miss out of a match.
+
+        The stubs return the same findings every run, so a correct
+        implementation drops nothing. This is the end-to-end guard on that: if
+        the key derivation on the current run ever diverges from the one
+        applied to history, every finding would look absent from itself and
+        this block would fill with phantom misses — the most damaging way this
+        feature could fail, since it accuses the run of missing real work.
+        """
+        with _stubbed_run(tmp_path):
+            pass
+        with _stubbed_run(tmp_path) as second:
+            dropped = second["reproducibility"]["dropped"]
+            md = render_report_markdown(second)
+
+        assert second["reproducibility"]["comparable_run_count"] == 1
+        assert dropped["total"] == 0, dropped["findings"]
+        assert "may have missed" not in md

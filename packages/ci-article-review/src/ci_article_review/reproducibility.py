@@ -145,6 +145,18 @@ DENOMINATOR_FIELD = "reproduced_of"
 #: this.
 _GROUNDED_SUFFIX = " [grounded]"
 
+#: Prior runs required before a dropped finding is worth printing. At one
+#: prior run "it found this and we did not" is simply the run-to-run noise this
+#: module exists to describe — measured at 130 such findings on the
+#: dc-environment cluster, against 4 once two or more runs must agree. See
+#: ``dropped_findings`` for the full table.
+_MIN_PRIOR_RUNS_FOR_DROPPED = 2
+
+#: Dropped findings rendered before the list is cut off, with the remainder
+#: counted rather than dropped silently. Same reasoning as the worklist's cap:
+#: a list nobody finishes is worse than a short one that gets read.
+_MAX_DROPPED_LISTED = 10
+
 #: Most recent comparable runs to carry in the report's run list. The counting
 #: itself is unbounded; this only bounds how much provenance the report JSON
 #: repeats back, since each entry is a filename and a timestamp.
@@ -255,37 +267,53 @@ def _is_degraded(report):
     return bool(report.get("model_failures"))
 
 
-def finding_keys(report):
-    """Map of section name -> set of normalised passage keys in that section.
+def finding_index(report):
+    """Map of section name -> {normalised key: the passage as written}.
 
     Uses ``consolidation._passage_key`` rather than its own normalisation so
     that "the same finding" means the same thing here as it does in consensus
     detection. Two modules disagreeing about that would produce a
     reproducibility rate that quietly measured its own key function.
+
+    The unnormalised text is carried alongside because a key is a lowercased,
+    whitespace-collapsed 250-character prefix — fine for matching, unreadable
+    in a report. ``dropped_findings`` shows a prior run's finding to someone
+    who never saw it, so it needs the sentence the model actually wrote.
     """
     out = {}
     for section, field in _LIST_SECTIONS.items():
-        keys = set()
+        found = {}
         for finding in report.get(section) or []:
             if not isinstance(finding, dict):
                 continue
-            key = _passage_key(finding.get(field, ""))
+            text = finding.get(field, "")
+            key = _passage_key(text)
             if key:
-                keys.add(key)
-        out[section] = keys
+                found.setdefault(key, text)
+        out[section] = found
 
     fact_check = report.get("section_2_fact_check") or {}
-    fc_keys = set()
+    fc = {}
     if isinstance(fact_check, dict):
         for bucket in _FACT_CHECK_BUCKETS:
             for finding in fact_check.get(bucket) or []:
                 if not isinstance(finding, dict):
                     continue
-                key = _passage_key(finding.get("claim", ""))
+                text = finding.get("claim", "")
+                key = _passage_key(text)
                 if key:
-                    fc_keys.add((bucket, key))
-    out["section_2_fact_check"] = fc_keys
+                    fc.setdefault((bucket, key), text)
+    out["section_2_fact_check"] = fc
     return out
+
+
+def finding_keys(report):
+    """Map of section name -> set of normalised passage keys in that section.
+
+    Derived from ``finding_index`` rather than extracting separately, so the
+    two can never disagree about what counts as a finding.
+    """
+    return {section: set(found) for section, found in finding_index(report).items()}
 
 
 def _load_prior_reports(history_root, history_key, before_ts=None):
@@ -360,6 +388,92 @@ def comparable_runs(report, history_root, history_key, before_ts=None):
         comparable.append((timestamp, path, prior))
 
     return comparable, skipped
+
+
+def dropped_findings(report, comparable, denominators):
+    """Findings every comparable prior run raised, and this one did not.
+
+    The report says how often each finding it *did* raise recurred. The
+    silence on the other side is the larger gap: on the five-run
+    ``dc-environment`` cluster a single run reproduces roughly a quarter of
+    the findings in its section 5, which means each run also *misses* a great
+    many its predecessors caught. An author revising from one run never learns
+    they existed.
+
+    Why "fixed" is not one of the possibilities
+    -------------------------------------------
+    Ordinarily a finding present last time and absent now is ambiguous — it may
+    have been fixed. Here it cannot have been: comparability already pins the
+    draft to the same text, byte for byte after whitespace normalisation. So a
+    dropped finding is noise in the prior runs or a miss in this one, and
+    nothing else. That is what makes the block safe to show without implying
+    the author resolved anything.
+
+    Why unanimity, and why at least two prior runs
+    ----------------------------------------------
+    Both thresholds were set by counting what they would actually print, on the
+    same cluster, with each run in turn treated as the current one:
+
+      prior runs (N)              1     2     3     4
+      raised by >=1 prior run   130   239   329   424
+      raised by >=half           130   239    35    54
+      raised by all              130    15     4     4
+
+    "Raised by at least one other run" is a backlog, not a signal, and it grows
+    with the history. Unanimity is a short list — but at N=1 every rule
+    degenerates to "everything the other run found", which is why two prior
+    runs are also required. What survives is the case worth an author's time:
+    every previous run of this exact draft saw it, and this one did not.
+    """
+    if not comparable:
+        return {"findings": [], "total": 0, "eligible_sections": []}
+
+    mine = finding_keys(report)
+    counts, texts, sources = {}, {}, {}
+    for _ts, path, prior in comparable:
+        index = finding_index(prior)
+        for section, found in index.items():
+            if not _covers_section(prior, section):
+                continue
+            for key, text in found.items():
+                counts[(section, key)] = counts.get((section, key), 0) + 1
+                texts.setdefault((section, key), text)
+                sources[(section, key)] = path.name
+
+    eligible = [
+        section
+        for section in denominators
+        if denominators.get(section, 0) >= _MIN_PRIOR_RUNS_FOR_DROPPED
+    ]
+
+    out = []
+    for (section, key), seen in counts.items():
+        denominator = denominators.get(section, 0)
+        if denominator < _MIN_PRIOR_RUNS_FOR_DROPPED or seen != denominator:
+            continue
+        if key in (mine.get(section) or set()):
+            continue
+        bucket = key[0] if isinstance(key, tuple) else None
+        out.append(
+            {
+                "section": section,
+                "bucket": bucket,
+                "passage": texts[(section, key)],
+                "raised_in": seen,
+                "of": denominator,
+                "last_seen": sources[(section, key)],
+            }
+        )
+
+    # Stable order: the sections an author acts on first, then by text so two
+    # runs over the same history produce the same list.
+    order = {name: i for i, name in enumerate(_SECTION_DOMAINS)}
+    out.sort(key=lambda d: (order.get(d["section"], 99), d["passage"]))
+    return {
+        "findings": out[:_MAX_DROPPED_LISTED],
+        "total": len(out),
+        "eligible_sections": eligible,
+    }
 
 
 def _annotate_findings(report, prior_keys, denominators):
@@ -458,6 +572,7 @@ def annotate(report, history_root, history_key, before_ts=None):
         )
 
     stats = _annotate_findings(report, prior_keys, denominators)
+    dropped = dropped_findings(report, comparable, denominators)
     degraded = sum(1 for _, _, prior in comparable if _is_degraded(prior))
 
     listed = [
@@ -479,6 +594,7 @@ def annotate(report, history_root, history_key, before_ts=None):
         "skipped_count": len(skipped),
         "section_denominators": denominators,
         "sections": stats,
+        "dropped": dropped,
         "calibration": CALIBRATION,
     }
     return report

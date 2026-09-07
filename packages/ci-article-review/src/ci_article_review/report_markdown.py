@@ -306,6 +306,75 @@ def _render_reading_note(report):
         "the evidence for it is one sample."
     )
     lines.append("")
+    lines.extend(_render_dropped(repro))
+    return lines
+
+
+#: How each tracked section is named in the dropped-findings list. A reader
+#: being shown a finding this run never made needs to know which section would
+#: have carried it; the numbers match the section headings below.
+_DROPPED_SECTION_LABELS = {
+    "section_1_consensus": "Section 1, consensus",
+    "section_2_fact_check": "Section 2, fact-check",
+    "section_3_voice": "Section 3, voice",
+    "section_4_argument": "Section 4, argument",
+    "section_5_completeness": "Section 5, completeness",
+}
+
+
+def _render_dropped(repro):
+    """Findings every comparable prior run raised and this one did not.
+
+    The other half of the reproducibility story, and the half a reader cannot
+    reconstruct for themselves: the rest of this report can only annotate
+    findings that are present. What this run *missed* is invisible by
+    construction, and on measured history each run misses a great many.
+
+    Safe to state plainly because comparability pins the draft: these runs
+    reviewed the same text, so a finding here was not fixed between runs. It is
+    noise in the earlier runs or a miss in this one.
+    """
+    dropped = repro.get("dropped") or {}
+    findings = dropped.get("findings") or []
+    if not findings:
+        return []
+
+    total = dropped.get("total", len(findings))
+    lines = [
+        f"### What this run may have missed ({total})",
+        "",
+        "Raised by **every** comparable prior run of this same draft, and not "
+        "raised here. The draft did not change between those runs and this one "
+        "— that is what makes them comparable — so nothing below was fixed in "
+        "the meantime. Each is either noise in the earlier runs or a miss in "
+        "this one, and the report cannot tell you which. They are listed "
+        "because the alternative is that they vanish.",
+        "",
+    ]
+    for finding in findings:
+        label = _DROPPED_SECTION_LABELS.get(
+            finding.get("section"), finding.get("section", "?")
+        )
+        bucket = finding.get("bucket")
+        if bucket:
+            label += f" / {bucket}"
+        passage = finding.get("passage", "")
+        lines.append(
+            f"- **{label}** — raised in {finding.get('raised_in')} of "
+            f'{finding.get("of")} prior runs: "{passage}"'
+        )
+    if total > len(findings):
+        lines.append(
+            f"- _...and {total - len(findings)} more, not listed. The full set "
+            f"is in this run's `_report.json` under `reproducibility.dropped`._"
+        )
+    lines.append("")
+    lines.append(
+        "A `fact-check / confirmed` entry means a claim earlier runs verified "
+        "went unchecked this time — a gap in coverage rather than a problem "
+        "missed."
+    )
+    lines.append("")
     return lines
 
 

@@ -471,3 +471,154 @@ class TestRendererStaysInStepWithModule:
             repro.REPRODUCED_FIELD,
             repro.DENOMINATOR_FIELD,
         }
+
+
+class TestDroppedFindings:
+    """Findings every comparable prior run raised, and this one did not.
+
+    The rest of the module can only annotate findings that are present. What a
+    run *missed* is invisible by construction, and on measured history each run
+    misses a great many — so the thresholds here are about keeping the list
+    short enough to be read, not about whether the data exists.
+    """
+
+    def _dropped(self, current, tmp_path):
+        repro.annotate(current, str(tmp_path), KEY, before_ts=NOW)
+        return current["reproducibility"]["dropped"]
+
+    def test_a_finding_every_prior_run_raised_and_this_one_did_not(self, tmp_path):
+        write_history(
+            tmp_path, KEY, [make_report(voice=["gone"]), make_report(voice=["gone"])]
+        )
+        dropped = self._dropped(make_report(voice=["kept"]), tmp_path)
+        assert dropped["total"] == 1
+        entry = dropped["findings"][0]
+        assert entry["section"] == "section_3_voice"
+        assert entry["passage"] == "gone"
+        assert (entry["raised_in"], entry["of"]) == (2, 2)
+
+    def test_a_finding_still_present_is_not_dropped(self, tmp_path):
+        write_history(
+            tmp_path, KEY, [make_report(voice=["kept"]), make_report(voice=["kept"])]
+        )
+        assert self._dropped(make_report(voice=["kept"]), tmp_path)["total"] == 0
+
+    def test_a_finding_only_some_prior_runs_raised_is_not_dropped(self, tmp_path):
+        """Unanimity, not majority.
+
+        Measured on the dc-environment cluster: "raised by at least one prior
+        run" listed 424 findings and "at least half" listed 54, against 4 for
+        unanimity. The looser rules print a backlog that grows with history.
+        """
+        write_history(
+            tmp_path, KEY, [make_report(voice=["sometimes"]), make_report(voice=[])]
+        )
+        assert self._dropped(make_report(voice=[]), tmp_path)["total"] == 0
+
+    def test_one_prior_run_is_never_enough(self, tmp_path):
+        """At N=1 every threshold degenerates to "everything the other run found".
+
+        That was 130 findings on real history — the run-to-run noise this
+        module exists to describe, not a signal about this run.
+        """
+        write_history(tmp_path, KEY, [make_report(voice=["gone"])])
+        assert self._dropped(make_report(voice=[]), tmp_path)["total"] == 0
+
+    def test_no_comparable_history_drops_nothing(self, tmp_path):
+        assert self._dropped(make_report(voice=["a"]), tmp_path)["total"] == 0
+
+    def test_a_prior_run_that_lost_the_domain_cannot_break_unanimity(self, tmp_path):
+        """Consistent with the reproduction denominators.
+
+        A run whose voice passes all failed never had the chance to raise a
+        voice finding, so it neither counts toward that section's denominator
+        nor breaks another run's unanimity.
+        """
+        write_history(
+            tmp_path,
+            KEY,
+            [
+                make_report(voice=["gone"]),
+                make_report(voice=["gone"]),
+                make_report(voice=[], failures=["openai:voice_style"]),
+            ],
+        )
+        entry = self._dropped(make_report(voice=[]), tmp_path)["findings"][0]
+        assert (entry["raised_in"], entry["of"]) == (2, 2)
+
+    def test_fact_check_buckets_are_named_separately(self, tmp_path):
+        prior = make_report(fact_check={"contradicted": [{"claim": "c1"}]})
+        write_history(tmp_path, KEY, [prior, prior])
+        entry = self._dropped(make_report(), tmp_path)["findings"][0]
+        assert entry["section"] == "section_2_fact_check"
+        assert entry["bucket"] == "contradicted"
+
+    def test_the_list_is_capped_and_the_remainder_counted(self, tmp_path):
+        many = [f"finding {i}" for i in range(repro._MAX_DROPPED_LISTED + 5)]
+        write_history(tmp_path, KEY, [make_report(voice=many), make_report(voice=many)])
+        dropped = self._dropped(make_report(voice=[]), tmp_path)
+        assert dropped["total"] == len(many)
+        assert len(dropped["findings"]) == repro._MAX_DROPPED_LISTED
+
+    def test_the_passage_is_shown_as_written_not_as_a_match_key(self, tmp_path):
+        """Keys are lowercased and clipped; a reader needs the real sentence."""
+        text = "These Conditions Produce Better Outcomes Than A Standard Park."
+        write_history(
+            tmp_path, KEY, [make_report(voice=[text]), make_report(voice=[text])]
+        )
+        entry = self._dropped(make_report(voice=[]), tmp_path)["findings"][0]
+        assert entry["passage"] == text
+
+
+class TestDroppedRendering:
+    def test_the_block_names_what_was_missed(self, tmp_path):
+        write_history(
+            tmp_path, KEY, [make_report(voice=["gone"]), make_report(voice=["gone"])]
+        )
+        current = make_report(voice=[])
+        repro.annotate(current, str(tmp_path), KEY, before_ts=NOW)
+        md = render_report_markdown(current)
+        assert "### What this run may have missed (1)" in md
+        assert "Section 3, voice" in md
+        assert "gone" in md
+
+    def test_the_block_says_nothing_was_fixed(self, tmp_path):
+        """The claim that makes the block safe to print.
+
+        Comparability pins the draft, so a dropped finding cannot have been
+        resolved between runs — and a reader must not infer that it was.
+        """
+        write_history(
+            tmp_path, KEY, [make_report(voice=["gone"]), make_report(voice=["gone"])]
+        )
+        current = make_report(voice=[])
+        repro.annotate(current, str(tmp_path), KEY, before_ts=NOW)
+        assert "nothing below was fixed" in render_report_markdown(current)
+
+    def test_no_block_when_nothing_was_dropped(self, tmp_path):
+        current = make_report(voice=["a"])
+        repro.annotate(current, str(tmp_path), KEY, before_ts=NOW)
+        assert "may have missed" not in render_report_markdown(current)
+
+    def test_the_block_sits_above_the_findings(self, tmp_path):
+        write_history(
+            tmp_path, KEY, [make_report(voice=["gone"]), make_report(voice=["gone"])]
+        )
+        current = make_report(voice=[], consensus=["c"])
+        repro.annotate(current, str(tmp_path), KEY, before_ts=NOW)
+        md = render_report_markdown(current)
+        assert md.index("may have missed") < md.index("SECTION 1")
+
+
+class TestFindingIndexAndKeysAgree:
+    def test_keys_are_derived_from_the_index(self):
+        report = make_report(
+            voice=["v"],
+            argument=["a"],
+            completeness=["c"],
+            consensus=["s1"],
+            fact_check={"outdated": [{"claim": "fc"}]},
+        )
+        index = repro.finding_index(report)
+        assert repro.finding_keys(report) == {s: set(v) for s, v in index.items()}
+        assert index["section_3_voice"] == {"v": "v"}
