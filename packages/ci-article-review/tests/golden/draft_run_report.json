@@ -460,6 +460,60 @@
     "status": "unknown"
   },
   "publication": "testpub",
+  "reproducibility": {
+    "calibration": {
+      "distinct_findings": 259,
+      "reproduced_in_3_or_more": 18,
+      "runs": 4,
+      "source": "docs/CONFIGURATION.md, 'Prompt cache layout'"
+    },
+    "comparable_run_count": 0,
+    "degraded_runs": 0,
+    "draft_fingerprint": "c049f40691239b96",
+    "runs": [],
+    "runs_truncated": 0,
+    "section_denominators": {
+      "section_1_consensus": 0,
+      "section_2_fact_check": 0,
+      "section_3_voice": 0,
+      "section_4_argument": 0,
+      "section_5_completeness": 0
+    },
+    "sections": {
+      "section_1_consensus": {
+        "at_least_half": 0,
+        "denominator": 0,
+        "findings": 4,
+        "reproduced": 0
+      },
+      "section_2_fact_check": {
+        "at_least_half": 0,
+        "denominator": 0,
+        "findings": 2,
+        "reproduced": 0
+      },
+      "section_3_voice": {
+        "at_least_half": 0,
+        "denominator": 0,
+        "findings": 1,
+        "reproduced": 0
+      },
+      "section_4_argument": {
+        "at_least_half": 0,
+        "denominator": 0,
+        "findings": 2,
+        "reproduced": 0
+      },
+      "section_5_completeness": {
+        "at_least_half": 0,
+        "denominator": 0,
+        "findings": 1,
+        "reproduced": 0
+      }
+    },
+    "skipped": [],
+    "skipped_count": 0
+  },
   "run_number": 1,
   "section_1_consensus": [
     {

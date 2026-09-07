@@ -695,3 +695,80 @@ class TestADomainWithNoReviewerReachesTheReport:
         with _stubbed_run(tmp_path) as report:
             assert report["domains_not_run"] == []
             assert "Domains not reviewed" not in render_report_markdown(report)
+
+
+class TestReproducibilityAcrossRuns:
+    """The second run of a draft measures itself against the first, for free.
+
+    ``test_reproducibility.py`` covers the counting rules against hand-built
+    reports. This asserts the wiring those unit tests cannot see: that a real
+    ``run_draft_pipeline`` writes a history entry the *next* real run finds,
+    matches, and reports on — with no extra model call between them.
+
+    The stubs return identical findings every run, so reproduction here is
+    total by construction. That is the point: it isolates the plumbing. Whether
+    real findings recur is a property of the models, and is what the feature
+    exists to measure rather than to assume.
+    """
+
+    def test_a_first_run_reports_that_nothing_was_measured(self, tmp_path):
+        with _stubbed_run(tmp_path) as report:
+            block = report["reproducibility"]
+
+        assert block["comparable_run_count"] == 0
+        assert block["skipped_count"] == 0
+        # No measurement was taken, so no finding may carry a count.
+        assert all("reproduced_in" not in f for f in report["section_1_consensus"])
+
+    def test_a_second_run_is_measured_against_the_first(self, tmp_path):
+        with _stubbed_run(tmp_path) as first:
+            first_calls = len(first["api_call_log"])
+
+        with _stubbed_run(tmp_path) as second:
+            block = second["reproducibility"]
+            second_calls = len(second["api_call_log"])
+
+        assert block["comparable_run_count"] == 1, (
+            "The second run of an unchanged draft did not find the first in "
+            f"pipeline_history/. Skipped: {block['skipped']}"
+        )
+        assert (
+            block["draft_fingerprint"] == first["reproducibility"]["draft_fingerprint"]
+        )
+        # Free: the comparison adds no model calls to the run that benefits.
+        assert second_calls == first_calls
+
+        for section in ("section_1_consensus", "section_3_voice"):
+            for finding in second[section]:
+                assert finding["reproduced_of"] == 1
+                assert finding["reproduced_in"] == 1, (
+                    f"{section} finding did not match its own prior run: "
+                    f"{finding.get('passage')!r}"
+                )
+
+    def test_the_second_run_renders_the_measured_caveat(self, tmp_path):
+        from ci_article_review.report_markdown import render_report_markdown
+
+        with _stubbed_run(tmp_path):
+            pass
+        with _stubbed_run(tmp_path) as second:
+            md = render_report_markdown(second)
+
+        assert "Measured on this draft" in md
+        assert "also in 1 of 1 comparable prior runs" in md
+        assert md.index("Reading this report") < md.index("SECTION 1")
+
+    def test_an_edited_draft_is_not_compared_against_the_old_one(self, tmp_path):
+        """A revision must not inherit the previous draft's corroboration."""
+        with _stubbed_run(tmp_path):
+            pass
+
+        edited = dict(_HANDOFF)
+        edited["draft"] = edited["draft"] + "\n\nA newly added closing paragraph."
+        with patch.dict(_HANDOFF, edited, clear=False):
+            with _stubbed_run(tmp_path) as second:
+                block = second["reproducibility"]
+
+        assert block["comparable_run_count"] == 0
+        assert block["skipped_count"] == 1
+        assert block["skipped"][0]["reason"] == "different draft"

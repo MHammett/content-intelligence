@@ -198,6 +198,10 @@ Readable review (paste into chat): pipeline_history/my-article/run_1_20260809_14
 Your worklist (do NOT paste; these are yours): pipeline_history/my-article/run_1_20260809_143022_worklist.md
 ```
 
+**One run is not a measurement.** Repeat runs of an unedited draft return substantially different findings — in a four-run test of one article, only 18 of 259 distinct findings recurred in three or more of the four runs. Every review therefore opens with a **Reading this report** block saying what its counts are and are not, and Section 1 is grouped into bands rather than ranked, because ordering by weight does not order by reliability.
+
+Runs of the same draft are scored against each other automatically, from the reports already in `pipeline_history/` — so the second and later runs of a draft get that measurement for free, with no extra model calls. **Running a draft twice before you revise it is the cheapest way to tell a real finding from a fluke.** See [Reproducibility context](docs/CONFIGURATION.md#reproducibility-context).
+
 ### The worklist
 
 A run ends with gaps: a source that 403'd, a page that fetched but would not extract, a bulletin the fact-check pass could name but not link. The report describes those honestly and stops. The worklist turns them into errands, and it is also rendered at the top of `review.md`.
@@ -603,6 +607,8 @@ content-intelligence/
 │   │   │   ├── worklist.py            turns what the run could not settle into ranked
 │   │   │   │                          actions — run_N_*_worklist.md, and the block that
 │   │   │   │                          opens the review
+│   │   │   ├── reproducibility.py     scores this run's findings against earlier runs of
+│   │   │   │                          the same draft, free, from pipeline_history/
 │   │   │   ├── check.py               connectivity/credential check for all services
 │   │   │   ├── discover.py            live model discovery — queries provider APIs
 │   │   │   ├── live_model_check.py    caches that discovery and reports, in the run
