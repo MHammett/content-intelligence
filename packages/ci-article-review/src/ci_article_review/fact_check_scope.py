@@ -359,6 +359,27 @@ def _matches(claim_norm, claim_words, exclusion):
     return bool(union) and len(claim_words & passage_words) / union >= _SIMILARITY
 
 
+def _items(fact_check, bucket):
+    """The readable findings in one bucket — dicts only, never a crash.
+
+    In a real run this never filters anything: ``build_report`` runs
+    ``_normalise_fact_check_results`` over every fact-check payload before any
+    of this is reached, so by the time a section arrives here every bucket is
+    already a list of dicts. This is for the other callers — ``apply`` is public
+    and is exercised directly by tests and by anything holding a section it did
+    not build itself, and ``item.get(...)`` two lines down turns a stray string
+    into an ``AttributeError`` that takes the whole report with it.
+
+    Silent here, unlike upstream: this has no model name to name and no report
+    to record against, and warning a second time about something
+    ``_normalise_fact_check_results`` has already explained would just be noise.
+    """
+    value = fact_check.get(bucket)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
 # ---------------------------------------------------------------------------
 # The rules for one run
 # ---------------------------------------------------------------------------
@@ -507,7 +528,7 @@ class ScopeRules:
             return entry
 
         # 1. What the models themselves classified.
-        for item in fact_check.get("out_of_scope") or []:
+        for item in _items(fact_check, "out_of_scope"):
             claim = item.get("claim", "")
             if not claim:
                 continue
@@ -570,7 +591,7 @@ class ScopeRules:
         ]
         for bucket in SWEPT_BUCKETS:
             kept = []
-            for item in fact_check.get(bucket) or []:
+            for item in _items(fact_check, bucket):
                 claim = item.get("claim", "")
                 if not claim:
                     kept.append(item)
