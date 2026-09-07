@@ -646,6 +646,62 @@ class TestSection9Citations:
             in md.split("### Read, and supports the claim")[1]
         )
 
+    def test_the_drift_block_names_where_the_fetch_landed(self):
+        """The drift block tells the author to go and re-check a source, so the
+        address it prints has to be one they can open.
+
+        It read ``url`` directly while every other URL in the section went
+        through ``_citation_pair``. For a grounded-model citation ``url`` is a
+        ``grounding-api-redirect`` wrapper that names no publication and expires
+        within days -- the exact string the redirector fix exists to keep out of
+        the report.
+        """
+        redirect = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ"
+        landed = "https://www.jalopnik.com/honda-clocks-stuck"
+        report = _base_report(
+            section_9_citations=[
+                {
+                    "claim": "The bridge cost $4 million.",
+                    "resolved": True,
+                    "url": redirect,
+                    "final_url": landed,
+                    "verification": "checksum",
+                    "content_changed_since": {
+                        "prior_run": 4,
+                        "prior_article": "prior-article",
+                        "note": "changed",
+                    },
+                },
+            ]
+        )
+        md = render_report_markdown(report)
+        drift_section = md.split("### ⚠ Content changed")[1].split(
+            "### Read, and supports the claim"
+        )[0]
+
+        assert f"- URL: {landed}" in drift_section
+        assert redirect not in drift_section
+
+    def test_the_drift_block_still_names_a_citation_that_never_redirected(self):
+        """No ``final_url`` means the requested URL is where it landed."""
+        report = _base_report(
+            section_9_citations=[
+                {
+                    "claim": "The bridge cost $4 million.",
+                    "resolved": True,
+                    "url": "https://example.gov/budget.pdf",
+                    "verification": "checksum",
+                    "content_changed_since": {"prior_run": 4, "note": "changed"},
+                },
+            ]
+        )
+        md = render_report_markdown(report)
+        drift_section = md.split("### ⚠ Content changed")[1].split(
+            "### Read, and supports the claim"
+        )[0]
+
+        assert "- URL: https://example.gov/budget.pdf" in drift_section
+
     def test_no_drift_block_when_nothing_changed(self):
         report = _base_report(
             section_9_citations=[
