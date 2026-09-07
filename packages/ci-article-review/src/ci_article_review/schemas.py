@@ -4,7 +4,10 @@ Each domain prompt ends with a RETURN FORMAT block. These schemas are that block
 expressed so a provider can *enforce* it, rather than the model being asked
 nicely and the pipeline hoping. Verified 2026-08-16: every provider the ensemble
 uses honours a schema — the exception is gemini while grounded, which rejects
-the combination outright, so it keeps prompt-only JSON on fact_check.
+the combination outright and so keeps prompt-only JSON on every domain, not
+just fact_check: ``ci_core.llm.client._provider_params`` sets gemini's search
+tool unconditionally, with no per-domain check, so a grounded gemini call runs
+schema-free across all five review domains.
 
 Why bother, when the prompt already says what shape to return: a loose
 instruction to gpt-5.4-mini came back as ``{"ai_speak": ..., "suggestion": ...}``

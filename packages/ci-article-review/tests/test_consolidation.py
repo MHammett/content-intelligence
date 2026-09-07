@@ -1096,3 +1096,284 @@ class TestScopeRulesToleratesMalformedBuckets:
         )
         assert [i["claim"] for i in out["confirmed"]] == ["Kept."]
         assert [e["claim"] for e in out["out_of_scope"]] == ["I have a side job."]
+# ---------------------------------------------------------------------------
+# Malformed flags / red-team buckets
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedFlagsBuckets:
+    """A `flags` bucket that is not a list of dicts must not kill report
+    building, for the three domains that share the schema.
+
+    Every provider that enforces a schema is incapable of returning one.
+    Gemini while grounded is the exception — it runs prompt-only on every
+    domain, not only fact_check (`_provider_params` sets its search tool
+    unconditionally) — so any of voice_style, completeness and
+    argument_integrity can arrive in whatever shape the model felt like
+    returning. When that happened, `_extract_passages` (Section 1) was the
+    first reader to raise.
+    """
+
+    def _report(self, domain, data, extra=None):
+        results = {("gemini", domain): _ok(data, model="gemini")}
+        results.update(extra or {})
+        return build_report(
+            article_title="T",
+            publication_name="p",
+            run_number=1,
+            corrected_draft="d",
+            lt_result=None,
+            results=results,
+            ensemble_cfg={},
+            api_call_log=[],
+        )
+
+    _SECTION_KEY = {
+        "voice_style": "section_3_voice",
+        "argument_integrity": "section_4_argument",
+        "completeness": "section_5_completeness",
+    }
+
+    # -- the crash itself, across all three domains --------------------------
+
+    _TEXT_FIELD = {
+        "voice_style": "passage",
+        "argument_integrity": "passage",
+        "completeness": "passage_reference",
+    }
+
+    def test_a_dict_flags_bucket_does_not_raise(self):
+        for domain in ("voice_style", "argument_integrity", "completeness"):
+            report = self._report(domain, {"flags": {self._TEXT_FIELD[domain]: "p"}})
+            assert report[self._SECTION_KEY[domain]], domain
+
+    def test_a_string_flags_bucket_does_not_raise(self):
+        for domain in ("voice_style", "argument_integrity", "completeness"):
+            report = self._report(domain, {"flags": "nothing to report"})
+            assert report[self._SECTION_KEY[domain]] == [], domain
+
+    def test_a_string_bucket_is_not_iterated_character_by_character(self):
+        """`for item in "none"` yields four characters, each of which a naive
+        per-item coercion would turn into a flag."""
+        report = self._report("voice_style", {"flags": "none"})
+        assert report["section_3_voice"] == []
+
+    def test_a_null_flags_bucket_does_not_raise(self):
+        """`data.get("flags", [])` never reaches its default for a
+        present-but-null key."""
+        report = self._report("argument_integrity", {"flags": None})
+        assert report["section_4_argument"] == []
+
+    def test_a_non_dict_payload_does_not_raise(self):
+        """Same cause one level up: the whole response came back as a list."""
+        report = self._report("voice_style", [{"flags": [_flag("p")]}])
+        assert report["section_3_voice"] == []
+        assert report["degradations"]
+
+    # -- what survives ---------------------------------------------------
+
+    def test_readable_items_in_a_mixed_list_are_kept(self):
+        report = self._report(
+            "voice_style",
+            {"flags": [_flag("kept"), 12, _flag("also kept")]},
+        )
+        passages = [f["passage"] for f in report["section_3_voice"]]
+        assert passages == ["kept", "also kept"]
+
+    def test_a_bare_string_in_a_list_is_read_as_a_passage(self):
+        report = self._report("voice_style", {"flags": ["The grid is complex."]})
+        (flag,) = report["section_3_voice"]
+        assert flag["passage"] == "The grid is complex."
+
+    def test_completeness_reads_a_bare_string_as_passage_reference(self):
+        """Completeness flags key on `passage_reference`, not `passage` — the
+        coerced field has to match what `_extract_passages` reads for this
+        domain specifically."""
+        report = self._report("completeness", {"flags": ["Missing context."]})
+        (flag,) = report["section_5_completeness"]
+        assert flag["passage_reference"] == "Missing context."
+
+    def test_a_blank_string_in_a_list_is_dropped(self):
+        report = self._report("voice_style", {"flags": ["   "]})
+        assert report["section_3_voice"] == []
+
+    def test_a_dict_bucket_is_one_flag_returned_unwrapped(self):
+        report = self._report(
+            "argument_integrity", {"flags": {"passage": "p", "logical_problem": "x"}}
+        )
+        (flag,) = report["section_4_argument"]
+        assert flag["passage"] == "p"
+
+    def test_surviving_flags_still_carry_their_source_tag(self):
+        report = self._report("voice_style", {"flags": [_flag("kept"), None]})
+        (flag,) = report["section_3_voice"]
+        assert flag["source_model"] == "gemini"
+
+    # -- what the report says about it ---------------------------------------
+
+    def test_the_loss_is_recorded_as_a_degradation(self):
+        report = self._report("voice_style", {"flags": "none"})
+        (entry,) = report["degradations"]
+        assert entry["caused_by"] == ["gemini:voice_style"]
+
+    def test_the_degradation_names_the_provider_and_the_bucket(self):
+        report = self._report("argument_integrity", {"flags": "none"})
+        detail = report["degradations"][0]["detail"]
+        assert "gemini.flags" in detail
+        assert "str" in detail
+
+    def test_the_degradation_names_section_1_and_the_domain_section(self):
+        report = self._report("completeness", {"flags": "none"})
+        section = report["degradations"][0]["section"]
+        assert "SECTION 1" in section
+        assert "SECTION 5" in section
+
+    def test_dropped_and_repaired_counts_both_reach_the_detail(self):
+        report = self._report("voice_style", {"flags": [_flag("a"), "b", 3]})
+        detail = report["degradations"][0]["detail"]
+        assert "1 unreadable item(s) dropped" in detail
+        assert "1 bare string(s) read as passages" in detail
+
+    def test_a_clean_run_records_nothing(self):
+        report = self._report(
+            "voice_style", {"flags": [_flag("a")], "low_confidence": []}
+        )
+        assert "degradations" not in report
+
+    def test_an_absent_bucket_is_not_a_degradation(self):
+        report = self._report("voice_style", {"flags": []})
+        assert "degradations" not in report
+
+    def test_two_bad_domains_are_two_separate_degradation_entries(self):
+        report = self._report(
+            "voice_style",
+            {"flags": "bad"},
+            {("openai", "completeness"): _ok({"flags": "also bad"}, "openai")},
+        )
+        domains = {tuple(e["caused_by"]) for e in report["degradations"]}
+        assert ("gemini:voice_style",) in domains
+        assert ("openai:completeness",) in domains
+
+    def test_the_entry_matches_the_shape_the_renderers_read(self):
+        report = self._report("voice_style", {"flags": "none"})
+        (entry,) = report["degradations"]
+        assert set(entry) == {"section", "caused_by", "detail"}
+        assert isinstance(entry["caused_by"], list)
+
+    # -- other readers of the same payload ------------------------------------
+
+    def test_section_1_still_builds(self):
+        report = self._report(
+            "voice_style", {"flags": [_flag("The grid is complex."), "x"]}
+        )
+        assert report["section_1_consensus"] == []  # one model, below threshold
+
+    def test_a_well_formed_run_reaches_the_readers_untouched(self):
+        results = {
+            ("openai", "voice_style"): _ok({"flags": [_flag("p")]}, "openai"),
+            ("mistral", "argument_integrity"): _ok({"flags": []}, "mistral"),
+        }
+        out, degradations = _normalise_flags_results(results)
+        assert out is results
+        assert degradations == []
+
+    def test_the_captured_ensemble_is_not_mutated(self):
+        data = {"flags": "none"}
+        results = {("gemini", "voice_style"): _ok(data, model="gemini")}
+        build_report("T", "p", 1, "d", None, results, {}, [])
+        assert data == {"flags": "none"}
+        assert results[("gemini", "voice_style")]["data"] is data
+
+
+class TestMalformedRedTeamDicts:
+    """red_team's three top-level findings are single objects, not lists —
+    the same crash class, a different shape.
+    """
+
+    def _report(self, data, extra=None):
+        results = {("gemini", "red_team"): _ok(data, model="gemini")}
+        results.update(extra or {})
+        return build_report(
+            article_title="T",
+            publication_name="p",
+            run_number=1,
+            corrected_draft="d",
+            lt_result=None,
+            results=results,
+            ensemble_cfg={},
+            api_call_log=[],
+        )
+
+    def test_a_string_finding_does_not_raise(self):
+        report = self._report({"most_vulnerable_claim": "nothing found"})
+        assert report["section_6_red_team"]["most_vulnerable_claim"] == {}
+
+    def test_a_null_finding_does_not_raise(self):
+        report = self._report({"highest_audience_risk": None})
+        assert report["section_6_red_team"]["highest_audience_risk"] == {}
+
+    def test_every_finding_key_is_covered(self):
+        for key in (
+            "most_vulnerable_claim",
+            "highest_audience_risk",
+            "highest_credibility_risk",
+        ):
+            report = self._report({key: "malformed"})
+            assert report["section_6_red_team"][key] == {}, key
+
+    def test_a_non_dict_payload_does_not_raise(self):
+        report = self._report(["most_vulnerable_claim"])
+        assert report["section_6_red_team"] == {}
+        assert report["degradations"]
+
+    def test_a_single_item_list_is_unwrapped(self):
+        """The model put its one finding in an array it should not have."""
+        report = self._report(
+            {"most_vulnerable_claim": [{"passage": "p", "attack_vector": "a"}]}
+        )
+        assert report["section_6_red_team"]["most_vulnerable_claim"]["passage"] == "p"
+
+    def test_a_multi_item_list_is_dropped_not_guessed_at(self):
+        report = self._report(
+            {
+                "most_vulnerable_claim": [
+                    {"passage": "a"},
+                    {"passage": "b"},
+                ]
+            }
+        )
+        assert report["section_6_red_team"]["most_vulnerable_claim"] == {}
+
+    def test_a_well_formed_dict_is_untouched(self):
+        rt = {
+            "passage": "p",
+            "attack_vector": "a",
+            "supporting_evidence_for_attack": "b",
+        }
+        report = self._report({"most_vulnerable_claim": rt})
+        assert report["section_6_red_team"]["most_vulnerable_claim"] == rt
+
+    def test_the_degradation_names_the_bucket_as_an_object_not_a_list(self):
+        report = self._report({"most_vulnerable_claim": "none"})
+        detail = report["degradations"][0]["detail"]
+        assert "gemini.most_vulnerable_claim" in detail
+        assert "rather than an object" in detail
+
+    def test_the_degradation_names_section_1_and_section_6(self):
+        report = self._report({"most_vulnerable_claim": "none"})
+        section = report["degradations"][0]["section"]
+        assert "SECTION 1" in section
+        assert "SECTION 6" in section
+
+    def test_a_clean_run_records_nothing(self):
+        report = self._report(
+            {"most_vulnerable_claim": {"passage": "p", "attack_vector": "a"}}
+        )
+        assert "degradations" not in report
+
+    def test_the_captured_ensemble_is_not_mutated(self):
+        data = {"most_vulnerable_claim": "none"}
+        results = {("gemini", "red_team"): _ok(data, model="gemini")}
+        build_report("T", "p", 1, "d", None, results, {}, [])
+        assert data == {"most_vulnerable_claim": "none"}
+        assert results[("gemini", "red_team")]["data"] is data

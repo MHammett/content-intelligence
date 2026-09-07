@@ -969,6 +969,277 @@ def _build_red_team(results, ensemble_cfg):
 
 
 # ---------------------------------------------------------------------------
+# Malformed flags / red-team buckets
+# ---------------------------------------------------------------------------
+
+
+#: `flags` bucket -> the field a bare string found in it should be read as.
+#: fact_check has no `flags` bucket, and red_team's three findings are single
+#: objects rather than lists — see `_RED_TEAM_DICT_KEYS` below.
+_FLAGS_BUCKET_FIELDS = {
+    "voice_style": {"flags": "passage"},
+    "completeness": {"flags": "passage_reference"},
+    "argument_integrity": {"flags": "passage"},
+}
+
+#: The red_team schema's three top-level findings. Each is a single object, not
+#: a list — `_extract_passages` and the report readers pull `.passage` etc.
+#: straight off of it.
+_RED_TEAM_DICT_KEYS = (
+    "most_vulnerable_claim",
+    "highest_audience_risk",
+    "highest_credibility_risk",
+)
+
+
+def _coerce_flags_bucket(data, model_name, domain):
+    """Force the `flags` bucket of a voice_style/completeness/argument_integrity
+    payload to a list of dicts, and the payload itself to a dict.
+
+    Returns ``(data, notes)``: unchanged input when nothing needed fixing, one
+    note per bucket touched otherwise. `_extract_passages` and
+    `_build_flags_section` (reached for completeness through
+    `_build_completeness`) both read `flags` with no shape check, so a bucket
+    arriving as a string, a dict, or null — or a list holding a bare string
+    instead of an object — raises where the first of them runs.
+
+    Every provider that enforces a schema makes this unreachable.
+    :data:`ci_article_review.schemas.BY_DOMAIN` covers this domain like every
+    other one; gemini while grounded 400s on schema-plus-search and so runs
+    prompt-only here exactly as it does on fact_check (see the `schemas` module
+    docstring) — one live pass per run asking a model nicely for a shape and
+    hoping.
+
+    A bare string inside the list becomes ``{text_field: ...}`` — the model put
+    N elements in an array, so element k is one finding, the same coercion
+    `_collect_low_confidence` and `_collect_additional_observations` already
+    apply to their own buckets. A bare string *as* the whole bucket is dropped,
+    not wrapped: nothing asserts that ``"flags": "none"`` names a finding.
+    """
+    bucket_fields = _FLAGS_BUCKET_FIELDS.get(domain)
+    if not bucket_fields:
+        return data, []
+    if not isinstance(data, dict):
+        return {}, [
+            {
+                "model": model_name,
+                "bucket": None,
+                "field": bucket_fields["flags"],
+                "found": type(data).__name__,
+                "dropped": 0,
+                "repaired": 0,
+            }
+        ]
+
+    notes, replacements = [], {}
+    for bucket, text_field in bucket_fields.items():
+        if bucket not in data:
+            continue  # Absent: every reader defaults it to [].
+        value = data[bucket]
+        if isinstance(value, list) and all(isinstance(i, dict) for i in value):
+            continue  # The shape the schema promises.
+        if value is None:
+            # Present-but-null still needs rewriting even though nothing was
+            # lost: `_extract_passages` and `_build_flags_section` both spell
+            # this `data.get(bucket, [])`, whose default a present key never
+            # reaches.
+            replacements[bucket] = []
+            continue
+
+        dropped = repaired = 0
+        if isinstance(value, list):
+            items = []
+            for item in value:
+                if isinstance(item, dict):
+                    items.append(item)
+                elif isinstance(item, str) and item.strip():
+                    items.append({text_field: item.strip()})
+                    repaired += 1
+                else:
+                    dropped += 1
+        elif isinstance(value, dict) and str(value.get(text_field, "") or "").strip():
+            items, repaired = [value], 1
+        else:
+            items, dropped = [], 1
+
+        replacements[bucket] = items
+        notes.append(
+            {
+                "model": model_name,
+                "bucket": bucket,
+                "field": text_field,
+                "found": type(value).__name__,
+                "dropped": dropped,
+                "repaired": repaired,
+            }
+        )
+
+    if not replacements:
+        return data, notes
+    return {**data, **replacements}, notes
+
+
+def _coerce_red_team_dicts(data, model_name):
+    """Force red_team's three single-finding fields, and the payload itself, to
+    dicts.
+
+    `_extract_passages` and the report readers call
+    `.get("passage"/"risk"/..., ...)` on `most_vulnerable_claim`,
+    `highest_audience_risk` and `highest_credibility_risk` with no shape check.
+    Grounded gemini runs prompt-only on red_team like every other domain (see
+    the `schemas` module docstring) and can return any of the three as a
+    string, a list, or leave it null.
+
+    A single-item list is unwrapped rather than dropped — the model put its one
+    finding in an array it should not have, the same slip `_coerce_flags_bucket`
+    recovers for a bare string in a list bucket. Anything else becomes ``{}``,
+    which is exactly what every reader's own ``.get(key, {})`` already treats
+    as "no finding" — dropping it costs nothing a well-formed empty response
+    would not also have cost.
+    """
+    if not isinstance(data, dict):
+        return {}, [
+            {
+                "model": model_name,
+                "bucket": None,
+                "field": "passage",
+                "found": type(data).__name__,
+                "dropped": 0,
+                "repaired": 0,
+            }
+        ]
+
+    notes, replacements = [], {}
+    for key in _RED_TEAM_DICT_KEYS:
+        if key not in data:
+            continue
+        value = data[key]
+        if isinstance(value, dict):
+            continue
+        if value is None:
+            # Nothing lost, so nothing to report — same rule as a null
+            # fact-check bucket.
+            replacements[key] = {}
+            continue
+
+        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+            replacements[key] = value[0]
+            dropped, repaired = 0, 1
+        else:
+            replacements[key] = {}
+            dropped, repaired = 1, 0
+        notes.append(
+            {
+                "model": model_name,
+                "bucket": key,
+                "field": "passage",
+                "found": type(value).__name__,
+                "dropped": dropped,
+                "repaired": repaired,
+            }
+        )
+
+    if not replacements:
+        return data, notes
+    return {**data, **replacements}, notes
+
+
+def _describe_malformed_flags_bucket(note, shape="list"):
+    """One reader-facing phrase for a single coercion note.
+
+    ``shape`` names what the bucket was supposed to be — "list" for a `flags`
+    bucket, "object" for one of red_team's three findings — so the phrasing
+    matches what actually broke.
+    """
+    if note["bucket"] is None:
+        return f"{note['model']} returned a {note['found']}, not an object"
+
+    where = f"{note['model']}.{note['bucket']}"
+    if note["found"] != shape:
+        kept = f", {note['repaired']} finding recovered" if note["repaired"] else ""
+        article = "an" if shape[:1] in "aeiou" else "a"
+        return f"{where} was a {note['found']} rather than {article} {shape}{kept}"
+
+    parts = []
+    if note["dropped"]:
+        parts.append(f"{note['dropped']} unreadable item(s) dropped")
+    if note["repaired"]:
+        parts.append(f"{note['repaired']} bare string(s) read as {note['field']}s")
+    return f"{where}: {', '.join(parts)}"
+
+
+#: Every domain here also feeds SECTION 1 through `_extract_passages`, on top
+#: of its own section named in `_DOMAIN_SECTIONS`.
+_FLAGS_AFFECTED_SECTIONS = {
+    domain: ("SECTION 1: Consensus", section)
+    for domain, section in _DOMAIN_SECTIONS.items()
+    if domain != "fact_check"
+}
+
+
+def _normalise_flags_results(results):
+    """Make every voice_style/completeness/argument_integrity/red_team payload
+    safe to consolidate, before anything reads it.
+
+    Returns ``(results, degradations)``. ``results`` is the same object when
+    nothing needed coercing; otherwise a shallow copy with only the offending
+    entries replaced, so the caller's dict — and the captured ensemble a
+    ``--replay`` reads off disk — are left alone.
+
+    Called once at the top of :func:`build_report`, before `_extract_passages`
+    (Section 1), `_build_flags_section` / `_build_completeness` (Sections 3-5)
+    and `_build_red_team` (Section 6) all read the same payload — fixing only
+    one of them would just move the crash to the next.
+    """
+    notes_by_domain, cleaned = {}, {}
+    for key, result in results.items():
+        model_name, domain = key
+        if result.get("failed") or not result.get("data"):
+            continue
+        data = result["data"]
+        if domain in _FLAGS_BUCKET_FIELDS:
+            new_data, notes = _coerce_flags_bucket(data, model_name, domain)
+        elif domain == "red_team":
+            new_data, notes = _coerce_red_team_dicts(data, model_name)
+        else:
+            continue
+        if notes:
+            notes_by_domain.setdefault(domain, []).extend(notes)
+        if new_data is not data:
+            cleaned[key] = {**result, "data": new_data}
+
+    if not cleaned:
+        return results, []
+    results = {**results, **cleaned}
+    if not notes_by_domain:
+        return results, []
+
+    degradations = []
+    for domain, notes in sorted(notes_by_domain.items()):
+        sections = _FLAGS_AFFECTED_SECTIONS[domain]
+        shape = "object" if domain == "red_team" else "list"
+        described = "; ".join(_describe_malformed_flags_bucket(n, shape) for n in notes)
+        detail = (
+            f"{sections[0]} and {sections[1]} are short findings this run paid "
+            f"for: {len(notes)} {domain} bucket(s) came back in a shape "
+            f"consolidation cannot read ({described}). Whatever was readable "
+            f"was kept; the rest is missing from the report entirely. Only a "
+            f"pass running without schema enforcement can return this, so a "
+            f"re-run may well come back clean — treat the counts below as a "
+            f"floor."
+        )
+        log.warning("%s: %s", domain, detail)
+        degradations.append(
+            {
+                "section": ", ".join(sections),
+                "caused_by": sorted({f"{n['model']}:{domain}" for n in notes}),
+                "detail": detail,
+            }
+        )
+    return results, degradations
+
+
+# ---------------------------------------------------------------------------
 # Cross-model contradiction detection
 # ---------------------------------------------------------------------------
 
@@ -1321,11 +1592,14 @@ def build_report(
     """
     now = datetime.now(timezone.utc).isoformat()
 
-    # Before anything reads a fact-check bucket. Five readers below assume a
-    # list of dicts and none of them checks; one prompt-only pass returning a
-    # dict or a string where a list belongs used to kill report building here,
-    # after the ensemble had been paid for in full.
+    # Before anything reads a fact-check bucket, a `flags` bucket or a red_team
+    # finding. Every one of these is read by two separate functions below —
+    # `_extract_passages` for Section 1 and each domain's own section builder —
+    # and neither checks the shape it assumes; a malformed one used to kill
+    # report building wherever the first reader ran, after the ensemble had
+    # been paid for in full.
     results, fact_check_degradations = _normalise_fact_check_results(results)
+    results, flags_degradations = _normalise_flags_results(results)
 
     # LanguageTool flagged passages used for consensus boosting
     lt_flagged_passages = []
@@ -1504,10 +1778,11 @@ def build_report(
     }
     # Only when there is something to say. The key is absent on a clean run —
     # ``_record_fact_check_degradation`` and ``_record_impersonation_degradation``
-    # both ``setdefault`` onto it later, and both the console summary and
-    # ``_render_degradations`` treat an empty list and a missing key alike.
-    if fact_check_degradations:
-        report["degradations"] = fact_check_degradations
+    # in pipeline.py both ``setdefault`` onto it later, and both the console
+    # summary and ``_render_degradations`` treat an empty list and a missing
+    # key alike.
+    for entry in fact_check_degradations + flags_degradations:
+        report.setdefault("degradations", []).append(entry)
     return report
 
 
