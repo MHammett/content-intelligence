@@ -3,6 +3,9 @@ Generated: YYYY-MM-DD
 Pipeline run: [increment by 1 each time you re-run this article]
 Article: [Your article title — this is the history key, so keep it identical across re-runs of the same piece]
 Publication: [your publication config name, i.e. the NAME in configs/NAME.yaml]
+Author: [optional — who "I" refers to in the draft. Only needed when it is not
+         the publication's usual byline; citation verification uses it to check
+         first-person claims against a source page.]
 
 PRIMARY CLAIM
 [One or two sentences: the single thing this article argues. Not the topic —
@@ -41,6 +44,19 @@ SOURCES ALREADY CITED
 
 UNCERTAIN SECTIONS
 [Passages you are not confident about — the review models focus scrutiny here.
+If none, write "None identified by author."]
+
+OUT OF SCOPE FOR FACT-CHECK
+[Passages no outside source can settle — first-person statements about your own
+life or work, arithmetic the article derives from its own figures, conjectures
+the piece frames as your own reading. One per line, starting with "- ", with an
+optional reason after an em dash.
+
+Excluded from fact-checking and citation resolution only; every other review
+pass still sees them. You can also mark them in the draft with
+<!-- ci:no-verify --> ... <!-- /ci:no-verify -->, which is the only way that
+works when the draft has no metadata file at all.
+
 If none, write "None identified by author."]
 
 KNOWN GAPS

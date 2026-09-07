@@ -1,4 +1,19 @@
+# Unrecognised top-level keys are an error, so a typo cannot silently read as
+# an absent setting. If you need a key that is deliberately not this
+# pipeline's -- a note, or a value some other tool reads out of this file --
+# prefix it with x_ and it is ignored without complaint.
 publication_name: your_publication_name
+
+# Optional. Who "I" refers to in your drafts, by name. Citation verification
+# needs it to check a first-person claim against a source page: told nothing,
+# the verifier binds "I" to whoever it finds on the page; told only not to
+# guess, it reports a page that does name you as not addressing the claim.
+#
+# Set it here once for a single-author publication. A guest or co-authored
+# piece overrides it per article with the handoff's "Author:" line, which
+# wins when both are present. This default is the only source for --raw-draft
+# and --url, which carry no handoff metadata at all.
+author_name: Your Name
 
 publication_description: |
   One paragraph: what the publication covers, who the reader is,
@@ -67,6 +82,39 @@ languagetool:
     - TYPOGRAPHY
   suppress:
     - SENTENCE_FRAGMENT
+
+# Optional — claims this publication does not send to fact-checking or citation
+# resolution, because no external source can settle them. Omit the whole block to
+# take the defaults shown here.
+#
+# Excluded from fact_check verdicts and Section 9 ONLY. red_team,
+# argument_integrity, voice_style and completeness still see the whole draft: a
+# first-person claim can still be an argumentative weakness, and hiding it from
+# every reviewer would lose real findings.
+#
+# Per-article marking is better than config for anything that is not a standing
+# rule — wrap the passage in <!-- ci:no-verify --> ... <!-- /ci:no-verify --> in
+# the draft (works with --raw-draft), or list it under OUT OF SCOPE FOR
+# FACT-CHECK in the handoff. See the README section of the same name.
+fact_check_scope:
+  # Categories the fact-check models may rule out on their own say-so. The
+  # default is every category except `other`, which is the catch-all and so the
+  # place an unjustified exclusion would arrive: a claim classified `other` is
+  # reported to you but still verified.
+  exclude_types:
+    - first_person          # "I have a side job" — only the author can confirm it
+    - author_hypothesis     # a conjecture the draft frames as the author's own
+    - internal_arithmetic   # a sum derived from figures already in the draft
+    - subjective_judgment   # an evaluation, with no truth value to check
+    - future_prediction     # no current source confirms or contradicts it
+  # Set false to ignore model classification entirely and honour only passages
+  # you marked yourself.
+  trust_model_classification: true
+  # Standing exclusions for every article in this publication. An author marking
+  # outranks any model classification, whatever exclude_types says.
+  # exclude_passages:
+  #   - passage: "This site is a real expense, and there's no way to recoup it"
+  #     reason: "standing statement about the author's own finances"
 
 citation_sources:
   - name: EIA

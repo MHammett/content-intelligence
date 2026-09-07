@@ -25,9 +25,13 @@ all = ["google-auth>=2.0", "trafilatura>=1.6"]
 ci-setup = "ci_article_review.setup:main"
 ci-check = "ci_article_review.check:main"
 ci-discover = "ci_article_review.discover:main"
-ci-review = "ci_article_review.pipeline:main"
+# probe.py had no entry point at all, so the tool for checking that preset
+# models still answer — before paying for a full run — could not be run.
+ci-probe = "ci_article_review.probe:main"
+ci-review = "ci_article_review.pipeline:cli"
 ci-history-report = "ci_article_review.history_analytics:main"
 ci-voice-patterns = "ci_article_review.voice_pattern_report:main"
+ci-markers = "ci_article_review.markers:main"
 
 [tool.uv.sources]
 ci-core = { workspace = true }

@@ -28,6 +28,7 @@ from ci_core import redact
 from ci_core import llm
 
 from . import seo as seo_analysis
+from ci_core.llm import cost
 
 log = logging.getLogger(__name__)
 
@@ -171,14 +172,7 @@ def review(text, handoff=None, pub_config=None, api_keys=None, suggestions=None)
         log.warning("SEO content review call raised: %s", e)
         return {"status": "failed", "reason": f"content review raised: {e}"}, None
 
-    call_log_entry = {
-        "pass": CALL_LOG_PASS,
-        "model": result.get("model", _REVIEW_MODEL),
-        "failed": bool(result.get("failed")),
-        "tokens": result.get("tokens", {}),
-        "elapsed_seconds": result.get("elapsed_seconds"),
-        "error": result.get("error") if result.get("failed") else None,
-    }
+    call_log_entry = cost.call_log_entry(CALL_LOG_PASS, result, _REVIEW_MODEL)
 
     if result.get("failed"):
         reason = f"content review failed: {result.get('error', 'unknown error')}"

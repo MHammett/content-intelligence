@@ -36,6 +36,7 @@ while still exercising prompt assembly, the parallel dispatch, timeout wiring,
 result re-keying, the API call log, consolidation, citations, cost and the save.
 """
 
+import copy
 import json
 import os
 
@@ -43,6 +44,8 @@ from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
+
+from ci_article_review.report_markdown import render_report_markdown
 
 import pytest
 
@@ -109,7 +112,14 @@ _DOMAIN_DATA = {
                 "observation": "Borderline stock phrase.",
             }
         ],
-        "additional_observations": [],
+        "additional_observations": [
+            {
+                "passage": "Local officials were not consulted.",
+                "category": "red_team",
+                "observation": "The claim names an omission without evidence of it.",
+                "confidence": "high",
+            }
+        ],
     },
     "completeness": {
         "flags": [
@@ -121,7 +131,14 @@ _DOMAIN_DATA = {
             }
         ],
         "low_confidence": [],
-        "additional_observations": [],
+        "additional_observations": [
+            {
+                "passage": "The grid served 41 percent of load from nuclear.",
+                "category": "fact_check",
+                "observation": "No source given for the 41 percent figure.",
+                "confidence": "low",
+            }
+        ],
     },
     "argument_integrity": {
         "flags": [
@@ -133,7 +150,14 @@ _DOMAIN_DATA = {
             }
         ],
         "low_confidence": [],
-        "additional_observations": [],
+        "additional_observations": [
+            {
+                "passage": "Local officials were not consulted.",
+                "category": "red_team",
+                "observation": "Naming who was not consulted invites a response.",
+                "confidence": "medium",
+            }
+        ],
     },
     "red_team": {
         "most_vulnerable_claim": {
@@ -209,10 +233,6 @@ _CONFIG = {
         "gemini": {"api_key": "k"},
         "openai": {"api_key": "k"},
         "mistral": {"api_key": "k"},
-        # Carries no built-in slot at `standard`, so it changes nothing about a
-        # default run — it is here so the --expand test below has the one model
-        # that preset assigns to expansion.
-        "perplexity": {"api_key": "k"},
     },
     "pipeline": {
         "thoroughness": "standard",
@@ -235,7 +255,6 @@ _CONFIG = {
         "gemini": {"model": "gemini-2.5-flash"},
         "openai": {"model": "gpt-5.4"},
         "mistral": {"model": "mistral-large-latest"},
-        "perplexity": {"model": "sonar-pro"},
     },
 }
 
@@ -291,6 +310,10 @@ _VOLATILE_KEYS = {
     "timeout_budget_seconds",
     "registry_date",
     "registry_age_days",
+    # Derived from today's date against a registry stamp, so it changes on its
+    # own: "ok" becomes "notice" at 60 days and "warning" at 120, and this test
+    # would start failing on a calendar boundary rather than on a code change.
+    "registry_staleness",
     "prior_date",
 }
 
@@ -643,6 +666,170 @@ class TestProviderStagger:
         )
 
 
+class TestADomainWithNoReviewerReachesTheReport:
+    """The drafter exclusion can empty a domain; the run must not hide it.
+
+    `standard` assigns one model to voice_style, so declaring that model as the
+    drafter excludes it and leaves the domain with no reviewer — measured
+    2026-09-05 as the only preset/drafter pair that does this. Two repairs cover
+    it, backfill at assignment time and substitution after the calls, and the
+    report names the domain when neither could. All three run here against the
+    real pipeline, because every other test of them supplies the assignments by
+    hand and so cannot catch the wiring going missing.
+    """
+
+    def _config(self, **pipeline_overrides):
+        cfg = copy.deepcopy(_CONFIG)
+        cfg["pipeline"].update({"drafting_model": "openai", **pipeline_overrides})
+        return cfg
+
+    def _patch(self, cfg):
+        return [patch("ci_article_review.pipeline.merge_configs", return_value=cfg)]
+
+    def test_a_substitute_provider_reviews_it_instead(self, tmp_path):
+        """The normal outcome: another configured model takes the domain."""
+        with _stubbed_run(
+            tmp_path, extra_patches=self._patch(self._config())
+        ) as report:
+            assignments = report["ensemble"]["assignments"]
+            voice = [a for a in assignments if a.endswith(":voice_style")]
+            assert voice, f"voice_style was never reviewed: {assignments}"
+            assert not voice[0].startswith("openai:"), "the drafter reviewed itself"
+            assert report["domains_not_run"] == []
+
+    def test_with_both_repairs_off_the_report_says_it_was_not_reviewed(self, tmp_path):
+        """The fallback signal, for the run neither repair can fix.
+
+        Both are off here, not just substitution. Backfill runs earlier — at
+        assignment time — so leaving it on repairs the domain before
+        substitution is ever consulted, and the unreviewed case this asserts on
+        never arises.
+        """
+        cfg = self._config(
+            substitute_failed_domains=False, backfill_narrowed_domains=False
+        )
+        with _stubbed_run(tmp_path, extra_patches=self._patch(cfg)) as report:
+            assert not [
+                a
+                for a in report["ensemble"]["assignments"]
+                if a.endswith(":voice_style")
+            ]
+            (detail,) = report["domains_not_run"]
+            assert detail["domain"] == "voice_style"
+            assert detail["section"] == "SECTION 3: Voice and AI-Speak"
+            assert "openai drafted this article" in detail["reason"]
+
+            markdown = render_report_markdown(report)
+            assert "Domains not reviewed (1)" in markdown
+            assert "Not reviewed this run" in markdown
+            # The section it actually applies to, not just the header block.
+            section_3 = markdown.split("## SECTION 3:")[1].split("## SECTION 4:")[0]
+            assert "Not reviewed this run" in section_3
+
+    def test_an_ordinary_run_gains_neither_signal(self, tmp_path):
+        """No drafter declared — nothing is excluded, so nothing is reported."""
+        with _stubbed_run(tmp_path) as report:
+            assert report["domains_not_run"] == []
+            assert "Domains not reviewed" not in render_report_markdown(report)
+
+
+class TestReproducibilityAcrossRuns:
+    """The second run of a draft measures itself against the first, for free.
+
+    ``test_reproducibility.py`` covers the counting rules against hand-built
+    reports. This asserts the wiring those unit tests cannot see: that a real
+    ``run_draft_pipeline`` writes a history entry the *next* real run finds,
+    matches, and reports on — with no extra model call between them.
+
+    The stubs return identical findings every run, so reproduction here is
+    total by construction. That is the point: it isolates the plumbing. Whether
+    real findings recur is a property of the models, and is what the feature
+    exists to measure rather than to assume.
+    """
+
+    def test_a_first_run_reports_that_nothing_was_measured(self, tmp_path):
+        with _stubbed_run(tmp_path) as report:
+            block = report["reproducibility"]
+
+        assert block["comparable_run_count"] == 0
+        assert block["skipped_count"] == 0
+        # No measurement was taken, so no finding may carry a count.
+        assert all("reproduced_in" not in f for f in report["section_1_consensus"])
+
+    def test_a_second_run_is_measured_against_the_first(self, tmp_path):
+        with _stubbed_run(tmp_path) as first:
+            first_calls = len(first["api_call_log"])
+
+        with _stubbed_run(tmp_path) as second:
+            block = second["reproducibility"]
+            second_calls = len(second["api_call_log"])
+
+        assert block["comparable_run_count"] == 1, (
+            "The second run of an unchanged draft did not find the first in "
+            f"pipeline_history/. Skipped: {block['skipped']}"
+        )
+        assert (
+            block["draft_fingerprint"] == first["reproducibility"]["draft_fingerprint"]
+        )
+        # Free: the comparison adds no model calls to the run that benefits.
+        assert second_calls == first_calls
+
+        for section in ("section_1_consensus", "section_3_voice"):
+            for finding in second[section]:
+                assert finding["reproduced_of"] == 1
+                assert finding["reproduced_in"] == 1, (
+                    f"{section} finding did not match its own prior run: "
+                    f"{finding.get('passage')!r}"
+                )
+
+    def test_the_second_run_renders_the_measured_caveat(self, tmp_path):
+        from ci_article_review.report_markdown import render_report_markdown
+
+        with _stubbed_run(tmp_path):
+            pass
+        with _stubbed_run(tmp_path) as second:
+            md = render_report_markdown(second)
+
+        assert "Measured on this draft" in md
+        assert "also in 1 of 1 comparable prior runs" in md
+        assert md.index("Reading this report") < md.index("SECTION 1")
+
+    def test_an_edited_draft_is_not_compared_against_the_old_one(self, tmp_path):
+        """A revision must not inherit the previous draft's corroboration."""
+        with _stubbed_run(tmp_path):
+            pass
+
+        edited = dict(_HANDOFF)
+        edited["draft"] = edited["draft"] + "\n\nA newly added closing paragraph."
+        with patch.dict(_HANDOFF, edited, clear=False):
+            with _stubbed_run(tmp_path) as second:
+                block = second["reproducibility"]
+
+        assert block["comparable_run_count"] == 0
+        assert block["skipped_count"] == 1
+        assert block["skipped"][0]["reason"] == "different draft"
+
+    def test_identical_runs_report_nothing_missed(self, tmp_path):
+        """The dropped-findings block must not invent a miss out of a match.
+
+        The stubs return the same findings every run, so a correct
+        implementation drops nothing. This is the end-to-end guard on that: if
+        the key derivation on the current run ever diverges from the one
+        applied to history, every finding would look absent from itself and
+        this block would fill with phantom misses — the most damaging way this
+        feature could fail, since it accuses the run of missing real work.
+        """
+        with _stubbed_run(tmp_path):
+            pass
+        with _stubbed_run(tmp_path) as second:
+            dropped = second["reproducibility"]["dropped"]
+            md = render_report_markdown(second)
+
+        assert second["reproducibility"]["comparable_run_count"] == 1
+        assert dropped["total"] == 0, dropped["findings"]
+        assert "may have missed" not in md
+
+
 class TestExpansionRunsEndToEnd:
     """The opt-in pass, wired from the flag through to the rendered markdown.
 
@@ -662,15 +849,29 @@ class TestExpansionRunsEndToEnd:
             for url in text.split()
         ]
 
+    def _config(self):
+        """`standard` assigns expansion to perplexity alone, so this test needs
+        it configured. Scoped here rather than added to the shared _CONFIG."""
+        cfg = copy.deepcopy(_CONFIG)
+        cfg["api_keys"]["perplexity"] = {"api_key": "k"}
+        cfg["models"]["perplexity"] = {"model": "sonar-pro"}
+        return cfg
+
     def _run(self, tmp_path, **kwargs):
         links = patch(
             "ci_article_review.analysis.links.validate_links",
             side_effect=self._fake_links,
         )
-        return _stubbed_run(tmp_path, extra_patches=[links], expand=True, **kwargs)
+        cfg = patch(
+            "ci_article_review.pipeline.merge_configs", return_value=self._config()
+        )
+        return _stubbed_run(tmp_path, extra_patches=[cfg, links], expand=True, **kwargs)
 
     def test_the_default_run_does_not_schedule_it(self, tmp_path):
-        with _stubbed_run(tmp_path) as report:
+        cfg = patch(
+            "ci_article_review.pipeline.merge_configs", return_value=self._config()
+        )
+        with _stubbed_run(tmp_path, extra_patches=[cfg]) as report:
             assert report["section_10_expansion"] == {}
             assert not [
                 a for a in report["ensemble"]["assignments"] if "expansion" in a
@@ -760,21 +961,40 @@ class TestExpansionSurvivesRetryFailed:
         ensemble_capture.save(path, raw, article_title="T", run_number=1)
         return str(path)
 
+    def _config(self):
+        """perplexity configured, so `standard` assigns expansion to it rather
+        than backfilling gemini in — this class is about the retry, and a
+        backfilled substitute would answer a different question."""
+        cfg = copy.deepcopy(_CONFIG)
+        cfg["api_keys"]["perplexity"] = {"api_key": "k"}
+        cfg["models"]["perplexity"] = {"model": "sonar-pro"}
+        return cfg
+
+    def _patches(self):
+        return [
+            patch(
+                "ci_article_review.pipeline.merge_configs", return_value=self._config()
+            ),
+            patch(
+                "ci_article_review.analysis.links.validate_links",
+                side_effect=lambda text, **kw: [
+                    {"url": u, "ok": True, "status_code": 200, "verified_via": "direct"}
+                    for u in text.split()
+                ],
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.verify_source_supports",
+                return_value={
+                    "verification": "checksum",
+                    "relevance_reason": "backs it",
+                },
+            ),
+        ]
+
     def _run(self, tmp_path, capture):
-        links = patch(
-            "ci_article_review.analysis.links.validate_links",
-            side_effect=lambda text, **kw: [
-                {"url": u, "ok": True, "status_code": 200, "verified_via": "direct"}
-                for u in text.split()
-            ],
-        )
-        sources = patch(
-            "ci_article_review.adapters.citation.resolver.verify_source_supports",
-            return_value={"verification": "checksum", "relevance_reason": "backs it"},
-        )
         return _stubbed_run(
             tmp_path,
-            extra_patches=[links, sources],
+            extra_patches=self._patches(),
             expand=True,
             retry_failed_results=capture,
         )
@@ -798,13 +1018,10 @@ class TestExpansionSurvivesRetryFailed:
         assignments differ names passes with no runner here."""
         capture = self._capture(tmp_path, failed_names={"perplexity:expansion"})
         # Same capture, replayed by a run that never asked for expansion.
-        links = patch(
-            "ci_article_review.analysis.links.validate_links", return_value=[]
-        )
         with caplog.at_level("WARNING"):
             with _stubbed_run(
                 tmp_path,
-                extra_patches=[links],
+                extra_patches=self._patches(),
                 retry_failed_results=capture,
             ) as report:
                 assert report["section_10_expansion"] == {}

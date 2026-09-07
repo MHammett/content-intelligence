@@ -8,6 +8,19 @@ dev = [
     # finding 13) but must stay installed for development, so its tests keep
     # running in CI rather than silently skipping.
     "ci-core[persistence]",
+    # Same reasoning as [persistence], one tier along. The TLS-impersonation
+    # escalation stays an optional extra for end users, with the degradation
+    # documented — this line changes nothing about that. What it fixes is that
+    # `uv run` re-syncs from the lockfile before every invocation, so while
+    # curl_cffi appeared in no dependency group, no `uv run` command in this
+    # repo has ever had it: `impersonating_get` returned None unconditionally
+    # and both callers — analysis/links.py (escalation added 2026-08-12) and
+    # adapters/citation/resolver.py — degraded straight to the archive
+    # fallback. That is silent by construction: the run looks normal and just
+    # resolves fewer citations. The unit tests cannot catch it either, because
+    # they install a fake curl_cffi and pass whether or not the real one is
+    # present.
+    "ci-core[unblock]",
     "pre-commit>=3.0",
     "mypy>=1.9",
     "ruff>=0.4",
@@ -25,9 +38,11 @@ ci-core = { workspace = true }
 asyncio_mode = "strict"
 addopts = "--import-mode=importlib"
 markers = [
-    # Tests whose wall-clock cost is inherent, not accidental — currently just
-    # the one that proves a `concurrent.futures` atexit join really does hold
-    # the interpreter open, which can only be shown by waiting one out.
+    # Tests whose wall-clock cost is inherent, not accidental: the one that
+    # proves a `concurrent.futures` atexit join really does hold the interpreter
+    # open (only showable by waiting one out), and the one that proves
+    # `call_all` exits cleanly when a model has no computed backstop (needs a
+    # subprocess, which must pay litellm'''s ~6s import before it can start).
     #
     # Not skipped by default: a green run means the whole suite passed. Use
     # `-m "not slow"` to deselect them while iterating. See README "Running the

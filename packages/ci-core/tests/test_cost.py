@@ -55,10 +55,24 @@ class TestCalculate:
         expected_out = 500 / 1_000_000 * 15.00
         assert abs(result["total_usd"] - round(expected_in + expected_out, 4)) < 0.0001
 
-    def test_failed_entry_contributes_zero(self):
+    def test_a_failure_that_generated_nothing_costs_nothing(self):
+        """The ordinary failure: a transport error or a timeout. The client
+        reports zero tokens for these, so they cost nothing without needing a
+        flag to say so."""
+        entry = self._log("gpt-5.4", 0, 0, failed=True)
+        assert calculate([entry])["total_usd"] == 0.0
+
+    def test_a_failure_that_did_generate_output_is_still_billed(self):
+        """The provider bills for tokens it generated, whatever the pipeline
+        made of them.
+
+        A response whose JSON will not parse is complete and charged for, and
+        the client returns it with real token counts alongside `failed: True`.
+        A `failed` short-circuit in the cost layer priced that at $0.00 — the
+        same undercount as the discarded retry attempts, reached by a different
+        route."""
         entry = self._log("gpt-5.4", 100_000, 50_000, failed=True)
-        result = calculate([entry])
-        assert result["total_usd"] == 0.0
+        assert calculate([entry])["total_usd"] > 0
 
     def test_pricing_known_true_for_known_models(self):
         entry = self._log("gpt-5.4", 1000, 500)
@@ -289,3 +303,205 @@ class TestCachedTokensAreNotCountedTwice:
             "tokens": {"prompt": 10840, "cached": 10832},
         }
         assert cost._entry_cost(doubled)[0] > cost._entry_cost(honest)[0] * 1.9
+
+
+class TestDiscardedAttemptsAreBilled:
+    """A retry throws away an attempt the provider already charged for.
+
+    ``_with_retry`` replaced the failed attempt's result with the next one's, so
+    those tokens left the accounting entirely. Seven attempts went unrecorded on
+    2026-09-03 under a summary line reading "Estimated cost: $3.4878 (exact)".
+    """
+
+    def _entry(self, discarded=None):
+        entry = {
+            "pass": "openai:fact_check",
+            "model": "gpt-5.4",
+            "tokens": {"prompt": 1000, "completion": 1000},
+        }
+        if discarded is not None:
+            entry["discarded_attempts"] = discarded
+        return entry
+
+    def test_a_discarded_attempt_with_usage_is_added_to_the_cost(self):
+        without = calculate([self._entry()])
+        with_discard = calculate(
+            [
+                self._entry(
+                    {
+                        "count": 1,
+                        "costed": 1,
+                        "reasons": ["MalformedJSONError"],
+                        "tokens": {"prompt": 1000, "completion": 1000},
+                    }
+                )
+            ]
+        )
+        # The discarded attempt used the same tokens again, so it doubles.
+        assert with_discard["total_usd"] == round(without["total_usd"] * 2, 4)
+        assert with_discard["discarded_calls"] == 1
+        assert with_discard["uncosted_calls"] == 0
+
+    def test_an_attempt_with_no_usage_is_counted_but_not_priced(self):
+        summary = calculate(
+            [
+                self._entry(
+                    {
+                        "count": 1,
+                        "costed": 0,
+                        "reasons": ["StreamStalled"],
+                        "tokens": {"prompt": 0, "completion": 0},
+                    }
+                )
+            ]
+        )
+        assert summary["discarded_calls"] == 1
+        # A stalled stream reports no usage, so the total is a floor and the
+        # caller must stop describing it as exact.
+        assert summary["uncosted_calls"] == 1
+        assert summary["total_usd"] == calculate([self._entry()])["total_usd"]
+
+    def test_no_retries_leaves_the_counters_at_zero(self):
+        summary = calculate([self._entry()])
+        assert summary["discarded_calls"] == 0
+        assert summary["uncosted_calls"] == 0
+
+
+class TestReplayedSpendIsSeparated:
+    """A replay re-reports the captured run's tokens; they were not spent here."""
+
+    def test_replayed_entries_do_not_count_as_incurred(self):
+        summary = calculate(
+            [
+                {
+                    "pass": "openai:fact_check",
+                    "model": "gpt-5.4",
+                    "tokens": {"prompt": 1000, "completion": 1000},
+                    "replayed": True,
+                },
+                {
+                    "pass": "seo_suggestions",
+                    "model": "gpt-5.4",
+                    "tokens": {"prompt": 100, "completion": 100},
+                },
+            ]
+        )
+        assert summary["incurred_usd"] > 0
+        assert summary["replayed_usd"] > summary["incurred_usd"]
+        # Each field rounds to 4dp independently, exactly as total_input_usd and
+        # total_output_usd already do, so the split reconciles to within one
+        # rounding unit of the total — not to the cent. The bound is 2e-4 rather
+        # than 1e-4 because binary floats put 0.0193 - 0.0192 a hair above it.
+        split = summary["replayed_usd"] + summary["incurred_usd"]
+        assert abs(split - summary["total_usd"]) < 0.0002
+
+    def test_a_fully_replayed_run_incurred_nothing(self):
+        summary = calculate(
+            [
+                {
+                    "pass": "openai:fact_check",
+                    "model": "gpt-5.4",
+                    "tokens": {"prompt": 1000, "completion": 1000},
+                    "replayed": True,
+                }
+            ]
+        )
+        assert summary["incurred_usd"] == 0.0
+
+
+class TestDiscardedSummaryShape:
+    """`_summarise_discarded` is what the cost layer consumes, so its shape is
+    part of the contract between the two."""
+
+    def test_usage_is_recovered_where_the_attempt_carried_it(self):
+        from ci_core.llm.client import _summarise_discarded
+
+        summary = _summarise_discarded(
+            [
+                {
+                    "reason": "MalformedJSONError",
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 250},
+                },
+                {"reason": "StreamStalled", "usage": None},
+            ]
+        )
+        assert summary["count"] == 2
+        # Only the malformed-JSON attempt had usage to read.
+        assert summary["costed"] == 1
+        assert summary["tokens"]["completion"] == 250
+        assert summary["reasons"] == ["MalformedJSONError", "StreamStalled"]
+
+    def test_an_attempt_with_no_usage_contributes_no_tokens(self):
+        from ci_core.llm.client import _summarise_discarded
+
+        summary = _summarise_discarded([{"reason": "StreamStalled", "usage": None}])
+        assert summary["count"] == 1
+        assert summary["costed"] == 0
+        assert summary["tokens"] == {"prompt": 0, "completion": 0}
+
+    def test_a_failed_call_still_reports_what_it_discarded(self):
+        """The most expensive outcome — two full attempts and no usable answer —
+        was the one the cost summary could not see, because the field was
+        attached only to the success path."""
+        from ci_core.llm.client import _discarded_field
+
+        assert _discarded_field([]) == {}
+        field = _discarded_field([{"reason": "StreamStalled", "usage": None}])
+        assert field["discarded_attempts"]["count"] == 1
+
+
+class TestCallLogEntryBuilder:
+    """One builder, so a new cost field cannot be forgotten by three callers.
+
+    Citation verification and the two SEO passes each wrote this dict by hand,
+    identical apart from the pass name. When `discarded_attempts` was added so
+    retried attempts could be billed, all three kept dropping it — the retries
+    were counted for the ensemble and silently free everywhere else.
+    """
+
+    def test_it_carries_the_standard_fields(self):
+        entry = cost.call_log_entry(
+            "seo_suggestions",
+            {
+                "model": "mistral-small-latest",
+                "failed": False,
+                "tokens": {"prompt": 10, "completion": 5},
+                "elapsed_seconds": 1.2,
+            },
+        )
+        assert entry["pass"] == "seo_suggestions"
+        assert entry["model"] == "mistral-small-latest"
+        assert entry["failed"] is False
+        assert entry["error"] is None
+
+    def test_it_carries_discarded_attempts(self):
+        entry = cost.call_log_entry(
+            "citation_verification:known_url",
+            {
+                "model": "mistral-small-latest",
+                "tokens": {"prompt": 10, "completion": 5},
+                "discarded_attempts": {
+                    "count": 1,
+                    "costed": 1,
+                    "reasons": ["StreamStalled"],
+                    "tokens": {"prompt": 10, "completion": 5},
+                },
+            },
+        )
+        assert entry["discarded_attempts"]["count"] == 1
+        # And the cost layer then bills it.
+        assert cost.calculate([entry])["discarded_calls"] == 1
+
+    def test_the_field_is_absent_when_nothing_was_discarded(self):
+        entry = cost.call_log_entry("x", {"model": "gpt-5.4", "tokens": {}})
+        assert "discarded_attempts" not in entry
+
+    def test_the_default_model_is_used_when_the_result_has_none(self):
+        entry = cost.call_log_entry("x", {"tokens": {}}, "fallback-model")
+        assert entry["model"] == "fallback-model"
+
+    def test_an_error_is_only_reported_for_a_failed_call(self):
+        ok = cost.call_log_entry("x", {"failed": False, "error": "ignored"})
+        assert ok["error"] is None
+        bad = cost.call_log_entry("x", {"failed": True, "error": "HTTP 503"})
+        assert bad["error"] == "HTTP 503"

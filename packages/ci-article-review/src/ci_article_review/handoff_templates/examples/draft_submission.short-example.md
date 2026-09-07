@@ -67,6 +67,9 @@ UNCERTAIN SECTIONS
 - The NCSL count of states with contingent permanent-DST legislation is a
   rounded floor that changes as more states act, not a current count.
 
+OUT OF SCOPE FOR FACT-CHECK
+None identified by author.
+
 KNOWN GAPS
 - This piece doesn't quantify the retail/tourism economic case for permanent
   daylight time beyond naming it — no revenue estimates by sector. Flagged so

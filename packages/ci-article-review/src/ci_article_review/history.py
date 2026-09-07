@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from .report_markdown import render_report_markdown
+from .worklist import build_worklist, render_worklist
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +91,39 @@ def _existing_run_dir(history_root, article_title):
     return path if path.is_dir() else None
 
 
+def _write_generated(path, build, label):
+    """Write ``build()``'s output to ``path``. Returns ``path``, or None.
+
+    ``build`` is called *before* the file is opened, and every exception it
+    raises is caught. Both matter, and neither used to be true: the renderers
+    were called inside the ``with open(...)`` block with only ``OSError``
+    caught, so a bug in one left a zero-byte file on disk *and* propagated out
+    of ``save_run`` — taking the corrections log, written further down, with
+    it. A malformed finding in one section cost the run every artifact but the
+    report JSON.
+
+    The report JSON is already written by this point, which is what makes
+    catching broadly the right call rather than a way of hiding bugs: the run's
+    actual results are safe on disk, the traceback goes to the log, and what is
+    lost is a file derived from data the author still has. Losing the run for
+    it is the worse trade.
+    """
+    try:
+        text = build()
+    except Exception:
+        log.exception(f"Could not render {label}; {path} not written")
+        return None
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        log.warning(f"Could not write {label} to {path}: {e}")
+        return None
+
+    return path
+
+
 def save_run(
     history_root, article_title, run_number, report, corrections_log, run_ts=None
 ):
@@ -101,25 +135,43 @@ def save_run(
         d = _run_dir(history_root, article_title)
     except OSError as e:
         log.error(f"Cannot create history directory: {e}")
-        return {"report_path": None, "corrections_path": None, "markdown_path": None}
+        return {
+            "report_path": None,
+            "corrections_path": None,
+            "markdown_path": None,
+            "worklist_path": None,
+        }
 
     report_path = d / f"run_{run_number}_{ts_str}_report.json"
     corrections_path = d / f"run_{run_number}_{ts_str}_corrections.log"
     markdown_path = d / f"run_{run_number}_{ts_str}_review.md"
+    worklist_path = d / f"run_{run_number}_{ts_str}_worklist.md"
 
     try:
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, default=str)
     except OSError as e:
         log.error(f"Could not write report to {report_path}: {e}")
-        return {"report_path": None, "corrections_path": None, "markdown_path": None}
+        return {
+            "report_path": None,
+            "corrections_path": None,
+            "markdown_path": None,
+            "worklist_path": None,
+        }
 
-    try:
-        with open(markdown_path, "w", encoding="utf-8") as f:
-            f.write(render_report_markdown(report))
-    except OSError as e:
-        log.warning(f"Could not write markdown review to {markdown_path}: {e}")
-        markdown_path = None
+    markdown_path = _write_generated(
+        markdown_path, lambda: render_report_markdown(report), "markdown review"
+    )
+
+    # The same worklist that opens the review, on its own. The review is 200KB
+    # of evidence and the worklist is the dozen things to go and do; an author
+    # working through them wants the second open in front of them, not scrolled
+    # to inside the first. One builder feeds both, so they cannot disagree.
+    worklist_path = _write_generated(
+        worklist_path,
+        lambda: "\n".join(render_worklist(build_worklist(report))).rstrip() + "\n",
+        "worklist",
+    )
 
     try:
         lines = [
@@ -135,12 +187,14 @@ def save_run(
             "report_path": str(report_path),
             "corrections_path": None,
             "markdown_path": str(markdown_path) if markdown_path else None,
+            "worklist_path": str(worklist_path) if worklist_path else None,
         }
 
     return {
         "report_path": str(report_path),
         "corrections_path": str(corrections_path),
         "markdown_path": str(markdown_path) if markdown_path else None,
+        "worklist_path": str(worklist_path) if worklist_path else None,
     }
 
 

@@ -89,9 +89,17 @@ floor_seconds: 90
 variance_margin: 2.5
 
 # By draft character count. 62k (this calibration doc) sits in the 1.0 anchor bucket.
+# SMALL-DRAFT BUCKETS, revised 2026-09-04. 0.4 and 0.6 assumed a short draft is
+# a cheap call. It is not, and this file already says why: generation time is
+# driven by OUTPUT length, and output is bounded by what the domain prompt asks
+# for rather than by how much input was read. Measured on a 2,182-char draft,
+# grok emitted 12,032 output tokens and took 377.61s — longer than its worst
+# *measurable* call on a 130,190-char draft. Scaling the budget down by 60% for
+# a small draft contradicted the model's own stated principle, and the cost of
+# it was borne entirely by whichever model was slowest.
 size_multipliers:
-  - { max_chars: 5000,   mult: 0.4 }
-  - { max_chars: 20000,  mult: 0.6 }
+  - { max_chars: 5000,   mult: 0.7 }
+  - { max_chars: 20000,  mult: 0.8 }
   - { max_chars: 50000,  mult: 0.85 }
   - { max_chars: 80000,  mult: 1.0 }    # calibration anchor (~62k)
   - { max_chars: 150000, mult: 1.4 }
@@ -110,7 +118,25 @@ size_multipliers:
 # same thing. Splitting the axes properly is only worth it if these cells start
 # drifting again now that the wall-clock is a backstop rather than a tight budget.
 model_multipliers:
-  grok:               2.0   # was 1.2 (-> 126s at the 1.4 size bucket), which grok used
+  grok:               5.5   # MEASURED 2026-09-03, and the first time this cell has
+                            # been set from real numbers rather than from a ceiling
+                            # a call had just hit. A wall-clock bug meant no
+                            # per-call budget was actually enforced that run, which
+                            # accidentally produced exactly the --no-timeout
+                            # condition this file asks for: grok-4.6 ran to
+                            # completion five times at 2,182 chars, taking 17.58s,
+                            # 143.34s, 232.51s, 310.06s and 377.61s. Median 232.51s
+                            # is the "typical" the multipliers target; the 2.5
+                            # variance_margin then covers the tail, giving ~581s
+                            # against a 377.61s worst case.
+                            #
+                            # 5.5 looks large next to gpt-5.4's 1.0 for the reason
+                            # given above: grok has no reasoning_effort parameter,
+                            # so effort_multipliers.default (1.0) applies and this
+                            # cell carries the reasoning cost as well as the model
+                            # cost. Compare it to sonar's 7.0, not to gpt-5.4's 1.0.
+                            #
+                            # Previously 2.0 # was 1.2 (-> 126s at the 1.4 size bucket), which grok used
                             # 100% of on a 130k-char run: completeness timed out at 126s
                             # and two more domains landed within 14s of the ceiling
                             # (111.8s, 112.83s). The 1.2 was set when grok ran 16-51s at

@@ -1,6 +1,8 @@
 """FRED (Federal Reserve Economic Data) / BLS resolver."""
 
 import requests
+
+from ci_core.http import DEFAULT_HEADERS
 import logging
 import os
 
@@ -20,7 +22,7 @@ def resolve(claim, api_key=None):
 
     try:
         url = f"{FRED_BASE}/series/observations?series_id={series_id}&api_key={api_key}&file_type=json&limit=5&sort_order=desc"
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, timeout=15, headers=DEFAULT_HEADERS)
         if resp.status_code == 200:
             data = resp.json()
             observations = data.get("observations", [])

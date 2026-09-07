@@ -9,6 +9,21 @@ AUDIENCE:
 VOICE PROFILE (for context only — do not flag style issues):
 {voice_profile}
 
+OUT OF SCOPE FOR VERIFICATION:
+{out_of_scope_passages}
+Some claims cannot be settled by any source, and checking them against one produces a false negative rather than a finding. A first-person statement resolved against a company's team page comes back "the page does not mention this", which reads as a reason to withdraw a true sentence. Arithmetic you performed yourself and then reported as "confirmed" reads as a document backing it. Put those claims in "out_of_scope" instead, with the category that fits:
+
+- first_person — a statement about the author's own life, work, motives or circumstances that only they can confirm ("I have a side job", "this took me three weeks"). Judge this by whether a source could settle it, not by the pronoun: if the author is named above and a public page could confirm the claim ("I run the exchange at FD-IX", a role a team page states), it is an ordinary verifiable claim and belongs in the normal buckets.
+- author_hypothesis — a conjecture the draft itself frames as the author's reading of the evidence rather than as established fact.
+- internal_arithmetic — a sum, difference, conversion or date interval derived from figures already stated in the draft. Say in "reason" whether the arithmetic checks out; that is useful. Do not report a calculation you performed as a claim a source confirms.
+- subjective_judgment — an evaluation, preference or editorial stance, which has no truth value to check.
+- future_prediction — a claim about what will happen, which no current source can confirm or contradict.
+- other — genuinely out of scope but none of the above. Say why in "reason". Expect this to be reported to the author rather than acted on, so prefer a specific category where one fits.
+
+"out_of_scope" is for claims where searching harder would not help. A claim you simply could not find a source for is "unverifiable" — that distinction is the whole point of the bucket, and collapsing it would hide real gaps.
+
+A passage the author has marked above goes in "out_of_scope" whether or not a source exists for it. Everything else in the draft is in scope as usual. Judging a claim out of scope removes it from verification and from citation resolution, so it is reported to the author with your reason attached — do not use it to set aside a claim a source could settle.
+
 YOUR TASK:
 For each specific figure, statistic, date, regulatory reference, named attribution, and quantitative claim in the draft, verify it against current authoritative sources.
 
@@ -17,6 +32,8 @@ EVIDENCE REQUIREMENTS — these apply to every claim you place in "confirmed", "
 1. "source_url" must be a single, complete, directly-openable URL (starting with http:// or https://) for the specific page carrying the evidence — not a site's home page, not a search-results page, and not a description of where to look. If you cannot produce such a URL, the claim does not belong in these buckets: put it in "primary_source_needed" with your best candidate instead.
 
 2. "supporting_quote" must be text copied verbatim from that page — the sentence or table row that actually establishes the verdict. Do not paraphrase it, do not summarise it, and do not reconstruct it from memory. If you cannot quote the page, you have not verified the claim against it: use "primary_source_needed" or "unverifiable".
+
+3. "sources_checked" and "best_candidate_url" apply to the two buckets that do NOT reach a verdict. If you opened pages while checking a claim and still could not verify it, list those pages in "sources_checked" — that a real source was read and did not settle the question is itself a finding, and the pipeline will re-check those pages against the claim. If you are recommending a primary source in "primary_source_needed" and you have its actual URL, put it in "best_candidate_url"; use null when you are describing a document you have not opened, such as an internal record. Do not invent a URL to fill either field, and do not repeat a search engine's results page as a source.
 
 These two fields are what makes a verdict checkable by a human. A verdict without them is an assertion, and downstream it is treated as one: the pipeline reports how many of your confirmations arrived with quotable evidence, and a claim whose source cannot be opened and read is reported as unverified regardless of the bucket you chose. Choosing the honest bucket is always better than a confident-sounding verdict that nothing backs up.
 
@@ -40,10 +57,13 @@ RETURN FORMAT (JSON only, no other text):
     {"claim": "exact quote from draft", "contradiction": "what contradicts it", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page that conflicts with the claim", "confidence": "high|medium|low"}
   ],
   "unverifiable": [
-    {"claim": "exact quote from draft", "checked": "what sources were searched", "reason": "why it could not be verified"}
+    {"claim": "exact quote from draft", "checked": "what sources were searched", "sources_checked": ["https://... every page you actually opened, [] if none"], "reason": "why it could not be verified"}
   ],
   "primary_source_needed": [
-    {"claim": "exact quote from draft", "best_candidate_source": "recommended primary source"}
+    {"claim": "exact quote from draft", "best_candidate_source": "recommended primary source", "best_candidate_url": "https://... the page itself if you found it, null if you are naming a document you did not open"}
+  ],
+  "out_of_scope": [
+    {"claim": "exact quote from draft", "claim_type": "first_person|author_hypothesis|internal_arithmetic|subjective_judgment|future_prediction|other", "reason": "why no source can settle this"}
   ],
   "additional_observations": [
     {

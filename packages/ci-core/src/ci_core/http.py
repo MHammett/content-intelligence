@@ -7,11 +7,14 @@ the string from drifting back to per-package values.
 """
 
 import ipaddress
+import logging
 import socket
 from importlib import metadata
 from urllib.parse import urlparse
 
 import requests
+
+log = logging.getLogger(__name__)
 
 try:
     _VERSION = metadata.version("ci-core")
@@ -92,13 +95,28 @@ def classify_host(url):
         infos = socket.getaddrinfo(host, None)
     except Exception:
         return HOST_UNRESOLVABLE
+
+    checked = 0
     for info in infos:
         try:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
+        checked += 1
         if not ip.is_global or ip.is_loopback or ip.is_private or ip.is_link_local:
             return HOST_NON_PUBLIC
+
+    # Reaching here having validated nothing is not evidence that the host is
+    # public — it is the absence of evidence either way. Returning HOST_PUBLIC
+    # for it made the guard fail open on precisely the inputs it could not
+    # reason about: an empty ``getaddrinfo`` result, or addresses that do not
+    # parse as IPs. "Unresolvable" is the honest answer and every caller already
+    # handles it — ``safe_get`` turns it into the ConnectionError requests would
+    # have raised anyway, and link validation fails open there deliberately, to
+    # get an accurate DNS message rather than a security refusal it cannot
+    # justify.
+    if not checked:
+        return HOST_UNRESOLVABLE
     return HOST_PUBLIC
 
 
@@ -217,6 +235,7 @@ __all__ = [
     "is_public_host",
     "safe_get",
     "safe_head",
+    "impersonation_available",
 ]
 
 
@@ -241,6 +260,49 @@ BROWSER_HEADERS = {
 }
 
 
+def impersonation_available():
+    """True when the optional ``unblock`` extra (``curl_cffi``) is importable.
+
+    Callers use this to tell two outcomes apart that ``impersonating_get``
+    deliberately reports the same way. It returns ``None`` both when a block
+    genuinely held and when there was never an escalation to attempt, because
+    every caller was written to treat ``None`` as "the block held" — which is
+    the right default for a *fetch*, and the wrong one for *reporting*, since
+    only one of the two is fixable by installing something.
+    """
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+#: Set once the missing-extra warning has been emitted. A 15-link article would
+#: otherwise print the same line 15 times, which trains the reader to skip it.
+_unavailable_warned = False
+
+
+def _warn_impersonation_unavailable():
+    """Say once, per process, that the escalation tier is not installed.
+
+    This is the line whose absence let the tier sit inert from 2026-08-12 to
+    2026-09-06: `curl_cffi` was in no dependency group, so no ``uv run``
+    invocation had it, ``impersonating_get`` returned ``None`` every time, and
+    the run looked exactly like one where every blocked host simply stayed
+    blocked. Nothing anywhere said the attempt had not been made.
+    """
+    global _unavailable_warned
+    if _unavailable_warned:
+        return
+    _unavailable_warned = True
+    log.warning(
+        "TLS-impersonation escalation is unavailable: the optional 'unblock' "
+        "extra (curl_cffi) is not installed, so blocked links fall straight "
+        "through to the archive fallback without an escalation attempt. "
+        "Install with: uv sync --extra unblock"
+    )
+
+
 def impersonating_get(url, timeout=30):
     """Fetch ``url`` with a browser TLS fingerprint, or return ``None``.
 
@@ -250,28 +312,69 @@ def impersonating_get(url, timeout=30):
     headers it sends.
 
     ``None`` when ``curl_cffi`` is not installed (it is an optional extra), when
-    the fetch raises, or when the response is still an error. Callers treat that
-    exactly as they treated the original block, so nothing regresses if the
-    dependency is absent.
+    the fetch raises, when a hop fails the SSRF guard, or when the response is
+    still an error. Callers treat that exactly as they treated the original
+    block, so nothing regresses if the dependency is absent.
+
+    Redirects are followed hop by hop with ``_guard`` applied to each, for the
+    same reason ``safe_get`` does it: ``allow_redirects=True`` validates the URL
+    you pass and then follows an attacker-chosen chain unchecked. That gap was
+    tolerable while the only caller recorded a status code, and is not now that
+    citation verification checksums this body and hands it to a model — the case
+    ``DEFAULT_HEADERS`` above singles out as needing the fail-closed default. A
+    refused hop returns ``None`` rather than raising, because every other
+    failure here does and callers are written to treat ``None`` as "the block
+    held".
 
     This does not defeat a genuine paywall or a JS/CAPTCHA challenge, and no
     attempt is made to: the three academic publishers in the measurement above
     return a challenge page to this too.
+
+    Whether this tier works at all depends on the installed ``curl_cffi``
+    version, because ``impersonate="chrome"`` resolves to whatever
+    ``DEFAULT_CHROME`` that release ships and Cloudflare fingerprints stale
+    profiles. Measured 2026-09-06: 0.16.0 (``chrome146``) was challenged on
+    congress.gov and bianchihonda.com; 0.16.1+ (``chrome150``) read both in
+    full. The extra pins a floor for this reason — see
+    ``packages/ci-core/pyproject.toml``.
+
+    Debugging a 403 that reaches here: this function returns ``None`` for every
+    failure, so check the response headers directly. ``cf-mitigated:
+    challenge`` means the fingerprint was rejected and the fix is a newer
+    curl_cffi; its absence means the origin refuses browsers too, which is a
+    subscription or JS gate and not worth chasing.
     """
     try:
         from curl_cffi import requests as _cffi
     except ImportError:
+        _warn_impersonation_unavailable()
         return None
+    current = url
     try:
-        resp = _cffi.get(
-            url,
-            impersonate="chrome",
-            timeout=timeout,
-            headers=BROWSER_HEADERS,
-            allow_redirects=True,
-        )
+        for _hop in range(_MAX_REDIRECTS + 1):
+            _guard(current)
+            resp = _cffi.get(
+                current,
+                impersonate="chrome",
+                timeout=timeout,
+                headers=BROWSER_HEADERS,
+                allow_redirects=False,
+            )
+            if not 300 <= resp.status_code < 400:
+                break
+            location = resp.headers.get("Location")
+            if not location:
+                break
+            # Relative Locations are legal and common; resolve before validating.
+            current = requests.compat.urljoin(current, location)
+        else:
+            return None
     except Exception:
         return None
-    if resp.status_code >= 400:
+    # >= 300 rather than >= 400: the loop also breaks on a 3xx carrying no
+    # Location, which is a redirect we cannot follow rather than a document.
+    # Handing that back would let a caller checksum a redirect stub and feed it
+    # to a model as the source's content.
+    if resp.status_code >= 300:
         return None
     return resp

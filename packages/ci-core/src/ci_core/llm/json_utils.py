@@ -22,16 +22,30 @@ Returns the parsed object, or None if nothing parses.
 import json
 import re
 
+from .. import text_repair
+
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _FENCED_BLOCK = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 _JSON_SPAN = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _try_parse(text):
+    r"""Parse ``text``, repairing narrowed punctuation in whatever comes back.
+
+    Every strategy below — and the salvage path — funnels through here, which
+    makes this the one place provider JSON becomes Python data.
+
+    The repair has to happen *after* the parse, not on the response text.
+    Perplexity sends its damage as the escape ``\u0019`` rather than a literal
+    control byte (a literal one would make the body unparseable, and these
+    responses parse), so there is no control character to find until json has
+    decoded the escape. See :mod:`ci_core.text_repair`.
+    """
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except (json.JSONDecodeError, TypeError):
         return None
+    return text_repair.repair_tree(parsed)
 
 
 def extract_json(content):

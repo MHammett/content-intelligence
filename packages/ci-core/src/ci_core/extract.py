@@ -176,11 +176,59 @@ def extract_article(html):
                 title = n["text"]
                 break
 
-    body = _extract_with_trafilatura(html)
-    if not body:
-        body = _fallback_body(parser.nodes)
+    body = _best_body(html, parser.nodes)
 
     return (title or "Untitled"), (body or "").strip()
+
+
+#: How much longer the heuristic body must be before it displaces trafilatura's.
+#:
+#: Sized from the failure that prompted it rather than picked. On a six-person
+#: team page (36,717 bytes) trafilatura returned 439 characters covering one
+#: person, while the heuristic parser returned 3,381 covering all six — a factor
+#: of 7.7. A normal article does not produce that gap: trafilatura's job there is
+#: to strip navigation, a modest trim rather than a 90% cut. 2.5 sits well above
+#: the trim and well below the cliff.
+_HEURISTIC_WINS_RATIO = 2.5
+
+
+def _best_body(html, nodes):
+    """Body text, preferring trafilatura but not when it has lost most of the page.
+
+    trafilatura is tuned for news articles: it finds one main content block and
+    discards the rest as boilerplate. That is the right instinct for an article
+    and the wrong one for a page whose content *is* repeated blocks — a team
+    page, a staff directory, a list of filings. The heuristic parser was only
+    consulted when trafilatura returned nothing at all, so a page it mangled
+    down to one seventh passed through unnoticed.
+
+    Measured 2026-09-04 on https://fd-ix.com/about/team/, which a fact-check
+    model had cited for two claims about the article's author. trafilatura kept
+    one colleague's bio; the author's own — the text that settles both claims —
+    was not in it. Citation verification then reported the source as failing to
+    support a claim the page states outright, and no trafilatura option
+    (favor_recall, deduplicate, include_comments) recovered it.
+
+    Erring toward recall is right for this caller specifically. Missing text
+    produces a confident "the source does not support this", asserting something
+    false about a real document; surplus navigation produces noise, and
+    ``select_excerpt`` already centres its window on the claim's own terms. The
+    wrong refutation is the more expensive error.
+    """
+    trafilatura_body = (_extract_with_trafilatura(html) or "").strip()
+    heuristic_body = (_fallback_body(nodes) or "").strip()
+
+    if not trafilatura_body:
+        return heuristic_body
+    if len(heuristic_body) > len(trafilatura_body) * _HEURISTIC_WINS_RATIO:
+        log.debug(
+            "Heuristic body (%d chars) displaces trafilatura's (%d): a gap that "
+            "size means the page is not shaped like an article.",
+            len(heuristic_body),
+            len(trafilatura_body),
+        )
+        return heuristic_body
+    return trafilatura_body
 
 
 def looks_like_pdf(content_type=None, url=None, raw=None):
@@ -289,6 +337,30 @@ def looks_like_access_wall(text):
     return any(marker in lowered for marker in _ACCESS_WALL_MARKERS)
 
 
+#: Above this share of undecodable characters, a "text" body is a binary file
+#: that was decoded rather than a document that was read. Real prose sits at
+#: zero; a stray replacement character from one bad byte in a long page stays
+#: far below it, so this does not discard a page over a single mojibake.
+_MAX_UNDECODABLE_RATIO = 0.05
+
+
+def looks_like_binary(text):
+    """True if ``text`` is decoded bytes rather than readable content.
+
+    PDFs are caught before this by magic bytes, and markup by the HTML path.
+    What reaches here is the remaining case: a body with no angle brackets that
+    some server labelled ``text/plain`` (or did not label at all), decoded with
+    ``errors="replace"`` into a run of replacement characters. Handing that to
+    the verifier asks a model whether mojibake supports a claim, which is the
+    same failure as handing it raw PDF -- just without the magic bytes that
+    make it obvious.
+    """
+    if not text:
+        return False
+    bad = sum(1 for c in text if c == "\ufffd" or (ord(c) < 0x20 and c not in "\t\n\r"))
+    return bad / len(text) > _MAX_UNDECODABLE_RATIO
+
+
 def extract_response_text(raw, content_type=None, url=None, encoding="utf-8"):
     """Turn a fetched response body into readable text.
 
@@ -313,7 +385,8 @@ def extract_response_text(raw, content_type=None, url=None, encoding="utf-8"):
     if ctype and not ctype.startswith("text/") and "html" not in ctype:
         # Plain text, JSON, CSV, XML: no markup to strip, use it as-is.
         if ctype in ("application/json", "text/plain") or "xml" in ctype:
-            return decoded.strip(), "text"
+            text = decoded.strip()
+            return ("" if looks_like_binary(text) else text), "text"
 
     if "<" in decoded and ">" in decoded:
         _title, body = extract_article(decoded)
@@ -323,7 +396,8 @@ def extract_response_text(raw, content_type=None, url=None, encoding="utf-8"):
         # through rather than handing raw tags to a text model.
         return "", "html"
 
-    return decoded.strip(), "text"
+    text = decoded.strip()
+    return ("" if looks_like_binary(text) else text), "text"
 
 
 # --- Claim-centered excerpt selection -------------------------------------

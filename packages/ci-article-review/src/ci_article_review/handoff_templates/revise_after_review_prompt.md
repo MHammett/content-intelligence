@@ -20,12 +20,27 @@ to the JSON report in `pipeline_history/<article-slug>/`) and paste its
 SECTION 1 through SECTION 10 content below it, plus the SEO SUGGESTIONS and
 SEO STRUCTURE REVIEW blocks at the end of that file if the run produced them.
 
+Paste the "Reading this report" block at the top of the file as well. It
+carries how many comparable prior runs this draft was measured against, and the
+per-finding notes below it ("also in 3 of 4 comparable prior runs") only make
+sense with it. A single review run is roughly 75% non-reproducible, so a model
+handed the findings without that framing will treat every one of them as an
+established defect in the article.
+
 Paste SECTION 9 too — it is easy to skip because it is long, and it is where
 the citation work lands. In particular its "Unresolved" block contains
 content-mismatch entries: sources that were fetched and read, where a model
 found the page does not actually support the claim it was cited for. Those are
 among the most actionable findings a run produces, and they are invisible in
 SECTIONS 1-8.
+
+Do NOT paste the WORKLIST block. It sits above SECTION 1 in the same file (and
+in `run_N_<timestamp>_worklist.md` on its own), so it is the first thing you
+meet when you open the review — but it is your list, not the model's. It is a
+set of documents nobody has read yet, named down to bulletin numbers and URLs,
+and handing that to a model asks it to fill in what those documents say. That
+is the failure this whole pipeline exists to catch. Start the paste at
+"## SECTION 1".
 
 SECTION 10 is the one section you do NOT paste wholesale, and it only exists if
 you ran with --expand. It is a menu of proposed additions rather than a list of
@@ -34,9 +49,11 @@ which ones you actually want FIRST, and paste only those. Pasting the whole
 menu hands the model a mandate to work every suggestion in, which is how a
 revision pass turns into an expansion pass and a draft stops converging.
 
-Ignore any candidate marked LINK FAILED unless you have found the real source
-yourself — a URL that does not resolve was very likely invented, and the model
-revising the draft has no way to tell that from a good one.
+Ignore any SECTION 10 candidate marked LINK DEAD unless you have found the real
+source yourself — that means a 404 or a host that does not exist, so the URL was
+very likely invented and the model revising the draft cannot tell it from a good
+one. A candidate marked "could not read" is a different thing: the page refused
+us, which is no evidence against it.
 
 ──────────────────────────────────────────────────────────────────────────────
 
@@ -45,6 +62,25 @@ review pipeline and I'm pasting the consolidated findings below. Revise the
 draft to address the findings you agree are valid, then output BOTH the
 revised draft and an updated metadata block — in the exact format below, with
 no additional commentary outside the two files.
+
+How to weigh the findings:
+- This is ONE run of a non-deterministic pipeline, not a defect list. Where the
+  review says a finding also appeared in prior runs of the same draft, that is
+  the strongest evidence in the report. Where it says the finding is new, the
+  evidence for it is a single sample.
+- SECTION 1 is grouped into bands, not ranked. Order within a band means
+  nothing, and the weight figure is a per-run score, not a severity. Do not
+  work top-down as though the first item were the most important.
+- Prefer corroborated findings when they conflict with single-run ones. Do not
+  dismiss a single-run finding for being single-run: most real findings appear
+  once. Judge it on the argument it makes, and say so if you decline it.
+- "What this run may have missed" is NOT a findings list. Those are passages
+  every earlier run of this same draft flagged and this one did not, carried
+  as pointers with no diagnosis attached. Do not revise against them as though
+  a reviewer had made the case. Read the passage, and if you can see the
+  problem yourself, address it and say which one you acted on; otherwise leave
+  it and note that it wants another run. Inventing the missing critique is the
+  failure mode here.
 
 Rules for the metadata update:
 - PRIMARY CLAIM: leave unchanged UNLESS a finding directly challenges the core
@@ -74,9 +110,14 @@ Rules for the metadata update:
   to what the source actually says, or drop it) while `not_addressed` usually
   means the wrong URL was checked (fix the citation, not the sentence).
   "Source URL identified, but the fetch was refused" names a document that
-  exists but did not load for an automated fetch — usually a 403, and usually
-  still readable in a browser or via the archive copy listed beside it; those
-  are worth opening by hand rather than treating as unsourced. "Pointer only",
+  exists but did not load — a 404, an unreachable host, or a 403 that survived
+  a browser-shaped retry, which in practice means a subscription gate or a
+  JS/CAPTCHA challenge rather than a bot policy. Some are still readable to a
+  logged-in person, or via the archive copy listed beside it; those are worth
+  opening by hand rather than treating as unsourced. A citation whose entry
+  carries a "Reader access" line was read successfully — that line describes
+  friction the reader may meet, not a weaker verification, and the archive link
+  beside it is the durable half of the pairing. "Pointer only",
   "Fetched, but could not be read", and "No source identified"
   establish nothing either way — do not treat them as either confirmation or
   refutation; flag them in your summary as needing a human check. In

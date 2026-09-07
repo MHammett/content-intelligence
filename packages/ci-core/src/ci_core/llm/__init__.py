@@ -24,7 +24,16 @@ verdict — should use :func:`call_text`.
 
 import logging
 
-from . import cache, client, cost, json_utils, model_registry, schema, timeout_model
+from . import (
+    cache,
+    client,
+    cost,
+    json_utils,
+    model_registry,
+    schema,
+    timeout_model,
+    watermarking,
+)
 from .client import PROVIDERS
 
 log = logging.getLogger(__name__)
@@ -38,6 +47,7 @@ __all__ = [
     "cost",
     "json_utils",
     "model_registry",
+    "watermarking",
     "schema",
     "timeout_model",
 ]

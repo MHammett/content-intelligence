@@ -96,6 +96,7 @@ import httpx
 import litellm
 
 from .. import redact
+from .. import text_repair
 from . import cache as cache_mod
 from . import schema as schema_mod
 from .json_utils import extract_json_with_salvage
@@ -444,12 +445,25 @@ def _provider_params(provider, cfg, response_schema=None):
         effort = cfg.get("effort")
         if budget is not None:
             params["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
-            params["max_tokens"] = int(budget) + 4096
+            # Room for the answer on top of the thinking allowance, which is
+            # spent before the response begins.
+            default_max_tokens = int(budget) + 4096
         elif effort:
             params["reasoning_effort"] = effort
-            params["max_tokens"] = 16000
+            default_max_tokens = 16000
         else:
-            params["max_tokens"] = 4096
+            # Was a flat 4096, and `cfg["max_tokens"]` was ignored on all three
+            # branches, so there was no way to raise it from config either.
+            # Measured 2026-09-05 on a standard-preset run (135514 chars,
+            # effort=none): claude:argument_integrity stopped at exactly 4096
+            # output tokens and came back PARTIAL — salvage kept the complete
+            # findings and discarded the rest. Every other provider finished.
+            #
+            # 8000 matches the default mistral's no-effort path already uses,
+            # and claude-haiku-4-5's real max_output_tokens is 64000, so this
+            # is still 8x below the provider's ceiling rather than near it.
+            default_max_tokens = 8000
+        params["max_tokens"] = int(cfg.get("max_tokens", default_max_tokens))
         # No temperature — see _SENDS_TEMPERATURE.
 
     elif provider in ("mistral", "grok", "perplexity"):
@@ -623,6 +637,56 @@ def _provider_field(chunk, *names):
     return None
 
 
+def _direct_field(chunk, name):
+    """``name`` read straight off the chunk or any of its deltas.
+
+    The sibling of :func:`_provider_field`, for fields that sit in the OpenAI
+    schema proper rather than in ``provider_specific_fields``. OpenAI's own
+    ``annotations`` is one, so it is reachable by neither the plain
+    ``getattr(chunk, ...)`` above nor the provider-specific walk.
+    """
+    holders = [chunk]
+    for choice in getattr(chunk, "choices", None) or []:
+        for attr in ("delta", "message"):
+            holder = getattr(choice, attr, None)
+            if holder is not None:
+                holders.append(holder)
+    for holder in holders:
+        value = getattr(holder, name, None)
+        if value:
+            return value
+    return None
+
+
+def _url_citations(annotations):
+    """Source URLs carried by OpenAI Responses-API ``annotations``.
+
+    A grounded OpenAI call reports what its search read as annotations on the
+    message — ``{"type": "url_citation", "url": ..., "title": ...}`` — rather
+    than under either name Perplexity and Anthropic use. Nothing read that, so
+    ``openai:fact_check`` on 2026-09-03 spent 84,634 prompt tokens and $0.85
+    doing live search, reported ``grounding_available: None``, and contributed
+    not one source to Section 9. The evidence was bought and discarded.
+
+    Tolerant about shape: litellm hands these back as dicts or as objects
+    depending on the path, and an annotation without a URL is not a citation.
+    """
+    urls = []
+    for annotation in annotations or []:
+        if isinstance(annotation, dict):
+            kind, url = annotation.get("type"), annotation.get("url")
+        else:
+            kind, url = (
+                getattr(annotation, "type", None),
+                getattr(annotation, "url", None),
+            )
+        # Untyped annotations carrying a URL still count — the type name is the
+        # part most likely to be renamed by a provider or a shim.
+        if url and (not kind or "citation" in str(kind)):
+            urls.append(url)
+    return urls
+
+
 def _consume_completion_stream(stream, first_byte, gap):
     """Drain a ``litellm.completion(stream=True)`` response.
 
@@ -673,14 +737,23 @@ def _consume_completion_stream(stream, first_byte, gap):
                 if isinstance(entry, dict) and entry:
                     grounding_meta = entry
 
-    return {
-        "content": "".join(parts),
-        "usage": usage,
-        "finish_reason": finish_reason,
-        "citations": citations,
-        "search_results": search_results,
-        "grounding_metadata": grounding_meta,
-    }
+    # Repaired here, at the point the provider's bytes become our strings,
+    # so everything downstream -- the JSON parse, the text shim,
+    # search-result snippets -- sees the same corrected text. See
+    # ci_core.text_repair for what Perplexity does to General Punctuation.
+    return text_repair.repair_tree(
+        {
+            "content": "".join(parts),
+            "usage": usage,
+            "finish_reason": finish_reason,
+            "citations": citations,
+            "search_results": search_results,
+            # Only the Responses API surfaces web-search events; this keeps the two
+            # consumers returning the same keys so _extras_from needs no branch.
+            "web_search_used": False,
+            "grounding_metadata": grounding_meta,
+        }
+    )
 
 
 def _consume_responses_stream(stream, first_byte, gap):
@@ -695,6 +768,8 @@ def _consume_responses_stream(stream, first_byte, gap):
     """
     parts = []
     reasoning_parts = []
+    citations = []
+    searched = False
     usage = None
     status = None
 
@@ -704,6 +779,26 @@ def _consume_responses_stream(stream, first_byte, gap):
             parts.append(getattr(event, "delta", "") or "")
         elif etype == "response.reasoning_summary_text.delta":
             reasoning_parts.append(getattr(event, "delta", "") or "")
+        # `etype` is a str-subclass enum: `==` against the dotted value works,
+        # but `str()` renders it as "ResponsesAPIStreamEvents.WEB_SEARCH_CALL_..."
+        # instead. Read `.value` so a prefix test sees the wire name.
+        elif str(getattr(etype, "value", etype) or "").startswith(
+            "response.web_search_call"
+        ):
+            # The only evidence that a search happened. Measured 2026-09-04
+            # against a live grounded call: these events carry an ``item_id``
+            # and a sequence number and nothing else — no query, no URLs, no
+            # results. They are still worth reading, because "did this call
+            # consult live sources" is exactly what ``grounding_available``
+            # claims to answer, and without them openai answered "no" while
+            # spending 8,661 prompt tokens searching.
+            searched = True
+        elif etype == "response.content_part.done":
+            # Where OpenAI puts url_citation annotations when it has any.
+            part = getattr(event, "part", None)
+            for url in _url_citations(getattr(part, "annotations", None)):
+                if url not in citations:
+                    citations.append(url)
         elif etype in ("response.completed", "response.incomplete"):
             resp = getattr(event, "response", None)
             if resp is not None:
@@ -713,17 +808,25 @@ def _consume_responses_stream(stream, first_byte, gap):
                 if incomplete is not None:
                     status = getattr(incomplete, "reason", None) or status
 
-    return {
-        "content": "".join(parts),
-        "usage": usage,
-        # The Responses API reports truncation as an incomplete status with
-        # reason "max_output_tokens" rather than finish_reason="length".
-        "finish_reason": "length" if status == "max_output_tokens" else status,
-        "reasoning_summary": "".join(reasoning_parts),
-        "citations": [],
-        "search_results": [],
-        "grounding_metadata": {},
-    }
+    return text_repair.repair_tree(
+        {
+            "content": "".join(parts),
+            "usage": usage,
+            # The Responses API reports truncation as an incomplete status with
+            # reason "max_output_tokens" rather than finish_reason="length".
+            "finish_reason": "length" if status == "max_output_tokens" else status,
+            "reasoning_summary": "".join(reasoning_parts),
+            # Usually empty even on a grounded call, and that is the provider's
+            # doing rather than a gap here: OpenAI attaches url_citation
+            # annotations to cited spans of prose, and every review domain asks for
+            # a JSON schema, which has no prose to cite. Measured 2026-09-04 —
+            # search ran, the answer was right, `annotations` came back `[]`.
+            "citations": citations,
+            "search_results": [],
+            "web_search_used": searched,
+            "grounding_metadata": {},
+        }
+    )
 
 
 def _usage_as_dict(usage):
@@ -903,7 +1006,61 @@ def _error_body(exc):
     return redact.truncate_excerpt(redact.redact_url_keys(body)) if body else ""
 
 
-def _with_retry(fn, retry, retry_delay, label):
+def _record_discarded(discarded, exc):
+    """Note an attempt that was thrown away, and its usage if we have it.
+
+    A retry replaces the failed attempt's result with the next one's, so the
+    tokens the provider already generated — and billed for — vanished from the
+    run's accounting entirely. Seven attempts were discarded this way on
+    2026-09-03 while the summary printed ``Estimated cost: $3.4878 (exact)``.
+
+    Usage is only sometimes recoverable. ``MalformedJSONError`` carries the whole
+    assembled response, so its token counts are exact. A stalled stream or a
+    transport error has no usage to read — those are counted but not costed,
+    rather than quietly rolling an invented number into the total.
+    """
+    if discarded is None:
+        return
+    assembled = getattr(exc, "assembled", None)
+    usage = assembled.get("usage") if isinstance(assembled, dict) else None
+    discarded.append({"reason": exc.__class__.__name__, "usage": usage})
+
+
+def _discarded_field(discarded):
+    """``{"discarded_attempts": ...}`` if anything was thrown away, else ``{}``.
+
+    Spread into each of the three result shapes so success, malformed-JSON and
+    hard failure all report abandoned attempts the same way, and none of them
+    has to remember the key name.
+    """
+    return {"discarded_attempts": _summarise_discarded(discarded)} if discarded else {}
+
+
+def _summarise_discarded(discarded):
+    """Fold recorded discarded attempts into counts and recoverable tokens.
+
+    ``costed`` is how many of them carried usage we can price. The rest are real
+    spend with no number attached, which is exactly why the run stops calling its
+    total "exact" when any are present.
+    """
+    prompt = completion = costed = 0
+    for attempt in discarded:
+        usage = attempt.get("usage")
+        if not usage:
+            continue
+        tokens = _read_tokens(usage)
+        prompt += tokens.get("prompt", 0)
+        completion += tokens.get("completion", 0)
+        costed += 1
+    return {
+        "count": len(discarded),
+        "costed": costed,
+        "reasons": sorted({a.get("reason", "unknown") for a in discarded}),
+        "tokens": {"prompt": prompt, "completion": completion},
+    }
+
+
+def _with_retry(fn, retry, retry_delay, label, discarded=None):
     """Run ``fn``, retrying once on a genuinely transient failure.
 
     ``num_retries=0`` is set on the litellm call itself, so this is the only
@@ -934,6 +1091,7 @@ def _with_retry(fn, retry, retry_delay, label):
     except (StreamStalled, MalformedJSONError) as exc:
         if not retry:
             raise
+        _record_discarded(discarded, exc)
         log.warning(
             f"{label} {exc.__class__.__name__}. Waiting {retry_delay}s before one retry."
         )
@@ -954,6 +1112,7 @@ def _with_retry(fn, retry, retry_delay, label):
                 f"Not retrying — a wait will not refill it."
             )
             raise
+        _record_discarded(discarded, exc)
         log.warning(f"{label} HTTP {status}. Waiting {retry_delay}s before one retry.")
         time.sleep(retry_delay)
         return fn()
@@ -1013,12 +1172,24 @@ def _attempt(
                 # summary="auto" is what makes the thinking phase audible on the
                 # wire; without it this surface goes as quiet as Chat Completions.
                 kwargs["reasoning"] = {"effort": effort, "summary": "auto"}
-            else:
-                # Only when there is no reasoning effort. gpt-5.x rejects
-                # temperature outright — "Unsupported parameter: 'temperature'
-                # is not supported with this model", HTTP 400 — which silently
-                # 400'd every web-search call until it was caught in a live run.
-                kwargs["temperature"] = _TEMPERATURE
+            # No temperature on this path either, whatever the reasoning effort.
+            #
+            # There used to be an `else` here sending one, under a comment
+            # correctly stating that gpt-5.x rejects temperature outright. The
+            # comment described the model; the branch sent it anyway, to exactly
+            # the calls the comment was about — the ones with no reasoning
+            # effort. Every openai call without an effort therefore 400'd with
+            # "Unsupported parameter: 'temperature' is not supported with this
+            # model".
+            #
+            # The maximum preset hid it, because openai runs at xhigh there and
+            # took the branch above. economy, standard and balanced set no
+            # effort, so openai failed on every domain it was assigned. Caught
+            # on a live standard-preset run, 2026-09-04: openai:voice_style and
+            # openai:completeness both dead in under a second.
+            #
+            # ``_SENDS_TEMPERATURE`` has excluded openai all along; this path
+            # simply never consulted it.
 
             # Live web search. The pipeline resolves this per domain before
             # calling (only fact_check has any use for it, and it bills per
@@ -1083,7 +1254,12 @@ def _attempt(
         if provider == "gemini":
             extras["grounding_chunks"] = grounding
             extras["grounding_available"] = bool(grounding)
-        elif provider == "perplexity" or citations or assembled["search_results"]:
+        elif (
+            provider == "perplexity"
+            or citations
+            or assembled["search_results"]
+            or assembled.get("web_search_used")
+        ):
             # Perplexity always reports these; grok and claude do too once their
             # search is switched on. Keyed off the payload rather than the
             # provider name so a newly-grounded provider surfaces without
@@ -1091,8 +1267,14 @@ def _attempt(
             # shape, not by who sent them.
             extras["citations"] = citations
             extras["search_results"] = assembled["search_results"]
+            # True when a search ran, even if the provider named no sources.
+            # openai does exactly that under a JSON schema, and reporting it as
+            # ungrounded understated a call that had just spent 84,634 prompt
+            # tokens consulting the live web.
             extras["grounding_available"] = bool(
-                citations or assembled["search_results"]
+                citations
+                or assembled["search_results"]
+                or assembled.get("web_search_used")
             )
         return extras
 
@@ -1106,9 +1288,10 @@ def _attempt(
             raise MalformedJSONError(assembled)
         return assembled, parsed, truncated
 
+    discarded = []
     try:
         assembled, parsed, truncated = _with_retry(
-            _invoke_and_parse, retry, retry_delay, label
+            _invoke_and_parse, retry, retry_delay, label, discarded
         )
     except MalformedJSONError as exc:
         elapsed = round(time.monotonic() - t0, 2)
@@ -1128,6 +1311,11 @@ def _attempt(
             "tokens": tokens,
             "elapsed_seconds": elapsed,
             **_extras_from(assembled),
+            # A call that failed, retried and failed again was billed twice.
+            # Attaching this only to the success path would have left the
+            # most expensive outcome — two full attempts, no usable result —
+            # as the one the cost summary still could not see.
+            **_discarded_field(discarded),
         }
     except Exception as exc:
         elapsed = round(time.monotonic() - t0, 2)
@@ -1151,6 +1339,7 @@ def _attempt(
             # reaches the report.
             "_status": _status_of(exc),
             "_terminal": _is_terminal_quota_error(exc),
+            **_discarded_field(discarded),
         }
 
     elapsed = round(time.monotonic() - t0, 2)
@@ -1181,6 +1370,10 @@ def _attempt(
     }
     if truncated:
         result["truncated"] = True
+    # Attempts the provider generated and billed, whose output this call then
+    # threw away and replaced. Kept separate from ``tokens`` so the successful
+    # call's own numbers stay honest; cost accounting adds them.
+    result.update(_discarded_field(discarded))
     return result
 
 

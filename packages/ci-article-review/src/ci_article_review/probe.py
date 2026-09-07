@@ -1,76 +1,89 @@
 #!/usr/bin/env python3
 """
-Probe — empirically verifies every model ID and parameter assumption baked
-into the cost presets.  Makes minimal API calls (one tiny prompt each) and
-reports exactly what each provider accepted, rejected, or returned.
+Probe — checks that the models a cost preset names will actually answer, before
+a full article run is paid for.
 
 Usage:
-  python probe.py                # test all providers
-  python probe.py openai        # test one provider only
-  python probe.py openai mistral gemini
+  ci-probe                          # every preset, every provider
+  ci-probe --preset maximum         # one preset
+  ci-probe --preset standard openai claude
+  ci-probe --list-models            # also ask each provider what it offers
 
-This is intentionally separate from check.py, which only tests the model
-currently in user.yaml.  Probe tests the specific model IDs that live in
-the balanced/thorough/maximum presets so we know they'll work before we pay
-for a full article run.
+What it sends and why it matters
+--------------------------------
+Every call goes through ``ci_core.llm.client.call`` — the same entry point the
+pipeline uses — against the config ``merge_configs`` resolves for that preset.
+So a probe exercises the real model ID, the real reasoning effort, the real
+temperature decision, the real schema support and the real streaming path.
+
+That is the whole point, and it was not true before. This module used to hand-
+roll its own ``requests.post`` per provider with a payload of its own design.
+On 2026-09-04 it reported ``gpt-5.6-terra OK`` while a live standard run failed
+every openai call with HTTP 400 — the pipeline sent ``temperature`` and the
+model refused it, but the probe had never sent one. A pre-flight check that
+does not send what the flight sends can only tell you the model exists.
+
+It also read credentials straight from ``os.getenv``, bypassing the project's
+precedence (CLI override > publication config > .env > OS environment). On a
+machine where a provider key is set in both places with different values — and
+this repo already prints a ``WP_USER`` notice for exactly that — the probe would
+test one credential and the run would use another. Keys now come from
+``load_user_config``, which resolves ``${VAR}`` the documented way.
 """
 
-import os
-import time
 import argparse
-import requests
-from dotenv import load_dotenv
+import json
+import sys
+from pathlib import Path
 
-load_dotenv()
+import yaml
+
+# Before anything prints: this report carries ANSI colour and model names a
+# default Windows console (cp1252) cannot encode. Required of every console
+# script, and enforced by test_every_cli_entry_point_forces_utf8_stdio.
+from ci_core.console import force_utf8_stdio
+
+force_utf8_stdio()
+
+from ci_core.llm import client  # noqa: E402
+
+from .config_loader import (  # noqa: E402
+    load_publication_config,
+    load_user_config,
+    merge_configs,
+)
 
 OK = "\033[32m OK  \033[0m"
 FAIL = "\033[31m FAIL\033[0m"
 WARN = "\033[33m WARN\033[0m"
 SKIP = "\033[33m SKIP\033[0m"
 
-MINI_PROMPT = "Reply with the single word: ok"
-
-# ---------------------------------------------------------------------------
-# Models to probe — mirrors the cost-preset assumptions
-# ---------------------------------------------------------------------------
-
-OPENAI_MODELS = [
-    # (model_id, reasoning_effort_or_None, label)
-    ("gpt-5.4-mini", None, "economy/standard non-reasoning"),
-    ("gpt-5.4", None, "standard non-reasoning"),
-    ("o4-mini", "low", "balanced/thorough reasoning"),
-    ("o3", "high", "maximum reasoning"),
-]
-
-MISTRAL_MODELS = [
-    ("mistral-small-latest", None, "economy non-reasoning"),
-    ("mistral-large-latest", None, "standard non-reasoning"),
-    (
-        "mistral-medium-3-5",
-        "high",
-        "balanced+ reasoning (replaces magistral-medium-latest; only high/none supported)",
-    ),
-]
-
-GEMINI_MODELS = [
-    "gemini-2.5-flash",  # standard / thorough
-    "gemini-3.5-flash",  # maximum preset
-]
-
-GROK_MODELS = [
-    "grok-4.3",  # standard — also supports reasoning_effort for balanced+ (no separate model needed)
-    "grok-build-0.1",  # capacity fallback
-]
-
-PERPLEXITY_MODELS = [
-    "sonar",  # economy
-    "sonar-pro",  # standard
-    "sonar-reasoning-pro",  # balanced+
-]
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+#: A probe has to ask for JSON, because the client parses every response as JSON
+#: and raises on anything else. Asking for a schema too is deliberate: schema
+#: support is the one capability that genuinely differs per provider (see
+#: ci_core.llm.schema), so a probe that skipped it would leave the most
+#: provider-specific behaviour unchecked.
+#: Ordinary phrasing, deliberately. A terser instruction —
+#: 'Return exactly this object and nothing more: {"ok": true}' — tripped xAI's
+#: content filter outright (``permission-denied``, ``SAFETY_CHECK_TYPE_BIO``)
+#: and reported grok as unreachable when it was fine. A probe that fails for
+#: reasons of its own is the failure mode this whole module was rewritten to
+#: remove.
+PROBE_SYSTEM = "You are a helpful assistant. Reply with JSON and no other text."
+PROBE_PROMPT = (
+    "Please reply with a JSON object that has a single field named ok, set to true."
+)
+#: The client takes ``{"name": ..., "schema": ...}``, matching
+#: ``schemas.for_domain``, not a bare JSON Schema.
+PROBE_SCHEMA = {
+    "name": "probe",
+    "schema": {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    },
+}
 
 
 def _result(ok, label, detail=""):
@@ -89,447 +102,200 @@ def _warn(label, detail=""):
     print(line)
 
 
-# ---------------------------------------------------------------------------
-# OpenAI
-# ---------------------------------------------------------------------------
+def preset_names():
+    """Every preset defined in the packaged presets.yaml."""
+    path = Path(__file__).parent / "configs" / "presets.yaml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return [name for name, cfg in data.items() if isinstance(cfg, dict)]
 
 
-def probe_openai():
-    print("\n-- OpenAI ------------------------------------------------------")
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        print(f"  {SKIP}  OPENAI_API_KEY not set — skipping")
-        return
+def resolve_preset(preset, publication, config_dir):
+    """``(models, api_keys)`` exactly as a run with this preset would resolve them.
 
-    for model, reasoning_effort, label in OPENAI_MODELS:
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": MINI_PROMPT}],
-        }
-        if reasoning_effort:
-            payload["reasoning_effort"] = reasoning_effort
-            # Reasoning mode: no response_format or temperature
-        else:
-            payload["response_format"] = {"type": "text"}
-            payload["max_completion_tokens"] = 20
-
-        t0 = time.monotonic()
-        try:
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=60,
-            )
-            elapsed = round(time.monotonic() - t0, 1)
-            if resp.status_code == 200:
-                data = resp.json()
-                actual_model = data.get("model", "?")
-                # Reasoning models may return content as a list of typed chunks.
-                raw_content = data["choices"][0]["message"]["content"]
-                if isinstance(raw_content, list):
-                    reply = "".join(
-                        c.get("text", "")
-                        for c in raw_content
-                        if c.get("type") == "text"
-                    ).strip()[:60]
-                else:
-                    reply = raw_content.strip()[:60]
-                _result(
-                    True,
-                    f"{model} ({label})",
-                    f"model_in_response={actual_model!r} reply={reply!r} {elapsed}s",
-                )
-            else:
-                body = resp.text[:300]
-                _result(False, f"{model} ({label})", f"HTTP {resp.status_code}: {body}")
-        except Exception as e:
-            elapsed = round(time.monotonic() - t0, 1)
-            _result(False, f"{model} ({label})", f"{e} ({elapsed}s)")
+    Goes through the same loader the pipeline does, so ``${VAR}`` follows the
+    project's precedence rather than a second, private reading of the
+    environment.
+    """
+    user = load_user_config(config_dir)
+    user.setdefault("pipeline", {})["cost_preset"] = preset
+    pub = load_publication_config(publication, config_dir)
+    config = merge_configs(user, pub)
+    return config.get("models") or {}, config.get("api_keys") or {}
 
 
-# ---------------------------------------------------------------------------
-# Mistral
-# ---------------------------------------------------------------------------
+def _api_key_for(provider, api_keys):
+    """The key the pipeline would use, or "" when the provider needs none.
+
+    Gemini via Vertex authenticates with a service-account file named in the
+    model config, so an absent key is expected rather than a failure.
+    """
+    return ((api_keys.get(provider) or {}).get("api_key")) or ""
 
 
-def probe_mistral():
-    print("\n-- Mistral -----------------------------------------------------")
-    api_key = os.getenv("MISTRAL_API_KEY", "")
-    if not api_key:
-        print(f"  {SKIP}  MISTRAL_API_KEY not set — skipping")
-        return
+def probe_provider(provider, model_cfg, api_key):
+    """One real call, through the client the pipeline uses."""
+    model_cfg = dict(model_cfg or {})
 
-    for model, reasoning_effort, label in MISTRAL_MODELS:
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": MINI_PROMPT}],
-        }
-        if reasoning_effort:
-            payload["reasoning_effort"] = reasoning_effort
-        else:
-            payload["response_format"] = {"type": "text"}
-            payload["max_tokens"] = 20
+    # Live search off, always. The pipeline resolves ``web_search`` to a bool
+    # per domain before calling — only fact_check has any use for it, and it
+    # bills per search. Passing the raw config through left it as the list
+    # ``["fact_check"]``, which is truthy, so every openai probe ran a real
+    # search: 4,487 prompt tokens for a one-line question, on a tool whose
+    # whole selling point is being cheap enough to run before every job.
+    model_cfg["web_search"] = False
 
-        t0 = time.monotonic()
-        try:
-            resp = requests.post(
-                "https://api.mistral.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=90,
-            )
-            elapsed = round(time.monotonic() - t0, 1)
-            if resp.status_code == 200:
-                data = resp.json()
-                actual_model = data.get("model", "?")
-                # Reasoning models may return content as a list of typed chunks.
-                raw_content = data["choices"][0]["message"]["content"]
-                if isinstance(raw_content, list):
-                    reply = "".join(
-                        c.get("text", "")
-                        for c in raw_content
-                        if c.get("type") == "text"
-                    ).strip()[:60]
-                else:
-                    reply = raw_content.strip()[:60]
-                _result(
-                    True,
-                    f"{model} ({label})",
-                    f"model_in_response={actual_model!r} reply={reply!r} {elapsed}s",
-                )
-            else:
-                body = resp.text[:300]
-                _result(False, f"{model} ({label})", f"HTTP {resp.status_code}: {body}")
-        except Exception as e:
-            elapsed = round(time.monotonic() - t0, 1)
-            _result(False, f"{model} ({label})", f"{e} ({elapsed}s)")
+    model = model_cfg.get("model") or provider
+    effort = model_cfg.get("reasoning_effort")
+    detail_bits = [f"effort={effort}" if effort else "effort=none"]
 
-
-# ---------------------------------------------------------------------------
-# Gemini (Vertex AI — uses your configured credentials)
-# ---------------------------------------------------------------------------
-
-
-def probe_gemini_vertex():
-    print("\n-- Gemini (Vertex AI) ------------------------------------------")
-
+    label = f"{provider}: {model}"
     try:
-        import google.auth
-        import google.auth.transport.requests
-        from google.oauth2 import service_account
-    except ImportError:
-        print(
-            f"  {SKIP}  google-auth not installed — run: pip install 'google-auth>=2.22.0,<3.0'"
+        result = client.call(
+            provider,
+            PROBE_SYSTEM,
+            PROBE_PROMPT,
+            api_key,
+            # A probe wants the first answer, not a masked one: retrying here
+            # would hide exactly the transient a run is about to hit.
+            retry=False,
+            model=model,
+            provider_config=model_cfg,
+            response_schema=PROBE_SCHEMA,
         )
-        return
+    except Exception as e:  # pragma: no cover - network shapes vary
+        return _result(False, label, f"{type(e).__name__}: {e}")
 
-    credentials_file = (
-        r"C:\Users\mhammett.HAMMETT\gcp-keys\mikehammett-317d1e506314.json"
+    elapsed = result.get("elapsed_seconds")
+    if result.get("failed"):
+        body = (result.get("error_body") or "").strip().replace("\n", " ")[:200]
+        detail = f"{result.get('error')}"
+        if body:
+            detail += f" | {body}"
+        return _result(False, label, detail)
+
+    data = result.get("data")
+    reported = result.get("model", "?")
+    tokens = result.get("tokens") or {}
+    detail = (
+        f"answered={json.dumps(data)} model_in_response={reported!r} "
+        f"{', '.join(detail_bits)} "
+        f"{tokens.get('prompt', 0)}+{tokens.get('completion', 0)} tok {elapsed}s"
     )
-    project = "mikehammett"
-    location = "us-central1"
+    ok = _result(True, label, detail)
+    if data != {"ok": True}:
+        _warn(
+            label,
+            "the schema was accepted but the content is not what was asked for",
+        )
+    return ok
 
-    if not os.path.exists(credentials_file):
-        print(f"  {SKIP}  credentials file not found: {credentials_file}")
-        return
 
+def probe_preset(preset, providers, publication, config_dir):
+    """Probe every requested provider as ``preset`` resolves them."""
+    print(f"\n== {preset} " + "=" * (62 - len(preset)))
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            credentials_file,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
-        auth_req = google.auth.transport.requests.Request()
-        creds.refresh(auth_req)
-    except Exception as e:
-        print(f"  {FAIL}  credentials refresh failed — {e}")
-        return
+        models, api_keys = resolve_preset(preset, publication, config_dir)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"  {FAIL}  could not resolve this preset: {e}")
+        return False
 
-    for model in GEMINI_MODELS:
-        url = (
-            f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}"
-            f"/locations/{location}/publishers/google/models/{model}:generateContent"
-        )
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": MINI_PROMPT}]}],
-            "generationConfig": {"maxOutputTokens": 64},
-        }
-        t0 = time.monotonic()
-        try:
-            resp = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {creds.token}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=45,
-            )
-            elapsed = round(time.monotonic() - t0, 1)
-            if resp.status_code == 200:
-                candidates = resp.json().get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    text_parts = [
-                        p for p in parts if not p.get("thought") and "text" in p
-                    ]
-                    reply = (
-                        (text_parts[0]["text"].strip()[:60])
-                        if text_parts
-                        else "(no text part)"
-                    )
-                else:
-                    reply = "(no candidates)"
-                _result(True, f"{model}", f"replied={reply!r} {elapsed}s")
-            else:
-                body = resp.text[:300]
-                _result(False, f"{model}", f"HTTP {resp.status_code}: {body}")
-        except Exception as e:
-            elapsed = round(time.monotonic() - t0, 1)
-            _result(False, f"{model}", f"{e} ({elapsed}s)")
+    all_ok = True
+    for provider in providers:
+        cfg = models.get(provider)
+        if not cfg or cfg.get("enabled") is False:
+            print(f"  {SKIP}  {provider}: not enabled in this preset")
+            continue
+        key = _api_key_for(provider, api_keys)
+        if not key and provider != "gemini":
+            print(f"  {SKIP}  {provider}: no API key resolved — skipping")
+            continue
+        all_ok = probe_provider(provider, cfg, key) and all_ok
+    return all_ok
 
 
-# ---------------------------------------------------------------------------
-# Grok
-# ---------------------------------------------------------------------------
-
-
-def probe_grok():
-    print("\n-- Grok --------------------------------------------------------")
-    api_key = os.getenv("GROK_API_KEY", "")
-    if not api_key:
-        print(f"  {SKIP}  GROK_API_KEY not set — skipping")
-        return
-
-    for model in GROK_MODELS:
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": MINI_PROMPT}],
-            "max_tokens": 20,
-        }
-        t0 = time.monotonic()
-        try:
-            resp = requests.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=60,
-            )
-            elapsed = round(time.monotonic() - t0, 1)
-            if resp.status_code == 200:
-                data = resp.json()
-                actual_model = data.get("model", "?")
-                reply = data["choices"][0]["message"]["content"].strip()[:60]
-                _result(
-                    True,
-                    f"{model}",
-                    f"model_in_response={actual_model!r} reply={reply!r} {elapsed}s",
-                )
-            else:
-                body = resp.text[:300]
-                _result(False, f"{model}", f"HTTP {resp.status_code}: {body}")
-        except Exception as e:
-            elapsed = round(time.monotonic() - t0, 1)
-            _result(False, f"{model}", f"{e} ({elapsed}s)")
-
-
-# ---------------------------------------------------------------------------
-# Perplexity
-# ---------------------------------------------------------------------------
-
-
-def probe_perplexity():
-    print("\n-- Perplexity --------------------------------------------------")
-    api_key = os.getenv("PERPLEXITY_API_KEY", "")
-    if not api_key:
-        print(f"  {SKIP}  PERPLEXITY_API_KEY not set — skipping")
-        return
-
-    for model in PERPLEXITY_MODELS:
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": MINI_PROMPT}],
-            "max_tokens": 20,
-        }
-        t0 = time.monotonic()
-        try:
-            resp = requests.post(
-                "https://api.perplexity.ai/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=60,
-            )
-            elapsed = round(time.monotonic() - t0, 1)
-            if resp.status_code == 200:
-                data = resp.json()
-                actual_model = data.get("model", "?")
-                reply = data["choices"][0]["message"]["content"].strip()[:60]
-                _result(
-                    True,
-                    f"{model}",
-                    f"model_in_response={actual_model!r} reply={reply!r} {elapsed}s",
-                )
-            else:
-                body = resp.text[:300]
-                _result(False, f"{model}", f"HTTP {resp.status_code}: {body}")
-        except Exception as e:
-            elapsed = round(time.monotonic() - t0, 1)
-            _result(False, f"{model}", f"{e} ({elapsed}s)")
-
-
-# ---------------------------------------------------------------------------
-# OpenAI — list available models (confirms IDs without making a chat call)
-# ---------------------------------------------------------------------------
-
-
-def list_openai_models():
-    print("\n-- OpenAI available models (filtered for relevant families) ----")
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        print(f"  {SKIP}  OPENAI_API_KEY not set")
-        return
-
-    try:
-        resp = requests.get(
-            "https://api.openai.com/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        models = sorted(m["id"] for m in resp.json().get("data", []))
-        relevant = [
-            m
-            for m in models
-            if any(
-                m.startswith(prefix) for prefix in ("gpt-5", "gpt-4o", "o3", "o4", "o1")
-            )
-        ]
-        for m in relevant:
-            print(f"    {m}")
-        if not relevant:
-            print("    (no gpt-5/o3/o4 models found in your account)")
-    except Exception as e:
-        print(f"  {FAIL}  {e}")
-
-
-# ---------------------------------------------------------------------------
-# Mistral — list available models
-# ---------------------------------------------------------------------------
-
-
-def list_mistral_models():
-    print("\n-- Mistral available models (filtered for relevant families) ---")
-    api_key = os.getenv("MISTRAL_API_KEY", "")
-    if not api_key:
-        print(f"  {SKIP}  MISTRAL_API_KEY not set")
-        return
-
-    try:
-        resp = requests.get(
-            "https://api.mistral.ai/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        models = sorted(m["id"] for m in resp.json().get("data", []))
-        relevant = [
-            m
-            for m in models
-            if any(kw in m for kw in ("mistral", "magistral", "codestral", "pixtral"))
-        ]
-        for m in relevant:
-            print(f"    {m}")
-        if not relevant:
-            print("    (no models returned)")
-    except Exception as e:
-        print(f"  {FAIL}  {e}")
-
-
-# ---------------------------------------------------------------------------
-# Grok — list available models
-# ---------------------------------------------------------------------------
-
-
-def list_grok_models():
-    print("\n-- Grok available models ---------------------------------------")
-    api_key = os.getenv("GROK_API_KEY", "")
-    if not api_key:
-        print(f"  {SKIP}  GROK_API_KEY not set")
-        return
-
-    try:
-        resp = requests.get(
-            "https://api.x.ai/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        models = sorted(m["id"] for m in resp.json().get("data", []))
-        for m in models:
-            print(f"    {m}")
-        if not models:
-            print("    (no models returned)")
-    except Exception as e:
-        print(f"  {FAIL}  {e}")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-PROVIDER_MAP = {
-    "openai": (probe_openai, list_openai_models),
-    "mistral": (probe_mistral, list_mistral_models),
-    "gemini": (probe_gemini_vertex, None),
-    "grok": (probe_grok, list_grok_models),
-    "perplexity": (probe_perplexity, None),
-}
+#: Providers a preset can name. Read from the packaged presets rather than
+#: hardcoded, so a provider added there is probed without editing this file.
+def known_providers():
+    path = Path(__file__).parent / "configs" / "presets.yaml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    found = []
+    for cfg in data.values():
+        if not isinstance(cfg, dict):
+            continue
+        for provider in cfg.get("models") or {}:
+            if provider not in found:
+                found.append(provider)
+    return found
 
 
 def main():
+    providers = known_providers()
+    presets = preset_names()
+
     parser = argparse.ArgumentParser(
-        description="Probe preset model IDs and parameters."
+        description=(
+            "Check that the models a cost preset names will answer, using the "
+            "same client and config resolution a real run uses."
+        )
     )
+    # No `choices=` on the positional: with nargs="*" argparse validates a list
+    # default as a single value, so `ci-probe` with no arguments died on
+    # `invalid choice: "['all']"` and the documented default invocation had
+    # never worked. Validated below instead.
     parser.add_argument(
         "providers",
         nargs="*",
-        choices=list(PROVIDER_MAP) + ["all"],
-        default=["all"],
-        help="Providers to probe (default: all)",
+        help=f"Providers to probe: {', '.join(providers)}, or all (default: all)",
     )
     parser.add_argument(
-        "--list-models",
-        action="store_true",
-        help="Also fetch the provider's models list to confirm available IDs",
+        "--preset",
+        action="append",
+        help=f"Preset to probe (repeatable). One of: {', '.join(presets)}. "
+        f"Default: every preset.",
+    )
+    parser.add_argument(
+        "--publication",
+        default="mikehammett",
+        help="Publication config to resolve against (default: mikehammett)",
+    )
+    parser.add_argument(
+        "--config-dir", default="configs", help="Directory containing config files"
     )
     args = parser.parse_args()
 
-    providers = list(PROVIDER_MAP) if "all" in args.providers else args.providers
+    requested = args.providers or ["all"]
+    unknown = [p for p in requested if p != "all" and p not in providers]
+    if unknown:
+        parser.error(
+            f"unknown provider(s): {', '.join(unknown)}. "
+            f"Choose from: {', '.join(providers)}, all"
+        )
+    chosen_providers = providers if "all" in requested else requested
 
-    print("Probing preset model assumptions...")
-    print(
-        "Each call sends a one-word prompt.  Results show model ID from response body."
-    )
+    chosen_presets = args.preset or presets
+    unknown_presets = [p for p in chosen_presets if p not in presets]
+    if unknown_presets:
+        parser.error(
+            f"unknown preset(s): {', '.join(unknown_presets)}. "
+            f"Choose from: {', '.join(presets)}"
+        )
 
-    for name in providers:
-        probe_fn, list_fn = PROVIDER_MAP[name]
-        probe_fn()
-        if args.list_models and list_fn:
-            list_fn()
+    print("Probing preset models through the pipeline's own client.")
+    print("Each call sends one tiny schema-constrained prompt.")
+
+    all_ok = True
+    for preset in chosen_presets:
+        all_ok = (
+            probe_preset(preset, chosen_providers, args.publication, args.config_dir)
+            and all_ok
+        )
 
     print()
+    if all_ok:
+        print("All probed models answered.")
+    else:
+        print("Some models did not answer — see FAIL rows above.")
+    sys.exit(0 if all_ok else 1)
 
 
 if __name__ == "__main__":

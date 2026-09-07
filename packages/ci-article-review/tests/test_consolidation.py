@@ -7,10 +7,13 @@ The consolidation API changed in the ensemble refactor:
 
 from ci_article_review.consolidation import (
     _find_consensus,
+    _normalise_fact_check_results,
+    _normalise_flags_results,
     _passage_key,
     build_report,
     rerun_recommended,
 )
+from ci_article_review.fact_check_scope import ScopeRules
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +50,21 @@ class TestPassageKey:
     def test_lowercased(self):
         assert _passage_key("Hello World") == _passage_key("hello world")
 
-    def test_truncated_at_250(self):
+    def test_not_truncated(self):
+        """The old 250-character cap merged any two passages sharing a prefix.
+
+        Three of the fifteen consensus passages in the 2026-09-03 run were
+        longer than 250 characters, so this was live, not theoretical: two
+        distinct findings on one long paragraph collapsed into a single key.
+        """
         long = "a" * 300
-        assert len(_passage_key(long)) == 250
+        assert len(_passage_key(long)) == 300
+
+    def test_two_passages_sharing_a_long_prefix_stay_distinct(self):
+        shared = "the pipeline checks every claim against a primary source " * 5
+        assert _passage_key(shared + "and then stops.") != _passage_key(
+            shared + "and then keeps going."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -613,3 +628,755 @@ class TestComputeDeltaDetection:
             "# Title\n\n## One\n\ncompletely different body wording here", prior, []
         )
         assert d["structure_changed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Regressions from the 2026-09-03 audit
+# ---------------------------------------------------------------------------
+
+
+class TestFactCheckReachesConsensus:
+    """The buckets models actually fill must feed Section 1.
+
+    Consensus read only ``outdated`` and ``contradicted``. Both were empty
+    across all six fact-check passes on 2026-09-03 while ``unverifiable`` held
+    50 claims, so the domain that cost 39% of the run contributed nothing.
+    """
+
+    def test_unverifiable_agreed_by_two_models_is_consensus(self):
+        results = {
+            ("gemini", "fact_check"): _ok(
+                {"unverifiable": [{"claim": "The grid is complex."}]}
+            ),
+            ("openai", "fact_check"): _ok(
+                {"unverifiable": [{"claim": "The grid is complex."}]}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert len(consensus) == 1
+        assert consensus[0]["passage"] == "The grid is complex."
+
+    def test_primary_source_needed_also_counts(self):
+        results = {
+            ("gemini", "fact_check"): _ok(
+                {"primary_source_needed": [{"claim": "The grid is complex."}]}
+            ),
+            ("openai", "fact_check"): _ok(
+                {"primary_source_needed": [{"claim": "The grid is complex."}]}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert len(consensus) == 1
+
+    def test_confirmed_is_not_a_finding(self):
+        """A claim that checked out is not something to fix, so it stays out of
+        the section that drives the revision prompt."""
+        results = {
+            ("gemini", "fact_check"): _ok(
+                {"confirmed": [{"claim": "The grid is complex."}]}
+            ),
+            ("openai", "fact_check"): _ok(
+                {"confirmed": [{"claim": "The grid is complex."}]}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert consensus == []
+
+
+class TestConsensusNeedsDistinctModels:
+    """Weight alone let one model agree with itself into Section 1."""
+
+    def test_one_model_flagging_twice_is_not_consensus(self):
+        # Two red_team sub-findings on one passage, the exact shape that put
+        # mistral alone into Section 1 at weight 2.2 against a 2.0 threshold.
+        results = {
+            ("mistral", "red_team"): _ok(
+                {
+                    "most_vulnerable_claim": {"passage": "The grid is complex."},
+                    "highest_credibility_risk": {"passage": "The grid is complex."},
+                }
+            ),
+        }
+        consensus, single = _find_consensus(results, [], {})
+        assert consensus == []
+        assert len(single) == 2
+
+    def test_two_models_still_reach_consensus(self):
+        results = {
+            ("mistral", "red_team"): _ok(
+                {"most_vulnerable_claim": {"passage": "The grid is complex."}}
+            ),
+            ("grok", "red_team"): _ok(
+                {"most_vulnerable_claim": {"passage": "The grid is complex."}}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert len(consensus) == 1
+
+    def test_languagetool_counts_as_a_second_source(self):
+        results = {
+            ("claude", "voice_style"): _ok(
+                {"flags": [_flag("It is important to note that the grid is complex.")]}
+            ),
+        }
+        consensus, _ = _find_consensus(
+            results,
+            ["It is important to note that the grid is complex."],
+            {"consensus_threshold": 1.0},
+        )
+        assert len(consensus) == 1
+        assert consensus[0]["languagetool_also_flagged"] is True
+
+
+class TestNestedQuotationsMerge:
+    """One passage quoted two ways is one finding, not two."""
+
+    def test_the_same_claim_quoted_two_ways_is_one_item(self):
+        shorter = "Citations get checked against primary sources every time."
+        longer = "Citations get checked against primary sources every single time."
+        results = {
+            ("claude", "voice_style"): _ok({"flags": [_flag(shorter)]}),
+            ("openai", "voice_style"): _ok({"flags": [_flag(longer)]}),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert len(consensus) == 1
+        # The fuller quotation represents the group.
+        assert consensus[0]["passage"] == longer
+
+    def test_a_sentence_inside_a_much_longer_quote_is_left_alone(self):
+        """Deliberate. Containment cannot separate a fuller quote of one claim
+        from a different claim in the same paragraph, and the caller treats
+        Section 1 as its strongest signal, so only near-identical quotations
+        merge. Merging these two cost a fabricated 27-flag consensus group on
+        the real 2026-09-03 draft."""
+        sentence = "Citations get checked against primary sources every time."
+        paragraph = (
+            sentence + " Arguments get stress-tested by a process built to find "
+            "the weak points I did not catch while writing, and drafts get "
+            "flagged wherever I overstated the evidence."
+        )
+        results = {
+            ("claude", "voice_style"): _ok({"flags": [_flag(sentence)]}),
+            ("openai", "voice_style"): _ok({"flags": [_flag(paragraph)]}),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert consensus == []
+
+    def test_different_sentences_of_one_paragraph_stay_separate(self):
+        """The guard against the opposite error: two models flagging different
+        sentences are not agreeing with each other."""
+        results = {
+            ("claude", "voice_style"): _ok(
+                {"flags": [_flag("The transmission queue is twelve years long.")]}
+            ),
+            ("openai", "voice_style"): _ok(
+                {"flags": [_flag("Local officials were never consulted at all.")]}
+            ),
+        }
+        consensus, _ = _find_consensus(results, [], {})
+        assert consensus == []
+
+
+class TestEmptyResultsAreRecorded:
+    """A well-formed empty response is a third outcome, not a success."""
+
+    def test_an_empty_payload_is_flagged(self):
+        results = {
+            ("gemini", "voice_style"): _ok(
+                {"flags": [], "low_confidence": [], "additional_observations": []}
+            ),
+            ("openai", "voice_style"): _ok({"flags": [_flag("The grid is complex.")]}),
+        }
+        report = build_report(
+            "T", "pub", 1, "draft text", None, results, {}, [], primary_claim=""
+        )
+        assert report["empty_results"] == ["gemini:voice_style"]
+        assert report["model_failures"] == []
+        detail = report["empty_result_details"][0]
+        assert detail["section"] == "SECTION 3: Voice and AI-Speak"
+
+    def test_a_populated_pass_is_not_flagged(self):
+        results = {
+            ("openai", "voice_style"): _ok({"flags": [_flag("The grid is complex.")]}),
+        }
+        report = build_report(
+            "T", "pub", 1, "draft text", None, results, {}, [], primary_claim=""
+        )
+        assert report["empty_results"] == []
+
+
+# ---------------------------------------------------------------------------
+# Malformed fact-check buckets
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedFactCheckBuckets:
+    """A bucket that is not a list of dicts must not kill report building.
+
+    Every provider that enforces `schemas.FACT_CHECK` is incapable of returning
+    one. Gemini while grounded is the exception — it 400s on schema-plus-search
+    and runs prompt-only on fact_check — so exactly one live pass per run asks
+    for the shape and hopes. When that hope failed, the first reader to touch
+    the bucket (`_extract_passages`, building Section 1) raised, and the whole
+    report was lost with the ensemble already paid for.
+    """
+
+    def _report(self, fc, extra=None):
+        results = {("gemini", "fact_check"): _ok(fc, model="gemini")}
+        results.update(extra or {})
+        return build_report(
+            article_title="T",
+            publication_name="p",
+            run_number=1,
+            corrected_draft="d",
+            lt_result=None,
+            results=results,
+            ensemble_cfg={},
+            api_call_log=[],
+        )
+
+    # -- the crash itself ---------------------------------------------------
+
+    def test_a_dict_bucket_does_not_raise(self):
+        report = self._report({"unverifiable": {"claim": "The grid is 60Hz."}})
+        assert report["section_2_fact_check"]["unverifiable"]
+
+    def test_a_string_bucket_does_not_raise(self):
+        report = self._report({"confirmed": "nothing to report"})
+        assert report["section_2_fact_check"]["confirmed"] == []
+
+    def test_a_string_bucket_is_not_iterated_character_by_character(self):
+        """`for item in "none"` yields four characters, each of which a naive
+        per-item coercion would turn into a finding."""
+        report = self._report({"unverifiable": "none"})
+        assert report["section_2_fact_check"]["unverifiable"] == []
+
+    def test_every_bucket_is_covered(self):
+        """All six, not just the two the sort touches — every one carries
+        per-item source tags and so every one is spread with `{**item}`."""
+        for bucket in (
+            "confirmed",
+            "outdated",
+            "contradicted",
+            "unverifiable",
+            "primary_source_needed",
+            "out_of_scope",
+        ):
+            report = self._report({bucket: "malformed"})
+            assert report["section_2_fact_check"][bucket] == [], bucket
+
+    def test_a_non_dict_payload_does_not_raise(self):
+        """Same cause one level up: the whole response came back as a list."""
+        report = self._report([{"claim": "The grid is 60Hz."}])
+        assert report["section_2_fact_check"] == {}
+        assert report["degradations"]
+
+    # -- what survives ------------------------------------------------------
+
+    def test_readable_items_in_a_mixed_list_are_kept(self):
+        report = self._report(
+            {
+                "unverifiable": [
+                    {"claim": "kept", "reason": "r"},
+                    12,
+                    {"claim": "also kept", "reason": "r"},
+                ]
+            }
+        )
+        claims = [i["claim"] for i in report["section_2_fact_check"]["unverifiable"]]
+        assert claims == ["kept", "also kept"]
+
+    def test_surviving_items_still_carry_their_source_tag(self):
+        """Coercion runs before tagging, not instead of it — a kept finding has
+        to name the model that asserted it, or the citation re-ask has nobody to
+        hand a refutation back to."""
+        report = self._report({"unverifiable": [{"claim": "kept"}, None]})
+        (item,) = report["section_2_fact_check"]["unverifiable"]
+        assert item["source_model"] == "gemini"
+        assert item["source_weight"] == 1.0
+
+    def test_a_bare_string_in_a_list_is_read_as_a_claim(self):
+        """Array position asserts itemhood: element k is one finding. Same
+        coercion `_collect_low_confidence` has always applied to its bucket."""
+        report = self._report({"unverifiable": ["The grid is 60Hz."]})
+        (item,) = report["section_2_fact_check"]["unverifiable"]
+        assert item["claim"] == "The grid is 60Hz."
+
+    def test_a_blank_string_in_a_list_is_dropped_not_read_as_a_claim(self):
+        report = self._report({"unverifiable": ["   "]})
+        assert report["section_2_fact_check"]["unverifiable"] == []
+
+    def test_a_dict_bucket_is_one_finding_returned_unwrapped(self):
+        report = self._report(
+            {"unverifiable": {"claim": "The grid is 60Hz.", "reason": "r"}}
+        )
+        (item,) = report["section_2_fact_check"]["unverifiable"]
+        assert item["claim"] == "The grid is 60Hz."
+
+    def test_a_dict_bucket_with_no_claim_is_dropped(self):
+        """`claim` is required on all six buckets and every reader keys on it,
+        so a dict without one is not a finding — and wrapping a claims-by-key
+        mapping would print one blank row nobody asserted."""
+        report = self._report({"unverifiable": {"a": {"claim": "x"}, "b": {}}})
+        assert report["section_2_fact_check"]["unverifiable"] == []
+
+    def test_a_good_bucket_alongside_a_bad_one_is_untouched(self):
+        report = self._report(
+            {
+                "confirmed": "malformed",
+                "unverifiable": [{"claim": "kept", "reason": "r"}],
+            }
+        )
+        fact = report["section_2_fact_check"]
+        assert fact["confirmed"] == []
+        assert [i["claim"] for i in fact["unverifiable"]] == ["kept"]
+
+    # -- what the report says about it --------------------------------------
+
+    def test_the_loss_is_recorded_as_a_degradation(self):
+        report = self._report({"unverifiable": "none"})
+        (entry,) = report["degradations"]
+        assert entry["caused_by"] == ["gemini:fact_check"]
+
+    def test_the_degradation_names_the_provider_and_the_bucket(self):
+        """ "The fact-check section is short" is not actionable. Which pass to
+        re-run and which bucket to distrust is."""
+        report = self._report({"unverifiable": "none"})
+        detail = report["degradations"][0]["detail"]
+        assert "gemini.unverifiable" in detail
+        assert "str" in detail
+
+    def test_the_degradation_names_every_affected_section(self):
+        """Four of these buckets vote in Section 1 and all six feed citation
+        resolution, so a dropped claim is missing from three places."""
+        report = self._report({"unverifiable": "none"})
+        section = report["degradations"][0]["section"]
+        assert "SECTION 1" in section
+        assert "SECTION 2" in section
+        assert "SECTION 9" in section
+
+    def test_dropped_and_repaired_counts_both_reach_the_detail(self):
+        report = self._report({"unverifiable": [{"claim": "a"}, "b", 3]})
+        detail = report["degradations"][0]["detail"]
+        assert "1 unreadable item(s) dropped" in detail
+        assert "1 bare string(s) read as claims" in detail
+
+    def test_two_bad_buckets_are_one_entry_naming_both(self):
+        report = self._report({"confirmed": "x", "unverifiable": "y"})
+        (entry,) = report["degradations"]
+        assert "gemini.confirmed" in entry["detail"]
+        assert "gemini.unverifiable" in entry["detail"]
+
+    def test_two_bad_models_are_both_named_in_caused_by(self):
+        report = self._report(
+            {"unverifiable": "none"},
+            {("perplexity", "fact_check"): _ok({"confirmed": "x"}, "perplexity")},
+        )
+        (entry,) = report["degradations"]
+        assert entry["caused_by"] == ["gemini:fact_check", "perplexity:fact_check"]
+
+    def test_the_entry_matches_the_shape_the_renderers_read(self):
+        """`_render_degradations` and the console summary both read `detail`;
+        the markdown block also reads `section` and `caused_by`."""
+        report = self._report({"unverifiable": "none"})
+        (entry,) = report["degradations"]
+        assert set(entry) == {"section", "caused_by", "detail"}
+        assert entry["section"] and entry["detail"]
+        assert isinstance(entry["caused_by"], list)
+
+    def test_a_clean_run_records_nothing(self):
+        """The key stays absent: `_record_fact_check_degradation` and
+        `_record_impersonation_degradation` both `setdefault` onto it later, and
+        several tests assert on its absence."""
+        report = self._report({"unverifiable": [{"claim": "a", "reason": "r"}]})
+        assert "degradations" not in report
+
+    def test_an_absent_bucket_is_not_a_degradation(self):
+        report = self._report({"unverifiable": []})
+        assert "degradations" not in report
+
+    def test_an_explicit_null_bucket_is_rewritten_but_not_reported(self):
+        """`"confirmed": null` means "nothing here" — nothing was lost, so
+        nothing is said. It still has to be rewritten: `find_contradictions`
+        and `_extract_passages` spell this `data.get(bucket, [])`, whose
+        default a present-but-null key never reaches."""
+        report = self._report({"confirmed": None, "unverifiable": []})
+        assert "degradations" not in report
+        assert report["contradictions"] == []
+
+    def test_a_malformed_additional_observations_does_not_raise(self):
+        """Not a verdict bucket, but `_build_fact_check` spreads it with
+        `{**obs}` in the same loop and dies on it the same way."""
+        report = self._report(
+            {"additional_observations": ["A bare observation.", None]},
+            {("openai", "fact_check"): _ok({"confirmed": []}, "openai")},
+        )
+        (obs,) = report["section_2_fact_check"]["additional_observations"]
+        assert obs["observation"] == "A bare observation."
+        assert obs["source_model"] == "gemini"
+
+    def test_additional_observations_is_reported_against_its_own_section(self):
+        """It feeds Section 8, not Sections 1, 2 and 9 — naming the wrong ones
+        sends a reader to look for a shortfall that is not there."""
+        report = self._report({"additional_observations": "none"})
+        (entry,) = report["degradations"]
+        assert entry["section"] == "SECTION 8: Additional Observations"
+        assert entry["detail"].startswith("Section 8 is")
+
+    # -- the other readers of the same payload ------------------------------
+
+    def test_section_1_still_builds(self):
+        """`_extract_passages` runs before `_build_fact_check` and reads four of
+        these buckets, so it is where the crash actually landed."""
+        report = self._report({"unverifiable": [{"claim": "The grid is 60Hz."}, "x"]})
+        assert report["section_1_consensus"] == []  # one model, below threshold
+
+    def test_contradictions_still_build(self):
+        """`find_contradictions` reads `confirmed` and three challenge buckets
+        off the raw results with the same unguarded `item.get`."""
+        report = self._report(
+            {"confirmed": [{"claim": "The grid is 60Hz.", "source_url": "u"}]},
+            {("perplexity", "fact_check"): _ok({"unverifiable": "bad"}, "perplexity")},
+        )
+        assert report["contradictions"] == []
+
+    def test_a_well_formed_run_reaches_the_readers_untouched(self):
+        """The no-op guarantee, stated where it can be broken.
+
+        Normalisation sits in front of five readers on every run, so "it changes
+        nothing when there is nothing to change" has to be more than an
+        intention: on clean input both helpers return their argument *by
+        identity*, and every reader below sees the object it always saw.
+        """
+        results = {
+            ("gemini", "fact_check"): _ok(
+                {"confirmed": [{"claim": "a", "source_url": "u"}]}, "gemini"
+            ),
+            ("openai", "voice_style"): _ok({"flags": [_flag("p")]}, "openai"),
+        }
+        out, degradations = _normalise_fact_check_results(results)
+        assert out is results
+        assert degradations == []
+
+    def test_the_captured_ensemble_is_not_mutated(self):
+        """A `--replay` reads the captured ensemble straight off disk; coercing
+        in place would rewrite the evidence of what the provider actually sent."""
+        data = {"unverifiable": "none"}
+        results = {("gemini", "fact_check"): _ok(data, model="gemini")}
+        build_report("T", "p", 1, "d", None, results, {}, [])
+        assert data == {"unverifiable": "none"}
+        assert results[("gemini", "fact_check")]["data"] is data
+
+
+class TestScopeRulesToleratesMalformedBuckets:
+    """`ScopeRules.apply` is public, and reaches `item.get` two lines in.
+
+    `build_report` normalises before this is ever called, so in a real run these
+    filter nothing. They guard the direct callers — tests, and anything holding
+    a section it did not build itself.
+    """
+
+    def _rules(self):
+        return ScopeRules.from_run(
+            "<!-- ci:no-verify: personal -->I have a side job.<!-- /ci:no-verify -->",
+            {},
+            {},
+        )
+
+    def test_a_string_bucket_does_not_raise(self):
+        out = self._rules().apply({"confirmed": "none", "unverifiable": []})
+        assert out["confirmed"] == []
+
+    def test_a_string_out_of_scope_bucket_does_not_raise(self):
+        out = self._rules().apply({"out_of_scope": "none", "confirmed": []})
+        assert out["out_of_scope"] == []
+
+    def test_non_dict_items_are_skipped_and_the_rest_swept(self):
+        out = self._rules().apply(
+            {"confirmed": [None, {"claim": "I have a side job."}, {"claim": "Kept."}]}
+        )
+        assert [i["claim"] for i in out["confirmed"]] == ["Kept."]
+        assert [e["claim"] for e in out["out_of_scope"]] == ["I have a side job."]
+
+
+# ---------------------------------------------------------------------------
+# Malformed flags / red-team buckets
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedFlagsBuckets:
+    """A `flags` bucket that is not a list of dicts must not kill report
+    building, for the three domains that share the schema.
+
+    Every provider that enforces a schema is incapable of returning one.
+    Gemini while grounded is the exception — it runs prompt-only on every
+    domain, not only fact_check (`_provider_params` sets its search tool
+    unconditionally) — so any of voice_style, completeness and
+    argument_integrity can arrive in whatever shape the model felt like
+    returning. When that happened, `_extract_passages` (Section 1) was the
+    first reader to raise.
+    """
+
+    def _report(self, domain, data, extra=None):
+        results = {("gemini", domain): _ok(data, model="gemini")}
+        results.update(extra or {})
+        return build_report(
+            article_title="T",
+            publication_name="p",
+            run_number=1,
+            corrected_draft="d",
+            lt_result=None,
+            results=results,
+            ensemble_cfg={},
+            api_call_log=[],
+        )
+
+    _SECTION_KEY = {
+        "voice_style": "section_3_voice",
+        "argument_integrity": "section_4_argument",
+        "completeness": "section_5_completeness",
+    }
+
+    # -- the crash itself, across all three domains --------------------------
+
+    _TEXT_FIELD = {
+        "voice_style": "passage",
+        "argument_integrity": "passage",
+        "completeness": "passage_reference",
+    }
+
+    def test_a_dict_flags_bucket_does_not_raise(self):
+        for domain in ("voice_style", "argument_integrity", "completeness"):
+            report = self._report(domain, {"flags": {self._TEXT_FIELD[domain]: "p"}})
+            assert report[self._SECTION_KEY[domain]], domain
+
+    def test_a_string_flags_bucket_does_not_raise(self):
+        for domain in ("voice_style", "argument_integrity", "completeness"):
+            report = self._report(domain, {"flags": "nothing to report"})
+            assert report[self._SECTION_KEY[domain]] == [], domain
+
+    def test_a_string_bucket_is_not_iterated_character_by_character(self):
+        """`for item in "none"` yields four characters, each of which a naive
+        per-item coercion would turn into a flag."""
+        report = self._report("voice_style", {"flags": "none"})
+        assert report["section_3_voice"] == []
+
+    def test_a_null_flags_bucket_does_not_raise(self):
+        """`data.get("flags", [])` never reaches its default for a
+        present-but-null key."""
+        report = self._report("argument_integrity", {"flags": None})
+        assert report["section_4_argument"] == []
+
+    def test_a_non_dict_payload_does_not_raise(self):
+        """Same cause one level up: the whole response came back as a list."""
+        report = self._report("voice_style", [{"flags": [_flag("p")]}])
+        assert report["section_3_voice"] == []
+        assert report["degradations"]
+
+    # -- what survives ---------------------------------------------------
+
+    def test_readable_items_in_a_mixed_list_are_kept(self):
+        report = self._report(
+            "voice_style",
+            {"flags": [_flag("kept"), 12, _flag("also kept")]},
+        )
+        passages = [f["passage"] for f in report["section_3_voice"]]
+        assert passages == ["kept", "also kept"]
+
+    def test_a_bare_string_in_a_list_is_read_as_a_passage(self):
+        report = self._report("voice_style", {"flags": ["The grid is complex."]})
+        (flag,) = report["section_3_voice"]
+        assert flag["passage"] == "The grid is complex."
+
+    def test_completeness_reads_a_bare_string_as_passage_reference(self):
+        """Completeness flags key on `passage_reference`, not `passage` — the
+        coerced field has to match what `_extract_passages` reads for this
+        domain specifically."""
+        report = self._report("completeness", {"flags": ["Missing context."]})
+        (flag,) = report["section_5_completeness"]
+        assert flag["passage_reference"] == "Missing context."
+
+    def test_a_blank_string_in_a_list_is_dropped(self):
+        report = self._report("voice_style", {"flags": ["   "]})
+        assert report["section_3_voice"] == []
+
+    def test_a_dict_bucket_is_one_flag_returned_unwrapped(self):
+        report = self._report(
+            "argument_integrity", {"flags": {"passage": "p", "logical_problem": "x"}}
+        )
+        (flag,) = report["section_4_argument"]
+        assert flag["passage"] == "p"
+
+    def test_surviving_flags_still_carry_their_source_tag(self):
+        report = self._report("voice_style", {"flags": [_flag("kept"), None]})
+        (flag,) = report["section_3_voice"]
+        assert flag["source_model"] == "gemini"
+
+    # -- what the report says about it ---------------------------------------
+
+    def test_the_loss_is_recorded_as_a_degradation(self):
+        report = self._report("voice_style", {"flags": "none"})
+        (entry,) = report["degradations"]
+        assert entry["caused_by"] == ["gemini:voice_style"]
+
+    def test_the_degradation_names_the_provider_and_the_bucket(self):
+        report = self._report("argument_integrity", {"flags": "none"})
+        detail = report["degradations"][0]["detail"]
+        assert "gemini.flags" in detail
+        assert "str" in detail
+
+    def test_the_degradation_names_section_1_and_the_domain_section(self):
+        report = self._report("completeness", {"flags": "none"})
+        section = report["degradations"][0]["section"]
+        assert "SECTION 1" in section
+        assert "SECTION 5" in section
+
+    def test_dropped_and_repaired_counts_both_reach_the_detail(self):
+        report = self._report("voice_style", {"flags": [_flag("a"), "b", 3]})
+        detail = report["degradations"][0]["detail"]
+        assert "1 unreadable item(s) dropped" in detail
+        assert "1 bare string(s) read as passages" in detail
+
+    def test_a_clean_run_records_nothing(self):
+        report = self._report(
+            "voice_style", {"flags": [_flag("a")], "low_confidence": []}
+        )
+        assert "degradations" not in report
+
+    def test_an_absent_bucket_is_not_a_degradation(self):
+        report = self._report("voice_style", {"flags": []})
+        assert "degradations" not in report
+
+    def test_two_bad_domains_are_two_separate_degradation_entries(self):
+        report = self._report(
+            "voice_style",
+            {"flags": "bad"},
+            {("openai", "completeness"): _ok({"flags": "also bad"}, "openai")},
+        )
+        domains = {tuple(e["caused_by"]) for e in report["degradations"]}
+        assert ("gemini:voice_style",) in domains
+        assert ("openai:completeness",) in domains
+
+    def test_the_entry_matches_the_shape_the_renderers_read(self):
+        report = self._report("voice_style", {"flags": "none"})
+        (entry,) = report["degradations"]
+        assert set(entry) == {"section", "caused_by", "detail"}
+        assert isinstance(entry["caused_by"], list)
+
+    # -- other readers of the same payload ------------------------------------
+
+    def test_section_1_still_builds(self):
+        report = self._report(
+            "voice_style", {"flags": [_flag("The grid is complex."), "x"]}
+        )
+        assert report["section_1_consensus"] == []  # one model, below threshold
+
+    def test_a_well_formed_run_reaches_the_readers_untouched(self):
+        results = {
+            ("openai", "voice_style"): _ok({"flags": [_flag("p")]}, "openai"),
+            ("mistral", "argument_integrity"): _ok({"flags": []}, "mistral"),
+        }
+        out, degradations = _normalise_flags_results(results)
+        assert out is results
+        assert degradations == []
+
+    def test_the_captured_ensemble_is_not_mutated(self):
+        data = {"flags": "none"}
+        results = {("gemini", "voice_style"): _ok(data, model="gemini")}
+        build_report("T", "p", 1, "d", None, results, {}, [])
+        assert data == {"flags": "none"}
+        assert results[("gemini", "voice_style")]["data"] is data
+
+
+class TestMalformedRedTeamDicts:
+    """red_team's three top-level findings are single objects, not lists —
+    the same crash class, a different shape.
+    """
+
+    def _report(self, data, extra=None):
+        results = {("gemini", "red_team"): _ok(data, model="gemini")}
+        results.update(extra or {})
+        return build_report(
+            article_title="T",
+            publication_name="p",
+            run_number=1,
+            corrected_draft="d",
+            lt_result=None,
+            results=results,
+            ensemble_cfg={},
+            api_call_log=[],
+        )
+
+    def test_a_string_finding_does_not_raise(self):
+        report = self._report({"most_vulnerable_claim": "nothing found"})
+        assert report["section_6_red_team"]["most_vulnerable_claim"] == {}
+
+    def test_a_null_finding_does_not_raise(self):
+        report = self._report({"highest_audience_risk": None})
+        assert report["section_6_red_team"]["highest_audience_risk"] == {}
+
+    def test_every_finding_key_is_covered(self):
+        for key in (
+            "most_vulnerable_claim",
+            "highest_audience_risk",
+            "highest_credibility_risk",
+        ):
+            report = self._report({key: "malformed"})
+            assert report["section_6_red_team"][key] == {}, key
+
+    def test_a_non_dict_payload_does_not_raise(self):
+        report = self._report(["most_vulnerable_claim"])
+        assert report["section_6_red_team"] == {}
+        assert report["degradations"]
+
+    def test_a_single_item_list_is_unwrapped(self):
+        """The model put its one finding in an array it should not have."""
+        report = self._report(
+            {"most_vulnerable_claim": [{"passage": "p", "attack_vector": "a"}]}
+        )
+        assert report["section_6_red_team"]["most_vulnerable_claim"]["passage"] == "p"
+
+    def test_a_multi_item_list_is_dropped_not_guessed_at(self):
+        report = self._report(
+            {
+                "most_vulnerable_claim": [
+                    {"passage": "a"},
+                    {"passage": "b"},
+                ]
+            }
+        )
+        assert report["section_6_red_team"]["most_vulnerable_claim"] == {}
+
+    def test_a_well_formed_dict_is_untouched(self):
+        rt = {
+            "passage": "p",
+            "attack_vector": "a",
+            "supporting_evidence_for_attack": "b",
+        }
+        report = self._report({"most_vulnerable_claim": rt})
+        assert report["section_6_red_team"]["most_vulnerable_claim"] == rt
+
+    def test_the_degradation_names_the_bucket_as_an_object_not_a_list(self):
+        report = self._report({"most_vulnerable_claim": "none"})
+        detail = report["degradations"][0]["detail"]
+        assert "gemini.most_vulnerable_claim" in detail
+        assert "rather than an object" in detail
+
+    def test_the_degradation_names_section_1_and_section_6(self):
+        report = self._report({"most_vulnerable_claim": "none"})
+        section = report["degradations"][0]["section"]
+        assert "SECTION 1" in section
+        assert "SECTION 6" in section
+
+    def test_a_clean_run_records_nothing(self):
+        report = self._report(
+            {"most_vulnerable_claim": {"passage": "p", "attack_vector": "a"}}
+        )
+        assert "degradations" not in report
+
+    def test_the_captured_ensemble_is_not_mutated(self):
+        data = {"most_vulnerable_claim": "none"}
+        results = {("gemini", "red_team"): _ok(data, model="gemini")}
+        build_report("T", "p", 1, "d", None, results, {}, [])
+        assert data == {"most_vulnerable_claim": "none"}
+        assert results[("gemini", "red_team")]["data"] is data

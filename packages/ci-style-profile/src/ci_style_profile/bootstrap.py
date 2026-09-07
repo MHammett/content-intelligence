@@ -12,7 +12,7 @@ Startup sequence:
   5. Validate collector configs
   6. Check staging schema versions
   7. Log expected API call count
-  8. Collect (parallel ThreadPoolExecutor)
+  8. Collect (parallel daemon threads, see ci_core.concurrency)
   9. Deduplicate by content_hash
   10. Normalize (compute metrics in-place)
   11. Print corpus stats + bias warnings
@@ -31,12 +31,12 @@ import argparse
 import json
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import yaml as _yaml
 from dotenv import find_dotenv, load_dotenv
 
+from ci_core.concurrency import run_all_bounded
 from ci_core.console import force_utf8_stdio
 from ci_core.env_provenance import (
     effective_env as _effective_env,
@@ -67,6 +67,16 @@ _EFFECTIVE_ENV = _effective_env(_ENV_SNAPSHOT)
 log = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 1
+
+#: Wall-clock safety net for collecting one source, as a whole. Deliberately
+#: generous: the real bound on a collection is the per-request timeout inside
+#: each collector, and a large WordPress or Drupal corpus legitimately takes
+#: many minutes to page through. This exists only to catch what those don't —
+#: a paginator that never advances, or a host that keeps a socket alive by
+#: dribbling a byte inside every read gap. Without it a single wedged source
+#: hangs the whole bootstrap run indefinitely, because there is no other
+#: wall-clock bound anywhere in the collection path.
+_COLLECT_TIMEOUT_SECONDS = 3600
 _DEFAULT_STAGING_DIR = Path(__file__).parent / "staging"
 _WATERMARKS_FILE = _DEFAULT_STAGING_DIR / ".watermarks.json"
 
@@ -601,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
     def _collect_task(source_name):
         collector_cls = REGISTRY[source_name]
         source_specific_cfg = sources_cfg.get(source_name, {})
-        return source_name, _collect_source(
+        return _collect_source(
             source_name,
             collector_cls,
             source_specific_cfg,
@@ -611,29 +621,43 @@ def main(argv: list[str] | None = None) -> int:
             no_stage=args.no_stage,
         )
 
-    with ThreadPoolExecutor(max_workers=len(active_sources)) as pool:
-        futures = {pool.submit(_collect_task, s): s for s in active_sources}
-        for fut in as_completed(futures):
-            source_name = futures[fut]
-            try:
-                _, docs = fut.result()
-                all_docs.extend(docs)
-            except CollectorError as e:
-                msg = f"Collection failed for {source_name}: {e}"
-                if args.continue_on_error:
-                    log.warning("%s (skipping)", msg)
-                    collection_errors.append(str(e))
-                else:
-                    log.error("%s", msg)
-                    return 1
-            except Exception as e:
-                msg = f"Unexpected error collecting {source_name}: {e}"
-                if args.continue_on_error:
-                    log.warning("%s (skipping)", msg)
-                    collection_errors.append(msg)
-                else:
-                    log.error("%s", msg)
-                    return 1
+    # One daemon thread per source, all of them at once (what the previous
+    # `max_workers=len(active_sources)` meant) — never a ThreadPoolExecutor.
+    # See :mod:`ci_core.concurrency`: a pool worker still inside a collector's
+    # network I/O at interpreter exit is joined by concurrent.futures' atexit
+    # hook with a bare, untimed t.join().
+    #
+    # The old form also made "fail fast" a lie. `return 1` sat *inside* the
+    # `with` block, so bailing on the first error still ran the pool's __exit__
+    # first, which joins every remaining worker — the run waited out every other
+    # source's collection before returning non-zero. Collecting the whole batch
+    # up front and then deciding is both honest about that and bounded, and it
+    # makes which error wins deterministic (source order) rather than a race.
+    outcomes = run_all_bounded(
+        [
+            (name, lambda name=name: _collect_task(name), _COLLECT_TIMEOUT_SECONDS)
+            for name in active_sources
+        ],
+        max_parallel=0,
+    )
+
+    for source_name in active_sources:
+        docs, error = outcomes[source_name]
+        if error is None:
+            all_docs.extend(docs)
+            continue
+        if isinstance(error, CollectorError):
+            msg = f"Collection failed for {source_name}: {error}"
+            recorded = str(error)
+        else:
+            msg = f"Unexpected error collecting {source_name}: {error}"
+            recorded = msg
+        if args.continue_on_error:
+            log.warning("%s (skipping)", msg)
+            collection_errors.append(recorded)
+        else:
+            log.error("%s", msg)
+            return 1
 
     if not all_docs:
         log.error("No documents collected. Check your sources configuration.")

@@ -2,6 +2,8 @@
 
 import os
 import requests
+
+from ci_core.http import DEFAULT_HEADERS
 import logging
 
 EIA_BASE = "https://api.eia.gov/v2"
@@ -24,7 +26,9 @@ def resolve(claim, api_key=None):
 
     try:
         url = f"{EIA_BASE}/seriesid/{'+'.join(keywords[:2])}"
-        resp = requests.get(url, params={"api_key": api_key}, timeout=15)
+        resp = requests.get(
+            url, params={"api_key": api_key}, timeout=15, headers=DEFAULT_HEADERS
+        )
         if resp.status_code == 200:
             data = resp.json()
             return {

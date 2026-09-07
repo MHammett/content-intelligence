@@ -82,7 +82,7 @@ api_keys:
     secret_key: your_secret_key_here
 ```
 
-**`archive_org`** is optional. The pipeline submits unarchived citation URLs to archive.org either way; credentials just switch it from the unauthenticated capture endpoint to the authenticated SPN2 endpoint, which has higher rate limits. Get a key pair at <https://archive.org/account/s3.php>. See [CITATIONS.md](CITATIONS.md#wayback-machine-behavior) for what the submission actually does.
+**`archive_org`** is optional. The pipeline submits unarchived citation URLs to archive.org either way; credentials switch it from the unauthenticated capture endpoint to the authenticated SPN2 endpoint, which has higher rate limits, returns a job id, and — the part that matters for the report — lets the pipeline ask `/save/status/<job_id>` how a capture actually went. That endpoint is credential-only, so without a key pair a queued capture can never be followed up. Get a key pair at <https://archive.org/account/s3.php>. See [CITATIONS.md](CITATIONS.md#wayback-machine-behavior) for what the submission actually does.
 
 Note that the `mistral` key does double duty: besides its review passes, it powers the citation relevance check that gates the "verified" confidence tier. Without it, citations are fetched and checksummed but not relevance-confirmed — see [CITATIONS.md](CITATIONS.md#confidence-tiers).
 
@@ -138,7 +138,7 @@ models:
   gemini: gemini-2.5-flash    # best price-performance; gemini-3.5-flash for upgrade
   mistral: mistral-large-latest
   perplexity: sonar-reasoning-pro
-  grok: grok-4.3              # grok-4.20-0309-reasoning for CoT (same price)
+  grok: grok-4.3              # grok-4.6 for CoT, via reasoning_effort
   claude: claude-opus-4-8     # claude-sonnet-4-6 for lower cost with extended thinking
 ```
 
@@ -318,14 +318,28 @@ All Gemini 2.5 and 3.x models support this. Gemini 2.5 Flash already uses dynami
 
 #### Grok — model selection
 
-Grok reasoning is model-based, not parameter-based:
+Grok reasoning was model-based until grok-4.6 (2026-08-12), which added a
+real `reasoning_effort`. Both forms still exist, and which one applies depends
+entirely on the model:
 
 ```yaml
 models:
   grok:
-    model: grok-4.20-0309-reasoning   # reasoning variant (same $1.25/$2.50 price)
-    timeout_seconds: 180
+    model: grok-4.6
+    reasoning_effort: low     # low | medium | high | xhigh
 ```
+
+**Unset is not off.** It resolves to the provider default, which for grok-4.6 is
+`high` — so omitting the flag buys the most expensive setting. Every preset that
+runs grok-4.6 now states what it wants for that reason.
+
+Verified live 2026-09-05: litellm forwards the parameter to xAI with no
+client-side rejection and none of the `allowed_openai_params` escape hatch
+Mistral needs, and Grok honours it — ~380 completion tokens at `low` against
+~1060 at `high` on the same prompt, a 3x difference in both tokens and latency.
+
+Earlier Grok models take no `reasoning_effort` at all; on those, reasoning is
+model selection only and sending the parameter is a 400 for no gain.
 
 #### Mistral — `reasoning_effort`
 
@@ -450,7 +464,7 @@ pipeline:
   recovery_delay_seconds: 30    # pause before each recovery pass — deliberately coarser than retry_delay_seconds
   abort_if_all_provider_calls_fail: false
   task_timeout_seconds: 1100    # absolute ceiling for the sliding-scale timeout model; formula clamps to this − 15
-  cost_preset: balanced         # economy | standard | balanced | thorough | maximum
+  cost_preset: balanced         # economy | wide | balanced | thorough | maximum
 
   link_validation: true         # check HTTP status of every URL in the draft
   wayback_link_check: true      # also query the Wayback Machine for each URL
@@ -495,7 +509,13 @@ Accepted names are the model keys: `claude`, `openai`, `gemini`, `mistral`, `gro
 
 Only `voice_style` is affected. A model re-reading its own reasoning in `argument_integrity` has a similar conflict but a much weaker one — that prompt asks whether the logic holds, not whether the prose carries the model's fingerprints — and widening the exclusion costs real review coverage.
 
-Watch for one edge case: at `standard` thoroughness `voice_style` is a single model, so declaring that model as the drafter leaves the domain with no reviewer. The pipeline logs a warning when that happens, because an empty voice section then means "never ran", which looks identical in the report to "found nothing". At `thorough` or `maximum` there are always other models covering it.
+Watch for one edge case: at `standard` thoroughness `voice_style` is a single model, so declaring that model as the drafter leaves the domain with no reviewer. Drafting with `openai` at `standard` is the only preset/drafter combination that does this — at `thorough` or `maximum` there are always other models covering it.
+
+Three things happen when it does, because an empty voice section otherwise reads exactly like a clean one:
+
+1. **A warning at assignment time**, before any call is made, naming the domain and the drafter — the only signal that arrives while the run can still be stopped.
+2. **A substitute provider runs the domain**, via the same pass that covers a domain whose models all failed (see *Substituting a provider for an empty domain* below). This is the normal outcome: any other configured, credentialed model can take `voice_style`.
+3. **The report says the domain was not reviewed** — a *Domains not reviewed* block in the header and a note above the section itself — for when substitution cannot help: `substitute_failed_domains: false`, a replay (which makes no calls), or no other model available to take the domain.
 
 ---
 
@@ -512,7 +532,329 @@ Providers cache on an exact *leading* prefix. The per-domain instruction normall
 
 **Why it stays off anyway, for this project:** the same four runs surfaced something bigger than the caching question — only 18 of 259 distinct findings reproduced across 3 or more of the 4 runs, meaning a single run here is roughly 75% non-reproducible regardless of this setting. Against that, a $0.55 saving on a ~$8 run (≈7%) optimizes the cost of a measurement this pipeline's own output doesn't yet make trustworthy in one copy — and the setting is a second prompt-assembly path to keep working. That's a judgment call about this pipeline's priorities, not a defect in the feature: **if your use case runs the pipeline at high volume, or already aggregates multiple runs into one result (where the saving scales with run count instead of being swamped by per-run noise), this is a legitimate setting to turn on.** The code, tests, and this section exist so that decision is cheap to make.
 
+**Re-examine this now that aggregation has landed (2026-09-05).** The clause above names a condition — "already aggregates multiple runs into one result" — that the pipeline now meets part of the way by itself: every run is scored against earlier runs of the same draft (see [Reproducibility context](#reproducibility-context) below). That does not flip the decision on its own, and the default stays `false`. What changed is the incentive underneath it. Re-running an unchanged draft used to buy nothing but a different random sample; it now measurably improves the report, because each repeat run enlarges the denominator every finding is scored against. **If you start deliberately running a draft two or three times before revising it, you are the use case this setting was left open for, and the per-run saving multiplies by the number of runs you make.** If you keep running each draft once, nothing here has changed and it should stay off.
+
 **The golden report cannot verify this.** `test_pipeline_end_to_end.py` stubs `_run_domain`, and that is exactly where this setting is applied, so flipping the flag produces an empty golden diff by construction. An empty diff there is evidence the code never ran, not evidence the findings held. Verifying it means a live run compared against a prior live run of the same article — and, per the finding above, at least two runs per condition, since a single run's findings are not a stable baseline to diff against.
+
+---
+
+### Substituting a provider for an empty domain
+
+```yaml
+pipeline:
+  substitute_failed_domains: true   # default; false disables the pass
+```
+
+When every model assigned to a domain fails, one different provider is tried for
+that domain. It runs after the recovery pass, adds nothing to a clean run, and
+tries exactly one substitute — a provider having an outage should not buy call
+after call.
+
+**Why recovery is not enough.** `recovery_passes` retries the model that failed,
+which is right for a flake and useless for an outage. Measured 2026-09-05 on
+`dc-environment-v26` at `--cost-preset standard`: `gemini:fact_check` returned
+"stream stalled before the first chunk: nothing received for 160.0s", recovery
+retried the same model and it stalled identically, and the run exited 0 having
+spent $0.64.
+
+**Why `fact_check` in particular.** At `standard` thoroughness it is a single
+model *and* the only source of claims, so losing it empties Section 2, leaves
+nothing for citation resolution, and empties Section 9 as well. Losing one of
+two models in another domain costs coverage; losing this one costs both sections
+that justify the run.
+
+Substitutes are drawn from the `maximum` preset's list for the domain, minus
+whatever was already tried, and honour the same credential checks, `prompts:`
+overrides and drafting-model exclusion as a normal assignment. For `fact_check`
+the search-grounded models are preferred first — grounding is the reason gemini
+is in that ensemble at all — falling back to an ungrounded model only because an
+ungrounded fact-check pass is still worth more than an empty section. The
+original failure is kept in the results either way, so the report still says
+which model failed.
+
+**A domain that was never assigned a model is repaired too.** The set of domains
+checked for emptiness comes from the thoroughness preset, not from the results.
+Results only exist for domains that were *attempted*, so a domain whose every
+candidate was excluded — no credentials, `enabled: false`, a `prompts:` override,
+or drafting with the one model assigned to it — produces no result to be found
+empty, and used to be the one case this pass could not see. That is the total
+loss, not a partial one.
+
+---
+
+### Ensemble width, and backfilling a narrowed domain
+
+```yaml
+pipeline:
+  backfill_narrowed_domains: true   # default; false keeps the preset's literal lists
+```
+
+A cost preset buys fewer models, and that is the point of it. Two things make
+the trade worse than it needs to be, and both are addressed here.
+
+**The report now states the width.** Every report carries an *Ensemble Width*
+section in its header giving, for the preset actually used: how many domains ran
+on a single model, how many distinct models ran at all, a per-domain table of
+which models ran where, and what that does to Section 1. Previously the only
+record was the API call table, which reads as width only if you already know
+`_THOROUGHNESS_PRESETS` by heart and subtract the models the preset disabled.
+
+Consensus is the part whose meaning changes. Section 1 needs
+`consensus_min_models` (default 2) *distinct* sources on a passage, so:
+
+- Where every domain runs one model, no passage can reach the minimum from
+  inside a single domain — it takes two different domains flagging the same
+  passage. The section says so rather than leaving a thin Section 1 to read as a
+  clean draft.
+- Where the whole voter pool is below the minimum, Section 1 **cannot flag
+  anything at all**, and the report says that in those words. LanguageTool
+  counts toward the pool, since it is an independent source.
+
+`consensus_min_models` is deliberately *not* lowered automatically at thin
+presets. Lowering it would trade the one guarantee Section 1 makes — that
+something more than a single model agreed — for a fuller-looking section, and
+the backfill below recovers the width more honestly. Set it yourself if you want
+the weaker bar; the report prints the value in force.
+
+**Backfill.** A domain left narrower than its own preset entry asked for is
+topped back up from the models still available. Measured 2026-09-05 at
+`economy`, which disables grok and claude: the `standard` map pairs mistral with
+claude in `argument_integrity` and with grok in `red_team`, so disabling those
+two costs *two* domains their second model — and perplexity, which `economy`
+configures as a cheap grounded model, that map never assigns at all. The result
+was five domains on three distinct models, with the cheapest available second
+opinion sitting idle. With backfill it is seven calls across four distinct
+models, and three single-model domains.
+
+The rules are deliberately tight:
+
+- A domain is topped up **only to two models**, and never past what its own
+  preset entry asked for. Two is what corroboration costs — one model flagging
+  a passage is a finding, two is agreement, and `consensus_min_models` will not
+  promote anything to Section 1 below it. Going further buys a third voter for
+  a passage that already had a second: measured at +30% cost on `thorough` with
+  one key missing, for no change in how many domains were left uncorroborated.
+- A run with every configured model available is **untouched** — nothing is
+  short, so nothing is added.
+- Candidates are ordered by which model is carrying the fewest domains already,
+  so the width bought is distinct-model coverage rather than a third and fourth
+  domain piled onto whichever model sorts first.
+- Credential checks, `enabled: false`, `prompts:` overrides and the
+  drafting-model exclusion all apply exactly as in a normal assignment, and
+  `fact_check` still prefers a search-grounded model.
+
+Every backfilled assignment is logged (`Backfilled: ...`) and listed in the
+report's *Ensemble Width* section, naming the preset entry it stands in for.
+Set `backfill_narrowed_domains: false` to keep the preset's literal lists.
+
+**What it costs, per tier.** Measured 2026-09-05 against the real presets and
+`pricing.yaml`, for a ~1,400-word draft. With every provider credentialled only
+`economy` changes at all — the tier that was losing the most, and the only one
+whose preset disables models:
+
+| Preset | Calls | Distinct models | Single-model domains | Review-call cost |
+| --- | --- | --- | --- | --- |
+| `economy` | 5 → 7 | 3 → 4 | 5 → 3 | $0.019 → $0.034 (+81%) |
+| `standard` | 7 → 7 | 5 → 5 | 3 → 3 | unchanged |
+| `balanced` / `thorough` / `maximum` | unchanged | unchanged | unchanged | unchanged |
+
+`economy`'s +81% is the largest relative increase and the smallest absolute one:
+about 1.5 cents. A live run measured $0.0645 all-in, inside the $0.04–$0.10 band
+this file's preset table already documents for that tier.
+
+When a key is missing rather than a preset disabling a model, the two-model cap
+is what keeps the thick tiers cheap: `thorough` without a claude key is 9 → 10
+calls (+9%), where topping up to full preset width would have been 12 (+30%) for
+the same number of uncorroborated domains.
+
+Turn it off with `backfill_narrowed_domains: false` if the preset's literal call
+count is the budget you are holding to. It is also off automatically under
+`--only-model` / `--only-domain`, which exist to price one cell.
+
+**Why not rebalance the preset lists instead?** Splitting the mistral pairing
+would fix `economy` specifically and nothing else. Backfill fixes whichever
+models a given run is actually missing, including combinations nobody
+anticipated — a key that expired, a provider having an outage, a `prompts:`
+override — so the fixed lists stay a statement of intent rather than a table
+that has to encode every degraded configuration.
+
+---
+
+### Citation re-ask
+
+```yaml
+pipeline:
+  citation_reask: true          # default; false disables the pass entirely
+  citation_reask_limit: 12      # default; refutations re-asked per run
+```
+
+When a citation is fetched, read, and found not to support the claim it was
+cited for, the claim is handed back to the model that asserted it. The model is
+shown its own claim, the URL, the verdict, and the sentence the relevance check
+relied on, and answers with one of four actions: correct the claim, propose a
+different source, withdraw it, or stand by it. The answer is rendered under the
+refutation in Section 9.
+
+**Why it is worth a call.** In the run this was built against, 2 of 49
+refutations came back `contradicts`, and both were repairable rather than wrong:
+a claim of "17 billion gallons" against a page reading "66 billion liters" —
+which is ≈17.4 billion gallons — and a compound claim whose page supported one
+half. In both the correct figure was already on the page the pipeline had
+fetched, and the report said only that the citation failed.
+
+**What it cannot do.** The model being asked is the one whose assertion just
+failed, and the question invites it to defend itself. So a re-ask never changes
+`verification`: a refuted citation stays refuted, and the answer is advisory
+text beside it. A proposed alternative URL is not reported as a source either —
+it goes back through the same fetch, checksum, relevance check and
+grounded-quote requirement as any other citation, and what the report shows is
+what that check found. A model answering with a plausible-looking URL gets it
+checked, not printed.
+
+`stand` is a first-class answer for the same reason: a model with no way to
+disagree picks the nearest available action instead, and a fabricated
+`different_source` costs a fetch to disprove.
+
+**Cost.** One call per refutation, bounded by `citation_reask_limit`; live web
+search is disabled for these calls. Refutations past the limit are logged rather
+than dropped silently. The pass does not run with `--offline`. A claim traced to
+the draft's own citation block was asserted by the author rather than by a
+model, so there is nobody to hand it back to and it is skipped.
+
+---
+
+### Reproducibility context
+
+Every run compares itself against earlier runs of the same draft and reports what
+it finds. There is no setting: it is always on, it costs nothing, and it makes no
+model calls.
+
+**The problem it addresses.** A review report used to present one run's findings
+as a definitive list — counts, weights, and a ranked Section 1 that feeds the
+revision prompt. It is not one. As measured above, only 18 of 259 distinct
+findings reproduced across 3 or more of 4 runs of the same unedited article. A
+reader — including the person who wrote the draft — reasonably takes "4 consensus
+flags" as a property of their article. It is substantially a property of that
+run. Reports now say so, at the top, in a **Reading this report** block that
+frames the sections rather than footnoting them.
+
+**Where the comparison comes from.** `pipeline_history/` already holds a full
+report for every run ever made, including the draft text each one reviewed. So
+the Nth run of a draft can be scored against the N-1 that preceded it using work
+already paid for. Nothing is re-run, and no run costs more than it did before.
+This directly answers the objection that reproducibility can only be bought by
+paying N times per draft: for the second and later runs of a draft, it is free.
+
+**What counts as comparable.** Two runs are compared only when they reviewed the
+same draft *and* ran the same ensemble configuration. Both halves matter, and
+the second is easy to get wrong. This project's own
+`pipeline_history/dc-environment` holds 47 runs over 8 distinct drafts, and its
+largest same-draft cluster — 23 runs — mixes single-pass probes with full 25-pass
+`maximum` runs. Grouping on the draft alone would report a finding as "absent
+from 11 runs" that never ran the domain capable of producing it. Runs that do not
+match are listed in the report as skipped, with the reason, so a small
+denominator never looks like a thin history.
+
+The key covers more than the pass list, because `model:domain` names a
+*provider*: `openai:fact_check` is the same string whether the run used
+`gpt-5.4-mini` or `gpt-5.5`. So the distinct model identities are folded in from
+the run's call log, together with `consensus_threshold` and
+`consensus_min_models` — the two settings that decide what reaches Section 1 at
+all. Change a preset or retune either gate and later runs stop being scored
+against the old ones, which is correct: they are measuring a different pipeline.
+
+Every part of that key was chosen by measuring what it costs against the 47-run
+`dc-environment` history, counting runs that still find a comparable
+predecessor: pass list alone 25, plus the two consensus gates 25 (free), plus
+model identities 20. Two further candidates were rejected for what they cost —
+splitting on the `[grounded]` suffix (14) and on per-call reasoning effort (11).
+The grounding suffix in particular marks a *call*, not a configuration: the same
+model appears with and without it inside a single run.
+
+Whitespace-only differences do not count as a different draft. `prompt_cache_layout`
+is deliberately *not* part of the comparability key: the four-run test above found
+its two conditions indistinguishable within run-to-run noise, and it is the pairing
+of those two conditions that produced the 18-of-259 figure in the first place.
+
+**Partial failures.** A run whose `voice_style` passes all failed had no
+opportunity to raise a voice finding, and scoring it as "did not reproduce" would
+understate every voice finding in the report. Denominators are therefore per
+section: a prior run counts toward a section only if at least one pass feeding
+that section succeeded. This matters more than it sounds — of the 12 comparable
+25-pass runs of one draft in this repo, exactly **one** finished with no failed
+passes, so discarding degraded runs would have discarded the history. The
+correction is partial by construction (a run that lost one of five voice passes
+still counts as a whole unit), so reproduction counts are a floor rather than a
+point estimate, and the report says that whenever any comparable run was degraded.
+
+**What the report shows.**
+
+- A **Reading this report** block at the top: how many comparable runs were
+  found, how many of this run's findings recurred in at least half of them, and
+  a per-section table. With no comparable history it says so plainly and quotes
+  the 18-of-259 calibration figure instead of implying a measurement it did not
+  take.
+- **Section 1 in bands, not ranked.** The old strict ordering by `weight_sum`
+  was misleading: in one measured run of this repo's own history, the
+  top-ranked finding (weight 2.5) appeared in *none* of the 4 comparable prior
+  runs, while the finding ranked third appeared in all 4. Findings are now
+  grouped into `Reproduced in earlier runs` / `Partly reproduced` / `New in
+  this run`, and order within a band carries no meaning. They say
+  "reproduced", not "corroborated": this report uses corroboration for a
+  different axis — several models agreeing *within one run*, in Section 8's
+  ranking and in the Ensemble Width block — and a finding can be one without
+  the other. Without comparable
+  history the bands fall back to how many passes flagged each finding, which is
+  a count of evidence rather than a weighted score.
+- **Weights to one decimal, labelled "run weight".** Two decimals implied a
+  precision the process does not have: the same finding on the same draft scored
+  anywhere from 2.0 to 7.4 across repeat runs.
+- **Per-finding notes** in Sections 1 through 5, reading `[also in 3 of 4
+  comparable prior runs]` or `[new — in none of 4 ...]`.
+
+A finding raised only once is not thereby wrong. Most findings are single-run,
+and single-run findings include real ones. It means the evidence for it is one
+sample, which is what the report now says.
+
+**What this run may have missed.** Everything above annotates findings that are
+*present*. The reverse — what earlier runs caught and this one did not — is
+invisible by construction, and on measured history it is the larger set: a run
+of the dc-environment draft reproduced 3 of 26 completeness findings, so each
+run also misses many its predecessors found. The report now lists them, under
+that heading, above the worklist.
+
+Ordinarily "present last time, absent now" would be ambiguous — it might have
+been fixed. Here it cannot be. Comparability already pins the draft to the same
+text, so nothing in that list was resolved between runs; each entry is either
+noise in the earlier runs or a miss in this one, and the report says it cannot
+tell you which.
+
+Two thresholds keep it readable, both set by counting what they would actually
+print on the same cluster with each run in turn treated as the current one:
+
+| prior runs (N) | 1 | 2 | 3 | 4 |
+|---|---:|---:|---:|---:|
+| raised by >=1 prior run | 130 | 239 | 329 | 424 |
+| raised by >=half | 130 | 239 | 35 | 54 |
+| raised by **all** | 130 | **15** | **4** | **4** |
+
+So a finding is listed only when **every** comparable prior run raised it, and
+only when there are **at least two** of them — at N=1 every rule degenerates to
+"everything the other run found". The list caps at ten with the remainder
+counted, and the full set is in the report JSON. A `fact-check / confirmed`
+entry means a claim earlier runs verified went unchecked this time: a gap in
+coverage rather than a problem missed.
+
+**In the report JSON**, findings carry `reproduced_in` / `reproduced_of`, and a
+`reproducibility` block records the fingerprint, the comparable runs, the skipped
+ones with reasons, per-section totals, and `dropped` (the block above). When
+nothing comparable was found the per-finding fields are **absent rather than
+zero** — a measurement that was never taken must not read as a measurement that
+came back empty.
+
+**To get the measurement**, run the same draft twice before revising it. The
+second run reports against the first at no extra cost. Editing the draft resets
+it, which is correct: findings about the old text are not evidence about the new.
 
 ---
 
@@ -580,7 +922,7 @@ The tables below show exactly what settings each preset applies to each provider
 | gemini | _(user model)_ | — | not set (dynamic) | Dynamic thinking (model default) |
 | mistral | `mistral-medium-3-5` | — | — | Reasoning model; `low`/`medium` not accepted — preset omits effort flag |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding |
-| grok | `grok-4.3` | `reasoning_effort` | `"low"` | Light CoT |
+| grok | `grok-4.6` | `reasoning_effort` | `"low"` | Light CoT. Unset would mean `high` |
 | claude | `claude-sonnet-4-6` | `effort` | `"medium"` | Adaptive thinking (always on on Sonnet 4.6); effort controls depth |
 
 #### thorough preset — thorough thoroughness, ~$1.00–$2.50/article
@@ -591,7 +933,7 @@ The tables below show exactly what settings each preset applies to each provider
 | gemini | _(user model)_ | — | not set (dynamic) | Dynamic thinking (model default) |
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted on this model |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding |
-| grok | `grok-4.3` | `reasoning_effort` | `"medium"` | Standard CoT depth |
+| grok | `grok-4.6` | `reasoning_effort` | `"high"` | Full CoT depth |
 | claude | `claude-opus-4-8` | `effort` | `"high"` | Adaptive thinking (always on); effort=high pushes harder |
 
 #### maximum preset — maximum thoroughness, ~$2.50–$5.00/article
@@ -602,7 +944,7 @@ The tables below show exactly what settings each preset applies to each provider
 | gemini | `gemini-2.5-pro` | `thinking_budget` | `16000` | Upgraded to pro; 16K thinking budget; flash doesn't support `thinking_budget` in Vertex AI |
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding |
-| grok | `grok-4.3` | `reasoning_effort` | `"high"` | Full CoT depth |
+| grok | `grok-4.6` | `reasoning_effort` | `"high"` | Full CoT depth. `xhigh` exists, unmeasured |
 | claude | `claude-opus-4-8` | `effort` | `"high"` | Adaptive thinking, max effort |
 
 **Notes on the preset tables:**
@@ -668,28 +1010,44 @@ LanguageTool adds a partial vote (`lt_weight`) when it independently flagged the
 
 | Model | Default | fact_check | voice_style | completeness | argument_integrity | red_team |
 |---|---|---|---|---|---|---|
-| gemini | 1.0 | **1.5** | 1.0 | 1.0 | 1.0 | 1.0 |
-| perplexity | 1.0 | **1.5** | 1.0 | 1.0 | 1.0 | 1.0 |
+| gemini | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 |
+| perplexity | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 |
 | openai | 1.0 | 1.0 | **1.2** | **1.2** | 1.0 | 1.0 |
 | mistral | 1.0 | 1.0 | 1.0 | 1.0 | **1.2** | **1.1** |
 | grok | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | **1.2** |
 | claude | 1.0 | 1.0 | **1.1** | **1.1** | **1.3** | 1.0 |
 
-Gemini and Perplexity receive a 1.5× bonus for fact_check because their responses are grounded in live web sources. Claude receives a 1.3× bonus for argument_integrity based on observed reasoning depth.
+Claude receives a 1.3× bonus for argument_integrity based on observed reasoning depth.
 
-**Consensus threshold logic (default 2.0):**
+Gemini and Perplexity used to carry a flat **1.5×** for fact_check here. That was a guess about which models ground, standing in for whether they actually did — and on 2026-09-03 it was wrong in both directions at once: gemini took the bonus while reporting `grounding_available: False`, and openai ran a real search on the flat 1.0. The bonus is now applied by reading the result rather than the model name:
 
-- Two general models (1.0 + 1.0 = 2.0) → consensus
-- One grounded model alone (1.5 < 2.0) → not consensus; needs corroboration
-- One grounded + one general (1.5 + 1.0 = 2.5) → consensus
-- Two grounded models (1.5 + 1.5 = 3.0) → strong consensus
+```yaml
+ensemble:
+  grounding_bonus: 1.5       # multiplier when a fact_check call actually consulted live sources
+```
+
+**Measured 2026-09-05 — what these weights actually change.** Re-scoring 12 captured ensembles with the default table against a flat 1.0 for every model produced **identical Section 1 membership in all 12**, while changing the *order* in 10 of them. The same held for `grounding_bonus` at 1.5 versus 1.0: no membership change.
+
+The reason is that `consensus_threshold: 2.0` sits below the point where weights discriminate. Two models at 1.0 already reach exactly 2.0, so any passage with two distinct voters clears the bar whatever the weights say, and a bonus can only move something already over the line further over it. Sweeping the threshold, output was identical at 1.0, 1.5 and 2.0, and only began to cut at 2.5.
+
+So today the weights table is a **ranking** control, not a gate, and what actually decides Section 1 membership is `consensus_min_models`. If you want the weights to affect what surfaces rather than the order it surfaces in, raise `consensus_threshold` to 2.5 or above so a bare two-model agreement no longer clears it on its own.
+
+**What reaches Section 1 (defaults: threshold 2.0, min_models 2):**
+
+- One model, however heavily weighted → **not** consensus. `consensus_min_models` blocks it whatever the sum reaches, which is the point: a single model emitting two red_team sub-findings on one passage once totalled 2.2 and published itself as consensus.
+- Two distinct models at 1.0 each → 2.0, meets the threshold → consensus.
+- Anything weighted above 1.0 → also consensus, but it was already over the line at 1.0.
+
+That third case is why the weights do not currently gate anything. LanguageTool counts as one of the distinct sources when it independently flagged the same passage.
 
 **Configuring weights:**
 
 ```yaml
 ensemble:
-  consensus_threshold: 2.0   # lower = more aggressive consensus detection
+  consensus_min_models: 2    # distinct sources required — the actual gate
+  consensus_threshold: 2.0   # weighted sum required alongside that count
   lt_weight: 0.5             # LanguageTool partial vote
+  grounding_bonus: 1.5       # applied when a fact_check call really searched
 
   weights:
     # Override only what you want to change.
@@ -764,9 +1122,9 @@ pipeline:
     mistral:
       reasoning_effort: medium  # balanced uses "low"
 
-# Use standard but add Perplexity reasoning (normally standard uses sonar-pro):
+# Use wide but add Perplexity reasoning (normally wide uses sonar):
 pipeline:
-  cost_preset: standard
+  cost_preset: wide
   preset_overrides:
     perplexity:
       model: sonar-reasoning-pro
@@ -865,6 +1223,7 @@ Open `configs/your_publication_name.yaml`. Key fields:
 |---|---|
 | `publication_description` | One paragraph: what you cover, who reads it, what makes a piece unpublishable |
 | `audience.primary` | Who reads it, what they know, what makes them stop reading |
+| `author_name` | Optional — who "I" refers to in your drafts, by name. Citation verification needs it to check first-person claims against a source page. The handoff's `Author:` line overrides it per article; this is the only source for `--raw-draft` and `--url`. |
 | `style_profile` | Your characteristic style — see PLAYBOOK.md for how to develop this (the legacy key `voice_profile` is still accepted) |
 | `style_rules.banned_words` | Words you never want in your published writing |
 | `style_rules.banned_phrases` | Phrases you never want |
@@ -879,6 +1238,10 @@ Open `configs/your_publication_name.yaml`. Key fields:
 | `wordpress.username` | Your WordPress login username |
 | `wordpress.application_password` | The application password from your WordPress profile |
 | `api_keys` | Optional — overrides specific providers' credentials from `user.yaml` for this publication only. See [API key precedence](#api-key-precedence). |
+
+Any top-level key not in this table is an error. That is deliberate: a misspelled key used to read as an absent setting, so `authorname` silently cost the run its author and nothing anywhere said so. The error names the key, suggests the intended spelling when it is close, and lists what is valid.
+
+If you need a key that is deliberately not this pipeline's -- a note to a colleague, or a value another tool reads out of the same file -- prefix it with `x_`. Anything under that prefix is passed over without validation, following the same idea as OpenAPI's `x-` specification extensions.
 
 **`seo_rules`** is optional — omit it to use the defaults. Add it when your publication has different SEO standards from the defaults:
 

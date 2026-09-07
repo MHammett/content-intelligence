@@ -33,6 +33,44 @@ def _base_report(**overrides):
     return report
 
 
+def _mismatch_citation(**overrides):
+    """A content-mismatch citation shaped like the ones the resolver emits.
+
+    Modelled on the Honda run's single refutation: a grounded-model citation
+    that fetched and read cleanly, came back ``not_addressed``, and carries a
+    ``note`` the resolver builds by restating the verdict and the reason. The
+    URLs are long on purpose — the opaque redirect ones in that run were 271
+    characters each, and three of them were what buried the actionable line.
+    """
+    citation = {
+        "claim": "the chip advanced to exactly January 1, 2003.",
+        "url": "https://example.test/redirect/" + "A" * 200,
+        "resolved": True,
+        "verification": "content_mismatch",
+        "relevance_verdict": "not_addressed",
+        "relevance_reason": "The page discusses 1998 or 2002, not 2003.",
+        "note": (
+            "Source URL loaded, and its extracted article text was read and "
+            "checked, but content verification found it does not support this "
+            "specific claim (not_addressed): The page discusses 1998 or 2002, "
+            "not 2003."
+        ),
+        "content_summary": "SUMMARY " * 60,
+        "checksum": "451bb861017fe7c4446b7dc274a2d6ce",
+        "alternates_checked": [
+            "https://example.test/alt-one/" + "B" * 200,
+            "https://example.test/alt-two/" + "C" * 200,
+        ],
+        "wayback": {
+            "archived": True,
+            "snapshot_url": "https://web.archive.test/x",
+            "snapshot_age_days": 10,
+        },
+    }
+    citation.update(overrides)
+    return citation
+
+
 class TestFailedModelPassesAreExplained:
     """A failed pass has to say what happened and what it cost the report.
 
@@ -608,6 +646,62 @@ class TestSection9Citations:
             in md.split("### Read, and supports the claim")[1]
         )
 
+    def test_the_drift_block_names_where_the_fetch_landed(self):
+        """The drift block tells the author to go and re-check a source, so the
+        address it prints has to be one they can open.
+
+        It read ``url`` directly while every other URL in the section went
+        through ``_citation_pair``. For a grounded-model citation ``url`` is a
+        ``grounding-api-redirect`` wrapper that names no publication and expires
+        within days -- the exact string the redirector fix exists to keep out of
+        the report.
+        """
+        redirect = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ"
+        landed = "https://www.jalopnik.com/honda-clocks-stuck"
+        report = _base_report(
+            section_9_citations=[
+                {
+                    "claim": "The bridge cost $4 million.",
+                    "resolved": True,
+                    "url": redirect,
+                    "final_url": landed,
+                    "verification": "checksum",
+                    "content_changed_since": {
+                        "prior_run": 4,
+                        "prior_article": "prior-article",
+                        "note": "changed",
+                    },
+                },
+            ]
+        )
+        md = render_report_markdown(report)
+        drift_section = md.split("### ⚠ Content changed")[1].split(
+            "### Read, and supports the claim"
+        )[0]
+
+        assert f"- URL: {landed}" in drift_section
+        assert redirect not in drift_section
+
+    def test_the_drift_block_still_names_a_citation_that_never_redirected(self):
+        """No ``final_url`` means the requested URL is where it landed."""
+        report = _base_report(
+            section_9_citations=[
+                {
+                    "claim": "The bridge cost $4 million.",
+                    "resolved": True,
+                    "url": "https://example.gov/budget.pdf",
+                    "verification": "checksum",
+                    "content_changed_since": {"prior_run": 4, "note": "changed"},
+                },
+            ]
+        )
+        md = render_report_markdown(report)
+        drift_section = md.split("### ⚠ Content changed")[1].split(
+            "### Read, and supports the claim"
+        )[0]
+
+        assert "- URL: https://example.gov/budget.pdf" in drift_section
+
     def test_no_drift_block_when_nothing_changed(self):
         report = _base_report(
             section_9_citations=[
@@ -719,6 +813,180 @@ class TestSection9Citations:
         md = render_report_markdown(_base_report(section_9_citations=contradicts))
         assert "1 of these came back `contradicts`" in md
         assert "possible factual error" in md
+
+    def test_a_conceding_reask_changes_the_guidance(self):
+        """Whenever nothing came back `contradicts`, the block told the reader
+        the page simply had not covered the claim and the URL was probably
+        wrong. On the Honda run the one `not_addressed` entry carried a re-ask
+        in which the asserting model read its own refutation, concluded the
+        *claim* was wrong, and proposed the fix — and the guidance steered the
+        reader away from the only actionable finding in the block."""
+        plain = [_mismatch_citation()]
+        md = render_report_markdown(_base_report(section_9_citations=plain))
+        assert "None came back `contradicts`" in md
+        assert "wrong URL was checked" in md
+
+        conceded = [
+            _mismatch_citation(
+                reask={
+                    "action": "correct_claim",
+                    "asked_model": "gemini",
+                    "reason": "The page says 1998 or 2002.",
+                    "corrected_claim": "the chip advanced to January 1, 1998 or 2002.",
+                }
+            )
+        ]
+        md = render_report_markdown(_base_report(section_9_citations=conceded))
+        assert "concluded the claim — not the citation — was wrong" in md
+        # Replaced, not merely appended to: the sentence that contradicted the
+        # finding below it must not survive alongside the correction.
+        assert "None came back `contradicts`" not in md
+        assert "wrong URL was checked" not in md
+
+    def test_a_withdrawing_reask_concedes_the_claim_too(self):
+        """`withdraw` faults the claim as squarely as `correct_claim` does; it
+        just has no replacement wording to offer."""
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[
+                    _mismatch_citation(
+                        reask={
+                            "action": "withdraw",
+                            "asked_model": "gemini",
+                            "reason": "Nothing supports it.",
+                        }
+                    )
+                ]
+            )
+        )
+        assert "concluded the claim — not the citation — was wrong" in md
+        assert "wrong URL was checked" not in md
+
+    def test_a_reask_that_blames_the_source_leaves_the_guidance_alone(self):
+        """`different_source` stands by the claim and blames the URL — which is
+        precisely the citation problem the default guidance describes — and
+        `stand` concedes nothing at all. Neither may flip the header."""
+        for action in ("different_source", "stand"):
+            md = render_report_markdown(
+                _base_report(
+                    section_9_citations=[
+                        _mismatch_citation(
+                            reask={
+                                "action": action,
+                                "asked_model": "gemini",
+                                "reason": "r",
+                                "source_url": "https://example.test/proposed",
+                            }
+                        )
+                    ]
+                )
+            )
+            assert "None came back `contradicts`" in md, action
+            assert "not the citation — was wrong" not in md, action
+
+    def test_each_guidance_sentence_is_scoped_to_the_entries_it_covers(self):
+        """With a mix in the block, every sentence has to carry its own count —
+        the reader is deciding what to do per entry, not per section."""
+        citations = [
+            _mismatch_citation(claim="contradicted", relevance_verdict="contradicts"),
+            _mismatch_citation(
+                claim="conceded",
+                reask={
+                    "action": "correct_claim",
+                    "asked_model": "gemini",
+                    "corrected_claim": "fixed wording",
+                },
+            ),
+            _mismatch_citation(claim="plain one"),
+            _mismatch_citation(claim="plain two"),
+        ]
+        md = render_report_markdown(_base_report(section_9_citations=citations))
+        assert "1 of these came back `contradicts`" in md
+        assert "refutation for 1 of these" in md
+        assert "The remaining 2 entries are" in md
+        # The unconditional wording must never appear beside a scoped count.
+        assert "None came back `contradicts`" not in md
+
+    def test_the_proposed_correction_precedes_the_bulk_evidence(self):
+        """The correction was the last line of a 2,682-character entry, below a
+        546-character content summary and three opaque redirect URLs."""
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[
+                    _mismatch_citation(
+                        reask={
+                            "action": "correct_claim",
+                            "asked_model": "gemini",
+                            "corrected_claim": "PROPOSED WORDING HERE",
+                        }
+                    )
+                ]
+            )
+        )
+        entry = md.split("### Read, and does NOT support the claim")[1]
+        correction = entry.index("PROPOSED WORDING HERE")
+        for later in ("Content summary:", "Checksum:", "Alternates checked:"):
+            assert correction < entry.index(later), later
+
+    def test_reordering_keeps_every_piece_of_evidence_reachable(self):
+        """The section exists so a reader can audit a tier instead of taking it
+        on trust. Reordering and compacting are fine; dropping evidence is not."""
+        md = render_report_markdown(
+            _base_report(section_9_citations=[_mismatch_citation()])
+        )
+        assert "451bb861017fe7c4446b7dc274a2d6ce" in md
+        assert "The page discusses 1998 or 2002, not 2003." in md
+        assert "https://web.archive.test/x" in md
+        assert "Live: https://example.test/redirect/" in md
+        for alternate in ("alt-one", "alt-two"):
+            assert alternate in md, alternate
+
+    def test_alternates_render_as_a_count_with_the_urls_beneath(self):
+        """Three opaque redirect URLs run together inside a Python list repr
+        were 546 of one entry's 2,682 characters, and the count they add up to
+        was not readable without parsing them."""
+        md = render_report_markdown(
+            _base_report(section_9_citations=[_mismatch_citation()])
+        )
+        assert "Alternates checked: 2 other source(s)" in md
+        assert "['https://example.test/alt-one/" not in md
+
+    def test_alternates_under_a_supported_claim_do_not_impugn_the_primary(self):
+        """`alternates_checked` is set on checksum entries too — five of them in
+        the saved runs — and there the primary source *did* support the claim.
+        The resolver's note says "none supported it either", which is true only
+        where it is written. This renderer is shared, so it may say only what
+        holds of the alternates themselves."""
+        supported = _mismatch_citation(
+            verification="checksum",
+            relevance_verdict="supports",
+            relevance_reason="The page states it directly.",
+            note="",
+        )
+        md = render_report_markdown(_base_report(section_9_citations=[supported]))
+        assert "### Read, and supports the claim (1)" in md
+        assert "Alternates checked: 2 other source(s)" in md
+        assert "none of them supported it." in md
+        assert "either" not in md.split("Alternates checked:")[1].split("\n")[0]
+
+    def test_note_is_dropped_only_when_it_restates_the_reason_above_it(self):
+        """The resolver builds the note as verdict + reason + alternates count,
+        and all three now render as their own lines. A note that says anything
+        else is still evidence, so the test is on the string, not the tier."""
+        md = render_report_markdown(
+            _base_report(section_9_citations=[_mismatch_citation()])
+        )
+        assert "Relevance reason: The page discusses 1998 or 2002, not 2003." in md
+        assert "Note: Source URL loaded" not in md
+
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[
+                    _mismatch_citation(note="Publisher issued a correction in 2024.")
+                ]
+            )
+        )
+        assert "Note: Publisher issued a correction in 2024." in md
 
     def test_confirmed_bucket_is_reconciled_against_what_was_retrieved(self):
         """The fact-check pass's "confirmed" verdict and this section's
@@ -1399,9 +1667,17 @@ class TestCitationsPairLiveAndArchiveLinks:
         )
         assert "STALE" in out
 
-    def test_a_just_submitted_archive_says_so_rather_than_going_quiet(self):
+    def test_a_bare_submitted_flag_no_longer_promises_a_future_snapshot(self):
+        """The old line — "submitted to the Wayback Machine this run; the
+        snapshot URL appears on the next run once archive.org has captured it" —
+        asserted a future nothing checked. A capture archive.org dropped read
+        exactly like one it completed. Reports written before the outcome
+        vocabulary existed still land here, and must not keep making the promise.
+        """
         out = self._text(self._cit(archived=False, submitted=True))
-        assert "submitted to the Wayback Machine this run" in out
+        assert "SUBMITTED, OUTCOME UNKNOWN" in out
+        assert "treat the URL as unarchived" in out
+        assert "appears on the next run" not in out
         assert "Cite both" not in out
 
     def test_an_unarchived_citation_says_it_is_undurable(self):
@@ -1567,6 +1843,225 @@ class TestUnresolvedCitationsRenderTheirArchiveState:
         assert "NOT CHECKED" in md
 
 
+#: Standing in for the sentence ``resolver._resolve_known_url`` writes onto an
+#: escalated citation. The renderer passes it through rather than composing its
+#: own, so one route states itself once — the wording itself is asserted in
+#: ``test_resolver.py``, where it is written.
+_READER_ACCESS = (
+    "This source refused an ordinary automated request (403) and served the "
+    "page only to a browser-shaped client. …cite the archive copy alongside it."
+)
+
+
+class TestEscalatedCitationsRenderReaderFriction:
+    """``verified_via`` is reader-facing information, not a disclosure.
+
+    For a public document the retrieval method does not bear on whether the
+    citation is valid — the reader opening the link gets the same page. What it
+    does bear on is durability: a source that refused an ordinary automated
+    request is the one whose link is most likely to fail somebody later, which
+    makes it exactly the citation that needs an archive copy beside it. That is
+    the framing under test here, in both directions — it has to say enough to be
+    useful and not so much that it reads as an admission.
+    """
+
+    LIVE = "https://www.bianchihonda.com/change-clock-with-navigation-repair/"
+    SNAPSHOT = "http://web.archive.org/web/20250912181258/" + LIVE
+
+    def _cit(self, **overrides):
+        citation = {
+            "claim": "The placeholder date was January 1, 2002.",
+            "url": self.LIVE,
+            "resolved": True,
+            "verification": "checksum",
+            "verified_via": "tls_impersonation",
+            "origin_failure": "blocked",
+            "reader_access": _READER_ACCESS,
+            "wayback": {"archived": True, "snapshot_url": self.SNAPSHOT},
+        }
+        citation.update(overrides)
+        return citation
+
+    def _pair(self, **overrides):
+        return "\n".join(report_markdown._render_archive_pair(self._cit(**overrides)))
+
+    def test_the_friction_is_stated_where_the_links_are(self):
+        out = self._pair()
+        assert f"Reader access: {_READER_ACCESS}" in out
+        # Immediately under the live URL, not paragraphs away in a key dump:
+        # this is what the author needs while deciding what to paste.
+        lines = [line.strip() for line in out.splitlines()]
+        assert lines[0].startswith("- Live:")
+        assert lines[1].startswith("- Reader access:")
+
+    def test_an_escalated_citation_still_offers_the_paste_ready_pairing(self):
+        out = self._pair()
+        assert f"Cite both: {self.LIVE} (archived: {self.SNAPSHOT})" in out
+
+    def test_a_missing_archive_is_stated_and_not_softened(self):
+        """The absence is the finding.
+
+        An escalated citation with no snapshot is the weakest thing this section
+        can produce: the live URL already refused a client once, so "only as
+        durable as the live URL" — the wording every other unarchived citation
+        gets — understates it.
+        """
+        out = self._pair(wayback={"archived": False})
+        assert "Archive: NONE" in out
+        assert "most needed one" in out
+        assert "only as durable as" not in out
+
+    def test_the_warning_survives_the_citation_actually_being_submitted(self):
+        """The branch carrying this warning sits under ``resolved``, which only
+        citations that were never submitted reach — and an escalated citation is
+        resolved, so ``_submit_missing_archives`` always submits it. That made
+        the warning almost unreachable in a real run: the common case (submitted,
+        capture pending) fell into the generic wording meant for ordinary
+        citations. An escalated source with no snapshot is in the same weak
+        position however the archiving turned out.
+        """
+        out = self._pair(
+            wayback={
+                "archived": False,
+                "submitted": True,
+                "archive_outcome": "pending",
+            }
+        )
+        assert "most needed an archive" in out
+        assert "SUBMITTED, OUTCOME UNKNOWN" in out
+
+    def test_a_failed_capture_on_an_escalated_source_says_both_things(self):
+        out = self._pair(
+            wayback={
+                "archived": False,
+                "submitted": True,
+                "archive_outcome": "capture_failed",
+                "archive_outcome_detail": "error:soft-time-limit-exceeded",
+            }
+        )
+        assert "CAPTURE FAILED" in out
+        assert "most needed an archive" in out
+
+    def test_the_warning_is_not_stated_twice(self):
+        """The ``resolved`` branch already says it for a never-submitted
+        citation. Saying it again below would double-state the same fact — the
+        thing this file's provenance test exists to prevent."""
+        out = self._pair(wayback={"archived": False})
+        assert out.count("most needed") == 1
+
+    def test_an_archived_escalated_citation_is_not_warned_about(self):
+        """It got its archive. The warning would be noise."""
+        out = self._pair(
+            wayback={
+                "archived": True,
+                "snapshot_url": self.SNAPSHOT,
+                "archive_outcome": "archived",
+            }
+        )
+        assert "most needed" not in out
+
+    def test_an_ordinary_unarchived_citation_keeps_its_milder_wording(self):
+        out = self._pair(
+            verified_via="direct", reader_access=None, wayback={"archived": False}
+        )
+        assert "Archive: none." in out
+        assert "Archive: NONE" not in out
+        assert "Reader access:" not in out
+
+    def test_a_directly_fetched_citation_says_nothing_about_retrieval(self):
+        """The unremarkable case stays silent. A line on every entry reporting
+        that nothing happened would bury the two entries where something did."""
+        out = self._pair(verified_via="direct", reader_access=None)
+        assert "Reader access:" not in out
+
+    def test_an_archive_read_states_its_provenance_exactly_once(self):
+        """Each retrieval route has one sentence, and only one.
+
+        A citation read from the archive already carries ``archive_provenance``,
+        which says more than a generic line could — it names the origin failure
+        and flags a stale snapshot. Adding a second sentence for the same fact
+        would make the entry state its provenance twice.
+        """
+        citation = self._cit(
+            verified_via="wayback_fallback",
+            reader_access=None,
+            archive_provenance="Content was read from an archive.org snapshot…",
+        )
+        pair = "\n".join(report_markdown._render_archive_pair(citation))
+        assert "Reader access:" not in pair
+
+        md = "\n".join(report_markdown._render_section_9([citation]))
+        assert md.count("Content was read from an archive.org snapshot") == 1
+        assert "wayback_fallback" not in md
+
+    def test_an_escalated_fetch_feeds_the_redirector_fix(self):
+        """The escalation path has to record ``final_url`` like the direct one.
+
+        Every refused claim in the 2026-09-05 Honda run cited a Vertex
+        ``grounding-api-redirect`` URL, so these are exactly the citations
+        ``_citation_pair`` was taught to resolve — and they only reach it
+        because ``_impersonation_fallback_content`` reports where the fetch
+        landed. Left unset, an escalated citation would still be published as
+        271 opaque characters that expire.
+        """
+        redirect = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ"
+        out = self._pair(url=redirect, final_url=self.LIVE)
+
+        assert f"Live: {self.LIVE}" in out
+        assert f"Cite both: {self.LIVE} (archived: {self.SNAPSHOT})" in out
+        assert redirect not in out
+
+    def test_the_raw_enum_is_never_dumped_beside_the_prose(self):
+        """``verified_via`` used to reach the reader through the generic
+        key/value dump as ``Verified via: tls_impersonation``. Rendering it
+        twice — once as an enum, once as prose — is worse than either."""
+        md = "\n".join(report_markdown._render_section_9([self._cit()]))
+        assert "tls_impersonation" not in md
+        assert "Verified via:" not in md
+        assert "Reader access:" in md
+
+    def test_the_url_is_stated_once_in_the_read_and_supports_bucket(self):
+        """The pair block renders the URL; the key/value dump must not repeat it.
+
+        Every other bucket in the section excludes ``url``/``final_url`` for
+        this reason. The checksum bucket was missed when the redirector fix went
+        in, so the largest block in the section kept printing each link twice —
+        once as "Live:" and again as "Url:". At 271 characters of opaque Vertex
+        redirect per entry, that duplicate is most of what the reader sees.
+        """
+        md = "\n".join(report_markdown._render_section_9([self._cit()]))
+        lines = [line.strip() for line in md.splitlines()]
+
+        assert lines.count(f"- Live: {self.LIVE}") == 1
+        # The labels the duplicate arrived under, from the generic dump.
+        assert not [
+            line for line in lines if line.startswith(("- Url:", "- Final url:"))
+        ]
+
+    def test_a_redirector_never_reaches_the_read_and_supports_bucket(self):
+        """The payoff of resolving ``final_url``: the opaque URL is not published.
+
+        ``_render_archive_pair`` on its own has never emitted it, so asserting
+        there proves nothing about the report. This asserts on the assembled
+        section, which is where it was still reaching the reader.
+        """
+        redirect = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ"
+        citation = self._cit(url=redirect, final_url=self.LIVE)
+
+        md = "\n".join(report_markdown._render_section_9([citation]))
+
+        assert "### Read, and supports the claim (1)" in md
+        assert redirect not in md
+        assert md.count(f"- Live: {self.LIVE}") == 1
+
+    def test_an_escalated_citation_sits_in_the_read_and_supports_bucket(self):
+        """Escalation changes how the document was obtained, not what was
+        established about it. A page read this way was read."""
+        md = "\n".join(report_markdown._render_section_9([self._cit()]))
+        assert "### Read, and supports the claim (1)" in md
+        assert "| Source URL identified, but the fetch was refused | 0 |" in md
+
+
 class TestWaybackIsRenderedForAReaderNotADebugger:
     """`_kv_lines` dumped the raw wayback dict into the report.
 
@@ -1643,3 +2138,1061 @@ class TestWaybackSummaryDoesNotDriftFromTheAdapter:
             assert report_markdown._wayback_summary(wb) == wayback.format_summary(wb), (
                 wb
             )
+
+
+class TestHandoffMetadataGapsBlock:
+    """The gap list has to reach the report, grouped and actionable.
+
+    ``handoff_gaps`` builds the entries; this is the half that decides whether
+    the author ever sees them. A report that carries ``handoff_gaps`` in its
+    JSON and renders nothing is exactly the silent degradation the feature was
+    built to end, moved one layer out.
+    """
+
+    GAPS = [
+        {
+            "field": "primary_claim",
+            "label": "PRIMARY CLAIM",
+            "severity": "critical",
+            "impact": "Three domains graded the draft against a claim they inferred.",
+            "domains": ["argument_integrity", "completeness", "red_team"],
+            "sections": ["SECTION 4: Argument Integrity"],
+            "suggestion": "PRIMARY CLAIM\nThe figures do not transfer.",
+            "suggestion_basis": "the draft's opening paragraph",
+            "guidance": None,
+            "placeholder": False,
+        },
+        {
+            "field": "known_gaps",
+            "label": "KNOWN GAPS",
+            "severity": "degrading",
+            "impact": "completeness could not tell an accepted gap from a missed one.",
+            "domains": ["completeness"],
+            "sections": ["SECTION 5: Completeness and Framing"],
+            "suggestion": None,
+            "suggestion_basis": None,
+            "guidance": "List what you know is missing and why.",
+            "placeholder": False,
+        },
+    ]
+
+    def test_no_block_when_the_handoff_was_complete(self):
+        md = render_report_markdown(_base_report())
+        assert "Handoff metadata gaps" not in md
+
+    def test_the_block_carries_impact_and_a_pasteable_proposal(self):
+        md = render_report_markdown(_base_report(handoff_gaps=self.GAPS))
+        assert "## ⚠ Handoff metadata gaps (2)" in md
+        assert "Three domains graded the draft against a claim they inferred." in md
+        assert "```\nPRIMARY CLAIM\nThe figures do not transfer.\n```" in md
+        assert "the draft's opening paragraph" in md
+
+    def test_a_field_with_no_candidate_still_says_what_to_add(self):
+        md = render_report_markdown(_base_report(handoff_gaps=self.GAPS))
+        assert "*What to add: List what you know is missing and why.*" in md
+
+    def test_the_block_disclaims_that_proposals_were_used(self):
+        """The one sentence that must never be dropped from this block."""
+        md = render_report_markdown(_base_report(handoff_gaps=self.GAPS))
+        assert "Nothing proposed here was used in the review" in md
+        assert "not used in this run" in md
+
+    def test_entries_are_grouped_by_severity_worst_first(self):
+        md = render_report_markdown(_base_report(handoff_gaps=self.GAPS))
+        assert md.index("Changed what the models were asked") < md.index(
+            "Context the models would have used"
+        )
+
+    def test_a_left_in_placeholder_is_called_out_on_the_heading(self):
+        gaps = [{**self.GAPS[0], "placeholder": True}]
+        md = render_report_markdown(_base_report(handoff_gaps=gaps))
+        assert "left as its template placeholder" in md
+
+
+class TestSectionsNameWhatTheyWereBuiltWithout:
+    """Per-section notes, so a finding is read against what the pass was told."""
+
+    GAP = {
+        "field": "primary_claim",
+        "label": "PRIMARY CLAIM",
+        "severity": "critical",
+        "impact": "The claim was empty.",
+        "domains": ["completeness"],
+        "sections": ["SECTION 5: Completeness and Framing"],
+        "suggestion": None,
+        "suggestion_basis": None,
+        "guidance": "State the claim.",
+        "placeholder": False,
+    }
+
+    def test_the_note_lands_on_the_section_whose_domain_lost_the_field(self):
+        md = render_report_markdown(_base_report(handoff_gaps=[self.GAP]))
+        section_5 = md.split("## SECTION 5")[1].split("## SECTION")[0]
+        assert "Built without `PRIMARY CLAIM`" in section_5
+
+    def test_the_note_stays_off_sections_the_field_never_reached(self):
+        md = render_report_markdown(_base_report(handoff_gaps=[self.GAP]))
+        section_3 = md.split("## SECTION 3")[1].split("## SECTION")[0]
+        assert "Built without" not in section_3
+
+    def test_a_failed_model_and_a_missing_field_both_get_said(self):
+        """They are not alternatives — one run can hit both, and both matter."""
+        md = render_report_markdown(
+            _base_report(
+                handoff_gaps=[self.GAP],
+                model_failures=["openai:completeness"],
+                model_failure_details=[
+                    {
+                        "pass": "openai:completeness",
+                        "model": "gpt-5.5",
+                        "domain": "completeness",
+                        "section": "SECTION 5: Completeness and Framing",
+                        "error": "timeout",
+                        "elapsed_seconds": 90.0,
+                    }
+                ],
+            )
+        )
+        section_5 = md.split("## SECTION 5")[1].split("## SECTION")[0]
+        assert "Built without gpt-5.5" in section_5
+        assert "Built without `PRIMARY CLAIM`" in section_5
+
+
+class TestArchiveOutcomeWording:
+    """ "Submitted" is a record of what was asked for. "Archived" is a claim
+    about the world. The renderer used to print the first and mean the second.
+    """
+
+    def _cit(self, **wayback):
+        return {
+            "claim": "A claim",
+            "url": "https://example.org/page",
+            "resolved": True,
+            "verification": "checksum",
+            "wayback": wayback,
+        }
+
+    def _text(self, citation):
+        return "\n".join(report_markdown._render_section_9([citation]))
+
+    SNAP = "https://web.archive.org/web/20260905121627/https://example.org/page"
+
+    def test_an_archived_citation_names_the_snapshot(self):
+        out = self._text(
+            self._cit(
+                archived=True,
+                snapshot_url=self.SNAP,
+                snapshot_age_days=0,
+                archive_outcome="archived",
+            )
+        )
+        assert f"Archive: {self.SNAP}" in out
+        assert "snapshot dated today" in out
+        assert f"Cite both: https://example.org/page (archived: {self.SNAP})" in out
+
+    def test_a_save_that_returned_an_older_snapshot_is_not_called_fresh(self):
+        """Save Page Now does not always capture. Observed live 2026-09-05: a
+        save of an IANA page redirected to a snapshot five days old. Reporting
+        that as "captured this run" is the same overstatement, one layer down."""
+        out = self._text(
+            self._cit(
+                archived=True,
+                snapshot_url=self.SNAP,
+                snapshot_age_days=5,
+                archive_outcome="archived",
+            )
+        )
+        assert "existing snapshot 5 days old" in out
+        assert "captured this run" not in out
+        assert "dated today" not in out
+
+    def test_a_pending_capture_is_not_reported_as_archived(self):
+        out = self._text(
+            self._cit(
+                archived=False,
+                submitted=True,
+                submission_job_id="spn2-abc",
+                archive_outcome="pending",
+                archive_outcome_detail="archive.org has not finished this capture yet",
+            )
+        )
+        assert "SUBMITTED, OUTCOME UNKNOWN" in out
+        assert "the next run reads the job's outcome" in out
+        assert "Cite both" not in out
+
+    def test_a_failed_capture_says_so_and_says_why(self):
+        """The state that was previously invisible: archive.org took the job and
+        could not capture the page. It rendered identically to success."""
+        out = self._text(
+            self._cit(
+                archived=False,
+                submitted=True,
+                archive_outcome="capture_failed",
+                archive_outcome_detail="Cannot resolve host example.invalid.",
+            )
+        )
+        assert "CAPTURE FAILED" in out
+        assert "Cannot resolve host example.invalid." in out
+        assert "NOT archived" in out
+
+    def test_a_refused_submission_says_so_and_says_why(self):
+        out = self._text(
+            self._cit(
+                archived=False,
+                submitted=False,
+                archive_outcome="submit_failed",
+                archive_outcome_detail="429 Too Many Requests",
+            )
+        )
+        assert "SUBMISSION FAILED" in out
+        assert "429 Too Many Requests" in out
+        assert "NOT archived" in out
+
+    def test_a_repeated_capture_failure_is_visible_as_a_pattern(self):
+        """One report at a time a URL that never archives looks like bad luck.
+        Naming the earlier failure is what makes it look like a page archive.org
+        cannot capture."""
+        out = self._text(
+            self._cit(
+                archived=False,
+                submitted=True,
+                archive_outcome="pending",
+                prior_capture_failure={
+                    "job_id": "spn2-old",
+                    "reason": "error:soft-time-limit-exceeded",
+                    "run_number": 7,
+                },
+            )
+        )
+        assert "a previous capture of this URL failed (run 7)" in out
+        assert "error:soft-time-limit-exceeded" in out
+
+    def test_a_successful_capture_does_not_dredge_up_the_old_failure(self):
+        """It archived. The history is no longer the reader's problem."""
+        out = self._text(
+            self._cit(
+                archived=True,
+                snapshot_url=self.SNAP,
+                archive_outcome="archived",
+                prior_capture_failure={"reason": "error:soft-time-limit-exceeded"},
+            )
+        )
+        assert "previous capture" not in out
+
+
+def test_the_archive_outcome_vocabulary_matches_the_adapters():
+    """``report_markdown`` duplicates the outcome constants instead of importing
+    them, to stay a dependency-free renderer over a plain dict — same reason as
+    ``_SEO_FIELD_ORDER``. This is the test that keeps the two in step; without
+    it a renamed outcome silently stops matching and every citation falls
+    through to a wrong branch.
+    """
+    from ci_article_review.adapters.citation import wayback as wb
+
+    renderer = {
+        report_markdown._ARCHIVE_SUBMITTED,
+        report_markdown._ARCHIVE_ARCHIVED,
+        report_markdown._ARCHIVE_PENDING,
+        report_markdown._ARCHIVE_CAPTURE_FAILED,
+        report_markdown._ARCHIVE_SUBMIT_FAILED,
+        report_markdown._ARCHIVE_NOT_ATTEMPTED,
+    }
+    assert renderer == set(wb.ARCHIVE_OUTCOME_LABELS)
+    assert report_markdown._ARCHIVE_ARCHIVED == wb.ARCHIVE_ARCHIVED
+    assert report_markdown._ARCHIVE_PENDING == wb.ARCHIVE_PENDING
+    assert report_markdown._ARCHIVE_SUBMITTED == wb.ARCHIVE_SUBMITTED
+    assert report_markdown._ARCHIVE_CAPTURE_FAILED == wb.ARCHIVE_CAPTURE_FAILED
+    assert report_markdown._ARCHIVE_SUBMIT_FAILED == wb.ARCHIVE_SUBMIT_FAILED
+    assert report_markdown._ARCHIVE_NOT_ATTEMPTED == wb.ARCHIVE_NOT_ATTEMPTED
+
+
+class TestArchiveMatchRendering:
+    SNAP = "https://web.archive.org/web/20260905123736/https://example.org/page"
+
+    def _cit(self, **over):
+        c = {
+            "claim": "A claim",
+            "url": "https://example.org/page",
+            "resolved": True,
+            "verification": "checksum",
+            "wayback": {"archived": True, "snapshot_url": self.SNAP},
+        }
+        c.update(over)
+        return c
+
+    def _text(self, c):
+        return "\n".join(report_markdown._render_archive_pair(c))
+
+    def test_a_verified_pairing_says_so(self):
+        out = self._text(self._cit(archive_match="identical"))
+        assert "Archive verified" in out
+        assert "safe to publish" in out
+        assert "Cite both" in out
+
+    def test_a_divergent_archive_is_stated_prominently(self):
+        out = self._text(
+            self._cit(
+                archive_match="differs",
+                archive_match_detail="the archived text does not match.",
+            )
+        )
+        assert "Archive does NOT match the live page" in out
+
+    def test_an_unchecked_archive_claims_nothing(self):
+        out = self._text(
+            self._cit(
+                archive_match="unchecked",
+                archive_match_detail="the snapshot could not be read this run.",
+            )
+        )
+        assert "not verified" in out
+        assert "may or may not contain the document" in out
+
+    def test_an_ordinary_citation_gains_no_line(self):
+        assert "Archive verified" not in self._text(self._cit())
+
+    def test_a_snapshot_of_an_error_page_is_called_out(self):
+        """A snapshot exists and preserves the refusal, not the document."""
+        out = self._text(
+            self._cit(
+                wayback={
+                    "archived": True,
+                    "snapshot_url": self.SNAP,
+                    "snapshot_status": "403",
+                    "snapshot_is_error_capture": True,
+                }
+            )
+        )
+        assert "capture of an HTTP 403 response" in out
+        assert "the source is not" in out
+
+    def test_the_match_vocabulary_matches_the_resolver(self):
+        from ci_article_review.adapters.citation import resolver as r
+
+        assert report_markdown._MATCH_IDENTICAL == r.ARCHIVE_MATCH_IDENTICAL
+        assert report_markdown._MATCH_DIFFERS == r.ARCHIVE_MATCH_DIFFERS
+        assert report_markdown._MATCH_UNCHECKED == r.ARCHIVE_MATCH_UNCHECKED
+
+
+class TestReferenceList:
+    """The pairing existed per citation but only inside the diagnostic entries,
+    spread over five buckets. Getting a reference list out of the report meant
+    reading all of it and transcribing by hand."""
+
+    SNAP = "https://web.archive.org/web/20260905123736/https://example.org/a"
+
+    def _cit(self, url="https://example.org/a", archived=True, **over):
+        c = {
+            "claim": "A claim",
+            "url": url,
+            "resolved": True,
+            "verification": "checksum",
+            "wayback": (
+                {"archived": True, "snapshot_url": self.SNAP}
+                if archived
+                else {"archived": False}
+            ),
+        }
+        c.update(over)
+        return c
+
+    def _text(self, *cits):
+        return "\n".join(report_markdown._render_reference_list(list(cits)))
+
+    def test_both_addresses_appear_together(self):
+        out = self._text(self._cit())
+        assert "1. https://example.org/a" in out
+        assert f"archived: {self.SNAP}" in out
+
+    def test_a_source_backing_several_claims_is_listed_once(self):
+        """Deduplicated by address — an article's reference list names a source
+        once however many claims lean on it."""
+        out = self._text(self._cit(), self._cit(), self._cit())
+        # Count numbered entries, not the bare address: the snapshot URL
+        # ends with the live address, so a substring sees it twice.
+        assert "(1 source(s))" in out
+        assert out.count("1. https://example.org/a") == 1
+        assert "2. " not in out
+
+    def test_order_is_first_citation_order(self):
+        out = self._text(
+            self._cit(url="https://example.org/first"),
+            self._cit(url="https://example.org/second"),
+        )
+        assert out.index("first") < out.index("second")
+        assert "1. https://example.org/first" in out
+        assert "2. https://example.org/second" in out
+
+    def test_the_resolved_address_is_published_not_the_redirector(self):
+        """A grounded model cites through an opaque redirect; the article should
+        carry the page's real address."""
+        out = self._text(
+            self._cit(
+                url="https://redirector.example/grounding-api-redirect/AUZIYabc",
+                final_url="https://www.jalopnik.com/honda-clocks-stuck",
+            )
+        )
+        assert "jalopnik.com" in out
+        assert "grounding-api-redirect" not in out
+
+    def test_sources_with_no_archive_are_listed_not_dropped(self):
+        """Silence would read as "all of them are fine". The author needs to
+        know which references cannot carry an archive link."""
+        out = self._text(self._cit(url="https://example.org/b", archived=False))
+        assert "No archive copy (1)" in out
+        assert "https://example.org/b" in out
+        assert "no snapshot of this URL" in out
+
+    def test_a_divergent_archive_is_flagged_in_the_list(self):
+        out = self._text(self._cit(archive_match="differs"))
+        assert "archive does not match the live page" in out
+
+    def test_an_unverified_archive_is_flagged_in_the_list(self):
+        out = self._text(self._cit(archive_match="unchecked"))
+        assert "not verified against the live page" in out
+
+    def test_a_snapshot_of_an_error_page_is_not_offered_for_publication(self):
+        out = self._text(
+            self._cit(
+                wayback={
+                    "archived": True,
+                    "snapshot_url": self.SNAP,
+                    "snapshot_status": "403",
+                    "snapshot_is_error_capture": True,
+                }
+            )
+        )
+        assert "do not publish this pairing" in out
+        assert "HTTP 403" in out
+
+    def test_a_stale_snapshot_says_so(self):
+        out = self._text(
+            self._cit(
+                wayback={
+                    "archived": True,
+                    "snapshot_url": self.SNAP,
+                    "snapshot_stale": True,
+                }
+            )
+        )
+        assert "stale" in out
+
+    def test_a_verified_pairing_carries_no_warning(self):
+        out = self._text(self._cit(archive_match="identical"))
+        assert "**" not in out.split("archived:")[1]
+
+    def test_a_citation_with_no_url_is_omitted(self):
+        assert report_markdown._render_reference_list([{"claim": "c"}]) == []
+
+    def test_the_list_appears_in_section_9(self):
+        out = "\n".join(report_markdown._render_section_9([self._cit()]))
+        assert "Reference list — live and archived addresses" in out
+        assert f"archived: {self.SNAP}" in out
+
+    def test_the_reason_a_source_is_unarchived_is_specific(self):
+        pending = self._cit(url="https://example.org/p", archived=False)
+        pending["wayback"]["archive_outcome"] = "pending"
+        failed = self._cit(url="https://example.org/f", archived=False)
+        failed["wayback"]["archive_outcome"] = "capture_failed"
+        out = self._text(pending, failed)
+        assert "no snapshot yet" in out
+        assert "tried to capture it and could not" in out
+
+
+class TestHtmlReferenceBlock:
+    """The markdown list pastes into a markdown-authored article; a WordPress
+    block editor wants anchors."""
+
+    SNAP = "https://web.archive.org/web/20260905123736/https://example.org/a"
+
+    def _cit(self, url="https://example.org/a", archived=True, **over):
+        c = {
+            "claim": "A claim",
+            "url": url,
+            "resolved": True,
+            "verification": "checksum",
+            "wayback": (
+                {"archived": True, "snapshot_url": self.SNAP}
+                if archived
+                else {"archived": False}
+            ),
+        }
+        c.update(over)
+        return c
+
+    def _text(self, *cits):
+        return "\n".join(report_markdown._render_reference_list(list(cits)))
+
+    def test_both_addresses_become_anchors(self):
+        out = self._text(self._cit(archive_match="identical"))
+        assert '<a href="https://example.org/a">https://example.org/a</a>' in out
+        assert f'(<a href="{self.SNAP}">archived</a>)' in out
+
+    def test_it_is_a_fenced_html_block(self):
+        out = self._text(self._cit(archive_match="identical"))
+        assert "```html" in out
+        assert "<ol>" in out and "</ol>" in out
+
+    def test_a_source_with_no_archive_is_still_listed_as_a_link(self):
+        """It is still a reference the article cites; dropping it from the block
+        the author pastes would quietly lose it."""
+        out = self._text(self._cit(url="https://example.org/b", archived=False))
+        assert (
+            '<li><a href="https://example.org/b">https://example.org/b</a></li>' in out
+        )
+
+    def test_an_unconfirmed_pairing_is_not_offered_for_pasting(self):
+        """A copy-paste block is acted on without re-reading the reasoning above
+        it, so a questionable pairing must not be in it."""
+        out = self._text(self._cit(archive_match="differs"))
+        assert "archived</a>" not in out
+        assert "not confirmed to match the page" in out
+
+    def test_an_unverified_pairing_is_also_withheld(self):
+        out = self._text(self._cit(archive_match="unchecked"))
+        assert "archived</a>" not in out
+
+    def test_a_snapshot_of_an_error_page_is_never_pasted(self):
+        out = self._text(
+            self._cit(
+                wayback={
+                    "archived": True,
+                    "snapshot_url": self.SNAP,
+                    "snapshot_status": "404",
+                    "snapshot_is_error_capture": True,
+                }
+            )
+        )
+        assert "archived</a>" not in out
+
+    def test_the_count_of_archive_links_is_stated(self):
+        out = self._text(
+            self._cit(url="https://example.org/a", archive_match="identical"),
+            self._cit(url="https://example.org/b", archived=False),
+        )
+        assert "1 of 2 carry an archive link." in out
+
+    def test_ampersands_in_urls_are_escaped(self):
+        """A raw & in an href silently truncates the link at the first
+        parameter — a broken citation that looks fine in the editor."""
+        out = self._text(self._cit(url="https://example.org/s?a=1&b=2", archived=False))
+        assert "a=1&amp;b=2" in out
+        assert 'href="https://example.org/s?a=1&b=2"' not in out
+
+    def _html_only(self, *cits):
+        """Just the fenced HTML block.
+
+        The markdown list above it prints URLs as plain text, as every other
+        URL in this module always has; escaping there is a separate, module-wide
+        question. What must hold here is that the anchors we generate cannot be
+        broken out of.
+        """
+        out = self._text(*cits)
+        return out.split("```html", 1)[1].split("```", 1)[0]
+
+    def test_angle_brackets_and_quotes_cannot_break_out_of_the_attribute(self):
+        block = self._html_only(
+            self._cit(url='https://example.org/"><script>x</script>', archived=False)
+        )
+        assert "<script>" not in block
+        assert "&quot;&gt;&lt;script&gt;" in block
+
+
+class TestReaskArchiveIsCarriedThrough:
+    """A proposed replacement source goes through the whole of
+    ``resolve_citations``, so the run has already asked archive.org about it and,
+    where it was missing, spent a real capture. Showing the URL without the
+    archive copy threw that away."""
+
+    SNAP = "https://web.archive.org/web/20260905123736/https://example.org/alt"
+
+    def _cit(self, **check):
+        base = {
+            "verification": "checksum",
+            "resolved": True,
+            "url": "https://example.org/alt",
+        }
+        base.update(check)
+        return {
+            "claim": "A claim",
+            "url": "https://example.org/orig",
+            "resolved": True,
+            "relevance_verdict": "contradicts",
+            "reask": {
+                "action": "different_source",
+                "source_url": "https://example.org/alt",
+                "source_check": base,
+            },
+        }
+
+    def _text(self, **check):
+        return "\n".join(report_markdown._render_reask(self._cit(**check)["reask"]))
+
+    def test_the_archive_address_is_offered_beside_the_proposal(self):
+        out = self._text(snapshot_url=self.SNAP, archive_match="identical")
+        assert f"Archive of that source: {self.SNAP}" in out
+        assert "verified identical to the live page" in out
+
+    def test_a_divergent_archive_is_flagged(self):
+        out = self._text(snapshot_url=self.SNAP, archive_match="differs")
+        assert "does not match the live page" in out
+
+    def test_an_unverified_archive_is_offered_without_a_claim(self):
+        out = self._text(snapshot_url=self.SNAP, archive_match="unchecked")
+        assert f"Archive of that source: {self.SNAP}" in out
+        assert "verified identical" not in out
+        assert "does not match" not in out
+
+    def test_a_snapshot_of_an_error_page_is_not_offered(self):
+        out = self._text(snapshot_url=self.SNAP, snapshot_is_error_capture=True)
+        assert "Archive of that source" not in out
+
+    def test_a_proposal_with_no_archive_gains_no_line(self):
+        assert "Archive of that source" not in self._text()
+
+
+class TestKnockOnEffectsReachTheReport:
+    """`degradations` had a producer and a console reader, and no report reader.
+
+    The entry exists to link two facts that are unremarkable apart —
+    "perplexity:fact_check failed" and "9 claims verified" — and it was only
+    ever said in the terminal, which scrolls. The file the author keeps and
+    pastes into a chat model never carried it.
+    """
+
+    ENTRY = {
+        "section": "SECTION 2: Factual Verification, SECTION 9: Citations",
+        "caused_by": ["perplexity:fact_check", "mistral:fact_check"],
+        "detail": (
+            "Sections 2 and 9 are working from an incomplete claim list: 2 of 5 "
+            "fact-check passes failed. Counts in both sections are lower than a "
+            "clean run would produce."
+        ),
+    }
+
+    def test_no_block_when_nothing_degraded(self):
+        assert "Knock-on effects" not in render_report_markdown(_base_report())
+
+    def test_the_detail_reaches_the_report(self):
+        md = render_report_markdown(_base_report(degradations=[self.ENTRY]))
+        assert "## ⚠ Knock-on effects of failed passes (1)" in md
+        assert "working from an incomplete claim list" in md
+
+    def test_it_names_the_sections_and_the_passes_that_caused_it(self):
+        md = render_report_markdown(_base_report(degradations=[self.ENTRY]))
+        assert "SECTION 2: Factual Verification, SECTION 9: Citations" in md
+        assert "perplexity:fact_check, mistral:fact_check" in md
+
+    def test_it_sits_with_the_failure_blocks_not_after_the_findings(self):
+        """The link is only useful next to the failure it explains."""
+        md = render_report_markdown(
+            _base_report(
+                degradations=[self.ENTRY],
+                model_failures=["perplexity:fact_check"],
+                model_failure_details=[
+                    {
+                        "pass": "perplexity:fact_check",
+                        "model": "sonar",
+                        "domain": "fact_check",
+                        "section": "SECTION 2: Factual Verification",
+                        "error": "timeout",
+                        "elapsed_seconds": 90.0,
+                    }
+                ],
+            )
+        )
+        assert md.index("Failed model passes") < md.index("Knock-on effects")
+        assert md.index("Knock-on effects") < md.index("## SECTION 1")
+
+    def test_an_older_entry_without_a_section_still_renders(self):
+        """Reports predate the key; a missing field must not fail a render."""
+        md = render_report_markdown(
+            _base_report(degradations=[{"detail": "Something was degraded."}])
+        )
+        assert "Something was degraded." in md
+        assert "Affected sections" in md
+
+    def test_every_entry_is_rendered_not_just_the_first(self):
+        md = render_report_markdown(
+            _base_report(
+                degradations=[
+                    self.ENTRY,
+                    {"section": "SECTION 3: Voice", "detail": "A second effect."},
+                ]
+            )
+        )
+        assert "(2)" in md
+        assert "A second effect." in md
+
+
+class TestMalformedEntriesInRemainingSectionsAreSkippedNotFatal:
+    """Sections 1, 3, 4, 5, 6, 7, 8 shared the same failure Section 2 and 9
+    hit: a findings list is meant to hold records, but a salvaged model
+    response can leave a bare string among them, and every one of these
+    renderers raised ``AttributeError: 'str' object has no attribute 'get'``
+    on the first one. Skipping it is the smaller loss; saying so — with a
+    count and a field name — is what keeps it from being a silent one.
+    """
+
+    # -- Section 1 (nested: entries, and each entry's own "flags" list) -----
+
+    def test_a_bare_string_among_consensus_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_1_consensus=[
+                    {"passage": "A survives.", "models": [], "flags": []},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_1_consensus` (1)" in md
+
+    def test_a_bare_string_among_a_flag_entrys_own_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_1_consensus=[
+                    {
+                        "passage": "A survives.",
+                        "models": [],
+                        "flags": [
+                            "salvaged",
+                            {"source_model": "openai", "domain": "argument_integrity"},
+                        ],
+                    }
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "openai:argument_integrity" in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_1_consensus[].flags` (1)" in md
+
+    def test_all_consensus_entries_malformed_reports_none_readable(self):
+        md = render_report_markdown(_base_report(section_1_consensus=["a", "b"]))
+        assert "No consensus flag entry in this run could be read." in md
+
+    # -- Sections 3-5 share _render_flags_section ----------------------------
+
+    def test_a_bare_string_among_voice_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_3_voice=[{"passage": "A survives.", "problem": "x"}, "salvaged"]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_3_voice` (1)" in md
+
+    def test_a_bare_string_among_argument_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_4_argument=[
+                    {"passage": "A survives.", "logical_problem": "x"},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "`section_4_argument` (1)" in md
+
+    def test_a_bare_string_among_completeness_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_5_completeness=[
+                    {"passage_reference": "A survives.", "what_is_missing": "x"},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_5_completeness` (1)" in md
+
+    def test_all_completeness_flags_malformed_reports_none_readable(self):
+        md = render_report_markdown(_base_report(section_5_completeness=["a"]))
+        assert "No flag entry in this run could be read." in md
+
+    # -- Section 6 (dict-shaped, not a list) ---------------------------------
+
+    def test_a_non_dict_value_in_single_source_red_team_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_6_red_team={
+                    "most_vulnerable_claim": "salvaged",
+                    "highest_audience_risk": {
+                        "passage": "Residents overwhelmingly support the plan.",
+                        "risk": "No polling data is cited.",
+                    },
+                }
+            )
+        )
+        assert "Residents overwhelmingly support the plan." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_6_red_team` (1)" in md
+
+    def test_a_non_dict_value_in_multi_source_red_team_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_6_red_team={
+                    "mistral": "salvaged",
+                    "openai": {
+                        "most_vulnerable_claim": {
+                            "passage": "openai finding",
+                            "attack_vector": "a",
+                        }
+                    },
+                }
+            )
+        )
+        assert "openai finding" in md
+        assert "1 malformed entry skipped" in md
+
+    def test_a_non_dict_item_within_a_multi_source_models_data_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_6_red_team={
+                    "mistral": {
+                        "most_vulnerable_claim": "salvaged",
+                        "highest_audience_risk": {
+                            "passage": "mistral survives.",
+                            "risk": "x",
+                        },
+                    }
+                }
+            )
+        )
+        assert "mistral survives." in md
+        assert "1 malformed entry skipped" in md
+
+    def test_red_team_that_salvaged_to_a_non_mapping_does_not_raise(self):
+        md = render_report_markdown(_base_report(section_6_red_team="salvaged"))
+        assert "this report cannot read" in md
+        assert "`section_6_red_team`" in md
+
+    # -- Section 7 ------------------------------------------------------------
+
+    def test_a_bare_string_among_low_confidence_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_7_low_confidence=[
+                    {"passage": "A survives.", "observation": "x"},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_7_low_confidence` (1)" in md
+
+    def test_all_low_confidence_flags_malformed_reports_none_readable(self):
+        md = render_report_markdown(_base_report(section_7_low_confidence=["a"]))
+        assert "No low-confidence entry in this run could be read." in md
+
+    # -- Section 8 ------------------------------------------------------------
+
+    def test_a_bare_string_among_additional_findings_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_8_additional=[
+                    {"passage": "A survives.", "category": "fact_check"},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_8_additional` (1)" in md
+
+    def test_all_additional_findings_malformed_reports_none_readable(self):
+        md = render_report_markdown(_base_report(section_8_additional=["a"]))
+        assert "No additional-findings entry in this run could be read." in md
+
+
+class TestMalformedFindingsAreSkippedNotFatal:
+    """A findings list is meant to hold records, but a salvaged model response
+    can leave a bare string among them. Both renderers used to raise
+    ``AttributeError: 'str' object has no attribute 'get'`` on the first one,
+    and ``history.save_run`` guards the markdown write against ``OSError``
+    only — so one unreadable entry cost the run its entire
+    ``run_N_*_review.md``. Skipping is the smaller loss; saying so is what
+    keeps it from being a silent one.
+    """
+
+    NOTE = "malformed"
+
+    # -- Section 2 ---------------------------------------------------------
+
+    def test_a_bare_string_among_fact_check_findings_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "confirmed": [{"claim": "The bridge opened in 1992."}, "salvaged"],
+                }
+            )
+        )
+        assert "The bridge opened in 1992." in md
+
+    def test_the_readable_findings_beside_it_still_render(self):
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "confirmed": ["salvaged", {"claim": "A survives."}],
+                    "contradicted": [{"claim": "B survives."}, "salvaged"],
+                }
+            )
+        )
+        assert "A survives." in md
+        assert "B survives." in md
+
+    def test_the_skipped_entries_are_counted_and_the_field_named(self):
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "confirmed": ["a"],
+                    "unverifiable": ["b", "c"],
+                }
+            )
+        )
+        assert "3 malformed entries skipped" in md
+        assert "`confirmed` (1)" in md
+        assert "`unverifiable` (2)" in md
+
+    def test_a_single_skipped_entry_is_described_in_the_singular(self):
+        md = render_report_markdown(
+            _base_report(section_2_fact_check={"confirmed": ["a"]})
+        )
+        assert "1 malformed entry skipped" in md
+        assert "That finding arrived" in md
+
+    def test_the_note_points_at_the_report_json_that_still_holds_the_entry(self):
+        md = render_report_markdown(
+            _base_report(section_2_fact_check={"confirmed": ["a"]})
+        )
+        assert "`_report.json`" in md
+
+    def test_a_bare_string_among_additional_observations_is_handled_too(self):
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "additional_observations": [
+                        "salvaged",
+                        {"passage": "An observation that survives."},
+                    ]
+                }
+            )
+        )
+        assert "An observation that survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`additional_observations` (1)" in md
+
+    def test_the_note_sits_above_the_counts_it_qualifies(self):
+        """Evidence coverage counts the verdicts that survived. A reader who
+        meets that number first has already read a total that is short.
+        """
+        md = render_report_markdown(
+            _base_report(
+                section_2_fact_check={
+                    "confirmed": ["a", {"claim": "x", "supporting_quote": "q"}]
+                }
+            )
+        )
+        assert md.index(self.NOTE) < md.index("verdict(s) arrived with a verbatim")
+
+    def test_a_clean_fact_check_gains_no_note(self):
+        md = render_report_markdown(
+            _base_report(section_2_fact_check={"confirmed": [{"claim": "a"}]})
+        )
+        assert self.NOTE not in md
+
+    def test_a_fact_check_that_is_not_a_mapping_does_not_raise(self):
+        """The same salvage failure one level up. "_No fact-check results._"
+        would describe a pass that never ran, which is not what happened.
+        """
+        md = render_report_markdown(_base_report(section_2_fact_check="salvaged"))
+        assert "cannot read" in md
+        assert "_No fact-check results._" not in md
+
+    # -- Section 9 ---------------------------------------------------------
+
+    def _citation(self, claim):
+        return {
+            "claim": claim,
+            "resolved": True,
+            "url": "https://example.gov/a",
+            "verification": "checksum",
+        }
+
+    def test_a_bare_string_among_citations_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[self._citation("A cited claim."), "salvaged"]
+            )
+        )
+        assert "A cited claim." in md
+
+    def test_skipped_citations_are_counted_and_the_field_named(self):
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[self._citation("A cited claim."), "salvaged"]
+            )
+        )
+        assert "1 malformed entry skipped" in md
+        assert "`section_9_citations` (1)" in md
+
+    def test_the_totals_describe_only_what_could_be_read(self):
+        """The percentage, the table and the tier headings all derive from the
+        same list, so the drop has to happen once, before any of them.
+        """
+        md = render_report_markdown(
+            _base_report(
+                section_9_citations=[self._citation("A cited claim."), "salvaged"]
+            )
+        )
+        assert "1 of 1 claim(s) (100%) were checked" in md
+
+    def test_every_citation_being_unreadable_is_not_reported_as_none_attempted(self):
+        """Resolution ran; its output was unreadable. Saying "not attempted"
+        would be a false claim about the run, and the emptied list would divide
+        by zero on the way to the percentage.
+        """
+        md = render_report_markdown(_base_report(section_9_citations=["a", "b"]))
+        assert "2 malformed entries skipped" in md
+        assert "No citation entry in this run could be read" in md
+        assert "_No citation resolution attempted._" not in md
+
+    def test_a_genuinely_empty_citation_list_still_says_none_attempted(self):
+        md = render_report_markdown(_base_report(section_9_citations=[]))
+        assert "_No citation resolution attempted._" in md
+        assert self.NOTE not in md
+
+    def test_a_clean_citation_list_gains_no_note(self):
+        md = render_report_markdown(
+            _base_report(section_9_citations=[self._citation("A cited claim.")])
+        )
+        assert self.NOTE not in md
+
+    # -- The loss this prevents -------------------------------------------
+
+    def test_the_run_still_gets_its_markdown_review_file(self, tmp_path):
+        """The regression that motivates all of the above. ``save_run`` catches
+        ``OSError`` around the markdown write and nothing else, so an
+        ``AttributeError`` from the renderer propagated out and the run lost
+        ``run_N_*_review.md`` entirely.
+        """
+        from pathlib import Path
+
+        from ci_article_review import history as hist
+
+        report = _base_report(
+            section_2_fact_check={"confirmed": ["salvaged", {"claim": "Survives."}]},
+            section_9_citations=["salvaged", self._citation("Also survives.")],
+        )
+        paths = hist.save_run(str(tmp_path), "Test Article", 1, report, [])
+
+        assert paths["markdown_path"] is not None
+        written = Path(paths["markdown_path"]).read_text(encoding="utf-8")
+        assert "Survives." in written
+        assert "Also survives." in written
+        assert "malformed" in written

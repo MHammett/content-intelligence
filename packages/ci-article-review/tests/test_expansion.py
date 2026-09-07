@@ -222,13 +222,37 @@ class TestUnionNotConsensus:
         out = _build_expansion(results, {})
         assert [t["topic"] for t in out["topics"]] == ["Sole", "Shared"]
 
-    def test_the_higher_weighted_model_orders_the_list(self):
+    def test_ordering_is_stable_rather_than_weighted(self):
+        """Section 10 carries no weights of its own any more.
+
+        It had some — perplexity 1.3, gemini 1.2 — on the reasoning that a model
+        which cannot fetch is guessing at URLs. The 2026-09-03 audit deleted the
+        static grounding bonus for precisely that reasoning: it guessed which
+        models ground rather than observing whether they did, and was wrong in
+        both directions. Weights here only ever ordered the list, so ordering
+        now falls back to encounter order and nothing is silently ranked by a
+        number nobody measured.
+        """
         results = {
             ("claude", "expansion"): _ok({"topics": [_topic("From claude")]}),
             ("perplexity", "expansion"): _ok({"topics": [_topic("From perplexity")]}),
         }
         out = _build_expansion(results, {})
-        # perplexity carries the grounding weight for this domain.
+        assert {t["topic"] for t in out["topics"]} == {
+            "From claude",
+            "From perplexity",
+        }
+        assert len(out["models"]) == 2
+
+    def test_a_configured_weight_is_still_honoured(self):
+        """Dropping the defaults did not remove the mechanism — ensemble.weights
+        in user.yaml still orders the section for anyone who wants it to."""
+        results = {
+            ("claude", "expansion"): _ok({"topics": [_topic("From claude")]}),
+            ("perplexity", "expansion"): _ok({"topics": [_topic("From perplexity")]}),
+        }
+        cfg = {"weights": {"perplexity": {"expansion": 2.0}}}
+        out = _build_expansion(results, cfg)
         assert out["topics"][0]["topic"] == "From perplexity"
         assert out["models"][0] == "perplexity"
 

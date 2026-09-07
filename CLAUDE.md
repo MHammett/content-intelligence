@@ -27,3 +27,25 @@ gh pr view <n> --json mergeable,mergeStateStatus,statusCheckRollup
 ```
 
 This repo sees frequent concurrent PRs — a branch that opened cleanly can go `CONFLICTING` by the time you come back to it if other PRs landed on `main` in the meantime.
+
+## Verifying a change without spending `maximum` money
+
+`configs/user.yaml` sets `cost_preset: maximum`, so a bare `ci-review` makes 30 calls at **$2.50–5.00**. That is the right preset for reviewing a real article and the wrong one for checking that your code works. With several sessions active at once, each verifying once, that default is the single largest avoidable cost in this repo.
+
+**Most changes need no model calls at all.** `--replay` re-runs everything downstream of ensemble dispatch — re-keying, consolidation, citations, the report — over a previously captured ensemble, and makes zero API calls. Every run writes its own capture to `pipeline_history/<key>/run_N_..._results.json`, so one live run per worktree buys unlimited free re-verification:
+
+```bash
+uv run ci-review --draft packages/ci-article-review/src/ci_article_review/handoff_templates/examples/draft_submission.short-example.full-coverage.md --publication mikehammett --cost-preset wide
+```
+
+then, for every iteration after that:
+
+```bash
+uv run ci-review --draft packages/ci-article-review/src/ci_article_review/handoff_templates/examples/draft_submission.short-example.full-coverage.md --publication mikehammett --replay pipeline_history/short-example-smoke-test/run_1_<ts>_results.json --offline
+```
+
+`--offline` additionally skips link validation, Wayback, citation resolution and the two SEO model calls. Note that a replay still prints `Estimated cost:` from the *captured* run's call log — it did not spend that; the "No model calls made" line above it is the true one.
+
+Replay is a real verification for anything in consolidation, scoring, the report, citations or history. It is **not** sufficient for changes to assignment, dispatch, retry, recovery or substitution — those decide which calls get made, and a replay makes none. Verify those live, at `--cost-preset wide` (12 calls, ~$0.12), not at `maximum`.
+
+Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset on every axis at 55% of the cost, so `wide` is a sound working default and not a degraded one. Nothing above `wide` has been measured — see `configs/presets.yaml` for what is and is not evidenced.

@@ -51,6 +51,10 @@ UNCERTAIN SECTIONS
 - [24d] Meta nuclear RFP: Reported by multiple outlets but I do not have a direct Meta primary source URL. The citation relies on Reuters and Bloomberg coverage.
 - The Marinoni et al. arXiv preprint [14b]: Not peer-reviewed. I characterized it accurately as a preprint. If it completes peer review with findings intact before publication, the tier label and characterization may need updating.
 
+OUT OF SCOPE FOR FACT-CHECK
+- The residential lot water intensity figures are my own calculations from public records — the arithmetic is in the citation note, and there is no outside document that states the result — internal_arithmetic
+- My characterisation of what the Yorkville planning commission was weighing is my reading of the meeting, not a published finding — author_hypothesis
+
 KNOWN GAPS
 - No direct comparison exists in peer-reviewed literature of data center environmental impacts versus comparably sized warehouse or manufacturing facilities on matched parcels. The article notes this explicitly in "What Nobody Knows."
 - Per-prompt water consumption figures are not in this article because no peer-reviewed study has measured them consistently across a representative sample. I chose to exclude the numbers rather than cite extrapolations presented as measured data.

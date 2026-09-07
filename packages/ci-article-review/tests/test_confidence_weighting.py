@@ -19,12 +19,18 @@ from ci_article_review import consolidation
 from ci_article_review.adapters.cms import wordpress
 
 
-def _fact_check_result(confidence):
-    """Two models flagging the same passage at the same stated confidence."""
+def _fact_check_result(confidence, grounded=False):
+    """Two models flagging the same passage at the same stated confidence.
+
+    ``grounded`` mirrors what the provider reported. The fact-check grounding
+    bonus is applied from that rather than from the model's name, so a fixture
+    that does not set it gets no bonus — which is the point.
+    """
 
     def one(model):
         return {
             "failed": False,
+            "grounding_available": grounded,
             "data": {
                 "outdated": [
                     {
@@ -65,9 +71,11 @@ class TestConfidenceWeightingWhenEnabled:
         high, _ = consolidation._find_consensus(_fact_check_result("high"), [], cfg)
         low, _ = consolidation._find_consensus(_fact_check_result("low"), [], cfg)
         assert low[0]["weight_sum"] < high[0]["weight_sum"]
-        # gemini 1.5 + openai 1.0, halved by the "low" multiplier.
-        assert high[0]["weight_sum"] == 2.5
-        assert low[0]["weight_sum"] == 1.25
+        # Neither model reported grounding, so neither earns the fact-check
+        # bonus: gemini 1.0 + openai 1.0.
+        assert high[0]["weight_sum"] == 2.0
+        # The same pair halved by the "low" multiplier.
+        assert low[0]["weight_sum"] == 1.0
 
     def test_two_hedged_models_can_drop_below_the_threshold(self):
         """The behavioural point: Section 1 stops implying certainty nobody claimed."""
@@ -270,3 +278,48 @@ class TestWordPressRequiresHttps:
                 {},
             )
         assert result["success"] is True
+
+
+class TestGroundingBonusFollowsTheResult:
+    """The fact-check bonus is earned by grounding, not by being a given model.
+
+    It was a flat 1.5 baked into the weights table for gemini and perplexity —
+    a guess about which models search, standing in for whether they did. On
+    2026-09-03 the guess was wrong both ways at once: gemini took the bonus
+    while reporting `grounding_available: False` (it has no `web_search`
+    configured), and openai ran a real search on the flat 1.0.
+    """
+
+    def test_an_ungrounded_call_gets_no_bonus(self):
+        consensus, _ = consolidation._find_consensus(
+            _fact_check_result("high", grounded=False), [], {}
+        )
+        assert consensus[0]["weight_sum"] == 2.0
+
+    def test_a_grounded_call_earns_it(self):
+        consensus, _ = consolidation._find_consensus(
+            _fact_check_result("high", grounded=True), [], {}
+        )
+        # 1.0 x 1.5, twice.
+        assert consensus[0]["weight_sum"] == 3.0
+
+    def test_the_bonus_is_configurable(self):
+        consensus, _ = consolidation._find_consensus(
+            _fact_check_result("high", grounded=True), [], {"grounding_bonus": 2.0}
+        )
+        assert consensus[0]["weight_sum"] == 4.0
+
+    def test_it_multiplies_a_user_configured_weight_rather_than_replacing_it(self):
+        cfg = {"weights": {"gemini": {"fact_check": 2.0}}}
+        consensus, _ = consolidation._find_consensus(
+            _fact_check_result("high", grounded=True), [], cfg
+        )
+        # gemini 2.0 x 1.5, plus openai 1.0 x 1.5.
+        assert consensus[0]["weight_sum"] == 4.5
+
+    def test_grounding_does_not_touch_other_domains(self):
+        """The bonus is about verifiable sourcing, which is a fact-check
+        property. A grounded voice_style call is not more right about prose."""
+        assert (
+            consolidation._get_weight("gemini", "voice_style", {}, grounded=True) == 1.0
+        )

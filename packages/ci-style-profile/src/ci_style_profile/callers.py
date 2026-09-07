@@ -6,8 +6,10 @@ per-provider read-gap timeouts, and truncated-JSON salvage.
 
 What stays here is the *policy* around those calls: which models run
 (Perplexity is excluded by default — web grounding adds noise for corpus
-analysis), how they fan out (ThreadPoolExecutor), the wall-clock backstop, and
-the cumulative API-call log used for cost reporting.
+analysis), how they fan out (:func:`ci_core.concurrency.run_all_bounded` —
+daemon threads, never a ``ThreadPoolExecutor``; see that module's docstring),
+the wall-clock backstop, and the cumulative API-call log used for cost
+reporting.
 
 Calls go through :func:`ci_core.llm.call_text` rather than
 :func:`ci_core.llm.call_provider`: the shared layer parses its response as JSON
@@ -23,9 +25,7 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from ci_core.concurrency import run_with_timeout
+from ci_core.concurrency import run_all_bounded
 from ci_core.config_helpers import normalize_model_configs
 from ci_core.llm import timeout_model
 from ci_core.llm import call_text
@@ -125,7 +125,18 @@ def call_all(
     exclude_perplexity: bool = True,
     pass_name: str = "",
 ) -> dict[str, dict]:
-    """Call each model in parallel (ThreadPoolExecutor).
+    """Call each model in parallel, bounded by ``max_parallel``.
+
+    Fans out on :func:`ci_core.concurrency.run_all_bounded` — one daemon
+    thread per model, semaphore-bounded — rather than a
+    ``ThreadPoolExecutor``. See :mod:`ci_core.concurrency` for why: a pool
+    worker still inside a call at interpreter exit is joined by
+    ``concurrent.futures``' atexit hook with a bare, untimed ``t.join()``,
+    which is how finished ``ci-review`` processes were found alive two days
+    later. This module's previous form nested ``run_with_timeout`` *inside*
+    pool workers, which looks bounded but is not: a model missing from
+    ``backstops`` got a None budget, and ``run_with_timeout(fn, None)``
+    waits forever — reintroducing the exact hang inside the pool.
 
     Args:
         system_prompt: System prompt string.
@@ -166,8 +177,6 @@ def call_all(
         )
         return {}
 
-    workers = len(active) if max_parallel <= 0 else max_parallel
-
     # Wall-clock backstop per model, sized from prompt length x model x effort.
     # Under streaming the socket timeout is only the inter-token read gap, so a
     # model that dribbles out tokens indefinitely would otherwise never stop.
@@ -177,59 +186,74 @@ def call_all(
         _TASK_CEILING_SECONDS,
     )
 
-    results: dict[str, dict] = {}
+    def _budget(name: str) -> float:
+        """The wall-clock budget for one model, never None.
 
-    def _task(name: str, cfg: dict) -> tuple[str, dict]:
-        """Run one call under its wall-clock backstop.
+        ``compute_all`` skips a model whose ``enabled`` is falsy-but-not-False,
+        while the filter above keeps it — ``enabled:`` written with no value at
+        all parses as None in YAML, which is exactly that shape. So ``backstops``
+        can genuinely lack an entry for a model we are about to call.
 
-        Same shape as the review pipeline's per-call backstop
-        (``ci_article_review.pipeline._run_reviews_in_parallel``), and the same
-        shared helper (:func:`ci_core.concurrency.run_with_timeout`): the budget
-        applies to this call alone rather than to the position of its future in
-        a completion queue, and a timed-out call is abandoned rather than
-        killed. See :mod:`ci_core.concurrency` for why that abandonment has to
-        happen on a daemon thread.
+        Left as None that model would run unbounded: the old code passed the
+        None straight to ``run_with_timeout``, whose documented contract for a
+        None timeout is to wait for the call, inside a pool worker that
+        ``concurrent.futures`` then joins untimed at exit. A one-character
+        config slip was enough to hang the process for as long as the provider
+        kept the socket open. Fall back to the task ceiling and say so, so the
+        config mistake surfaces as a warning instead of a silent hang.
         """
         budget = backstops.get(name)
-        try:
-            return name, run_with_timeout(
-                lambda: call_one(
-                    name,
-                    cfg,
-                    api_keys,
-                    system_prompt,
-                    user_prompt,
-                    pass_name=pass_name,
-                ),
-                budget,
+        if budget is None:
+            log.warning(
+                "call_all: %s has no computed backstop; check its 'enabled' "
+                "value in user.yaml. Falling back to the %ss task ceiling.",
+                name,
+                _TASK_CEILING_SECONDS,
             )
-        except TimeoutError:
+            return float(_TASK_CEILING_SECONDS)
+        return budget
+
+    budgets = {name: _budget(name) for name in active}
+
+    def _job(name: str, cfg: dict):
+        return lambda: call_one(
+            name,
+            cfg,
+            api_keys,
+            system_prompt,
+            user_prompt,
+            pass_name=pass_name,
+        )
+
+    jobs = [(name, _job(name, cfg), budgets[name]) for name, cfg in active.items()]
+
+    results: dict[str, dict] = {}
+    for name, (value, error) in run_all_bounded(
+        jobs, max_parallel=max_parallel
+    ).items():
+        if error is None:
+            results[name] = value
+            continue
+        if isinstance(error, TimeoutError):
+            budget = budgets[name]
             log.error("call_all: %s exceeded its %ss wall-clock backstop", name, budget)
-            return name, {
+            results[name] = {
                 "failed": True,
                 "error": f"Timed out after {budget}s (wall-clock backstop)",
-                "model": cfg.get("model", name),
+                "model": active[name].get("model", name),
                 "tokens": {},
                 # The call was cut off, so the true elapsed time is unknown —
                 # record the budget as a lower bound rather than 0.
                 "elapsed": float(budget or 0.0),
             }
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_task, name, cfg): name for name, cfg in active.items()}
-        for fut in as_completed(futures):
-            name = futures[fut]
-            try:
-                _, result = fut.result()
-                results[name] = result
-            except Exception as e:
-                log.error("call_all: unexpected error from %s: %s", name, e)
-                results[name] = {
-                    "failed": True,
-                    "error": str(e),
-                    "tokens": {},
-                    "elapsed": 0.0,
-                }
+        else:
+            log.error("call_all: unexpected error from %s: %s", name, error)
+            results[name] = {
+                "failed": True,
+                "error": str(error),
+                "tokens": {},
+                "elapsed": 0.0,
+            }
 
     return results
 

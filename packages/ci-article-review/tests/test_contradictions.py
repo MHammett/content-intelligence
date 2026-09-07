@@ -102,3 +102,76 @@ class TestFindContradictions:
         c = contradictions[0]
         assert set(c["confirmed_by"]) == {"gemini", "perplexity"}
         assert c["challenged_by"] == ["openai"]
+
+
+class TestUnverifiableIsAChallenge:
+    """One model confirming what another cannot verify is a disagreement.
+
+    Only ``outdated`` and ``contradicted`` counted, and those are the two
+    buckets this ensemble almost never fills: both were empty across all six
+    fact-check passes on 2026-09-03 while five claims were confirmed by one
+    model and marked unverifiable by another. The report said 0 contradictions.
+    Among the hidden five: "I have a family." — reported as *confirmed* by a
+    model that cannot possibly have checked it.
+    """
+
+    def _res(self, model, confirmed=None, unverifiable=None):
+        return (model, "fact_check"), {
+            "failed": False,
+            "data": {
+                "confirmed": confirmed or [],
+                "contradicted": [],
+                "outdated": [],
+                "unverifiable": unverifiable or [],
+            },
+        }
+
+    def test_confirmed_versus_unverifiable_is_reported(self):
+        results = dict(
+            [
+                self._res("openai", confirmed=[{"claim": "I have a family."}]),
+                self._res("mistral", unverifiable=[{"claim": "I have a family."}]),
+            ]
+        )
+        found = find_contradictions(results)
+        assert len(found) == 1
+        assert found[0]["challenge_type"] == "unverifiable"
+        assert found[0]["confirmed_by"] == ["openai"]
+        assert found[0]["challenged_by"] == ["mistral"]
+
+    def test_all_models_unverifiable_is_agreement_not_conflict(self):
+        results = dict(
+            [
+                self._res("openai", unverifiable=[{"claim": "I have a family."}]),
+                self._res("mistral", unverifiable=[{"claim": "I have a family."}]),
+            ]
+        )
+        assert find_contradictions(results) == []
+
+    def test_one_model_in_two_buckets_is_not_a_cross_model_conflict(self):
+        """A malformed response, not a disagreement between models."""
+        results = dict(
+            [
+                self._res(
+                    "openai",
+                    confirmed=[{"claim": "I have a family."}],
+                    unverifiable=[{"claim": "I have a family."}],
+                ),
+            ]
+        )
+        assert find_contradictions(results) == []
+
+    def test_the_same_claim_quoted_at_two_lengths_still_matches(self):
+        """Exact-string keying missed these entirely."""
+        short = "I have a day job running network infrastructure."
+        long = short + " I have a side job. I have a family."
+        results = dict(
+            [
+                self._res("openai", confirmed=[{"claim": short}]),
+                self._res("claude", unverifiable=[{"claim": long}]),
+            ]
+        )
+        found = find_contradictions(results)
+        assert len(found) == 1
+        assert found[0]["confirmed_by"] == ["openai"]
+        assert found[0]["challenged_by"] == ["claude"]

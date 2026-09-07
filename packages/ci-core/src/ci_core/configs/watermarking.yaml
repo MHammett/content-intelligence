@@ -1,0 +1,97 @@
+# Provider text-watermarking registry — last verified 2026-09-05.
+#
+# Which providers embed a statistical watermark in generated TEXT. This is
+# provenance bookkeeping, not detection: nothing in this repo can tell whether
+# a given passage carries a watermark. Detection requires the secret key that
+# biased the sampling, and without it watermarked text is statistically
+# indistinguishable from unmarked text — that is the scheme's design guarantee,
+# not a gap in our tooling. All this file supports is the honest statement
+# "the model you declared drafting with is one that marks its output."
+#
+# Bump registry_date whenever this is reviewed against live provider docs. The
+# staleness thresholds drive notices in the pipeline report, the same way
+# model_registry.yaml works — and this file will go stale faster, because
+# every signatory to the EU Code of Practice is still shipping changes.
+#
+# status values:
+#   yes      — verified as marking text output
+#   no       — verified as NOT marking text output at the time given
+#   partial  — marks on some surfaces but not confirmed on the API path
+#   unknown  — not verified; treated as unknown, never as "no"
+#
+# An unlisted provider is "unknown". Absence of evidence is recorded as
+# absence of evidence.
+
+registry_date: "2026-09-05"
+stale_notice_days: 60
+stale_warning_days: 120
+
+providers:
+  claude:
+    status: "yes"
+    scope: "API, Claude Code, and consumer surfaces; applied at model level, worldwide"
+    since: "2026-08-02"
+    method: "statistical, a SynthID-Text variant"
+    note: >-
+      Applies to output from supported models wherever Claude is offered, not
+      only in the EU, because the mark is applied at the model level. No opt-out
+      is documented. Anthropic has a third-party detection API in private
+      preview; eligible categories include media and fact-checkers.
+    source: "https://www.anthropic.com/news/claude-text-watermark"
+
+  gemini:
+    status: "partial"
+    scope: "Gemini and Gemini Advanced consumer surfaces; API path not confirmed"
+    since: "2026-08-11"
+    method: "SynthID-Text"
+    note: >-
+      Deployed across the Gemini consumer products. Whether text returned by
+      the Gemini API carries the same mark was still an open question on
+      Google's own developer forum at the registry date, so this is recorded as
+      partial rather than yes. If this pipeline's gemini calls go through the
+      API, treat the status as unresolved rather than assuming either way.
+    source: "https://deepmind.google/blog/watermarking-ai-generated-text-and-video-with-synthid/"
+
+  openai:
+    status: "no"
+    scope: "provenance signals on images and audio only"
+    since: null
+    method: null
+    note: >-
+      Applies provenance signals to images and audio and has stated an intent
+      to extend them to all modalities including text, under the same EU Code
+      of Practice commitment. No text method announced as of the registry date.
+      Expect this entry to change.
+    source: "https://artificialintelligenceact.eu/transparency-rules-article-50/"
+
+  mistral:
+    status: "no"
+    scope: null
+    since: null
+    method: null
+    note: >-
+      No text watermark documented. Much of the catalogue ships as open
+      weights, and a provider cannot watermark text sampled on hardware it does
+      not control — so this one is structural rather than a policy choice, and
+      is likelier than the others to stay put.
+    source: "https://artificialintelligenceact.eu/transparency-rules-article-50/"
+
+  grok:
+    status: "unknown"
+    scope: null
+    since: null
+    method: null
+    note: >-
+      Not verified. Press reporting at the registry date suggested xAI was not
+      following the text-watermarking commitment, but that was not confirmed
+      against primary documentation, so it is recorded as unknown rather than
+      no.
+    source: null
+
+  perplexity:
+    status: "unknown"
+    scope: null
+    since: null
+    method: null
+    note: "Not verified against primary documentation."
+    source: null

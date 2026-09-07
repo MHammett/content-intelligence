@@ -4,6 +4,8 @@ After the fact-check pass, the pipeline takes the claims that came out of it and
 
 **Which claims.** All five fact-check buckets are resolved: `confirmed`, `outdated`, `contradicted`, `unverifiable` and `primary_source_needed`. `confirmed` matters most and is easy to overlook — those are the claims that ship *as written*, so they are the ones whose sources most need checksumming and archiving. Each entry records which bucket it came from in `fact_check_bucket`, because the same URL verified the same way means something different behind a claim you are about to publish than behind one you are about to rewrite.
 
+**Which claims are held out.** A claim marked out of scope for fact-checking never reaches this section — no URL is chosen for it and no source is fetched. Measured 2026-09-05 on an entirely first-person article: 73 claims came out of the fact-check pass and 45 survived deduplication into citation resolution, every one of them a statement about the author's own life and work. One of them, `"I have a side job."`, resolved against a company team page describing a different person and came back `not_addressed`, which every provider then read as grounds to withdraw a true sentence. Resolution can only ever answer "does this page say this", so for a claim no page can settle it manufactures a false negative. Section 9 opens by stating how many claims were held out and points at Section 2, where each one is listed with its reason; see the README's *Marking claims out of scope for fact-checking* and `fact_check_scope.py`.
+
 **Which URL.** The draft's own citation for the claim comes first. Section 9 audits the article's citations, so the question worth answering is "does the source *you cited* say this" — not "is there some page on the internet that agrees." The pipeline reads the draft's numbered citation block, traces each claim back to the marker attached to it, and checks the claim against that source. See [How a claim is traced to a citation](#how-a-claim-is-traced-to-a-citation) below.
 
 Failing that — a claim the draft attaches no citation to — the URL named in the claim's own source field (`source`, or `best_candidate_source` for `primary_source_needed`) is used instead. A claim with neither gets no URL at all and falls through to the source adapters. That is deliberate: "the draft cites nothing here" is a true and useful thing to report, and it is the honest answer where a guess used to go.
@@ -17,6 +19,8 @@ The results land in **Section 9** of the report — both in `run_N_<timestamp>_r
 Section 9 is not a pass/fail list. A claim can be resolved at very different levels of confidence, and the difference matters: one tier means a model read the source and confirmed it backs the claim, another means "here is a portal that is probably about the right topic." Reading those as equivalent is exactly the mistake this section is structured to prevent.
 
 **How the readable report is organised.** It opens with the fraction that matters — *N of M claims were checked against a document the pipeline fetched and read* — then a table putting every claim in exactly one disposition, then one block per disposition in the same order. The fraction leads because it governs how much of the rest to trust, and it is usually small: in the run this structure was built from, 18 of 144 claims had a document fetched and read. "Checked" deliberately counts both read outcomes — 9 where the document supported the claim and 9 where it did not — because a mismatch *was* checked; the check returned "no". Counting only the confirmations would reproduce, in the summary line, the same conflation between assertion and retrieval that the tiers exist to separate. The tier names below were already honest about that, but a four-way count in the opening line made the reader derive it.
+
+**A `confirmed` finding with no external source is demoted.** The fact-check pass sometimes reports a claim as `confirmed` while citing nothing outside the draft. Measured 2026-09-05 on an 18K-char draft: 4 of 19 confirmations named no document — one cited "Draft Article", the pipeline confirming the draft against itself, and three cited "Manual Calculation", where the model did the arithmetic and reported the result as an established fact. All four carried `source_url: "N/A"`. Those move to `unverifiable`, keeping the original source text so the reader can see what was offered instead. The sums may well be right; `confirmed` is the tier that means a document backs the claim, and a model reasoning its way to a conclusion is what the other buckets already represent. A source naming a real document without a URL — an unlinked "Honda ServiceNews B18010I" — still counts, since those unlinked leads are among the most useful things the pass produces.
 
 **The `confirmed` bucket is reconciled against retrieval.** The fact-check pass's verdict and this section's retrieval are independent — the first is model judgment about the claim, the second is whether a document was opened. In that same run 85 claims came back `confirmed`; 9 had a document read that supported the claim, 8 had one that did not, and for 68 no document was read at all, so the report now states that relationship directly rather than leaving `fact_check_bucket: confirmed` sitting beside a claim with no URL, where it reads as corroboration it is not.
 
@@ -175,15 +179,95 @@ An `archived: false` entry is untouched by all of this: that is an answer, and o
 
 **Save Page Now submission.** After resolution finishes, any resolved citation whose URL is *not* yet archived gets submitted to archive.org's Save Page Now API. This runs as a follow-up pass at a lower concurrency than resolution itself (2 vs. 8), because each submission triggers a real page capture on archive.org's side rather than a cheap read.
 
-Submission is **fire-and-forget by design**. Captures run asynchronously and can take seconds to minutes, and the pipeline does not poll for completion — it won't block your run on someone else's crawler. The console reports it plainly:
+**Submitted is not archived, and the report no longer conflates the two.** This used to be fire-and-forget: the pipeline submitted, recorded `submitted: true`, and said "submitted for archiving" — which reads as *archived*. Nothing established that. A capture archive.org accepted and then dropped looked exactly like one it completed, run after run. Each citation now records an `archive_outcome`, and only one of its values claims a snapshot exists:
+
+| `archive_outcome` | Means | Snapshot URL? |
+| --- | --- | --- |
+| `archived` | archive.org named the snapshot it wrote | yes — reported and citable |
+| `pending` | capture queued, still running when the report was written | no |
+| `submitted` | accepted, no snapshot named and no job id to ask about | no |
+| `capture_failed` | accepted, then the capture failed — reason recorded | no |
+| `submit_failed` | archive.org refused the request itself | no |
+| `not_attempted` | never asked: non-public address, or the host did not resolve | no |
+
+How each is established depends on which endpoint the run can use:
+
+**Without credentials** the unauthenticated `GET /save/<url>` runs the capture inline and redirects to the resulting snapshot, so the snapshot URL is in hand before the call returns — no waiting, no polling, no next run. (Measured 2026-09-05: one 302 hop to a `/web/<timestamp>/<url>` minted seconds earlier.) The pipeline previously followed that redirect and discarded the URL.
+
+**With credentials** the SPN2 endpoint queues the capture and returns a job id instead. Those get a bounded same-run wait (~45s for the whole pass, sharing the pacing clock below), and anything still running when it expires stays `pending`, keeps its job id, and is reconciled on the *next* run: that run asks `/save/status/<job_id>` what became of it before resubmitting, so a capture that keeps failing is reported with archive.org's own reason instead of silently retrying forever. Note that the job-status endpoint is **credential-only** — it answers `401` to everyone else — which is why an unauthenticated run reads its answer off the redirect instead.
+
+Freshness is measured rather than assumed: a save can redirect to a pre-existing snapshot, and a four-year-old copy is still reported stale.
+
+The console says which happened:
 
 ```
-  3 resolved URL(s) submitted for archiving (check back later — archive.org processes asynchronously)
+  3 resolved URL(s) archived this run — snapshot URL recorded against the citation
+  1 resolved URL(s) submitted for archiving, capture NOT confirmed — reported as pending, not as archived
+  1 resolved URL(s) accepted by archive.org and then failed to capture — still not archived
 ```
 
-A later run's availability check will pick up the snapshot once it exists. A submission failure degrades to "still shows as unarchived" and never fails the run.
+Every failure here degrades to "not established" and never fails the run.
 
-**Unreadable-origin fallback.** When a direct fetch of a `known_url` fails in a way that means *we couldn't read the origin* rather than *the resource is gone*, the pipeline makes one attempt (never a retry loop) to read an archived snapshot of that same URL instead, and uses the snapshot's content for checksumming and relevance verification.
+**Capture options.** The `/save` form's control names *are* the API's parameter names, so everything the web form offers is available: `capture_outlinks`, `capture_all`, `capture_screenshot`, `disable_adblocker`, `wm-save-mywebarchive`, `email_result`, `wacz`. The pipeline sets exactly one, and it is a correctness fix rather than a feature:
+
+`capture_all=0` — **archive.org's own form defaults this ON**, and ON means "archive the page even if it answers 4xx/5xx". For citation archiving that manufactures a false positive: a source that blocks the capture with a 403 would have its block page archived, the next run's availability check would find a snapshot, and the report would call the citation archived when what is archived is an error page. It would bite hardest on sources that refuse automated requests — the citations already flagged as most needing an archive.
+
+Deliberately not set: `email_result` and `wacz` (archive.org emails the account owner once per capture, and a run submits many citations), `wm-save-mywebarchive` (writes to the operator's personal archive), `capture_outlinks` (enormous added load for pages the article does not cite), `capture_screenshot` (nothing renders a screenshot URL yet, so it would be collected and discarded), `force_get` (captures JavaScript-rendered pages worse).
+
+`if_not_archived_within` was tried and rejected. It looks like a fit for `wayback_snapshot_stale_days`, but measured 2026-09-06 it makes archive.org answer `job_id: null` with *"The same snapshot had been made 177 hours ago"* while the identical request without it captures normally — so it removes information, and it is a second gate on a decision this pass has already made.
+
+**Capacity-aware pacing (authenticated only).** `GET /save/status/user` reports what the account can actually do right now:
+
+```json
+{"processing":0,"available":3,"daily_captures":49,"daily_captures_limit":30000}
+```
+
+Every concurrency number governing archiving was otherwise invented. Before submitting, the run asks: if the daily quota is exhausted, nothing is submitted and each citation says so with the quota figures — rather than the author reading a batch of failures. If fewer capture slots are free than the static ceiling, the batch narrows to match. A reading can only ever make the run *more* cautious; it never widens past the static bound, so a stale or wrong answer cannot make things worse. Without credentials the endpoint answers 401 and the run behaves exactly as before.
+
+**Reference list for publication.** Section 9 opens with every cited address, once each, in the order first cited, paired with its archive copy:
+
+```
+### Reference list - live and archived addresses (3 source(s))
+
+1. https://www.iana.org/help/example-domains
+   archived: http://web.archive.org/web/20260905123736/https://www.iana.org/help/example-domains
+2. https://www.rfc-editor.org/rfc/rfc2606.html
+   archived: http://web.archive.org/web/20260830225036/https://www.rfc-editor.org/rfc/rfc2606.html
+
+**No archive copy (1)** - publishable only as a live link:
+- https://example.org/x - archive.org tried to capture it and could not
+```
+
+The pairing was always present per citation, but only inside the diagnostic entries below - spread over five disposition buckets and interleaved with claim text, verification tiers and relevance notes. That is the right shape for deciding whether to trust a citation and the wrong shape for putting both addresses into the article. A source backing three claims appeared three times; here it appears once.
+
+Sources with no snapshot are listed rather than dropped, each with the specific reason, because the author needs to know which references the article cannot carry an archive link for. A pairing that was not confirmed against the live page, captured an error page, or is stale is marked inline - those are the ones that should not be published as-is.
+
+**Does the archive say what the live page said?** The report tells you to *cite both* the live URL and the archive copy. That is a recommendation you act on, and nothing used to establish that the two agree — a snapshot of a paywall, a cookie wall, a bot block, or a much older version of the page renders exactly like a good one.
+
+Each resolved citation's snapshot is now fetched and compared against the same checksum the live fetch produced. It works the same whether this run created the snapshot or it already existed.
+
+The comparison is exact, not fuzzy, because of one API detail: `https://web.archive.org/web/<timestamp>id_/<url>` serves the **original captured bytes**, while the ordinary form injects archive.org's banner and its `wombat.js` URL rewriter. Measured 2026-09-06 across three URLs (one archived a week earlier), the `id_` body was byte-identical to the live page — SHA-256 equal — while the ordinary form was nearly three times the size for the same document. Comparing the injected form would report every citation as divergent.
+
+| `archive_match` | Report line |
+| --- | --- |
+| `identical` | "Archive verified: the snapshot's text is identical to the live page this run checked" |
+| `differs` | "**Archive does NOT match the live page**" plus what was measured |
+| `unchecked` | says why, and that the snapshot may or may not contain the document |
+
+A difference is reported, not judged. It has two innocent explanations (the page changed after capture; extraction differs slightly) and one serious one (the capture is not the document), and this pass cannot tell them apart. Citations resolved *from* the archive are skipped — comparing a snapshot with itself proves nothing.
+
+**Re-asked alternative sources.** When a refuted citation's asserting model proposes a different source, that proposal goes through the whole of `resolve_citations` — so the run has already asked archive.org about it and, where it was missing, spent a real capture. The archive address and match verdict are carried through to the proposal in the report rather than discarded, so a source the author may adopt arrives with its durable copy attached. The proposal's own verification is untouched: a refuted citation stays refuted.
+
+**Snapshots that captured an error page.** The availability API reports each capture's own HTTP status, and it was being discarded. A pre-existing snapshot can be a capture of a 403 or 404 — "archived" is then true and useless, because what is preserved is the refusal, not the document. Those are now flagged outright. The pipeline's own captures cannot produce one (`capture_all=0`), but pre-existing snapshots are outside its control.
+
+**Was that us, or archive.org?** A 520, a read timeout and a refused connection look identical from inside the pipeline, and each is equally consistent with "we asked too often" and "the service is having a bad afternoon" — all three were seen in a single afternoon of real runs. When at least one submission fails, the run asks `GET /save/status/system` once and records the answer against the failed entries, so a failure reads either *"archive.org reported its capture system healthy at the time"* (it was us) or *"...reported its capture system as degraded — this was the service, not the pipeline"*. A healthy run never makes the call, and an unknown verdict adds nothing rather than appending "we could not tell" to a failure the reader is already looking at. Credential-only, like the other status endpoints.
+
+**Queued captures expire after 7 days.** A job archive.org has forgotten would otherwise stay in the pending index permanently, and every future run would spend a paced status call rediscovering that. Captures finish in seconds to minutes; a week is generous.
+
+**Unreadable-origin fallback.** When a direct fetch of a `known_url` fails in a way that means *we couldn't read the origin* rather than *the resource is gone*, the pipeline makes one attempt (never a retry loop) to obtain the document another way, and uses whatever it gets for checksumming and relevance verification. There are two tiers, tried in this order:
+
+1. **The live page behind a browser TLS fingerprint** — 403 only. See "Escalating past a bot block" below.
+2. **An archive.org snapshot of the same URL** — every failure in the table below.
 
 It fires on:
 
@@ -201,9 +285,56 @@ The entry records `verified_via: "wayback_fallback"`, the `origin_failure` reaso
 
 The same rules govern draft link validation (`analysis/links.py`), so a link recovered from the archive after a timeout reads `OK (via archive: origin timed out)` rather than being flattened into a plain `OK` or a bare `BROKEN`.
 
+### Escalating past a bot block
+
+A 403 gets one more attempt before the archive: the same request with a browser TLS fingerprint, via `ci_core.http.impersonating_get`. **For a public document, retrieval method does not affect citation validity** — the reader opening the link gets the same page — so a source that refuses scripts but serves browsers is a verifiable citation, not an unverifiable one. On the 2026-09-05 Honda run this was eight claims whose sources the *link checker* could already read, because it has escalated since 2026-08-12 and citation verification did not.
+
+**Scope.** Only a 403. A 401 says an account is required, which is the access-controlled case this policy puts out of scope; a 429 is a rate limit, and changing fingerprint to slip one is abuse rather than verification; a timeout or DNS failure never reached the origin, and no handshake fixes that. No attempt is made at a CAPTCHA, a JS challenge or a subscription gate, and none would work — the measurement in `ci_core/http.py` records three academic publishers returning a challenge page to impersonation too.
+
+**Live before archive**, deliberately, because the two are not competing options:
+
+- The archive lookup runs on the success path regardless, so escalating first yields the snapshot link **as well as** a current read. Archive-first would trade the current read away to obtain something the run was going to get anyway.
+- The checksum and relevance verdict are reported at the strongest tier this pipeline has, so they should describe the document the article actually cites. Both snapshots behind the Honda run's refused claims were flagged stale (358 and 494 days); verifying a claim against a year-old copy and labelling it `checksum` asserts a currency the run never established.
+
+A failed escalation costs nothing: anything that comes back unreadable — a challenge page, a near-empty body — falls through to the archive fallback exactly as an un-escalated 403 would. The tier is additive or it is a regression.
+
+**What the entry records.** `verified_via: "tls_impersonation"`, `origin_failure: "blocked"`, and a `reader_access` note. That note is access information, not a disclosure: what escalation predicts is that the *reader* may hit friction on this host, which makes it exactly the citation that needs an archive copy printed beside it. Section 9 renders it under the live URL, where the author is deciding what to paste.
+
+Where the fetch landed somewhere other than the URL cited — the fact-check model supplies Vertex `grounding-api-redirect` URLs, so it usually does — the destination is recorded as `final_url`, **the archive lookup follows it**, and the paste-ready "Cite both" pairing names it. Asking archive.org about the redirect instead returns `archived: false`, which the report would state as "archive.org has no snapshot of this URL" while the real source is archived: a false absence printed beside the citations that most need the archive to be there.
+
+**This tier needs an optional dependency.** `impersonating_get` returns `None` — leaving the archive fallback to run exactly as before — unless `curl_cffi` is installed. It is an optional extra because the degradation is safe and the wheel carries a compiled libcurl; end users who want the tier install it explicitly:
+
+```bash
+uv sync --extra unblock
+```
+
+**In this repo it is no longer optional in practice.** `ci-core[unblock]` is in the root `[dependency-groups] dev`, alongside `ci-core[persistence]` and for the same reason: `uv run` re-syncs from the lockfile before every invocation, so while the extra appeared in no dependency group, *no `uv run` command ever had curl_cffi*. `impersonating_get` returned `None` unconditionally, and the escalation added to `analysis/links.py` on 2026-08-12 had never once fired — nor had `_impersonation_fallback_content` in the citation resolver. Nothing errors when this happens; the run simply resolves fewer citations, which is why it survived a month unnoticed. The unit tests do not catch it either: they install a fake `curl_cffi` and pass whether or not the real one is present. A plain `uv sync` now brings it in.
+
+**A run now says when the tier is missing**, in both places it matters. `impersonating_get` returns `None` for a held block and for an absent `curl_cffi` alike — the right default for a fetch, the wrong one for a report, since only one of the two is fixable by installing something. So the run logs a one-time warning (once per process, not per link), flags each affected link with `escalation_unavailable`, and records a `degradations` entry that reaches `run_N_*_review.md`. The entry says to read those links as **unknown rather than blocked**: the attempt was never made. Use `ci_core.http.impersonation_available()` to tell the two apart in code.
+
+**The version floor is load-bearing.** `impersonate="chrome"` resolves to whatever `curl_cffi.requests.impersonate.DEFAULT_CHROME` the installed release ships, so an older release asks for an older Chrome profile — and a stale profile is fingerprinted by exactly the Cloudflare deployments this tier exists to get past. Measured 2026-09-06, sequential fetches only — concurrent requests to a single Cloudflare host cannot tell a version difference apart from luck:
+
+| curl_cffi | `DEFAULT_CHROME` | congress.gov | bianchihonda.com |
+| --- | --- | --- | --- |
+| 0.16.0 | `chrome146` | 0 of 5 | 0 of 4 |
+| 0.16.1 | `chrome150` | 1 of 1 (422,259 bytes) | not sampled |
+| 0.16.2 | `chrome150` | 1 of 1 | not sampled |
+| 0.16.3 | `chrome150` | 2 of 2 | 4 of 5 |
+
+Every one of 0.16.0's nine failures carried `cf-mitigated: challenge`; none of the successes did. 0.16.3's one miss on bianchihonda.com is the nondeterminism described below, not a version effect — the same host served the same build on the attempts either side of it.
+
+The working boundary is 0.16.1, which bumped curl-impersonate to 2.1.1. The extra pins `>=0.16.3` — one release higher — because 0.16.3 fixes `tls_signed_cert_timestamps not applied` (upstream PR #833), a defect on the fingerprint surface itself: 0.16.1 and 0.16.2 clear these hosts while still sending a subtly wrong handshake. The old `>=0.7` was not merely permissive, it resolved to 0.16.0 in `uv.lock`, so the documented `uv sync --extra unblock` installed the one version measured to be challenged everywhere it was tried. Expect to raise this floor again; a profile that works today ages out.
+
+**Reading a 403 from this tier.** The `cf-mitigated` response header separates the two causes, which need opposite responses:
+
+- **`cf-mitigated: challenge` present** — Cloudflare rejected the *fingerprint*. That is a curl_cffi version problem, not a property of the source: raise the floor and re-measure.
+- **header absent** — the origin refuses browsers too. That is a genuine subscription or JS gate, and no fingerprint will move it; the three academic publishers in the `ci_core/http.py` measurement are this case. Not worth chasing.
+
+**Success is not deterministic.** Six concurrent requests to one Cloudflare-fronted host in a single run had four succeed and two challenged. A claim resolved this way in one run may be reported refused in the next — see the rerun-nondeterminism caveat that already applies to this pipeline. It is also why the version comparison above is one sequential fetch per version: concurrent fetches to a single Cloudflare host cannot tell a version difference apart from luck.
+
 ### archive.org credentials (optional)
 
-Submissions work without credentials via the unauthenticated capture endpoint, subject to tighter and less predictable rate limits. Supplying an S3-style key pair from <https://archive.org/account/s3.php> uses the authenticated SPN2 endpoint, which gets higher rate limits and returns a job id:
+Submissions work without credentials via the unauthenticated capture endpoint, subject to tighter and less predictable rate limits. Supplying an S3-style key pair from <https://archive.org/account/s3.php> uses the authenticated SPN2 endpoint, which gets higher rate limits and returns a job id. The trade-off is not one-directional: the unauthenticated endpoint captures inline and hands back a snapshot URL immediately, while the authenticated one queues the capture, so an authenticated run is the one that has to wait or reconcile. What credentials buy is the ability to *ask what happened* — `/save/status/<job_id>` is credential-only, so without them a queued capture can never be followed up:
 
 ```yaml
 api_keys:

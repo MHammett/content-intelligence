@@ -91,3 +91,58 @@ class TestMaskSecret:
 
     def test_custom_head_and_tail(self):
         assert mask_secret("abcdefghijklmnop", head=2, tail=2) == "ab...op"
+
+
+class TestHyphenatedCredentialParameters:
+    """The parameter-name list missed the spellings real providers use.
+
+    This module exists so a network error carrying a URL cannot put a
+    credential into a terminal, a log file or a saved report. It matched
+    `key`, `apikey`, `api_key`, `access_token` and `token` — and nothing
+    hyphenated. Azure OpenAI names its parameter `api-key`; Google sends
+    `X-Goog-Api-Key`. Eight of twelve real spellings tested on 2026-09-04
+    passed through untouched.
+    """
+
+    SECRET_URLS = [
+        "https://api.example.com/v1?key=SEKRIT",
+        "https://api.example.com/v1?api_key=SEKRIT",
+        "https://api.example.com/v1?apiKey=SEKRIT",
+        "https://api.example.com/v1?api-key=SEKRIT",
+        "https://api.example.com/v1?subscription-key=SEKRIT",
+        "https://api.example.com/v1?X-Goog-Api-Key=SEKRIT",
+        "https://api.example.com/v1?access_token=SEKRIT",
+        "https://api.example.com/v1?refresh_token=SEKRIT",
+        "https://api.example.com/v1?client_secret=SEKRIT",
+        "https://api.example.com/v1?password=SEKRIT",
+        "https://api.example.com/v1?auth=SEKRIT",
+        "https://api.example.com/v1?sig=SEKRIT",
+        "https://api.example.com/v1?signature=SEKRIT",
+        "https://api.example.com/v1?a=1&session-key=SEKRIT&b=2",
+    ]
+
+    #: Parameters that merely contain a sensitive substring. Anchoring the match
+    #: on `=` is what keeps these readable — `auth` cannot swallow `author`.
+    INNOCENT_URLS = [
+        "https://example.com/posts?author=mike",
+        "https://example.com/search?keywords=grid",
+        "https://example.com/list?category=news",
+        "https://example.com/feed?signal=on",
+    ]
+
+    def test_every_credential_spelling_is_redacted(self):
+        for url in self.SECRET_URLS:
+            assert "SEKRIT" not in redact_url_keys(url), url
+            assert "[REDACTED]" in redact_url_keys(url), url
+
+    def test_innocent_parameters_are_left_alone(self):
+        for url in self.INNOCENT_URLS:
+            assert redact_url_keys(url) == url, url
+
+    def test_the_rest_of_the_query_string_survives(self):
+        got = redact_url_keys("https://x/v1?a=1&api-key=SEKRIT&b=2")
+        assert got == "https://x/v1?a=1&api-key=[REDACTED]&b=2"
+
+    def test_an_error_body_carrying_a_hyphenated_key_is_scrubbed(self):
+        body = "Unauthorized for url: https://x/v1?api-key=SEKRIT&model=gpt"
+        assert "SEKRIT" not in redact_url_keys(body)
