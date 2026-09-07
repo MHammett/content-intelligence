@@ -229,15 +229,15 @@ Integration is mechanically possible. Both leading APIs return span-level output
 ### The cost is disqualifying on its own
 
 Ground it in this repo's own numbers. `draft_submission.filled-example.md` is
-**10,011 words** / 72,520 characters, and the README puts a `maximum`-preset run
-against it at **$3–5** — that is five domains × up to six models, ~30 LLM calls.
-A `standard` run is **under $1.00**.
+**10,073 words** (measured 2026-09-07; it drifts as the example is edited), and
+the README puts a `maximum`-preset run against it at **$3–5** — that is five
+domains × up to six models, ~30 LLM calls. A `standard` run is **under $1.00**.
 
-One Pangram 4 call on that same draft: 101 × $0.05 = **$5.01** ($4.01 bulk).
+One Pangram 4 call on that same draft: 101 × $0.05 = **$5.05** ($4.04 bulk).
 
 **The detector costs more than the entire six-model, five-domain review it would
 be a footnote inside** — and roughly 5× a standard run, to add one number.
-GPTZero at $1.50 is still above a full standard run. Originality's per-call cost
+GPTZero at $1.51 is still above a full standard run. Originality's per-call cost
 is trivial but its floor is $1,639/year, against a workload of a few articles a
 month.
 
@@ -303,6 +303,34 @@ clusters voice flags across `pipeline_history/` and reports patterns recurring i
 the cross-article "is this a real habit or a one-off?" signal a detector's
 aggregate score would only approximate — and it is already diagnostic and already
 free.
+
+### The one axis where a detector could have won — and why it no longer can
+
+There is a real objection this document owes an answer, and it is the most likely
+reason someone reopens the question: **`voice_style` is unstable.** A trained
+classifier is deterministic — same text, same score. The ensemble is not. On
+measured history, four full runs of one unedited draft produced 259 distinct
+findings of which only 18 recurred in three or more; a second measurement against
+`pipeline_history/` found 20 of 262 (7.6%). A single run's finding list is
+substantially a property of the run, not of the draft. Against that, "at least
+the detector says the same thing twice" is a fair argument.
+
+It stopped being a reason to buy one in September 2026, when
+[`reproducibility.py`](../packages/ci-article-review/src/ci_article_review/reproducibility.py)
+and the "what this run may have missed" block shipped (PRs #173, #174). Runs of
+the same draft are now scored against each other from reports already sitting in
+`pipeline_history/` — no extra model calls, retroactive to runs already paid for,
+and it reports in both directions: findings this run raised that earlier runs
+also raised, and findings earlier runs raised that this one dropped. It handles
+`voice_style` explicitly, including the case where the voice passes *failed*, so
+a missing opportunity is not scored as a failure to reproduce.
+
+That is a better answer than a detector on the axis the detector would have won,
+because the stability it produces is **per-finding and diagnostic** — *which*
+observation is durable — rather than a stable document-level number about
+authorship, which we already know. The cheapest way to tell a real voice finding
+from a fluke is to run the draft twice, and that costs a second run rather than a
+subscription.
 
 ---
 
