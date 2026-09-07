@@ -616,3 +616,66 @@ around its output. 239 lines is not where the pain is.
   Responses API has no such parameter, Perplexity does not support it, Anthropic
   has no equivalent, and mistral/gemini only sent it in the non-reasoning and
   non-grounded paths that `maximum` does not use.
+
+- **Seven retry/backoff implementations, no shared mechanism.**
+  **Surveyed 2026-09-07 against `ac73de5` — not fixed.** Retry *policy* should
+  differ between these; a 429 carrying `Retry-After` is not a stalled model
+  stream, and archive.org's IP-block behaviour is not Gmail's quota. What none
+  of them share is the *mechanism*, so a fix to jitter, caps or circuit-breaking
+  in one never reaches the others.
+
+  | # | site | attempts | delay | `Retry-After` | breaker | terminal-vs-transient |
+  |---|------|----------|-------|---------------|---------|-----------------------|
+  | 1 | `ci_core/llm/client.py` `_with_retry` | 1 | fixed `retry_delay` (10s) | no | no | **yes** — `_is_terminal_quota_error` |
+  | 2 | `pipeline.py` recovery passes | `recovery_passes` (1) | fixed `recovery_delay_seconds` (30s) | no | no | yes — skips terminal |
+  | 3 | `adapters/citation/wayback.py` | `_MAX_ATTEMPTS` (3) | `5.0 * 2**attempt` | **yes** | **yes** | 429 only |
+  | 4 | `adapters/grammar/languagetool.py` | 1 | fixed `retry_delay` (10s) | no | no | status list only |
+  | 5 | `collectors/outlook365.py` | 3 | `2**(attempt+1)` / `2**attempt` | yes | no | no |
+  | 6 | `collectors/twitter.py` | 3 | `2**(retries+1)` | yes | no | no |
+  | 7 | `collectors/gmail.py` | 3 | `2**attempt` | **no** | no | no |
+
+  **Not one of them jitters.** Verified by grep for
+  `jitter|random.uniform|random.random` across every file under
+  `packages/*/src`: zero matches. That matters because the fan-outs are wide and
+  synchronised — `analysis/links.py` runs 10 URL checks at once and
+  `adapters/citation/resolver.py` 8 claim resolutions, both against whatever
+  hosts an article happens to cite. When several of those hit the same host and
+  back off by the same `2**attempt`, every retry lands in the same instant. The
+  bound exists to be polite to the origin; un-jittered backoff spends it.
+
+  `wayback.py` is the one place that solved this, and it solved it the *opposite*
+  way on purpose: a process-wide clock (`_MIN_INTERVAL_SECONDS = 3.0`) plus a
+  shared `_blocked_until` that a 429 pushes out for **every** thread, not just
+  the one that hit it. That is right for a single rate-limited endpoint — and it
+  is unreachable from anywhere else, because it is module-global state in a
+  citation adapter.
+
+  The two most considered pieces of policy in the codebase are also the least
+  reachable:
+
+  - `_is_terminal_quota_error` (`client.py`) knows that an exhausted account
+    arrives as a 429 directly but as a synthesised 503 mid-stream, and that
+    neither is worth retrying. It is private, unexported, and referenced in
+    exactly one file.
+  - the circuit breaker (`wayback.py`) is module-global.
+
+  So `gmail.py` sleeps `2**attempt` on a 401 that will never succeed, and
+  nothing outside `client.py` can tell a dead account from a transient limit.
+
+  **What is verified above:** the per-site table and the absence of jitter, both
+  read off the tree at `ac73de5`. **What is not:** whether any of this has cost a
+  real run. No retry-storm has been measured; the argument is structural.
+
+  **The shape of a fix, if taken:** a single `retry(fn, policy)` primitive in
+  `ci_core` — attempts, delay function, jitter, cap, `Retry-After` handling, a
+  retryable-vs-terminal predicate and an optional shared breaker — with each of
+  the seven passing its own policy. Policy stays different everywhere; jitter,
+  caps and breaking get fixed once. Ordering note: this is the same argument
+  that `run_all_bounded` settled for fan-out (#162, #164), where three
+  hand-rolled semaphores in `resolver.py` had independently drifted and one of
+  them was silently mis-charging every job past the first wave. The retry sites
+  have had no equivalent consolidation and are spread across all three packages.
+
+  A cheap first step that is worth doing regardless of the larger consolidation:
+  give `gmail.py` the `Retry-After` handling its two sibling collectors already
+  have. It is the only one of the seven that ignores the header outright.
