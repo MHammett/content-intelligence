@@ -2823,3 +2823,188 @@ class TestKnockOnEffectsReachTheReport:
         )
         assert "(2)" in md
         assert "A second effect." in md
+
+
+class TestMalformedEntriesInRemainingSectionsAreSkippedNotFatal:
+    """Sections 1, 3, 4, 5, 6, 7, 8 shared the same failure Section 2 and 9
+    hit: a findings list is meant to hold records, but a salvaged model
+    response can leave a bare string among them, and every one of these
+    renderers raised ``AttributeError: 'str' object has no attribute 'get'``
+    on the first one. Skipping it is the smaller loss; saying so — with a
+    count and a field name — is what keeps it from being a silent one.
+    """
+
+    # -- Section 1 (nested: entries, and each entry's own "flags" list) -----
+
+    def test_a_bare_string_among_consensus_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_1_consensus=[
+                    {"passage": "A survives.", "models": [], "flags": []},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_1_consensus` (1)" in md
+
+    def test_a_bare_string_among_a_flag_entrys_own_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_1_consensus=[
+                    {
+                        "passage": "A survives.",
+                        "models": [],
+                        "flags": [
+                            "salvaged",
+                            {"source_model": "openai", "domain": "argument_integrity"},
+                        ],
+                    }
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "openai:argument_integrity" in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_1_consensus[].flags` (1)" in md
+
+    def test_all_consensus_entries_malformed_reports_none_readable(self):
+        md = render_report_markdown(_base_report(section_1_consensus=["a", "b"]))
+        assert "No consensus flag entry in this run could be read." in md
+
+    # -- Sections 3-5 share _render_flags_section ----------------------------
+
+    def test_a_bare_string_among_voice_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_3_voice=[{"passage": "A survives.", "problem": "x"}, "salvaged"]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_3_voice` (1)" in md
+
+    def test_a_bare_string_among_argument_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_4_argument=[
+                    {"passage": "A survives.", "logical_problem": "x"},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "`section_4_argument` (1)" in md
+
+    def test_a_bare_string_among_completeness_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_5_completeness=[
+                    {"passage_reference": "A survives.", "what_is_missing": "x"},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_5_completeness` (1)" in md
+
+    def test_all_completeness_flags_malformed_reports_none_readable(self):
+        md = render_report_markdown(_base_report(section_5_completeness=["a"]))
+        assert "No flag entry in this run could be read." in md
+
+    # -- Section 6 (dict-shaped, not a list) ---------------------------------
+
+    def test_a_non_dict_value_in_single_source_red_team_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_6_red_team={
+                    "most_vulnerable_claim": "salvaged",
+                    "highest_audience_risk": {
+                        "passage": "Residents overwhelmingly support the plan.",
+                        "risk": "No polling data is cited.",
+                    },
+                }
+            )
+        )
+        assert "Residents overwhelmingly support the plan." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_6_red_team` (1)" in md
+
+    def test_a_non_dict_value_in_multi_source_red_team_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_6_red_team={
+                    "mistral": "salvaged",
+                    "openai": {
+                        "most_vulnerable_claim": {
+                            "passage": "openai finding",
+                            "attack_vector": "a",
+                        }
+                    },
+                }
+            )
+        )
+        assert "openai finding" in md
+        assert "1 malformed entry skipped" in md
+
+    def test_a_non_dict_item_within_a_multi_source_models_data_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_6_red_team={
+                    "mistral": {
+                        "most_vulnerable_claim": "salvaged",
+                        "highest_audience_risk": {
+                            "passage": "mistral survives.",
+                            "risk": "x",
+                        },
+                    }
+                }
+            )
+        )
+        assert "mistral survives." in md
+        assert "1 malformed entry skipped" in md
+
+    def test_red_team_that_salvaged_to_a_non_mapping_does_not_raise(self):
+        md = render_report_markdown(_base_report(section_6_red_team="salvaged"))
+        assert "this report cannot read" in md
+        assert "`section_6_red_team`" in md
+
+    # -- Section 7 ------------------------------------------------------------
+
+    def test_a_bare_string_among_low_confidence_flags_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_7_low_confidence=[
+                    {"passage": "A survives.", "observation": "x"},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_7_low_confidence` (1)" in md
+
+    def test_all_low_confidence_flags_malformed_reports_none_readable(self):
+        md = render_report_markdown(_base_report(section_7_low_confidence=["a"]))
+        assert "No low-confidence entry in this run could be read." in md
+
+    # -- Section 8 ------------------------------------------------------------
+
+    def test_a_bare_string_among_additional_findings_does_not_raise(self):
+        md = render_report_markdown(
+            _base_report(
+                section_8_additional=[
+                    {"passage": "A survives.", "category": "fact_check"},
+                    "salvaged",
+                ]
+            )
+        )
+        assert "A survives." in md
+        assert "1 malformed entry skipped" in md
+        assert "`section_8_additional` (1)" in md
+
+    def test_all_additional_findings_malformed_reports_none_readable(self):
+        md = render_report_markdown(_base_report(section_8_additional=["a"]))
+        assert "No additional-findings entry in this run could be read." in md

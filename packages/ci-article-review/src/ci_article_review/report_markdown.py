@@ -131,10 +131,58 @@ def _kv_lines(d, exclude=()):
     return lines
 
 
+def _dicts(entries):
+    """The dict entries of ``entries``, and how many were dropped.
+
+    A findings list is meant to hold records, but a salvaged model response can
+    leave a bare string among them — a response truncated mid-object and
+    recovered as text. Rendering used to raise ``AttributeError`` on the first
+    one. Skipping is the smaller loss, so the count comes back alongside the
+    survivors instead of being swallowed — see ``_skipped_note``.
+    """
+    entries = entries or []
+    kept = [e for e in entries if isinstance(e, dict)]
+    return kept, len(entries) - len(kept)
+
+
+def _skipped_note(dropped_by_field):
+    """One line accounting for entries dropped by ``_dicts``, or [].
+
+    Dropping them silently would repeat the mistake the rest of this module is
+    built to avoid: a section short by a finding reads exactly like a section
+    that had one fewer finding to report. So it is counted and named. The field
+    name is what makes it actionable: the entry cannot be rendered, but it was
+    already written to the run's ``_report.json`` before this point, and the
+    field says where to find it.
+    """
+    dropped_by_field = {f: n for f, n in dropped_by_field.items() if n}
+    total = sum(dropped_by_field.values())
+    if not total:
+        return []
+    where = ", ".join(f"`{f}` ({n})" for f, n in sorted(dropped_by_field.items()))
+    one = total == 1
+    field_ref = "that field" if len(dropped_by_field) == 1 else "those fields"
+    return [
+        f"> **{total} malformed {'entry' if one else 'entries'} skipped** — "
+        f"{where}. {'That finding' if one else 'Those findings'} arrived as "
+        f"something other than a record, which usually means a model response "
+        f"was truncated and salvaged as text. This section is short by "
+        f"{total}; the raw {'entry is' if one else 'entries are'} in this run's "
+        f"`_report.json` under {field_ref}.",
+        "",
+    ]
+
+
 def _render_section_1(consensus_flags):
     lines = ["## SECTION 1: Consensus Flags", ""]
+    consensus_flags, dropped = _dicts(consensus_flags)
+    lines.extend(_skipped_note({"section_1_consensus": dropped}))
     if not consensus_flags:
-        lines.append("_No consensus flags._")
+        lines.append(
+            "_No consensus flag entry in this run could be read._"
+            if dropped
+            else "_No consensus flags._"
+        )
         return lines
 
     for i, entry in enumerate(consensus_flags, 1):
@@ -148,7 +196,9 @@ def _render_section_1(consensus_flags):
         )
         lines.append(f'### {i}. "{passage}"')
         lines.append(f"- Flagged by: {models} — weight {weight}{lt}")
-        for flag in entry.get("flags", []):
+        flags, flags_dropped = _dicts(entry.get("flags", []))
+        lines.extend(_skipped_note({"section_1_consensus[].flags": flags_dropped}))
+        for flag in flags:
             source = flag.get("source_model", "?")
             domain = flag.get("domain", "?")
             lines.append(f"  - **{source}:{domain}**")
@@ -578,11 +628,15 @@ def _render_section_2(fact_check, report=None):
     return lines
 
 
-def _render_flags_section(title, flags, passage_key="passage", note=()):
+def _render_flags_section(title, flags, passage_key="passage", note=(), field=None):
     lines = [f"## {title}", ""]
     lines.extend(note)
+    flags, dropped = _dicts(flags)
+    lines.extend(_skipped_note({field or title: dropped}))
     if not flags:
-        lines.append("_No flags._")
+        lines.append(
+            "_No flag entry in this run could be read._" if dropped else "_No flags._"
+        )
         return lines
     for flag in flags:
         passage = flag.get(passage_key, "")
@@ -601,11 +655,20 @@ def _render_red_team_entry(label, item):
 
 
 def _render_section_6(red_team, note=()):
-    lines = ["## SECTION 6: Red Team Findings", ""]
-    lines.extend(note)
+    header = ["## SECTION 6: Red Team Findings", ""]
+    header.extend(note)
     if not red_team:
-        lines.append("_No red team results._")
-        return lines
+        header.append("_No red team results._")
+        return header
+    if not isinstance(red_team, dict):
+        # The whole pass salvaged to something that is not a mapping — same
+        # failure mode as a bare string among a findings list, one level up.
+        header.append(
+            "_The red-team pass returned something this report cannot read. "
+            "Its raw output is in this run's `_report.json` under "
+            "`section_6_red_team`._"
+        )
+        return header
 
     rt_keys = (
         ("most_vulnerable_claim", "Most vulnerable claim"),
@@ -613,26 +676,44 @@ def _render_section_6(red_team, note=()):
         ("highest_credibility_risk", "Highest credibility risk"),
     )
 
+    # Not list-shaped, so ``_dicts`` doesn't apply directly — each entry is
+    # reached by key rather than by iterating a findings list — but a salvaged
+    # non-dict value in any of these spots raises the same
+    # ``AttributeError: 'str' object has no attribute 'get'`` a bare list entry
+    # does, so it gets the same tolerance and the same count.
+    body = []
+    dropped = 0
     if "most_vulnerable_claim" in red_team or "highest_audience_risk" in red_team:
         # Single-source: flat dict with the three well-known keys.
         for key, label in rt_keys:
             item = red_team.get(key)
-            if item:
-                lines.extend(_render_red_team_entry(label, item))
-        lines.append("")
+            if item is None:
+                continue
+            if not isinstance(item, dict):
+                dropped += 1
+                continue
+            body.extend(_render_red_team_entry(label, item))
+        body.append("")
     else:
         # Multi-source: keyed by model name.
         for model_name, data in red_team.items():
+            if not isinstance(data, dict):
+                dropped += 1
+                continue
             weight = data.get("_weight")
             weight_str = f" (weight {weight})" if weight is not None else ""
-            lines.append(f"### {model_name}{weight_str}")
+            body.append(f"### {model_name}{weight_str}")
             for key, label in rt_keys:
                 item = data.get(key)
-                if item:
-                    lines.extend(_render_red_team_entry(label, item))
-            lines.append("")
+                if item is None:
+                    continue
+                if not isinstance(item, dict):
+                    dropped += 1
+                    continue
+                body.extend(_render_red_team_entry(label, item))
+            body.append("")
 
-    return lines
+    return header + _skipped_note({"section_6_red_team": dropped}) + body
 
 
 def _render_section_7(low_confidence):
@@ -641,8 +722,14 @@ def _render_section_7(low_confidence):
         "_For awareness only — dismiss unless something catches your attention._",
         "",
     ]
+    low_confidence, dropped = _dicts(low_confidence)
+    lines.extend(_skipped_note({"section_7_low_confidence": dropped}))
     if not low_confidence:
-        lines.append("_None._")
+        lines.append(
+            "_No low-confidence entry in this run could be read._"
+            if dropped
+            else "_None._"
+        )
         return lines
     for item in low_confidence:
         passage = item.get("passage") or item.get("passage_reference", "")
@@ -659,8 +746,14 @@ def _render_section_7(low_confidence):
 
 def _render_section_8(additional):
     lines = ["## SECTION 8: Additional Findings", ""]
+    additional, dropped = _dicts(additional)
+    lines.extend(_skipped_note({"section_8_additional": dropped}))
     if not additional:
-        lines.append("_None._")
+        lines.append(
+            "_No additional-findings entry in this run could be read._"
+            if dropped
+            else "_None._"
+        )
         return lines
     lines.append(
         "_Most-corroborated first, then by the flagging model's stated "
@@ -2322,6 +2415,7 @@ def render_report_markdown(report):
             "SECTION 3: Voice and AI-Speak",
             report.get("section_3_voice", []),
             note=_domain_notes(report, "voice_style"),
+            field="section_3_voice",
         )
     )
     lines.extend(
@@ -2329,6 +2423,7 @@ def render_report_markdown(report):
             "SECTION 4: Argument Integrity",
             report.get("section_4_argument", []),
             note=_domain_notes(report, "argument_integrity"),
+            field="section_4_argument",
         )
     )
     lines.extend(
@@ -2337,6 +2432,7 @@ def render_report_markdown(report):
             report.get("section_5_completeness", []),
             passage_key="passage_reference",
             note=_domain_notes(report, "completeness"),
+            field="section_5_completeness",
         )
     )
     lines.extend(
