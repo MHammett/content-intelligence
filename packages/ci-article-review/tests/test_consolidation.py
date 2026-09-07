@@ -8,6 +8,7 @@ The consolidation API changed in the ensemble refactor:
 from ci_article_review.consolidation import (
     _find_consensus,
     _normalise_fact_check_results,
+    _normalise_flags_results,
     _passage_key,
     build_report,
     rerun_recommended,
@@ -1096,6 +1097,8 @@ class TestScopeRulesToleratesMalformedBuckets:
         )
         assert [i["claim"] for i in out["confirmed"]] == ["Kept."]
         assert [e["claim"] for e in out["out_of_scope"]] == ["I have a side job."]
+
+
 # ---------------------------------------------------------------------------
 # Malformed flags / red-team buckets
 # ---------------------------------------------------------------------------
