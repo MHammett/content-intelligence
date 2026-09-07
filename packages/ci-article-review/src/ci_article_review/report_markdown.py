@@ -145,6 +145,17 @@ def _dicts(entries):
     return kept, len(entries) - len(kept)
 
 
+def _mapping(value):
+    """``value`` if it is a dict, else an empty one.
+
+    The companion to ``_dicts`` for the case where a whole section, rather than
+    one entry in it, arrived as something other than a record. Section 2 handles
+    that case itself with a message saying so; this is for the call sites that
+    only need to reach through it without raising.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def _skipped_note(dropped_by_field):
     """One line accounting for entries dropped by ``_dicts``, or [].
 
@@ -591,8 +602,16 @@ def _render_section_2(fact_check, report=None):
     if not fact_check:
         lines.append("_No fact-check results._")
         return lines
-
-    lines.extend(_render_evidence_coverage(fact_check))
+    if not isinstance(fact_check, dict):
+        # The whole pass salvaged to something that is not a mapping. Rare, but
+        # it reaches here the same way a bad entry does, and "_No fact-check
+        # results._" would describe a pass that never ran.
+        lines.append(
+            "_The fact-check pass returned something this report cannot read. "
+            "Its raw output is in this run's `_report.json` under "
+            "`section_2_fact_check`._"
+        )
+        return lines
 
     labels = {
         "confirmed": "Confirmed",
@@ -601,6 +620,25 @@ def _render_section_2(fact_check, report=None):
         "unverifiable": "Unverifiable",
         "primary_source_needed": "Primary source resolution required",
     }
+
+    # Filter every findings list before anything reads it, rather than at each
+    # of the loops below: ``_render_evidence_coverage`` takes the whole mapping
+    # and reaches into the verdict buckets itself, and ``_render_out_of_scope``
+    # reads ``excluded`` off every entry it is handed — so a bare string in
+    # either would raise before the first heading is written.
+    dropped = {}
+    cleaned = dict(fact_check)
+    for key in tuple(labels) + ("additional_observations", "out_of_scope"):
+        if key not in fact_check:
+            continue
+        cleaned[key], n = _dicts(fact_check.get(key))
+        dropped[key] = n
+    fact_check = cleaned
+
+    # Above the counts it qualifies, so a reader meets the shortfall before the
+    # numbers it applies to rather than after.
+    lines.extend(_skipped_note(dropped))
+    lines.extend(_render_evidence_coverage(fact_check))
     for key, label in labels.items():
         items = fact_check.get(key, [])
         if not items:
@@ -1441,7 +1479,18 @@ def _render_section_9(citations, out_of_scope=()):
     # revision loop in handoff_templates/revise_after_review_prompt.md refers to
     # this section by name.
     lines = ["## SECTION 9: Citations — what was actually checked", ""]
-    held = [i for i in out_of_scope or () if i.get("excluded")]
+
+    # Once, at the top: every count, percentage and tier below is derived from
+    # this list, and ``_render_reference_list`` re-reads it, so filtering here
+    # is what keeps all of them consistent with each other. ``out_of_scope`` is
+    # filtered on the same line because it is read the same way, one statement
+    # later.
+    citations, dropped = _dicts(citations)
+    scoped, scoped_dropped = _dicts(out_of_scope)
+    lines.extend(
+        _skipped_note({"section_9_citations": dropped, "out_of_scope": scoped_dropped})
+    )
+    held = [i for i in scoped if i.get("excluded")]
     if held:
         # Before the "N of M were checked" line, not after: M is a smaller
         # number than the fact-check pass raised, and a reader who works that
@@ -1454,7 +1503,14 @@ def _render_section_9(citations, out_of_scope=()):
         )
         lines.append("")
     if not citations:
-        lines.append("_No citation resolution attempted._")
+        # Distinguished because "not attempted" is a claim about the run, and
+        # with entries dropped it is false — resolution ran and its output was
+        # unreadable. This also keeps ``total`` non-zero for the percentage.
+        lines.append(
+            "_No citation entry in this run could be read._"
+            if dropped
+            else "_No citation resolution attempted._"
+        )
         return lines
 
     grouped = {key: [] for key, _ in _DISPOSITIONS}
@@ -2446,7 +2502,7 @@ def render_report_markdown(report):
     lines.extend(
         _render_section_9(
             report.get("section_9_citations", []),
-            (report.get("section_2_fact_check") or {}).get("out_of_scope") or [],
+            _mapping(report.get("section_2_fact_check")).get("out_of_scope") or [],
         )
     )
     lines.extend(_render_seo_suggestions(report.get("pre_analysis", {})))

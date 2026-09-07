@@ -912,19 +912,19 @@ class TestBadInputDegradesRatherThanRaising:
         assert isinstance(_rendered(report), str)
 
     def test_the_worklist_is_not_what_breaks_a_review_built_from_junk(self):
-        """Scope note, pinned so it does not get mistaken for a regression here.
+        """The worklist renders ahead of Sections 2 and 9 in the same file, so
+        it must not become a *second* place that raises; that is what the tests
+        above pin.
 
-        ``_render_section_2`` and ``_render_section_9`` both raise on a non-dict
-        entry, and both did so before this module existed — verified against
-        ``git show HEAD`` while writing these tests. The worklist renders ahead
-        of them in the same file, so it must not become a *second* place that
-        raises; that is what the test above pins. Making the whole review
-        tolerate junk is a separate change to a separate module.
+        This used to assert that ``_render_section_9`` still raised, as a scope
+        note marking the separate change that had not been made yet. That change
+        has since landed — both section renderers skip non-dict entries and
+        report the count — so the whole review now renders from junk rather than
+        only the worklist part of it.
         """
         junk = ["oops"]
         assert isinstance(_rendered(_report(junk)), str)
-        with pytest.raises(AttributeError):
-            report_markdown._render_section_9(junk)
+        assert isinstance("\n".join(report_markdown._render_section_9(junk)), str)
 
 
 class TestTheHeaderDoesNotOverclaimCoverage:
