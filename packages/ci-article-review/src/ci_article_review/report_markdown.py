@@ -1380,7 +1380,14 @@ def _render_section_9(citations):
             drift = c["content_changed_since"]
             when = f" on {drift['prior_date']}" if drift.get("prior_date") else ""
             lines.append(f'- "{c.get("claim", "")}"')
-            lines.append(f"  - URL: {c.get('url', '')}")
+            # Where the fetch landed, not the address the model cited. A
+            # grounded-model citation arrives as a `grounding-api-redirect`
+            # wrapper that names no publication and expires within days; this
+            # block is telling the author to go and re-check a source, so it
+            # has to name one they can open. Every other URL in the section
+            # goes through `_citation_pair` for this reason -- the drift block
+            # predates it and kept reading `url` directly.
+            lines.append(f"  - URL: {_citation_pair(c)[0]}")
             lines.append(
                 f"  - Last matched in run {drift.get('prior_run')} of "
                 f"'{drift.get('prior_article')}'{when} — content has since changed. "
