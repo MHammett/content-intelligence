@@ -17,7 +17,7 @@ Copy everything between the dashed lines into the SAME chat thread that has
 the article's context (or paste the CURRENT metadata file if starting fresh),
 then open the pipeline run's `run_N_<timestamp>_review.md` file (saved next
 to the JSON report in `pipeline_history/<article-slug>/`) and paste its
-SECTION 1 through SECTION 9 content below it, plus the SEO SUGGESTIONS and
+SECTION 1 through SECTION 10 content below it, plus the SEO SUGGESTIONS and
 SEO STRUCTURE REVIEW blocks at the end of that file if the run produced them.
 
 Paste SECTION 9 too — it is easy to skip because it is long, and it is where
@@ -26,6 +26,17 @@ content-mismatch entries: sources that were fetched and read, where a model
 found the page does not actually support the claim it was cited for. Those are
 among the most actionable findings a run produces, and they are invisible in
 SECTIONS 1-8.
+
+SECTION 10 is the one section you do NOT paste wholesale, and it only exists if
+you ran with --expand. It is a menu of proposed additions rather than a list of
+defects: sources, topics, angles and data the pass thinks would fit. Decide
+which ones you actually want FIRST, and paste only those. Pasting the whole
+menu hands the model a mandate to work every suggestion in, which is how a
+revision pass turns into an expansion pass and a draft stops converging.
+
+Ignore any candidate marked LINK FAILED unless you have found the real source
+yourself — a URL that does not resolve was very likely invented, and the model
+revising the draft has no way to tell that from a good one.
 
 ──────────────────────────────────────────────────────────────────────────────
 
@@ -86,8 +97,9 @@ Rules for the metadata update:
 - Increment "Pipeline run" by 1.
 
 Here are the consolidated review findings:
-[paste SECTION 1 through SECTION 9 from the run's `run_N_<timestamp>_review.md`
-file here]
+[paste SECTION 1 through SECTION 10 from the run's `run_N_<timestamp>_review.md`
+file here — all of SECTIONS 1-9, but only the SECTION 10 candidates you have
+decided to adopt, if you ran with --expand]
 
 Here is the current metadata (paste your metadata_only.md content, or the
 full handoff document's non-DRAFT sections):

@@ -64,6 +64,12 @@ def _skip_for(skips, model_name):
     return matches[0]
 
 
+#: The domains every run gets. expansion is excluded — it is opt-in behind
+#: --expand, so it is absent from a default ensemble by design rather than by
+#: some model being unavailable.
+_DEFAULT_DOMAINS = [d for d in pipeline._DOMAIN_PROMPTS if d != "expansion"]
+
+
 def _pub(**domains):
     """A publication config carrying nothing but the custom domains given."""
     return {"custom_domains": domains}
@@ -92,6 +98,23 @@ class TestSkipReporting:
         assert "disabled" in line
         assert "enabled: false" in line
         # The five domains it would have run are named, not just counted.
+        # expansion is not among them: it is opt-in, so a run that did not ask
+        # for it has not "skipped" it.
+        for domain in _DEFAULT_DOMAINS:
+            assert domain in line, f"{domain!r} missing from skip line: {line}"
+        assert "expansion" not in line
+
+    def test_expansion_joins_the_skip_line_when_it_was_asked_for(self):
+        """--expand makes it a domain the run wanted, so its absence counts."""
+        configs = dict(_SIMPLE_CONFIGS)
+        configs["claude"] = {"enabled": False, "model": "claude-opus-4-8"}
+
+        skips = []
+        _build_assignments(
+            "maximum", configs, _ALL_KEYS, skips=skips, include_expansion=True
+        )
+
+        line = _skip_for(skips, "claude")
         for domain in pipeline._DOMAIN_PROMPTS:
             assert domain in line, f"{domain!r} missing from skip line: {line}"
 
@@ -187,7 +210,12 @@ class TestSkipReporting:
         )
 
         preset_slots = sum(
-            len(models) for models in pipeline._THOROUGHNESS_PRESETS["maximum"].values()
+            len(models)
+            for domain, models in pipeline._THOROUGHNESS_PRESETS["maximum"].items()
+            # The expansion slots are not in play: this run did not pass
+            # include_expansion, so they were never asked for and nothing
+            # reports skipping them.
+            if domain != "expansion"
         )
         # Each line states its own count; that count is what has to reconcile.
         reported_skips = sum(
@@ -321,9 +349,7 @@ class TestConfigFormNormalisation:
         assignments = _build_assignments(
             "maximum", {"gemini": "gemini-2.5-flash"}, {"gemini": {"api_key": "k"}}
         )
-        assert {d for m, d in assignments if m == "gemini"} == set(
-            pipeline._DOMAIN_PROMPTS
-        )
+        assert {d for m, d in assignments if m == "gemini"} == set(_DEFAULT_DOMAINS)
 
     def test_empty_prompts_override_runs_nothing_rather_than_raising(self):
         """`prompts:` with no value parses as None; it used to raise TypeError."""

@@ -341,6 +341,231 @@ def _render_section_8(additional):
     return lines
 
 
+#: How a proposal's URL check renders. Only ``missing`` shouts, and that is the
+#: whole point of the tiering: a fabricated URL beside a confident description
+#: is the one thing here that actively misleads, while a 403 means a real page
+#: refused us and deserves none of that heat. Calling both "LINK FAILED" told
+#: the author two genuine sleep-society position statements were probably
+#: invented.
+#: The second, deeper check: not "does the link answer" but "does the page say
+#: what the proposal claims it says". Only ``does_not_support`` is an adverse
+#: finding — ``unreadable`` means we could not form an opinion, and saying
+#: otherwise would repeat the mistake the URL tiers exist to prevent.
+_SOURCE_VERDICT_MARK = {
+    "supported": "READ — supports what it claims to establish",
+    "does_not_support": "READ — does NOT support what it claims to establish",
+    "unreadable": "could not be read — no opinion formed",
+    "unchecked": None,
+}
+
+
+_URL_STATUS_MARK = {
+    "ok": "link OK",
+    "redirected": "REDIRECTED — check it is the right page",
+    "archived": "origin refused; read from archive",
+    "blocked": "could not read — not disproved",
+    "missing": "LINK DEAD — likely invented",
+    "not_citable": "not citable",
+    "no_url": "no URL — lead only",
+    "unchecked": "link not checked",
+}
+
+
+def _render_expansion_item(item, headline_field, exclude):
+    """One proposal: what it is, who proposed it, and whether its link is real.
+
+    The URL and its verdict share a line directly under the headline, because
+    they are read together — a URL is worth copying only once you know it
+    resolves, and the verdict means nothing without the address it applies to.
+    """
+    lines = []
+    headline = item.get(headline_field, "")
+    proposers = ", ".join(item.get("proposed_by") or []) or "?"
+    suffix = " [also proposed independently]" if item.get("convergent") else ""
+    lines.append(f"- **{headline}** — proposed by {proposers}{suffix}")
+
+    status = item.get("url_status")
+    if status:
+        mark = _URL_STATUS_MARK.get(status, status)
+        error = item.get("url_error")
+        detail = f"{mark}: {error}" if error else mark
+        url = item.get("url")
+        lines.append(f"  - {url} — _{detail}_" if url else f"  - _{detail}_")
+
+    verdict = item.get("source_verdict")
+    mark = _SOURCE_VERDICT_MARK.get(verdict)
+    if mark:
+        reason = (item.get("source_verdict_reason") or "").strip()
+        lines.append(f"  - _{mark}_" + (f" — {reason}" if reason else ""))
+        quote = (item.get("source_verdict_quote") or "").strip()
+        if quote:
+            # Stored because it was checked against the page: a reader can open
+            # the source, search for this sentence, and see the same evidence.
+            lines.append(f'    > "{quote}"')
+
+    if item.get("reuses_proposed_source"):
+        lines.append("  - _points at a source already proposed above — not new ground_")
+
+    for kv in _kv_lines(
+        item,
+        exclude=(
+            headline_field,
+            "proposed_by",
+            "convergent",
+            "source_weight",
+            "source_verdict",
+            "source_verdict_reason",
+            "source_verdict_quote",
+            "reuses_proposed_source",
+            # Rendered on the status line above, with its verdict attached.
+            *(("url", "url_status", "url_error") if status else ()),
+            *exclude,
+        ),
+    ):
+        lines.append(kv)
+    return lines
+
+
+#: (bucket, heading, the field that names the proposal)
+_EXPANSION_LAYOUT = (
+    ("sources", "Sources to bring in", "title"),
+    ("topics", "Topics not covered", "topic"),
+    ("angles", "Angles on the existing argument", "angle"),
+    ("data_points", "Data worth finding", "data_point"),
+)
+
+
+def _expansion_counts_by_model(expansion):
+    """``{model: {bucket: n}}`` — every model credited for a proposal.
+
+    A merged candidate counts for everyone in ``proposed_by``, which is the
+    honest reading: both models did propose it.
+    """
+    counts = {}
+    for bucket, _, _ in _EXPANSION_LAYOUT:
+        for item in expansion.get(bucket) or []:
+            if not isinstance(item, dict):
+                continue
+            for model in item.get("proposed_by") or []:
+                counts.setdefault(model, {})[bucket] = (
+                    counts.setdefault(model, {}).get(bucket, 0) + 1
+                )
+    return counts
+
+
+def _render_section_10(expansion):
+    """Render the opt-in expansion proposals.
+
+    Last in the report on purpose. Sections 1-9 are what is wrong with the
+    draft and the order to fix it in; this is a menu of what could be added,
+    and putting a menu above a triage list is how the triage list stops getting
+    read. It is also the only section the author is expected to mostly decline.
+    """
+    lines = [
+        "## SECTION 10: Expansion Candidates",
+        "_Proposals, not findings. Nothing here is wrong with the draft — "
+        "each is material that would fit the claim you are already making. "
+        "Declining most of them is the expected outcome._",
+        "",
+    ]
+    if not expansion:
+        lines.append("_Expansion pass did not run (enable it with `--expand`)._")
+        lines.append("")
+        return lines
+
+    checks = expansion.get("url_check") or {}
+    total = sum(len(expansion.get(b) or []) for b, _, _ in _EXPANSION_LAYOUT)
+
+    # Per model, not just a combined total. Two models returning 17 each and one
+    # returning 30 alone are very different runs, and the combined number hides
+    # which. It is also the only way to see which model ignored the ceiling.
+    per_model = _expansion_counts_by_model(expansion)
+    breakdown = ", ".join(
+        f"{model} {sum(buckets.values())}" for model, buckets in per_model.items()
+    )
+    models = ", ".join(expansion.get("models") or []) or "no model"
+    lines.append(f"Proposed by: {breakdown or models} — {total} candidate(s) in total")
+
+    cap = expansion.get("max_per_bucket")
+    if cap:
+        over = [
+            f"{model} ({', '.join(f'{b}: {n}' for b, n in sorted(buckets.items()) if n > cap)})"
+            for model, buckets in per_model.items()
+            if any(n > cap for n in buckets.values())
+        ]
+        if over:
+            lines.append(
+                f"Over the {cap}-per-bucket ceiling the prompt set: "
+                + "; ".join(over)
+                + ". Nothing was trimmed — but a model that ignored the limit "
+                "handed you an unranked list, so read its ordering as arbitrary."
+            )
+    if checks.get("checked") or checks.get("not_citable"):
+        # Each tier only appears when it happened, so the line stays short on a
+        # clean run and gets longer exactly when there is something to say.
+        parts = [f"{checks.get('resolved', 0)} of {checks.get('checked', 0)} resolved"]
+        for key, phrasing in (
+            ("archived", "{} read from an archive snapshot"),
+            ("blocked", "{} could not be read (blocked, not disproved)"),
+            ("missing", "{} dead"),
+            ("not_citable", "{} were search redirects, not citable URLs"),
+            ("no_url", "{} lead(s) offered without a URL"),
+        ):
+            if checks.get(key):
+                parts.append(phrasing.format(checks[key]))
+        lines.append("Link check: " + "; ".join(parts))
+
+        # Drawn from `missing` alone. A 403 is the origin refusing us, which
+        # says nothing about whether the page exists — treating it as evidence
+        # of invention is the accusation this section must not make.
+        source_check = expansion.get("source_check") or {}
+        if source_check.get("checked"):
+            read_parts = [f"{source_check.get('supported', 0)} support the claim made"]
+            if source_check.get("does_not_support"):
+                read_parts.append(f"{source_check['does_not_support']} do NOT")
+            if source_check.get("unreadable"):
+                read_parts.append(f"{source_check['unreadable']} could not be read")
+            lines.append(
+                f"Source check: of {source_check['checked']} page(s) fetched and "
+                "read, " + ", ".join(read_parts)
+            )
+
+        reuse = expansion.get("cross_bucket_reuse")
+        if reuse:
+            lines.append(
+                f"{reuse} data point(s) only re-point at a source already "
+                "proposed above, so the headline count overstates how much new "
+                "ground is on offer."
+            )
+
+        if checks.get("missing"):
+            lines.append("")
+            lines.append(
+                f"> {checks['missing']} URL(s) returned 404 or named a host that "
+                "does not exist. Those were very likely invented, so read the "
+                "rest of what those models proposed — especially anything "
+                "carrying no link to check — with that in mind."
+            )
+    lines.append("")
+
+    if not total:
+        lines.append("_Ran, and proposed nothing that survived its fit test._")
+        lines.append("")
+        return lines
+
+    for bucket, heading, headline_field in _EXPANSION_LAYOUT:
+        items = expansion.get(bucket) or []
+        if not items:
+            continue
+        lines.append(f"### {heading}")
+        lines.append("")
+        for item in items:
+            lines.extend(_render_expansion_item(item, headline_field, exclude=()))
+        lines.append("")
+
+    return lines
+
+
 def _citation_pair(citation):
     """Return the live URL and its archive URL, for a citation the author can paste.
 
@@ -1157,6 +1382,7 @@ def render_report_markdown(report):
     lines.extend(_render_section_7(report.get("section_7_low_confidence", [])))
     lines.extend(_render_section_8(report.get("section_8_additional", [])))
     lines.extend(_render_section_9(report.get("section_9_citations", [])))
+    lines.extend(_render_section_10(report.get("section_10_expansion", {})))
     lines.extend(_render_seo_suggestions(report.get("pre_analysis", {})))
     lines.extend(_render_seo_content_review(report.get("pre_analysis", {})))
 

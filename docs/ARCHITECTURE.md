@@ -40,6 +40,9 @@ handoff document (or --url / --raw-draft)
   ├─ Pass 3   citations        claims from Pass 2 → primary sources → Section 9
   │                            fetch · checksum · verify relevance · archive
   │
+  ├─ expansion URL check       every URL the opt-in expansion pass proposed,
+  │                            fetched and marked → Section 10. HEAD only.
+  │
   └─ output                    run_N_*_report.json  +  run_N_*_review.md
                                written to pipeline_history/<article-slug>/
 ```
@@ -88,8 +91,13 @@ The expensive step, and the one the rest of the design is arranged around.
 | `completeness` | What is missing that this audience needs? |
 | `argument_integrity` | Do the inferences actually hold? |
 | `red_team` | How would a hostile critic attack this? |
+| `expansion` | What is missing that would *fit*? (opt-in, `--expand`) |
 
 Publications can add their own via `custom_domains`.
+
+`expansion` is the odd one out and is described in full below — it is the only
+domain that proposes material rather than judging it, and the only one that does
+not run by default.
 
 **Which models run which domains** comes from the thoroughness preset —
 `standard` (one model per domain), `thorough` (two or three), `maximum` (all
@@ -114,6 +122,79 @@ sum. Adding models costs money, not time. Removing them saves money, not time.
 
 A timed-out or failed call becomes a synthetic failure result rather than an
 exception, so one dead provider degrades the ensemble instead of killing the run.
+
+---
+
+## The expansion pass — the one that inverts the design
+
+`--expand` adds a sixth domain that proposes additional sources, topics, angles
+and data points fitting the draft's existing claim. Everything above is arranged
+around finding defects; this is the exception, and it breaks three of the rules
+the rest of the pipeline depends on. Each break is deliberate.
+
+**It does not run by default.** Every other domain runs on every run. The
+revision loop is iterative, and a pass that proposes new material on revision
+six is an invitation to reopen a draft that should be converging. It is useful
+early, or between drafts. That is a judgement about *when*, not about quality,
+which is why it is a CLI flag rather than a config key — `_build_assignments`
+ignores a `prompts: [expansion]` entry unless the flag is also set.
+
+**Consensus is not applied to it.** Sections 1-6 rank a finding higher when
+several models raise it, because independent agreement about a defect is
+corroboration. Agreement about a *suggestion* means something different and
+weaker: two models proposing the same source usually means it was the obvious
+one, and the proposal only one model made is regularly the one that justified
+the pass. `_build_expansion` therefore unions instead of scoring — nothing is
+dropped for standing alone, nothing is promoted for being repeated, and repeats
+merge into one entry naming every model that offered it. `_extract_passages`
+returns nothing for the domain, so it never reaches Section 1.
+
+**Its output is verified before it is believed.** The failure mode that would
+make the pass worthless is a model that cannot find a real source inventing a
+plausible one — indistinguishable from a good suggestion by reading. Every URL
+it returns is fetched (HEAD, via the same SSRF-guarded path as link validation)
+and marked. Failures are **marked, not dropped**: the proportion that came back
+dead is the number that says whether that model's *unlinked* proposals are worth
+anything, and a tidier section that hid it would be lying about the pass's own
+reliability.
+
+**But a failure to read is not an accusation of invention**, and the verdicts
+are tiered so the report cannot make one. The first live run got this wrong: two
+real sleep-society position statements returned 403 and were reported under the
+same "very likely invented" banner as a hostname that does not resolve — the
+error [CITATIONS.md](CITATIONS.md) forbids everywhere else here. `_verify_
+expansion_urls` now reads the `origin_failure` and `verified_via` fields
+`links.py` was already returning, and splits the outcome into `ok`,
+`redirected`, `archived`, `blocked`, `missing`, `not_citable` and `no_url`. Only
+`missing` — a 404 or a nonexistent host — feeds the warning.
+
+**Resolving is not the same as supporting**, so every source that resolves is
+then read. `verify_source_supports` in the citation resolver is the narrow
+public entry point for this: SSRF-guarded fetch, text extraction, the archive
+fallback, and the relevance check — deliberately *without* `resolve_citations`'
+checksum-drift index or its Save Page Now submission, since submitting a
+proposal the author has not adopted for permanent archiving is presumptuous and
+drift against prior runs is meaningless for a URL this article never cited. The
+model's own `what_it_establishes` is the assertion under test. An unreadable
+page is `unreadable`, never `does_not_support` — the same rule as the URL tiers,
+one level deeper.
+
+Two smaller traps the same run surfaced, both of which had scored as clean
+resolutions: a search provider's `grounding-api-redirect` URL answers 200 while
+naming no publisher, so it is followed to the page it forwards to and the real
+address carried forward (only an expired wrapper, which names nothing
+recoverable, stays `not_citable`);
+and a redirect that lands on a *different document* (a Smithsonian URL for the
+1974 daylight-saving experiment redirected to an article on the casting of The
+Godfather) is now flagged rather than counted as a clean read.
+
+**The drafting model is excluded**, for a stronger reason than the one that
+excludes it from `voice_style`: the sources and topics it would propose now are
+the ones it already considered and dropped while drafting.
+
+Section 10 renders last, below the citations. Sections 1-9 are what is wrong
+with the draft and the order to fix it in; a menu of optional additions placed
+above a triage list is how the triage list stops being read.
 
 ---
 
@@ -259,7 +340,7 @@ The fix was to make the safe call the reachable one.
 
 | To add… | Do this |
 |---|---|
-| A review domain | `custom_domains` in the publication config — inline prompt or `prompt_file`, plus which models run it |
+| A review domain | `custom_domains` in the publication config — inline prompt or `prompt_file`, plus which models run it. Note what this does *not* get you: consolidation has section builders for the built-in domains only, so a custom domain's output reaches the report through `low_confidence` and `additional_observations` (Sections 7 and 8) and nowhere else, and `schemas.for_domain` returns None for it so nothing enforces the shape its prompt asks for. Adding `expansion` as a built-in was the alternative path: prompt + schema + section builder + renderer. |
 | A citation source | A module in `adapters/citation/sources/` exposing `resolve(claim)`, registered in `ADAPTER_MAP` |
 | A provider | An entry in `_PROVIDERS` in `ci_core/llm/client.py` (litellm route prefix, call surface, fallback chain, read-gap default), plus `pricing.yaml` and `cached_input` |
 | A cost preset | `configs/presets.yaml` — the YAML is the single source of truth |

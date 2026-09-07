@@ -183,12 +183,116 @@ and infers only the title and body — it cannot supply an author's
 
 ---
 
+## Expansion pass
+
+Every domain above asks what is wrong with the draft. `--expand` adds one that
+does the opposite: it proposes **additional sources, topics, angles and data
+points** that fit the article you are already writing.
+
+```powershell
+uv run ci-review --draft handoff.md --publication your_publication_name --expand
+```
+
+It is off by default, and that is a recommendation rather than a technicality.
+The review loop runs on every revision; an additions pass on revision six is an
+invitation to reopen a draft that should be converging. Run it early, or when
+you are deliberately between drafts and looking for what to research next.
+
+**It proposes; it never rewrites.** Output lands in SECTION 10, last in the
+report, below the findings you are meant to act on. Most candidates are meant
+to be declined.
+
+**What it is told not to propose.** Each candidate has to pass a fit test
+before the model returns it: does it serve the PRIMARY CLAIM *as written* — if
+adopting it would mean revising the claim, it is a different article and gets
+discarded; is it already in the draft or in SOURCES ALREADY CITED; was it
+already rejected on purpose in the pre-draft analysis's *counterarguments
+dismissed*. KNOWN GAPS is read as a target list here rather than as a
+suppression list, which is the reverse of how the `completeness` domain uses it.
+
+**Search-provider wrappers are followed, not rejected.** Gemini's grounding
+metadata returns every citation as a `vertexaisearch.../grounding-api-redirect/`
+URL rather than the publisher's own — [documented behaviour, and the subject of
+a standing feature request](https://discuss.ai.google.dev/t/feature-request-provide-actual-source-urls-in-grounding-metadata/107352).
+The pipeline follows the redirect and carries on with the real address, keeping
+the wrapper as provenance. That matters for more than tidiness: the single
+wrapper one live run produced resolved to a **Facebook page**, which the model
+had hung three separate economic figures on. Rejecting the wrapper would have
+hidden that. They are resolved during the run rather than stored because they
+expire after a few days.
+
+**Every proposed URL is fetched.** A suggestion pass with nothing checking it
+will invent plausible-looking sources, and an invented URL beside a confident
+description is the one thing in this report that can actively mislead. The
+pipeline HEAD-requests every URL the pass returns and files the result under one
+of these:
+
+| Verdict | Meaning |
+|---|---|
+| `link OK` | read directly |
+| `REDIRECTED` | read, but the server sent us to a different document — check it is the one being described |
+| `origin refused; read from archive` | the live page refused us and an archive.org snapshot served it. The source is real |
+| `could not read — not disproved` | 401/403/429/timeout. Existence unconfirmed, **no suspicion of invention** |
+| `LINK DEAD — likely invented` | 404, or a hostname that does not exist |
+| `not citable` | a search-provider redirect that could not be followed — these expire after a few days |
+| `no URL — lead only` | the model declined to guess and named the source in prose |
+
+Failures are **marked, not removed** — the proportion that came back dead is how
+you judge whether that model's unlinked suggestions are worth anything either.
+
+**And every source that resolves is then read.** A URL answering 200 is not the
+same as a page saying what was claimed about it: one live run proposed a
+Smithsonian link that resolved *and* served an article about the casting of The
+Godfather. So each proposed source is fetched, its text extracted, and a model
+asked whether the page actually supports the `what_it_establishes` the proposal
+stated — the same standard Section 9 holds citations to. Proposals were
+otherwise being trusted more than the citations they might become. Verdicts:
+`supports what it claims to establish`, `does NOT`, or `could not be read — no
+opinion formed`, which is never treated as evidence against a source.
+
+Each check is one cheap `mistral-small` call plus a page fetch, so the whole
+pass adds a fraction of a cent.
+
+The distinction between *dead* and *blocked* is the one that matters, and the
+report's "very likely invented" warning is drawn from the dead count alone. A
+403 means a real page refused our fetch; reporting that as a fabrication is the
+same error [docs/CITATIONS.md](docs/CITATIONS.md) rules out everywhere else in
+this pipeline. A model that cannot produce a real URL is asked to return `null`
+and name the source in prose instead; that is recorded as a lead, not a failure.
+
+**Which models run it.** The drafting model is excluded, for a stronger reason
+than the one that excludes it from `voice_style`: the sources and topics it
+would propose now are the ones it already considered and dropped while writing.
+Search-grounded models come first (`perplexity`, then `gemini`), since the
+bucket carrying most of the value is `sources` and a model that cannot fetch is
+guessing at URLs.
+
+**Padding is capped and, when it happens, named.** The prompt sets a ceiling of
+three candidates per bucket — an unbounded "do not pad" is not an instruction,
+and the first two runs returned 34 and 25 for a ~1,000-word draft. Nothing is
+trimmed: a model that goes over is named in the report, because a model
+ignoring the limit handed you an unranked list. Section 10 also breaks counts
+out per model, and flags data points that only re-point at a source already
+proposed above — the per-bucket ceiling counts per bucket, so it cannot see
+that on its own.
+
+**Consensus does not apply.** Sections 1-6 treat two models agreeing as
+corroboration worth ranking first. Nothing of the sort holds for a suggestion —
+two models proposing the same source usually means it was the obvious one, and
+the proposal only one model made is regularly the one that justified the pass.
+Section 10 therefore unions every model's output instead of scoring it: nothing
+is dropped for lack of agreement, repeats merge into a single entry naming
+everyone who proposed it, and `[also proposed independently]` is left for you
+to weigh.
+
+---
+
 ## The revision loop
 
 The pipeline is built for a round trip between this tool and whatever chat model you drafted with. Each run writes two files side by side in `pipeline_history/<article-slug>/`:
 
 - `run_N_<timestamp>_report.json` — the full machine-readable report
-- `run_N_<timestamp>_review.md` — the same findings rendered as readable prose, SECTION 1 through SECTION 9
+- `run_N_<timestamp>_review.md` — the same findings rendered as readable prose, SECTION 1 through SECTION 10
 
 The markdown one is the artifact you actually work from. The end of every run prints its path:
 
@@ -200,7 +304,7 @@ Readable review (paste into chat): pipeline_history/my-article/run_1_20260809_14
 
 1. **Run the pipeline** on your draft handoff (`--draft`) or a plain draft file (`--raw-draft`).
 2. **Open the `review.md`.** Read it directly, or hand it to a model.
-3. **Paste `handoff_templates/revise_after_review_prompt.md` into the same chat thread** that has the article's context, followed by the review's SECTION 1 through SECTION 9 content, plus the SEO blocks at the end of the file. Include SECTION 9 — it is long and easy to skip, but its "Read, and does NOT support the claim" block (sources read and found *not* to support the claim they were cited for) is among the most actionable findings a run produces, and it appears nowhere in SECTIONS 1-8. The section opens with the fraction of claims actually checked against a fetched document, which is the number to read first. That prompt has the model revise the draft *and* regenerate the metadata in one pass — so PRIMARY CLAIM, UNCERTAIN SECTIONS, KNOWN GAPS and the rest don't silently go stale against the revised text. Those sections are fed straight to the review models, so a stale KNOWN GAPS entry gets re-flagged on every subsequent run.
+3. **Paste `handoff_templates/revise_after_review_prompt.md` into the same chat thread** that has the article's context, followed by the review's SECTION 1 through SECTION 10 content, plus the SEO blocks at the end of the file. SECTION 10 is the exception to "paste all of it" — it only exists on an `--expand` run, and you paste the candidates you decided to adopt, not the whole menu. Include SECTION 9 — it is long and easy to skip, but its "Read, and does NOT support the claim" block (sources read and found *not* to support the claim they were cited for) is among the most actionable findings a run produces, and it appears nowhere in SECTIONS 1-8. The section opens with the fraction of claims actually checked against a fetched document, which is the number to read first. That prompt has the model revise the draft *and* regenerate the metadata in one pass — so PRIMARY CLAIM, UNCERTAIN SECTIONS, KNOWN GAPS and the rest don't silently go stale against the revised text. Those sections are fed straight to the review models, so a stale KNOWN GAPS entry gets re-flagged on every subsequent run.
 4. **Save what comes back** as two files: the revised draft, and the metadata block (the format matches `handoff_templates/metadata_only.md`).
 5. **Re-run:**
 
@@ -293,6 +397,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--api-key PROVIDER[.FIELD]=VALUE` | Override one credential field for this run only — highest tier of the credential precedence (CLI > publication config > `.env`/`user.yaml` > OS environment variable). Repeatable. `PROVIDER=VALUE` is shorthand for `api_key` (`openai`, `gemini`, `mistral`, `grok`, `perplexity`, `claude`); multi-field credentials need `PROVIDER.FIELD` (`languagetool.username`, `archive_org.secret_key`, etc.). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#api-key-precedence). |
 | `--wp-user USERNAME` | Override the WordPress username for this run only (`--publish` mode) — same precedence idea as `--api-key`, applied to `publication.wordpress`. |
 | `--wp-password APPLICATION_PASSWORD` | Override the WordPress application password for this run only (`--publish` mode). |
+| `--expand` | Add the **expansion pass**: a sixth review domain that proposes additional sources, topics, angles and data fitting the draft's existing primary claim, instead of judging what is already there. Its output is SECTION 10, and every URL it proposes is fetched and marked resolved or not. Off by default — it costs extra model calls, and it earns them early in a draft rather than on a final revision. See [Expansion pass](#expansion-pass). |
 | `--no-seo-suggestions` | Skip both SEO model calls for this run — the [metadata suggestions](docs/CONFIGURATION.md#seo-suggestions) (focus keyword candidates, meta description, OG title, OG description, schema type) and the [structure review](docs/CONFIGURATION.md#seo-structure-review). Deterministic on-page checks still run. Permanent off: `seo_rules.suggestions` / `seo_rules.content_review`. |
 | `--retry-failed RESULTS_JSON` | Fill in the gaps from a prior run: make model calls only for the (model, domain) pairs marked failed in a `run_N_results.json`, merging the new attempts onto everything that already succeeded. Requires the same draft-loading flags (`--draft`/`--url`/`--raw-draft`) as the original run. Mutually exclusive with `--replay`, which makes no model calls at all. |
 | `--verbose`, `-v` | DEBUG logging |
@@ -303,7 +408,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 |---|---|
 | `--no-timeout` | Disable timeout truncation so true completion times are measured, never cut off |
 | `--only-model PROVIDER` | Run only one provider (e.g. `openai`) instead of the full ensemble |
-| `--only-domain DOMAIN` | Run only one domain (`fact_check`, `voice_style`, `completeness`, `argument_integrity`, `red_team`) |
+| `--only-domain DOMAIN` | Run only one domain (`fact_check`, `voice_style`, `completeness`, `argument_integrity`, `red_team`, or `expansion` with `--expand`) |
 | `--replay RESULTS_JSON` | Replay a captured ensemble instead of calling any models — free |
 | `--offline` | Skip every pass that reaches the network (link validation, Wayback, citation resolution) |
 

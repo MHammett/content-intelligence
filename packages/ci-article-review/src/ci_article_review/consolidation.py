@@ -3,7 +3,8 @@ Merge ensemble model responses into a structured review report.
 
 The pipeline runs each configured model against each assigned prompt domain,
 producing a dict of results keyed by (model_name, domain).  This module merges
-those results into a single report with eight sections.
+those results into a single report with eight sections, plus an opt-in tenth
+(``--expand``) that proposes material rather than judging it.
 
 Weighting
 ---------
@@ -30,6 +31,13 @@ Built-in default weights reflect observed capability fit:
 
   * Grounding bonus: search-grounded models receive a 1.5x weight for
     fact_check because their claims are verifiable against live sources.
+
+The opt-in ``expansion`` domain has its own weights, not shown in the table:
+perplexity 1.3, gemini 1.2, grok 1.1, everything else 1.0. The same grounding
+argument applies with more force — a model that cannot fetch is guessing at
+URLs — and grok is up a notch for reaching adjacent material the others do not.
+Unlike sections 1-6, these weights only order the list. Nothing in section 10 is
+dropped or promoted for how many models proposed it.
 
 All weights are configurable in configs/user.yaml under the ``ensemble`` key.
 
@@ -59,11 +67,11 @@ log = logging.getLogger(__name__)
 #: Built-in domain weights.  Configurable under ``ensemble.weights`` in user.yaml.
 #: The ``default`` key applies to all domains not explicitly listed.
 _DEFAULT_WEIGHTS = {
-    "gemini": {"default": 1.0, "fact_check": 1.5},
-    "perplexity": {"default": 1.0, "fact_check": 1.5},
+    "gemini": {"default": 1.0, "fact_check": 1.5, "expansion": 1.2},
+    "perplexity": {"default": 1.0, "fact_check": 1.5, "expansion": 1.3},
     "openai": {"default": 1.0, "voice_style": 1.2, "completeness": 1.2},
     "mistral": {"default": 1.0, "argument_integrity": 1.2, "red_team": 1.1},
-    "grok": {"default": 1.0, "red_team": 1.2},
+    "grok": {"default": 1.0, "red_team": 1.2, "expansion": 1.1},
     "claude": {"default": 1.0, "argument_integrity": 1.3, "voice_style": 1.1},
 }
 
@@ -87,6 +95,7 @@ _DOMAIN_SECTIONS = {
     "completeness": "SECTION 5: Completeness and Framing",
     "argument_integrity": "SECTION 4: Argument Integrity",
     "red_team": "SECTION 6: Red Team Findings",
+    "expansion": "SECTION 10: Expansion Candidates",
 }
 
 
@@ -141,6 +150,18 @@ def _extract_passages(model_name, domain, result):
       red_team           — most_vulnerable_claim.passage etc.
     """
     if result.get("failed") or not result.get("data"):
+        return []
+
+    # expansion proposes material the draft does not contain, so it has no
+    # passage to key on and no business in Section 1. The deeper reason is that
+    # consensus is the wrong test for it: agreement between two models on a
+    # defect is corroboration, but agreement on a suggestion is just the two of
+    # them reaching for the same obvious source. The proposal only one model
+    # made is frequently the one worth having, and a threshold would bury it.
+    # _build_expansion unions instead. Explicit rather than relying on the
+    # if/elif below falling through, which would silently absorb the next
+    # domain anyone adds.
+    if domain == "expansion":
         return []
 
     data = result["data"]
@@ -488,6 +509,199 @@ def _build_red_team(results, ensemble_cfg):
     return merged
 
 
+#: Which field identifies a proposal, per bucket, in preference order. Two
+#: models proposing the same EPA dataset under different titles are one
+#: candidate if the URL matches; two proposing the same topic in different
+#: words are matched on the normalised text and usually will not merge. That
+#: asymmetry is deliberate — a missed merge costs a duplicate line, and a wrong
+#: merge silently destroys one of the two proposals.
+#:
+#: **Do not "fix" this with fuzzy matching.** It was measured against two live
+#: runs, using the Jaccard content-word overlap the citation pass already uses
+#: (``pipeline._claim_key``). Within a single-topic article every proposal
+#: shares most of its vocabulary, so the score tracks the subject rather than
+#: the meaning:
+#:
+#:   0.42  "British Sleep Society position statement on DST"
+#:         "Daylight Saving Time: An AMA Position Statement"    <- different docs
+#:   0.16  "cite parallel position statements from British and European
+#:          sleep societies"
+#:         "broad scientific consensus across multiple medical and sleep
+#:          organizations"                                       <- same idea
+#:
+#: The genuinely duplicated pair scores *lower* than a dozen unrelated ones. No
+#: threshold separates them, and every threshold that catches the 0.16 merges
+#: distinct sources wholesale. A URL is the only identity available here that
+#: means anything, which is why it is the only one used.
+_EXPANSION_BUCKETS = {
+    "sources": ("url", "title"),
+    "topics": ("topic",),
+    "angles": ("angle",),
+    "data_points": ("data_point",),
+}
+
+
+#: Query parameters that identify a referrer rather than a document. Stripping
+#: these is safe in the direction that matters: two URLs differing only by a
+#: campaign tag are the same page. Every *other* parameter is left alone,
+#: because `?id=42` is identity, not decoration, and dropping it would merge two
+#: different documents.
+_TRACKING_PARAMS = (
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "fbclid",
+    "gclid",
+    "mc_cid",
+    "mc_eid",
+)
+
+
+def url_key(url):
+    """Normalise a URL enough to match the same page proposed twice.
+
+    Public because the pipeline needs the identical notion of "same page" in
+    three places — merging proposals here, deciding whether a redirect landed
+    somewhere new, and spotting a data point that only re-points at a source
+    already proposed. Three private copies of this drifted apart once already
+    within a single change.
+
+    **Every rule here errs toward *not* merging.** A missed merge costs one
+    duplicate line in a menu the author is skimming; a wrong merge silently
+    deletes somebody's proposal. So:
+
+    - Only the **host** is lowercased. Paths are case-sensitive on essentially
+      every server that is not Windows, so ``/Report.pdf`` and ``/report.pdf``
+      may be two documents. Lowercasing the whole URL — which this did until it
+      was measured — merges them, which is the destructive direction.
+    - The **fragment is dropped**. It is never sent to the server, so it cannot
+      identify a different document; ``#section-3`` is an anchor within the same
+      page.
+    - Only **known tracking parameters** are dropped. A general "strip the query
+      string" rule would collapse ``?id=42`` and ``?id=43``.
+
+    Not attempted: recognising that a DOI and a publisher URL are the same
+    paper, or a PubMed ID and a DOI. No syntactic rule finds those, and across
+    three live runs no two models ever proposed the same source at all — so the
+    machinery would be for a case that has not occurred.
+
+    **Why not w3lib.** ``w3lib.url.canonicalize_url`` was compared against this
+    on nine cases before this was kept. It is not a superset: it answers a
+    different question. It produces an RFC-correct canonical *URI*, so it
+    correctly keeps ``http://www.example.org/doc/`` distinct from
+    ``https://example.org/doc`` and keeps tracking parameters (sorted, not
+    dropped). Those two equivalences are the entire reason this function exists,
+    so adopting it would break the cases it is for. What it did better —
+    percent-encoding case and query-argument order — is folded in below, which
+    costs three lines against a new dependency in a workspace that deliberately
+    keeps its install small. Dot-segment resolution (``/a/../b``) is handled by
+    neither and left alone: a model proposing a relative traversal inside an
+    absolute source URL has not happened and would be strange.
+    """
+    key = (url or "").strip()
+    key = re.sub(r"^https?://", "", key, flags=re.IGNORECASE)
+    key = key.split("#", 1)[0]
+
+    # Split host from the rest before case-folding, so only the host folds.
+    host, slash, rest = key.partition("/")
+    host = re.sub(r"^www\.", "", host.lower(), flags=re.IGNORECASE)
+
+    if "?" in rest:
+        path, _, query = rest.partition("?")
+        kept = [
+            pair
+            for pair in query.split("&")
+            if pair and pair.split("=", 1)[0].lower() not in _TRACKING_PARAMS
+        ]
+        # Sorted, because argument order is not identity: ?a=1&b=2 and ?b=2&a=1
+        # are one page. Borrowed from w3lib's canonicalize_url rather than
+        # depending on it — see the docstring.
+        rest = path + ("?" + "&".join(sorted(kept)) if kept else "")
+
+    # Percent-encoding is case-insensitive in the escape digits, so %2f and %2F
+    # are the same octet. Also from w3lib.
+    key = host + slash + rest
+    key = re.sub(r"%([0-9a-fA-F]{2})", lambda m: "%" + m.group(1).upper(), key)
+    return key.rstrip("/")
+
+
+def _expansion_key(bucket, item):
+    """Identity for a proposal, or "" when it carries nothing to key on."""
+    for field in _EXPANSION_BUCKETS[bucket]:
+        value = item.get(field)
+        if value:
+            return url_key(value) if field == "url" else _passage_key(str(value))
+    return ""
+
+
+def _build_expansion(results, ensemble_cfg):
+    """Union every model's proposals, bucket by bucket.
+
+    This is the one section built by union rather than by scoring, and the
+    difference is the point of the domain. Sections 1-6 exist to rank defects,
+    where two models agreeing is corroboration worth surfacing first. Nothing
+    of the sort is true of a suggestion: two models proposing the same source
+    usually means it was the obvious one, and the proposal a single model made
+    is regularly the one that justified the pass. So nothing is dropped for
+    lack of agreement and nothing is promoted for having it — repeats merge
+    into one entry that records every model that offered it, and ``convergent``
+    is left for the reader to weigh rather than used as a sort key.
+
+    Ordering is by source-model weight, the same rule sections 3-5 use, which
+    orders by how well-suited the model is and not by how many models agreed.
+
+    Returns ``{}`` when no model ran the domain, which is the common case: the
+    pass is opt-in. An empty dict and a dict of empty buckets mean different
+    things downstream — "nobody ran this" versus "it ran and found nothing" —
+    and the renderer says which.
+    """
+    domain_results = [
+        (model, r)
+        for (model, d), r in results.items()
+        if d == "expansion" and not r.get("failed") and r.get("data")
+    ]
+    if not domain_results:
+        return {}
+
+    # Highest-weight model first, so its ordering wins where proposals merge.
+    domain_results.sort(
+        key=lambda pair: _get_weight(pair[0], "expansion", ensemble_cfg),
+        reverse=True,
+    )
+
+    out = {}
+    for bucket in _EXPANSION_BUCKETS:
+        merged = []
+        by_key = {}
+        for model_name, r in domain_results:
+            weight = _get_weight(model_name, "expansion", ensemble_cfg)
+            for item in r["data"].get(bucket, []) or []:
+                if not isinstance(item, dict):
+                    continue
+                key = _expansion_key(bucket, item)
+                existing = by_key.get(key) if key else None
+                if existing is not None:
+                    if model_name not in existing["proposed_by"]:
+                        existing["proposed_by"].append(model_name)
+                        existing["convergent"] = True
+                    continue
+                entry = {
+                    **item,
+                    "proposed_by": [model_name],
+                    "convergent": False,
+                    "source_weight": round(weight, 2),
+                }
+                merged.append(entry)
+                if key:
+                    by_key[key] = entry
+        out[bucket] = merged
+
+    out["models"] = [model for model, _ in domain_results]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Cross-model contradiction detection
 # ---------------------------------------------------------------------------
@@ -661,6 +875,10 @@ def build_report(
     section_5_completeness = _build_completeness(results, ensemble_cfg)
     section_6_red_team = _build_red_team(results, ensemble_cfg)
 
+    # Section 10 — opt-in expansion proposals. {} when the pass did not run,
+    # which is the default.
+    section_10_expansion = _build_expansion(results, ensemble_cfg)
+
     # Section 7 — Low-confidence observations
     section_7_low_confidence = _collect_low_confidence(results)
 
@@ -744,6 +962,8 @@ def build_report(
         "section_6_red_team": section_6_red_team,
         "section_7_low_confidence": section_7_low_confidence,
         "section_8_additional": section_8_additional,
+        # Section 9 (citations) is attached by the pipeline after Pass 3.
+        "section_10_expansion": section_10_expansion,
         "contradictions": contradictions,
         "model_failures": model_failures,
         "model_failure_details": model_failure_details,

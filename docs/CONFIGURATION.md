@@ -366,7 +366,15 @@ models:
     web_search: [fact_check]    # only fact_check searches
 ```
 
-`web_search: true` is still accepted and means every domain, which is what you almost never want. Search bills per search on top of tokens, and only `fact_check` has any use for it — there it replaces training recall with a live-fetched `source`. `voice_style` matches the draft against a voice profile, and `completeness`, `argument_integrity` and `red_team` all reason about the draft in front of them. At `maximum` thoroughness, where OpenAI runs all five domains, the list form is the difference between one paid search context per run and five.
+`web_search: true` is still accepted and means every domain, which is what you almost never want. Search bills per search on top of tokens, and among the always-on domains only `fact_check` has any use for it — there it replaces training recall with a live-fetched `source`. `voice_style` matches the draft against a voice profile, and `completeness`, `argument_integrity` and `red_team` all reason about the draft in front of them. At `maximum` thoroughness, where OpenAI runs all five domains, the list form is the difference between one paid search context per run and five.
+
+**`expansion` is the second domain worth listing**, on the runs where you use it. It is the opt-in pass behind `--expand`, and the bucket carrying most of its value is `sources` — a model without search is reaching into training recall for URLs, which is exactly the condition that produces invented ones. If you run `--expand` with a non-grounded model, add it:
+
+```yaml
+    web_search: [fact_check, expansion]
+```
+
+Perplexity needs nothing here — `sonar` models search natively. Gemini and OpenAI do. The pipeline fetches every URL the pass returns either way and reports how many resolved, so you can see directly what search bought you.
 
 If the Responses API is unavailable it falls back to standard chat completions silently.
 
