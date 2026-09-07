@@ -364,6 +364,16 @@ def pass_contribution(entries):
       sole_source      consensus flags ONLY it raised (nobody corroborated)
       corroborated     consensus flags it shared with at least one other pass
       usd_per_consensus_hit   cost efficiency, the number to sort by
+      proposals        Section 10 candidates it offered (expansion passes only)
+      usd_per_proposal expansion's equivalent of usd_per_consensus_hit
+
+    **The expansion domain cannot be scored on consensus and is not.** It never
+    reaches Section 1 — by design, since it proposes material rather than
+    flagging passages — so every expansion pass would show zero hits, no
+    cost-per-hit, and land in the "never contributed, consider trimming" note
+    below. That note would be recommending the deletion of a pass that was
+    working exactly as intended. Expansion passes are scored on proposals
+    offered and reported separately.
 
     The interesting signal is a pass with real cost and few consensus hits, or
     one whose hits are always corroborated by a cheaper pass — that is a
@@ -389,6 +399,7 @@ def pass_contribution(entries):
                 "consensus_hits": 0,
                 "sole_source": 0,
                 "corroborated": 0,
+                "proposals": 0,
             },
         )
 
@@ -409,6 +420,16 @@ def pass_contribution(entries):
             if name:
                 _slot(name)["total_usd"] += float(cost_entry.get("total_usd") or 0.0)
 
+        # Expansion's unit of output is a proposal, counted per model that
+        # offered it — a merged candidate credits everyone in proposed_by.
+        expansion = report.get("section_10_expansion") or {}
+        for bucket in ("sources", "topics", "angles", "data_points"):
+            for item in expansion.get(bucket) or []:
+                if not isinstance(item, dict):
+                    continue
+                for model in item.get("proposed_by") or []:
+                    _slot(f"{model}:expansion")["proposals"] += 1
+
         for flag in report.get("section_1_consensus") or []:
             models = [m for m in (flag.get("models") or []) if m]
             for name in set(models):
@@ -423,6 +444,10 @@ def pass_contribution(entries):
         hits = slot["consensus_hits"]
         slot["usd_per_consensus_hit"] = (
             round(slot["total_usd"] / hits, 4) if hits else None
+        )
+        proposals = slot["proposals"]
+        slot["usd_per_proposal"] = (
+            round(slot["total_usd"] / proposals, 4) if proposals else None
         )
         slot["total_usd"] = round(slot["total_usd"], 4)
 
@@ -536,6 +561,12 @@ def print_history_report(result):
             )
 
     contribution = result.get("pass_contribution") or []
+    # Split before rendering: the consensus table's whole question is "did this
+    # call reach Section 1", which expansion is structurally unable to do.
+    # Listing it there with a zero is not a neutral omission — the table is
+    # read as a trim list.
+    expansion_rows = [s for s in contribution if s["pass"].endswith(":expansion")]
+    contribution = [s for s in contribution if not s["pass"].endswith(":expansion")]
     if contribution:
         print("\nPer-pass contribution (is each ensemble call earning its cost?):")
         print(
@@ -562,6 +593,28 @@ def print_history_report(result):
                 "sees what nothing else sees scores badly here and is still "
                 "worth paying for."
             )
+
+    if expansion_rows:
+        print("\nExpansion passes (scored on proposals, not consensus):")
+        print(
+            f"  {'pass':30s} {'calls':>6s} {'fail':>5s} {'$total':>9s} "
+            f"{'props':>6s} {'$/prop':>9s}"
+        )
+        for s in expansion_rows:
+            per_proposal = (
+                f"${s['usd_per_proposal']:.4f}"
+                if s["usd_per_proposal"] is not None
+                else "—"
+            )
+            print(
+                f"  {s['pass']:30s} {s['calls']:6d} {s['failures']:5d} "
+                f"${s['total_usd']:8.4f} {s['proposals']:6d} {per_proposal:>9s}"
+            )
+        print(
+            "  These never appear in the table above because Section 10 never "
+            "reaches Section 1. Judge them on whether the proposals were "
+            "adopted and whether their URLs resolved — not on consensus."
+        )
 
     print()
 
