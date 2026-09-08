@@ -366,6 +366,18 @@ class TestSeoSuggestionPassReachedFromDraftRun:
                     return_value=({"status": "skipped", "reason": "test"}, None),
                 )
             )
+            # The content-review pass runs right behind the suggestion pass and
+            # is not what these tests are about. Left real, it took the
+            # api_keys entry above at its word and made a live Mistral call on
+            # every run — 10s of retry and backoff against a key that reads
+            # "k". `test_content_review_is_invoked_too` already stubs it the
+            # same way and is the test that asserts on it.
+            stack.enter_context(
+                patch(
+                    "ci_article_review.pipeline.seo_content.review",
+                    return_value=({"status": "ok", "findings": []}, None),
+                )
+            )
             with pytest.raises(SystemExit):
                 pipeline.run_draft_pipeline(
                     None,

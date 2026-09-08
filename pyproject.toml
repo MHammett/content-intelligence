@@ -26,6 +26,7 @@ dev = [
     "ruff>=0.4",
     "pytest-cov>=5.0",
     "pytest-asyncio>=0.23",
+    "pytest-socket>=0.8.1",
     "httpx2>=2.4.0",
 ]
 
@@ -36,13 +37,29 @@ ci-core = { workspace = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
-addopts = "--import-mode=importlib"
+# `--disable-socket --allow-hosts=...` is a correctness guard that happens to
+# be a large speedup. The unit suite is meant to be hermetic, and was not: 20
+# tests reached the real network, 15 of them opening TCP connections to
+# archive.org on every run. They passed either way, because the production code
+# they exercise correctly swallows a transport failure — so the calls were
+# invisible except as wall-clock time (61s of a 182s run) and as load on a
+# public service that owes us nothing.
+#
+# Loopback stays allowed: ci-core's db and logging tests bind real local
+# sockets, and blocking those would test nothing useful.
+#
+# A test that legitimately needs the network opts back in with
+# `@pytest.mark.enable_socket`. Today nothing does.
+addopts = "--import-mode=importlib --disable-socket --allow-hosts=127.0.0.1,::1"
 markers = [
-    # Tests whose wall-clock cost is inherent, not accidental: the one that
-    # proves a `concurrent.futures` atexit join really does hold the interpreter
-    # open (only showable by waiting one out), and the one that proves
-    # `call_all` exits cleanly when a model has no computed backstop (needs a
-    # subprocess, which must pay litellm'''s ~6s import before it can start).
+    # Tests whose wall-clock cost is inherent, not accidental: the three that
+    # prove something *hangs*, which is only showable by waiting one out — the
+    # `concurrent.futures` atexit join, the same join reached through a foreign
+    # thread pool, and `call_all` against a model with no computed backstop.
+    #
+    # Each waits the smallest interval that still separates "exits at once"
+    # from "does not exit": ~5s, ~5s and ~1.5s. Those are floors, not choices —
+    # shortening them further stops distinguishing the two outcomes.
     #
     # Not skipped by default: a green run means the whole suite passed. Use
     # `-m "not slow"` to deselect them while iterating. See README "Running the

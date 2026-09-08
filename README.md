@@ -535,15 +535,37 @@ uv run ci-review --draft handoff.md --publication mypub --cost-preset maximum --
 uv run pytest packages/
 ```
 
-Around 1,560 tests in roughly 20 seconds, all external API calls mocked — no
+Around 2,830 tests in roughly 45 seconds, all external API calls mocked — no
 keys required.
+
+### The suite does not touch the network
+
+`addopts` passes `--disable-socket --allow-hosts=127.0.0.1,::1`, so a unit test
+that opens a connection to anything but loopback fails instead of waiting on it.
+
+This is a correctness guard first. Twenty tests were reaching the real network
+without meaning to — fifteen of them opening TCP connections to archive.org on
+every single run — and all twenty passed either way, because the production code
+they exercise correctly swallows a transport failure. The calls were invisible
+except as wall-clock time: 61 seconds of a 182-second run, and load on a public
+service that owes us nothing.
+
+Loopback stays allowed because `ci-core`'s db and logging tests bind real local
+sockets. A test that genuinely needs the network opts back in with
+`@pytest.mark.enable_socket`; nothing does today.
+
+If you add a test that trips this, the fix is almost always a missing stub one
+layer below the one you already wrote — the collaborator that runs *after* the
+thing you are asserting on. `pytest --force-enable-socket` will show you what it
+was reaching for.
 
 ### The `slow` marker
 
-One test is inherently wall-clock-bound: `test_the_executor_form_really_did_hang`
-proves that a `concurrent.futures` atexit join really does hold the interpreter
-open after a run finishes, and the only way to show a hang is to wait one out
-(~5s). It is marked `slow`.
+Three tests are inherently wall-clock-bound, because each proves that something
+*hangs* and the only way to show a hang is to wait one out:
+`test_the_executor_form_really_did_hang`,
+`test_without_it_the_process_really_does_hang`, and
+`test_a_model_with_no_backstop_does_not_hold_the_process_open` (~5s, ~5s, ~1.5s).
 
 **`slow` tests are not skipped by default** — a green `uv run pytest packages/`
 means the whole suite passed, with nothing quietly sitting out. Deselect them
@@ -559,9 +581,13 @@ To run just those tests:
 uv run pytest packages/ -m slow
 ```
 
-The marker is registered in the root `pyproject.toml` (and in
-`packages/ci-core/pyproject.toml`, which is the config pytest reads when that
-package's tests are run on their own). Reach for it sparingly: almost every
+The marker and the socket guard are both registered in the root
+`pyproject.toml` **and** in each package's own `pyproject.toml`. The duplication
+is load-bearing: pytest picks the nearest config file to the paths you pass, so
+the root file is the inifile only for the repo-wide `pytest packages/` run. Pass
+a single package or a single file and the root `addopts` is not read at all —
+which is exactly the invocation you use while iterating, and exactly where an
+unguarded suite would go back to dialling out. Reach for the marker sparingly: almost every
 slow test this suite has had was slow by accident — a real `time.sleep`, an
 unstubbed network call, or a per-test fixture doing shared work — and those
 should be fixed, not marked.
