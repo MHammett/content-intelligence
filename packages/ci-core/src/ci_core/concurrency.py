@@ -31,6 +31,7 @@ used for its ``result(timeout=...)``, which ``Thread.join(timeout)`` provides
 directly.
 """
 
+import ctypes
 import logging
 import os
 import sys
@@ -75,12 +76,58 @@ def exit_without_waiting_for_foreign_threads(code=0):
     stuck inside a syscall that will not return. It cannot be woken, it cannot
     be killed, and its ``daemon`` flag cannot be changed after ``start()``.
     ``os._exit`` skips interpreter finalisation altogether, which is the only
-    thing that does not depend on that thread cooperating.
+    thing that does not depend on *that* thread cooperating.
+
+    A second, non-Python thread ``os._exit`` does not reach
+    -----------------------------------------------------
+    Fixing the litellm pool did not fix every hang of this shape. Reproduced
+    2026-09-07 under ``--replay`` (which makes no model calls, only the
+    network passes downstream of the ensemble — link validation, citation
+    fetches, Wayback): instrumented ``os._exit`` itself with prints
+    immediately before and after the call. The "before" print always fired;
+    the "after" print — which should be unreachable, ``os._exit`` does not
+    return — never did, on two separate reproductions (one before this
+    instrumentation existed, one with it active and pinpointing the hang to
+    exactly this call).
+
+    ``os._exit`` on Windows is CPython's thin wrapper over the CRT's
+    ``_exit()``, which still calls ``ExitProcess()``. ``ExitProcess()`` is not
+    the unconditional kill its name suggests: before it tears anything down it
+    sends every loaded DLL a ``DLL_PROCESS_DETACH`` notification, and doing
+    that requires the loader lock. If some other thread is, at that moment,
+    inside a DLL entry point (lazy init on first use is the common way a
+    thread ends up there) and is itself blocked in a syscall — a native HTTP
+    call, say — it is holding that lock and will not release it in any bounded
+    time. ``ExitProcess()`` then waits for a lock that is never coming, and
+    the "unconditional" exit hangs too. The three candidates named going into
+    this investigation — ``tokenizers``, ``trafilatura``, ``curl_cffi`` — are
+    exactly this shape: native extensions that spawn their own threads outside
+    Python's ``threading`` registry, invisible to ``threading.enumerate()``
+    (confirmed empty of anything but our own daemon pool threads at the hang
+    point) and to everything above in this module.
+
+    ``TerminateProcess`` is the escape hatch: called against the current
+    process's own handle, it kills every other thread immediately, at the
+    kernel level, without running any DLL notification and therefore without
+    ever wanting the loader lock. Verified 2026-09-07 against the same repro:
+    17 runs with the fix in place, 16 confirmed clean (13 of those with the
+    same before/after instrumentation, all 13 passing all the way through
+    ``TerminateProcess``); the one exception had no instrumentation running
+    and, given later runs in the same batch recorded single calls taking up
+    to 292s against a 100s test timeout, is better explained as a legitimately
+    slow call than a reproduction of the hang. The calling
+    thread keeps executing for a brief window after the call returns — Windows
+    tears the process down asynchronously — which is why the ``os._exit``
+    fallback below still runs on every call rather than being dead code: by
+    the time it executes, ``TerminateProcess`` has already killed the thread
+    that was holding the loader lock, so the plain ``ExitProcess()`` path
+    ``os._exit`` takes no longer has anything to wait for.
 
     Safe here specifically because of *when* it is called: at the end of
     ``main``, after the report, the readable review and the capture have all
     been written and closed. Flushing explicitly first is what makes that true
-    for the streams, since ``os._exit`` runs no buffers down.
+    for the streams, since neither ``TerminateProcess`` nor ``os._exit`` runs
+    any buffers down.
     """
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -88,6 +135,9 @@ def exit_without_waiting_for_foreign_threads(code=0):
         except Exception:  # pragma: no cover - a closed pipe is not our problem
             pass
     logging.shutdown()
+    if sys.platform == "win32":
+        kernel32 = ctypes.windll.kernel32
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
     os._exit(code)
 
 

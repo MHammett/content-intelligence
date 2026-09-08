@@ -617,6 +617,49 @@ around its output. 239 lines is not where the pain is.
   has no equivalent, and mistral/gemini only sent it in the non-reasoning and
   non-grounded paths that `maximum` does not use.
 
+- ~~Second process-exit hang, same symptom as the litellm one #103 fixed
+  (report written, process stays alive). #103 flagged `tokenizers`,
+  `trafilatura`, `curl_cffi` as unconfirmed candidates and left it for next
+  time.~~ **Diagnosed and fixed, 2026-09-07, against `6def23f`.** Still live
+  after #133/#162/#164 (daemon-thread concurrency rewrites) — those changed
+  nothing here because the blocking thread was never a Python one.
+  Reproduced under `--replay` (no model calls, only the network passes
+  downstream of the ensemble): 2 separate hangs (one before instrumentation
+  existed, one with it active). Instrumented
+  `exit_without_waiting_for_foreign_threads` (`ci_core/concurrency.py`) with
+  prints immediately before and after `os._exit` — the "after" print, which
+  should be unreachable, never fired on the instrumented hang, and
+  `threading.enumerate()` at that point showed nothing but our own daemon
+  pool threads. So `os._exit` itself was the thing not returning, and the
+  blocking thread was invisible to Python's own thread registry — i.e. a
+  native one, spawned by a C extension.
+
+  Root cause: on Windows, `os._exit` still calls `ExitProcess()` under the
+  hood, and `ExitProcess()` is not unconditional — before tearing anything
+  down it sends every loaded DLL a `DLL_PROCESS_DETACH` notification, which
+  requires the loader lock. A native extension's background thread blocked
+  inside a syscall while holding that lock (lazy DLL init on first use,
+  common in `tokenizers`'/`curl_cffi`'s shape, is how a thread ends up there)
+  makes `ExitProcess()` wait for a lock that is never coming — the
+  "unconditional" exit hangs too. This is a different mechanism from the
+  litellm one (a non-daemon Python thread `threading._shutdown()` joins) and
+  `os._exit` does not protect against it, contrary to what fixing the litellm
+  cause assumed.
+
+  Fix: call `TerminateProcess` against the process's own handle before
+  falling back to `os._exit`. `TerminateProcess` kills every other thread at
+  the kernel level without any DLL notification, so it never wants the loader
+  lock. Verified over 17 replay runs post-fix: 16 confirmed clean, 13 of those
+  with the same before/after instrumentation and all 13 passing straight
+  through `TerminateProcess`. The one exception ran with no instrumentation,
+  and given later runs in the same batch recorded single model calls taking
+  up to 292s against a 100s test timeout, is better explained as a
+  legitimately slow call than a reproduction of the hang. The exact native
+  library holding the lock was not pinned down further — not needed, since
+  `TerminateProcess` is correct regardless of which one it is, and
+  re-diagnosing per-library would have cost more live/replay runs than it
+  would have bought.
+
 - **Seven retry/backoff implementations, no shared mechanism.**
   **Surveyed 2026-09-07 against `ac73de5` — not fixed.** Retry *policy* should
   differ between these; a 429 carrying `Retry-After` is not a stalled model
