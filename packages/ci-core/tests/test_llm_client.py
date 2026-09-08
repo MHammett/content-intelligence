@@ -18,6 +18,9 @@ everything that would break silently if the shim mapped something wrong:
     empty rather than by raising.
 """
 
+import subprocess
+import sys
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1782,7 +1785,9 @@ class TestOpenAINeverReceivesTemperature:
         import inspect
 
         source = inspect.getsource(client)
-        start = source.index("litellm.responses(**kwargs)")
+        # `_litellm()` rather than a bare `litellm`: the import is deferred so
+        # the CLI does not pay ~7s of it at startup (TestLitellmIsImportedLazily).
+        start = source.index("_litellm().responses(**kwargs)")
         window = source[max(0, start - 3000) : start]
         assert 'kwargs["temperature"]' not in window, (
             "the Responses-API path sets a temperature again — gpt-5.x returns "
@@ -1842,3 +1847,91 @@ class TestClaudeOutputCeiling:
         """claude-haiku-4-5 reports max_output_tokens 64000. Raising the default
         to the ceiling would trade one silent failure for a cost surprise."""
         assert self._seen()["max_tokens"] <= 16000
+
+
+class TestLitellmIsImportedLazily:
+    """litellm must not be imported just because this module was.
+
+    It costs ~7.1s of the ~8.2s it takes to import `ci_article_review.pipeline`,
+    and every console script used to pay that at startup — including the ones
+    that never reach a provider (`ci-check`, `ci-discover`, `ci-setup`,
+    `ci-history-report`) and every `--help`.
+
+    This is the kind of regression that reports itself as "the CLI feels slow"
+    and never as a failing test, so it needs an assertion rather than a comment:
+    one `import litellm` added back at module scope would undo it silently.
+    """
+
+    def test_importing_the_shim_does_not_import_litellm(self):
+        """In a subprocess, because ~80 tests in this file touch
+        `client.litellm` and any one of them imports it process-wide — an
+        in-process assertion here would pass or fail on test ordering."""
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; import ci_core.llm.client; "
+                "print('litellm' in sys.modules); print('openai' in sys.modules)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.split() == ["False", "False"], (
+            f"Importing ci_core.llm.client pulled in litellm/openai: {proc.stdout!r}"
+        )
+
+    def test_the_attribute_still_resolves_to_the_configured_module(self):
+        """`client.litellm` is the handle this suite patches, ~80 times over.
+
+        It also has to arrive configured: litellm prints a provider-list banner
+        and update nags on first use, so the settings that suppress them have
+        to be applied between importing it and calling it.
+        """
+        module = client.litellm
+        assert module.__name__ == "litellm"
+        assert module.suppress_debug_info is True
+        assert module.telemetry is False
+
+    def test_an_unknown_attribute_still_raises(self):
+        """The lazy hook must not turn every typo into something importable."""
+        with pytest.raises(AttributeError, match="no attribute 'not_a_real_name'"):
+            client.not_a_real_name
+
+    def test_concurrent_first_use_returns_one_configured_module(self):
+        """The review pass fans ~30 calls across daemon threads, so several can
+        reach `_litellm()` at once with the cache still empty.
+
+        A barrier so the threads genuinely start together rather than in
+        sequence. What this pins is that every caller gets the same, configured
+        object — the failure modes being a second import, a None, or a module
+        observed before its settings were applied. It cannot force the unlucky
+        interleaving on demand (litellm is already in `sys.modules` by now, so
+        the window is small), which is why `_litellm()` assigns the cache last,
+        after configuring: that ordering is what makes the window unreachable
+        rather than merely unlikely.
+        """
+        client._litellm_module = None
+        gate = threading.Barrier(8, timeout=30)
+        seen = []
+        errors = []
+
+        def _race():
+            try:
+                gate.wait()
+                seen.append(client._litellm())
+            except BaseException as exc:  # noqa: BLE001 — reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_race) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, f"Concurrent first use raised: {errors}"
+        assert len(seen) == 8
+        assert all(m is seen[0] for m in seen), "Threads got different modules"
+        assert seen[0].suppress_debug_info is True
+        assert seen[0].telemetry is False
