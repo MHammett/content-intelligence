@@ -151,7 +151,10 @@ For smoke-testing a pipeline *code* change instead of a draft, use
 a similarly short fixture deliberately engineered to touch more of the
 pipeline's edges in one pass: a mix of resolving, dead, and mismatched
 citations, a claim that needs a live web search, an AI-speak passage several
-models should flag in consensus, and a vague SEO heading.
+models should flag in consensus, and a vague SEO heading. A `--cost-preset
+wide` run against it costs about $0.13, live-verified end to end (2026-09-08:
+all 12 ensemble calls completed, one transient malformed-JSON retry recovered
+cleanly, process exited without hanging).
 
 **6. Publish an approved draft:**
 
