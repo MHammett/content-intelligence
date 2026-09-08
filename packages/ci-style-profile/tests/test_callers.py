@@ -423,7 +423,12 @@ class TestModelWithNoComputedBackstop:
             patch.object(
                 C, "call_one", side_effect=lambda *a, **kw: never_returns.wait()
             ),
-            patch.object(C, "_TASK_CEILING_SECONDS", 2),
+            # The ceiling's *value* is not what this test is about — that a
+            # missing budget falls back to it at all is. The call it is waiting
+            # on never returns, so the two outcomes are "finishes at roughly
+            # the ceiling" and "never finishes"; 0.5s separates those exactly
+            # as well as 2s did, and costs the suite 1.5s less.
+            patch.object(C, "_TASK_CEILING_SECONDS", 0.5),
         ):
             started = time.monotonic()
             results = C.call_all(
@@ -434,7 +439,7 @@ class TestModelWithNoComputedBackstop:
         assert results["claude"]["failed"] is True
         assert "backstop" in results["claude"]["error"]
         # Bounded by the task ceiling it fell back to, not by the call.
-        assert elapsed < 10, (
+        assert elapsed < 5, (
             f"call_all waited {elapsed:.1f}s on a model with no computed "
             f"backstop — it is treating 'no budget' as 'no limit'"
         )
@@ -468,17 +473,18 @@ class TestCallAllProcessExit:
     interpreter can observe. This is the only test here that can see it.
     """
 
-    # Measured on this machine, 2026-09-05: the subprocess costs 7.2-8.3s, of
-    # which 5.9s is importing ci_style_profile.callers (litellm) before a line
-    # of the test runs. An earlier 8s limit was therefore timing the import, and
-    # failed in a full-suite run while passing in isolation.
+    # Measured 2026-09-05, the subprocess cost 7.2-8.3s, of which 5.9s was
+    # importing ci_style_profile.callers (litellm) before a line of the test
+    # ran; an earlier 8s limit was therefore timing the import, and failed in a
+    # full-suite run while passing in isolation. Re-measured 2026-09-07 at
+    # ~1.4s: PR #178 made litellm a lazy import, so that 5.9s is simply gone.
     #
     # There is no tight bound worth drawing here, because the two outcomes this
     # separates are not close: fixed, the process exits at import cost plus the
     # 1s ceiling; broken, it never exits at all (measured at >90s before being
     # killed, and unbounded in principle — the call it is waiting on never
-    # returns). 30s is ~3.6x the observed worst case and still decisively
-    # short of "forever".
+    # returns). 30s costs a passing run nothing — only a *failing* one waits it
+    # out — so it stays generous rather than being retuned to the new floor.
     MUST_EXIT_WITHIN = 30
 
     @pytest.mark.slow

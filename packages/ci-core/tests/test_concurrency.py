@@ -524,12 +524,19 @@ class TestBudgetStartsOnAcquire:
     """
 
     # Every job finishes in WORK, comfortably inside PER_CALL. But the batch as
-    # a whole takes (JOBS / MAX_PARALLEL) * WORK = 5s, which is longer than any
-    # single job's budget — the condition that exposes the bug.
+    # a whole takes (JOBS / MAX_PARALLEL) * WORK = 1.0s, which is longer than
+    # any single job's budget — the condition that exposes the bug.
+    #
+    # WORK and PER_CALL are a unit of time, not a duration that matters: what
+    # exposes the bug is the *ratio* — five waves of work against a budget that
+    # covers three — and that is what these preserve. They were 1.0/3.0, which
+    # made this pair of tests 8s of the suite to demonstrate a property that
+    # holds identically at 0.2/0.6. A job still gets 3x its own work in budget,
+    # and the batch still runs 1.67x longer than any single job's budget.
     JOBS = 40
     MAX_PARALLEL = 8
-    PER_CALL = 3.0
-    WORK = 1.0
+    PER_CALL = 0.6
+    WORK = 0.2
 
     def _batch(self):
         def work(i):
@@ -712,8 +719,17 @@ class TestForeignThreadPoolsDoNotHoldTheExitOpen:
     returning. The work was done; the process could not leave.
     """
 
-    STUCK_SECONDS = 30
-    MUST_EXIT_WITHIN = 15
+    # Same reasoning as TestProcessExit above, which this class had not yet
+    # been given. The fixed form exits at interpreter startup plus importing
+    # ci_core — 0.08s since litellm became a lazy import (PR #178), and
+    # independent of how long the foreign worker still has to run. The broken
+    # form exits at ~STUCK_SECONDS. So STUCK_SECONDS' only job is to put
+    # daylight between those two, and MUST_EXIT_WITHIN is the line between
+    # them. At 5s/2s the margin is >6x on both sides (0.3s against the 2s line,
+    # 2s against 5.1s) — the same demonstration the old 30s/15s made, 25s
+    # cheaper per run.
+    STUCK_SECONDS = 5
+    MUST_EXIT_WITHIN = 2
 
     def _run(self, body):
         script = textwrap.dedent(body).format(stuck=self.STUCK_SECONDS)
@@ -788,7 +804,7 @@ class TestForeignThreadPoolsDoNotHoldTheExitOpen:
             """
         )
         assert "work done" in proc.stdout
-        assert elapsed >= self.STUCK_SECONDS - 3, (
+        assert elapsed >= self.STUCK_SECONDS - 1.5, (
             f"exited in {elapsed:.1f}s — CPython no longer joins non-daemon "
             f"pool workers at shutdown, so this fix needs revisiting"
         )
