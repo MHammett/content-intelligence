@@ -15,6 +15,40 @@ from ci_article_review.adapters.citation import resolver, wayback
 _SOURCES = [{"name": "FRED", "adapter": "fred"}]
 
 
+@pytest.fixture(autouse=True)
+def no_service_status_lookup(monkeypatch):
+    """No test in this module asks archive.org how it is feeling.
+
+    ``_note_service_health`` runs at the end of any resolution where a
+    submission was attempted, and calls ``wayback.system_status``. Fourteen
+    tests in this file reach it incidentally — they are about submission,
+    capacity or escalation — and none of them stubbed it, so every run opened a
+    real TCP connection to archive.org and waited on it. That was 61s of a 182s
+    suite, invisible because ``system_status`` swallows a transport failure and
+    ``service_health_note`` returns None for an unknown service exactly as it
+    does for a healthy one. The assertions never saw the difference.
+
+    Returning the "we could not find out" shape is what those tests already
+    got, minus the wait. The four tests that are *about* ``_note_service_health``
+    patch this name themselves and still win — ``mock.patch`` sets and restores
+    around a monkeypatch. Scoped to this module rather than the package
+    conftest so ``test_wayback.py``, which is where ``system_status`` is
+    actually under test, keeps the real one.
+    """
+    monkeypatch.setattr(
+        wayback,
+        "system_status",
+        lambda **kw: {
+            "ok": None,
+            "status": "",
+            "recent_captures": None,
+            "busiest_queue": None,
+            "known": False,
+            "reason": "stubbed: unit tests do not ask archive.org for its status",
+        },
+    )
+
+
 def _no_wayback(url, timeout=10):
     return {"archived": None}
 
@@ -1755,6 +1789,24 @@ class TestArchiveSubmission:
                 "ci_article_review.adapters.citation.resolver.wayback.submit",
                 return_value={"submitted": True, "job_id": "j1"},
             ) as mock_submit,
+            # Real credentials are the point of this test, and they are also
+            # what unlocks the two lookups that bracket a submission: capacity
+            # before, job status after. Unstubbed, both went to archive.org for
+            # real — this test is about what `submit` was handed, not about
+            # either of them.
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.capture_capacity",
+                return_value={
+                    "known": False,
+                    "available": None,
+                    "daily_exhausted": False,
+                    "reason": None,
+                },
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.check_job_status",
+                return_value={"state": "not_checked", "reason": "stubbed"},
+            ),
         ):
             resolver.resolve_citations(
                 ["c"],

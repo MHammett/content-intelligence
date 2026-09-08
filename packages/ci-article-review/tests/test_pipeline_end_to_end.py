@@ -865,7 +865,22 @@ class TestExpansionRunsEndToEnd:
         cfg = patch(
             "ci_article_review.pipeline.merge_configs", return_value=self._config()
         )
-        return _stubbed_run(tmp_path, extra_patches=[cfg, links], expand=True, **kwargs)
+        # The expansion pass reads each proposed source to see whether it says
+        # what the model claimed. `_fake_links` stubs the *URL* check one layer
+        # above it; this stubs the read itself, which was going out to the real
+        # web on every run of these four tests. Nothing here asserts on
+        # `source_check` or `source_verdict` — `url_check` is what these cover —
+        # so the live fetch only ever contributed flakiness.
+        verify = patch(
+            "ci_article_review.adapters.citation.resolver.verify_source_supports",
+            return_value={
+                "verification": "unverifiable",
+                "note": "stubbed: end-to-end wiring test does not fetch",
+            },
+        )
+        return _stubbed_run(
+            tmp_path, extra_patches=[cfg, links, verify], expand=True, **kwargs
+        )
 
     def test_the_default_run_does_not_schedule_it(self, tmp_path):
         cfg = patch(
