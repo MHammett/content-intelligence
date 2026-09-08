@@ -10,6 +10,12 @@ jobs:
   scan:
     name: gitleaks
     runs-on: ubuntu-latest
+    # gitleaks-action calls GET /pulls/{n}/commits on every pull_request-triggered
+    # run to determine the commit range to scan — needs pull-requests:read even
+    # though this workflow itself never touches PR metadata.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v6
         with:
