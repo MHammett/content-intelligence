@@ -66,6 +66,16 @@ upstream: the credit-exhaustion classification above, and litellm's per-provider
 parameter allowlist rejecting ``reasoning_effort`` for Mistral even though the
 model accepts it (see :func:`_provider_params`).
 
+Importing litellm
+-----------------
+litellm is imported on first use by :func:`_litellm`, never at module scope.
+It costs ~7.1s of the ~8.2s it takes to import ``ci_article_review.pipeline``,
+and every console script was paying that at startup — including the four that
+never reach a provider. **New call sites must go through** :func:`_litellm`;
+a bare ``import litellm`` here undoes it for every command at once, which shows
+up as "the CLI feels slow" rather than as a failing test. There is a guard:
+``TestLitellmIsImportedLazily`` in ``ci-core/tests/test_llm_client.py``.
+
 Result contract
 ---------------
 Unchanged from the adapters, because the pipeline, ci-style-profile, and the
@@ -93,7 +103,6 @@ import threading
 import time
 
 import httpx
-import litellm
 
 from .. import redact
 from .. import text_repair
@@ -104,14 +113,67 @@ from .tokens import normalize_tokens
 
 log = logging.getLogger(__name__)
 
-# litellm prints a "provider list" banner and update nags on first use, and logs
-# a two-line "LiteLLM completion() model=..." banner at INFO for every call — 30
-# calls a run, doubled, interleaved with the pipeline's own progress output. This
-# is a library inside a CLI whose stdout is a report an operator reads; its
-# warnings and errors still come through, and -v still raises the level back.
-litellm.suppress_debug_info = True
-litellm.telemetry = False
+# litellm logs a two-line "LiteLLM completion() model=..." banner at INFO for
+# every call — 30 calls a run, doubled, interleaved with the pipeline's own
+# progress output. This is a library inside a CLI whose stdout is a report an
+# operator reads; its warnings and errors still come through, and -v still
+# raises the level back. Set here rather than in `_litellm()` because it
+# configures *our* logging tree, not litellm's module state, and so costs
+# nothing to apply before the import.
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
+_litellm_lock = threading.Lock()
+_litellm_module = None
+
+
+def _litellm():
+    """Import litellm on first use, apply our global settings, and cache it.
+
+    Deferred rather than imported at module scope because it costs ~7.1s of the
+    ~8.2s it takes to import this package — it pulls in the whole `openai`
+    package tree — and **every** console script paid that at startup whether or
+    not it would ever call a model. `ci-check`, `ci-discover`, `ci-setup`,
+    `ci-history-report` and every `--help` never reach a provider at all.
+
+    The two settings below have to move with the import: they suppress
+    litellm's provider-list banner and update nags, which it prints on first
+    use, so they must be applied between importing it and calling it. That is
+    exactly what this function guarantees, and why the import is not simply
+    inlined at the two call sites.
+
+    Double-checked locking because the review pass fans ~30 calls out across
+    daemon threads, so several can arrive here at once. `_litellm_module` is
+    assigned last, after the settings are applied, so a thread that sees it
+    non-None never sees a half-configured module.
+    """
+    global _litellm_module
+    if _litellm_module is None:
+        with _litellm_lock:
+            if _litellm_module is None:
+                import litellm as _module
+
+                _module.suppress_debug_info = True
+                _module.telemetry = False
+                _litellm_module = _module
+    return _litellm_module
+
+
+def __getattr__(name):
+    """Expose the lazily-imported module as ``client.litellm``.
+
+    PEP 562. This is the shim's public handle on litellm and what the suite
+    patches (`patch.object(client.litellm, "completion", ...)`, ~80 sites), so
+    it has to keep resolving to the real module. Touching it imports litellm,
+    which is correct: anything reaching for the attribute is about to use it.
+
+    Note this does *not* fire for a bare ``litellm`` inside a function in this
+    module — global lookup does not consult a module ``__getattr__`` — so the
+    call sites below go through `_litellm()` explicitly.
+    """
+    if name == "litellm":
+        return _litellm()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # Connection-establishment timeout. Small and constant — opening a socket has
 # nothing to do with how long the model will think. Honored as-is for OpenAI
@@ -1213,7 +1275,7 @@ def _attempt(
                 )
 
             return _consume_responses_stream(
-                litellm.responses(**kwargs), first_byte, gap
+                _litellm().responses(**kwargs), first_byte, gap
             )
 
         if provider in _SENDS_TEMPERATURE:
@@ -1230,7 +1292,7 @@ def _attempt(
             content = user_prompt
 
         return _consume_completion_stream(
-            litellm.completion(
+            _litellm().completion(
                 model=_qualified(provider, model),
                 messages=[
                     {"role": "system", "content": system_prompt},
