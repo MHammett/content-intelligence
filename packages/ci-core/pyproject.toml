@@ -107,6 +107,14 @@ markers = [
     "slow: inherently wall-clock-bound; deselect with -m 'not slow'",
 ]
 
+# Duplicated from the root pyproject.toml for the same reason the markers
+# above are: the root file is the inifile only for the repo-wide
+# `pytest packages/` run, and this one is what pytest reads when this
+# package's tests are run directly or a single file is passed. Without it
+# the socket guard silently does not apply to exactly the invocation a
+# developer iterating on one file uses.
+addopts = "--disable-socket --allow-hosts=127.0.0.1,::1"
+
 [tool.mypy]
 python_version = "3.10"
 strict = false
