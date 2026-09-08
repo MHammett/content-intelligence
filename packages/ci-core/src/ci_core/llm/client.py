@@ -66,6 +66,16 @@ upstream: the credit-exhaustion classification above, and litellm's per-provider
 parameter allowlist rejecting ``reasoning_effort`` for Mistral even though the
 model accepts it (see :func:`_provider_params`).
 
+Importing litellm
+-----------------
+litellm is imported on first use by :func:`_litellm`, never at module scope.
+It costs ~7.1s of the ~8.2s it takes to import ``ci_article_review.pipeline``,
+and every console script was paying that at startup — including the four that
+never reach a provider. **New call sites must go through** :func:`_litellm`;
+a bare ``import litellm`` here undoes it for every command at once, which shows
+up as "the CLI feels slow" rather than as a failing test. There is a guard:
+``TestLitellmIsImportedLazily`` in ``ci-core/tests/test_llm_client.py``.
+
 Result contract
 ---------------
 Unchanged from the adapters, because the pipeline, ci-style-profile, and the
