@@ -558,3 +558,119 @@ class TestPassContribution:
     def test_reports_missing_these_fields_do_not_raise(self):
         """The report schema has grown over time; old reports lack these keys."""
         assert ha.pass_contribution([{"slug": "a", "report": {}}]) == []
+
+
+class TestExpansionIsNotScoredOnConsensus:
+    """The expansion domain never reaches Section 1, by design.
+
+    Scored on the consensus table it would show zero hits and no cost-per-hit
+    on every run, and land in the "never contributed, consider trimming"
+    note — the report recommending deletion of a pass that was working exactly
+    as intended.
+    """
+
+    def _entry(self, *, api_log, by_pass, expansion, consensus=()):
+        return {
+            "slug": "a",
+            "report": {
+                "api_call_log": api_log,
+                "cost_summary": {"by_pass": by_pass},
+                "section_1_consensus": list(consensus),
+                "section_10_expansion": expansion,
+            },
+        }
+
+    def test_proposals_are_counted_per_proposing_model(self):
+        entry = self._entry(
+            api_log=[{"pass": "perplexity:expansion", "failed": False}],
+            by_pass=[{"pass": "perplexity:expansion", "total_usd": 0.04}],
+            expansion={
+                "sources": [
+                    {"title": "A", "proposed_by": ["perplexity"]},
+                    {"title": "B", "proposed_by": ["perplexity", "gemini"]},
+                ],
+                "topics": [{"topic": "C", "proposed_by": ["gemini"]}],
+            },
+        )
+        by_name = {s["pass"]: s for s in ha.pass_contribution([entry])}
+        assert by_name["perplexity:expansion"]["proposals"] == 2
+        # A merged candidate credits everyone who offered it.
+        assert by_name["gemini:expansion"]["proposals"] == 2
+
+    def test_cost_per_proposal_replaces_cost_per_hit(self):
+        entry = self._entry(
+            api_log=[{"pass": "perplexity:expansion", "failed": False}],
+            by_pass=[{"pass": "perplexity:expansion", "total_usd": 0.04}],
+            expansion={
+                "sources": [
+                    {"title": str(n), "proposed_by": ["perplexity"]} for n in range(4)
+                ]
+            },
+        )
+        slot = {s["pass"]: s for s in ha.pass_contribution([entry])}[
+            "perplexity:expansion"
+        ]
+        assert slot["usd_per_proposal"] == 0.01
+        assert slot["consensus_hits"] == 0
+        assert slot["usd_per_consensus_hit"] is None
+
+    def test_a_report_without_the_section_is_fine(self):
+        """Every run before --expand existed, and every run that skipped it."""
+        entry = {
+            "slug": "a",
+            "report": {
+                "api_call_log": [{"pass": "gemini:fact_check", "failed": False}],
+                "cost_summary": {"by_pass": []},
+                "section_1_consensus": [],
+            },
+        }
+        assert ha.pass_contribution([entry])[0]["proposals"] == 0
+
+    def test_the_trim_note_never_names_an_expansion_pass(self, tmp_path, capsys):
+        """The regression guard: that note is read as a delete list.
+
+        Driven through the real report builder rather than a hand-built result
+        dict, so it also proves the section survives the round trip to disk.
+        """
+        _write_report(
+            tmp_path,
+            "a",
+            1,
+            "2026-09-05T10:00:00",
+            {
+                "generated": "2026-09-05T10:00:00",
+                "run_number": 1,
+                "article_title": "T",
+                "publication": "p",
+                "api_call_log": [
+                    {"pass": "perplexity:expansion", "failed": False},
+                    {"pass": "gemini:fact_check", "failed": False},
+                ],
+                "cost_summary": {
+                    "by_pass": [
+                        {"pass": "perplexity:expansion", "total_usd": 0.04},
+                        {"pass": "gemini:fact_check", "total_usd": 0.02},
+                    ]
+                },
+                "section_1_consensus": [],
+                "section_10_expansion": {
+                    "sources": [{"title": "A", "proposed_by": ["perplexity"]}]
+                },
+            },
+        )
+
+        ha.print_history_report(ha.build_history_report(history_root=str(tmp_path)))
+        out = capsys.readouterr().out
+
+        # The note itself, not everything printed after it — the expansion
+        # table follows and would otherwise satisfy the substring by accident.
+        trim_note = ""
+        if "Note:" in out:
+            trim_note = out.split("Note:")[1].split("Expansion passes")[0]
+        assert "expansion" not in trim_note, (
+            "an expansion pass was listed as a candidate for trimming"
+        )
+        assert "gemini:fact_check" in out
+        # It is still reported, just on its own terms.
+        assert "scored on proposals" in out
+        assert "perplexity:expansion" in out

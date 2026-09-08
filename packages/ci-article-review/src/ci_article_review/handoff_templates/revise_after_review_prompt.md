@@ -17,7 +17,7 @@ Copy everything between the dashed lines into the SAME chat thread that has
 the article's context (or paste the CURRENT metadata file if starting fresh),
 then open the pipeline run's `run_N_<timestamp>_review.md` file (saved next
 to the JSON report in `pipeline_history/<article-slug>/`) and paste its
-SECTION 1 through SECTION 9 content below it, plus the SEO SUGGESTIONS and
+SECTION 1 through SECTION 10 content below it, plus the SEO SUGGESTIONS and
 SEO STRUCTURE REVIEW blocks at the end of that file if the run produced them.
 
 Paste the "Reading this report" block at the top of the file as well. It
@@ -41,6 +41,19 @@ set of documents nobody has read yet, named down to bulletin numbers and URLs,
 and handing that to a model asks it to fill in what those documents say. That
 is the failure this whole pipeline exists to catch. Start the paste at
 "## SECTION 1".
+
+SECTION 10 is the one section you do NOT paste wholesale, and it only exists if
+you ran with --expand. It is a menu of proposed additions rather than a list of
+defects: sources, topics, angles and data the pass thinks would fit. Decide
+which ones you actually want FIRST, and paste only those. Pasting the whole
+menu hands the model a mandate to work every suggestion in, which is how a
+revision pass turns into an expansion pass and a draft stops converging.
+
+Ignore any SECTION 10 candidate marked LINK DEAD unless you have found the real
+source yourself — that means a 404 or a host that does not exist, so the URL was
+very likely invented and the model revising the draft cannot tell it from a good
+one. A candidate marked "could not read" is a different thing: the page refused
+us, which is no evidence against it.
 
 ──────────────────────────────────────────────────────────────────────────────
 
@@ -125,8 +138,9 @@ Rules for the metadata update:
 - Increment "Pipeline run" by 1.
 
 Here are the consolidated review findings:
-[paste SECTION 1 through SECTION 9 from the run's `run_N_<timestamp>_review.md`
-file here]
+[paste SECTION 1 through SECTION 10 from the run's `run_N_<timestamp>_review.md`
+file here — all of SECTIONS 1-9, but only the SECTION 10 candidates you have
+decided to adopt, if you ran with --expand]
 
 Here is the current metadata (paste your metadata_only.md content, or the
 full handoff document's non-DRAFT sections):

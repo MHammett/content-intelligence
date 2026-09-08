@@ -74,6 +74,7 @@ from ci_core.config_helpers import normalize_model_configs
 from ci_core import llm
 from . import schemas
 from ci_core.concurrency import (
+    run_all_bounded,
     exit_without_waiting_for_foreign_threads,
     run_all_with_timeout,
 )
@@ -114,7 +115,45 @@ _DOMAIN_PROMPTS: dict[str, str] = {
     "completeness": "completeness.txt",
     "argument_integrity": "argument_integrity.txt",
     "red_team": "red_team.txt",
+    "expansion": "expansion.txt",
 }
+
+#: The one domain that proposes material instead of judging it.
+#:
+#: Kept out of the default ensemble and gated behind ``--expand``. The review
+#: loop runs on every revision; an additions pass on revision six is an
+#: invitation to reopen a draft that should be closing. It is also the only
+#: domain whose findings are not defects, which is why consolidation unions its
+#: output instead of scoring it for consensus.
+_EXPANSION_DOMAIN = "expansion"
+
+#: The per-bucket ceiling the expansion prompt states, substituted into it as
+#: ``{max_per_bucket}`` so the number the models are told and the number the
+#: report measures them against cannot drift apart.
+#:
+#: Three, because the first two live runs returned 34 and 25 candidates for a
+#: ~1,000-word draft against a prompt that only said "do not pad". An unbounded
+#: instruction to be selective is not an instruction. Nothing truncates the
+#: response — going over is reported, not silently trimmed, for the same reason
+#: a dead URL is reported rather than dropped.
+_EXPANSION_MAX_PER_BUCKET = 3
+
+#: Providers that already search without a ``web_search`` entry, for two
+#: different reasons — so telling either of them to add one would be telling the
+#: author to fix something that is not broken.
+#:
+#: perplexity: the sonar line searches on every call, by design.
+#: gemini:     ``ci_core.llm.client`` attaches ``tools=[{"googleSearch": {}}]``
+#:             to *every* gemini call unconditionally, whatever the config says.
+_SEARCH_ALWAYS_ON_PROVIDERS = frozenset({"perplexity", "gemini"})
+
+#: Providers where a ``web_search`` entry actually changes the request. Mirrors
+#: the two places in ``ci_core.llm.client`` that read the flag: the
+#: ``_WEB_SEARCH_PROVIDERS`` set (grok, claude) and the OpenAI Responses path.
+#: Anything outside this set ignores ``web_search`` entirely, so recommending it
+#: would be advice that silently does nothing.
+_WEB_SEARCH_HONOURING_PROVIDERS = frozenset({"openai", "grok", "claude"})
+
 
 #: Providers this pipeline can call — the six the shared LLM layer routes.
 _PROVIDERS: tuple[str, ...] = llm.PROVIDERS
@@ -129,6 +168,10 @@ _THOROUGHNESS_PRESETS: dict[str, dict[str, list[str]]] = {
         "completeness": ["openai"],
         "argument_integrity": ["mistral", "claude"],
         "red_team": ["mistral", "grok"],
+        # Opt-in (--expand). Search-grounded first: the bucket that carries
+        # most of the value is `sources`, and a model that cannot fetch is
+        # guessing at URLs.
+        "expansion": ["perplexity"],
     },
     "thorough": {
         # Two to three well-suited models per domain.
@@ -138,6 +181,15 @@ _THOROUGHNESS_PRESETS: dict[str, dict[str, list[str]]] = {
         "completeness": ["openai", "mistral"],
         "argument_integrity": ["mistral", "claude", "openai"],
         "red_team": ["mistral", "grok", "claude"],
+        # grok is deliberately absent, on evidence rather than taste. It
+        # already runs red_team at this level, so adding expansion doubled its
+        # concurrent calls against the provider with the tightest timeout
+        # budget of the six (180s at ~6.7k chars, against openai's 945s). It
+        # then failed *both* domains on two consecutive live runs — stream
+        # stalled before the first chunk, ~280s and ~456s — recovering neither,
+        # and contributed nothing while adding minutes of wall time. It stays
+        # in the `maximum` list, where the run has already opted into that.
+        "expansion": ["perplexity", "gemini"],
     },
     "maximum": {
         # Every configured model runs every domain.
@@ -154,8 +206,63 @@ _THOROUGHNESS_PRESETS: dict[str, dict[str, list[str]]] = {
             "claude",
         ],
         "red_team": ["gemini", "perplexity", "openai", "mistral", "grok", "claude"],
+        "expansion": [
+            "perplexity",
+            "gemini",
+            "grok",
+            "openai",
+            "mistral",
+            "claude",
+        ],
     },
 }
+
+
+def _warn_on_ungrounded_expansion(assignments, model_configs):
+    """Warn when a model proposes sources for a domain it cannot search.
+
+    Asked for sources with no search, a model can only recall URLs from
+    training, and a recalled URL is a plausible string rather than a page. The
+    verification layers catch them, so nothing false reaches the author, but
+    every one costs a fetch and arrives with no usable source attached.
+
+    **Scoped to the providers the flag reaches**, which is narrower than it
+    looks and was got wrong here once. The first version of this warning told
+    the author to add ``web_search: [fact_check, expansion]`` under
+    ``models.gemini`` after four live runs in which gemini produced nearly every
+    dead URL. That advice does nothing: gemini is not in
+    ``_WEB_SEARCH_PROVIDERS``, its grounding is attached unconditionally in the
+    LLM layer, and it was already searching on expansion. The dead URLs have
+    some other cause — plausibly that grounded gemini returns its citations as
+    ``grounding-api-redirect`` wrappers and writes prose URLs from recall
+    anyway — and a warning pointing at a config key that is never read would
+    have sent the author to fix the wrong thing.
+
+    Warned rather than corrected where it does apply: search bills per search,
+    which is the author's call.
+    """
+    for model_name, domain in assignments:
+        if domain != _EXPANSION_DOMAIN:
+            continue
+        if model_name in _SEARCH_ALWAYS_ON_PROVIDERS:
+            continue
+        if model_name not in _WEB_SEARCH_HONOURING_PROVIDERS:
+            continue
+        cfg = model_configs.get(model_name)
+        cfg = cfg if isinstance(cfg, dict) else {}
+        if _web_search_enabled(cfg.get("web_search"), _EXPANSION_DOMAIN):
+            continue
+        log.warning(
+            "%s is assigned 'expansion' with no live search for that domain, so "
+            "it will propose sources from training recall — which produces "
+            "plausible URLs that do not exist. Add it under models.%s in "
+            "user.yaml:\n"
+            "    web_search: [fact_check, expansion]\n"
+            "Search bills per search, so this is left as your call. Every URL is "
+            "checked either way and a dead one is reported, not hidden.",
+            model_name,
+            model_name,
+        )
 
 
 #: How many models a domain needs before backfill stops topping it up.
@@ -183,7 +290,16 @@ def _preset_domains(thoroughness: str) -> list[str]:
     is a single model, and drafting with that model empties the domain.
     """
     preset = _THOROUGHNESS_PRESETS.get(thoroughness, _THOROUGHNESS_PRESETS["standard"])
-    return list(preset)
+    # expansion is excluded, and not merely because it is opt-in. This function
+    # answers "which domains did this run owe the draft a review of", and feeds
+    # the substitution pass and the never-attempted report through
+    # _domains_with_nothing_usable. expansion reviews nothing — it proposes
+    # material — so a run that did not ask for it owes no coverage, and a run
+    # that did should not have a *substitute* bought for it: the point of the
+    # flag is that the author chose the spend. Its own two warnings
+    # (_warn_on_ungrounded_expansion, and the "--expand scheduled nothing" case)
+    # cover the empty outcome.
+    return [d for d in preset if d != _EXPANSION_DOMAIN]
 
 
 def _model_has_credentials(model_name: str, api_keys: dict, model_cfg: dict) -> bool:
@@ -267,7 +383,28 @@ def _model_has_credentials(model_name: str, api_keys: dict, model_cfg: dict) -> 
 #: text; it cannot separate that from claude simply being weaker at the voice
 #: task. The decision is the same either way. n = 3 runs on one draft — the
 #: direction is unanimous, but a second article would strengthen it.
-_DRAFTER_EXCLUDED_DOMAINS: tuple[str, ...] = ("voice_style",)
+#:
+#: expansion (added 2026-09-05) is excluded on a different basis, and a weaker
+#: one, which is worth stating plainly next to the measured case above. The
+#: argument is a priori: the drafting model already searched this space, so the
+#: sources and topics it would propose now are the ones it considered and
+#: dropped while writing, and the value seen from this pass has come from
+#: handing the article to a model that was not in the room.
+#:
+#: No measurement backs that, and the table above arguably cuts against it —
+#: the drafter sits at or above parity on completeness (0.89, 1.75, 0.83),
+#: which is the closest domain in kind. The distinction claimed is that
+#: completeness judges the draft in front of it while expansion asks what to go
+#: and find, and it is the *search* that was already done. That is a claim
+#: about mechanism, not evidence.
+#:
+#: Cheap to hold and cheap to reverse: expansion is opt-in, so this costs a run
+#: that does not ask for it nothing, and both _warn_on_ungrounded_expansion and
+#: the "--expand scheduled nothing" warning name the consequence when it empties
+#: the domain. To settle it: run --expand at `maximum` on a claude-drafted
+#: article with claude restored here, and compare its proposals against the
+#: peers' for overlap with what the draft already cites.
+_DRAFTER_EXCLUDED_DOMAINS: tuple[str, ...] = ("voice_style", "expansion")
 
 
 def _history_key(handoff: dict) -> str:
@@ -344,7 +481,9 @@ def _drafter_is_excluded(model_name: str, domain: str, drafting_model: str | Non
     )
 
 
-def _warn_on_domains_left_unreviewed(assignments, drafting_model: str | None) -> None:
+def _warn_on_domains_left_unreviewed(
+    assignments, drafting_model: str | None, requested_domains=None
+) -> None:
     """Warn when excluding the drafter leaves a domain with no reviewer at all.
 
     At ``maximum`` thoroughness every model runs every domain, so this cannot
@@ -363,6 +502,11 @@ def _warn_on_domains_left_unreviewed(assignments, drafting_model: str | None) ->
         return
     covered = {domain for _, domain in assignments}
     for domain in _DRAFTER_EXCLUDED_DOMAINS:
+        # A domain this run never asked for is not "left unreviewed" — expansion
+        # is absent from every run that did not pass --expand, and warning that
+        # nobody reviewed it would be noise on the common path.
+        if requested_domains is not None and domain not in requested_domains:
+            continue
         if domain not in covered:
             log.warning(
                 "No model is reviewing '%s': %s drafted this article and is "
@@ -407,6 +551,7 @@ def _build_assignments(
     api_keys: dict,
     drafting_model: str | None = None,
     skips: list[str] | None = None,
+    include_expansion: bool = False,
     backfill: bool = True,
     backfills: list[str] | None = None,
 ) -> list[tuple[str, str]]:
@@ -432,6 +577,12 @@ def _build_assignments(
     substituted-in (model, domain) pair, naming the preset entry it is standing
     in for.
 
+    ``include_expansion`` gates the one opt-in domain. It is applied before
+    everything else and overrides a per-model ``prompts:`` entry naming it,
+    deliberately: the flag answers "should this run spend money proposing new
+    material", which is a per-run question, and a config that could answer it
+    permanently would put that spend back on every revision.
+
     Pass a list as ``skips`` to find out what steps 2-5 dropped: every model the
     preset (or an explicit ``prompts:`` entry) asked for but that contributes
     fewer calls than asked appends one line naming it, the reason, and the
@@ -440,6 +591,8 @@ def _build_assignments(
     """
     model_configs = normalize_model_configs(model_configs)
     preset = _THOROUGHNESS_PRESETS.get(thoroughness, _THOROUGHNESS_PRESETS["standard"])
+    if not include_expansion:
+        preset = {d: m for d, m in preset.items() if d != _EXPANSION_DOMAIN}
     assignments: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -453,6 +606,8 @@ def _build_assignments(
     # model for; the second loop below assigns those, so they count as requested.
     for model_name, cfg in model_configs.items():
         for domain in _prompt_override(cfg) or []:
+            if domain == _EXPANSION_DOMAIN and not include_expansion:
+                continue
             if domain in _DOMAIN_PROMPTS and domain not in requested.get(
                 model_name, []
             ):
@@ -489,6 +644,8 @@ def _build_assignments(
         if model_name in blocked:
             continue
         for domain in _prompt_override(cfg) or []:
+            if domain == _EXPANSION_DOMAIN and not include_expansion:
+                continue
             if _drafter_is_excluded(model_name, domain, drafting_model):
                 continue
             pair = (model_name, domain)
@@ -547,7 +704,7 @@ def _build_assignments(
                         f"{', '.join(absent)} could not run"
                     )
 
-    _warn_on_domains_left_unreviewed(assignments, drafting_model)
+    _warn_on_domains_left_unreviewed(assignments, drafting_model, set(preset))
 
     if skips is not None:
         for model_name, domains in requested.items():
@@ -1253,6 +1410,7 @@ def _run_domain(
         positive_rules="\n".join(f"- {r}" for r in style.get("positive_rules", [])),
         primary_claim=handoff.get("primary_claim", ""),
         pre_draft_analysis=handoff.get("pre_draft_analysis", ""),
+        max_per_bucket=_EXPANSION_MAX_PER_BUCKET,
         # Only fact_check's prompt has this placeholder, so every other domain
         # renders unchanged. Telling the model *and* filtering its output is
         # deliberate: the instruction saves the search spend, the filter is what
@@ -1305,6 +1463,428 @@ def _run_domain(
     result["_model"] = model_name
     result["_domain"] = domain
     return result
+
+
+#: Expansion buckets that can carry a URL, and the item key holding it.
+_EXPANSION_URL_BUCKETS = ("sources", "data_points")
+
+#: Search-provider wrappers: URLs that answer 200 but name no publisher.
+#: Gemini's grounding metadata returns every citation this way — the documented
+#: behaviour of Grounding with Google Search, and the subject of a standing
+#: feature request asking Google to expose the real URL instead.
+#:
+#: These are **followed, not rejected.** Rejecting them on shape (the first
+#: version of this) threw away the source entirely. Following the redirect is
+#: the established workaround and recovers the publisher URL — and it recovers
+#: more than that: the single wrapper gemini returned in live run 1 resolved to
+#: a *Facebook page*, which it had hung three separate economic figures on. The
+#: wrapper had concealed the provenance, and rejecting it concealed the
+#: concealment.
+#:
+#: Resolved eagerly rather than stored, because these are documented as
+#: temporary and expire after a few days — a report keeping the wrapper would
+#: hold a link that stops working while the article is still being revised.
+_URL_REDIRECTOR_MARKERS = (
+    "grounding-api-redirect",
+    "vertexaisearch.cloud.google.com",
+    "google.com/url?",
+    "duckduckgo.com/l/",
+    "bing.com/ck/a",
+)
+
+#: ``origin_failure`` values meaning *we could not read it*, which is not the
+#: same claim as *it does not exist*. A 403 survives a GET retry and a TLS
+#: impersonation attempt inside links.py before it reaches here, so by this
+#: point it means a determined block: the page is very probably real and simply
+#: refusing us.
+_URL_BLOCKED_REASONS = frozenset(
+    {"blocked", "auth_required", "rate_limited", "timeout"}
+)
+
+
+def _is_redirector_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(marker in lowered for marker in _URL_REDIRECTOR_MARKERS)
+
+
+def _redirect_is_material(url: str, redirected_to: str) -> bool:
+    """True when a redirect landed on a different *document*, not a tidier URL.
+
+    Normalising away the scheme, a leading www and a trailing slash means the
+    routine redirects — http to https, adding or dropping either — are ignored,
+    and a genuine path change is what gets flagged.
+
+    Worth flagging because of what it looked like live: a Smithsonian URL for
+    the 1974 daylight-saving experiment returned 200 and redirected to an
+    article about the casting of The Godfather. It scored as a clean resolution
+    while carrying two specific figures the model had hung on it.
+    """
+
+    return bool(redirected_to) and consolidation.url_key(url) != consolidation.url_key(
+        redirected_to
+    )
+
+
+def _resolve_redirector_urls(items, canonical, counts, links_analysis):
+    """Rewrite each wrapper URL in place to the publisher page it forwards to.
+
+    Mutates ``item["url"]`` so every later stage works with the real address,
+    and keeps the wrapper in ``url_via_redirect`` so the provenance is not
+    lost — "this came out of a search tool's citation list" is worth knowing
+    when judging a source.
+
+    A wrapper that will not resolve is left alone; the caller reports it as
+    ``not_citable``. That is the honest outcome for an expired forwarder, which
+    names a page nobody can now recover.
+    """
+    wrappers = sorted({url for url in canonical.values() if _is_redirector_url(url)})
+    if not wrappers:
+        return
+
+    log.info(
+        "Expansion: following %d search-provider redirect(s) to their sources",
+        len(wrappers),
+    )
+    resolved = {}
+    for result in links_analysis.validate_links(
+        " ".join(wrappers), check_wayback=False
+    ):
+        destination = result.get("redirected_to")
+        if result.get("ok") and destination and not _is_redirector_url(destination):
+            resolved[result["url"]] = destination
+
+    for item in items:
+        original = canonical.get(id(item))
+        destination = resolved.get(original) if original else None
+        if not destination:
+            continue
+        item["url_via_redirect"] = original
+        item["url"] = destination
+        canonical[id(item)] = destination
+    counts["followed_redirects"] = len(resolved)
+
+
+def _verify_expansion_urls(expansion: dict, offline: bool = False) -> dict:
+    """Fetch every URL the expansion pass proposed and record what happened.
+
+    The failure mode this exists for is the one that would make the whole pass
+    worthless: a model that cannot find a real source inventing a plausible one.
+    A fabricated URL is not a weaker suggestion than a real one, it is a
+    liability, and it is indistinguishable from a good suggestion by reading.
+
+    **Failures are marked, not dropped.** Dropping them would produce a tidier
+    report that lies about the pass's reliability — the invention rate is the
+    number saying whether these proposals can be trusted at all, so it is
+    reported rather than quietly cleaned up.
+
+    **A failure to read is not an accusation of invention.** This is what the
+    first live run got wrong: two real sleep-society position statements came
+    back 403 and were reported under the same "very likely invented" banner as a
+    hostname that does not exist. That is exactly what CITATIONS.md forbids
+    everywhere else in this pipeline — "we could not read it" reported as "it is
+    not there" — so the verdicts are tiered:
+
+      ok          — read directly
+      redirected  — read, but the server sent us to a different document
+      archived    — the origin refused and an archive.org snapshot served it;
+                    the source is real either way
+      blocked     — 401/403/429/timeout with no snapshot. Existence unconfirmed,
+                    and it carries no suspicion of invention.
+      missing     — 404/410, or a hostname that does not resolve. The bucket
+                    that means invented, and the only one the report's warning
+                    is drawn from.
+      not_citable — resolves, but is a search-engine redirector
+      no_url      — the prompt asks for null over a guess; an honest lead
+
+    So neither ``url: null`` nor a 403 counts against a model.
+    """
+    if not expansion:
+        return expansion
+
+    from .analysis import links as links_analysis
+
+    # Canonicalise through the same extractor that will validate them, so the
+    # lookup below matches exactly rather than by luck of trailing punctuation.
+    canonical: dict[int, str] = {}
+    items = []
+    for bucket in _EXPANSION_URL_BUCKETS:
+        for item in expansion.get(bucket) or []:
+            items.append(item)
+            found = links_analysis.extract_urls(item.get("url") or "")
+            if found:
+                canonical[id(item)] = found[0]
+
+    counts = {
+        "checked": 0,
+        "resolved": 0,
+        "archived": 0,
+        "blocked": 0,
+        "missing": 0,
+        "not_citable": 0,
+        "no_url": 0,
+        "followed_redirects": 0,
+    }
+
+    if offline:
+        for item in items:
+            item["url_status"] = "unchecked" if id(item) in canonical else "no_url"
+            if item["url_status"] == "no_url":
+                counts["no_url"] += 1
+        counts["unchecked"] = len(canonical)
+        expansion["url_check"] = counts
+        return expansion
+
+    # Follow any search-provider wrapper to the page it names, and carry on
+    # with that. Everything downstream — the URL check, the source check, the
+    # dedup key, the cross-bucket comparison — then sees a real publisher URL
+    # instead of an opaque forwarder.
+    _resolve_redirector_urls(items, canonical, counts, links_analysis)
+
+    fetchable = {url for url in canonical.values() if not _is_redirector_url(url)}
+    checked = (
+        {
+            r["url"]: r
+            # Space-joined: extract_urls splits on whitespace, so this is just a
+            # bag of URLs for it to find — no document is being reconstructed.
+            for r in links_analysis.validate_links(
+                " ".join(sorted(fetchable)), check_wayback=False
+            )
+        }
+        if fetchable
+        else {}
+    )
+
+    for item in items:
+        url = canonical.get(id(item))
+        if url is None:
+            item["url_status"] = "no_url"
+            counts["no_url"] += 1
+            continue
+        if _is_redirector_url(url):
+            # Still a wrapper, so following it failed — these expire after a
+            # few days, and an expired one names nothing at all.
+            item["url_status"] = "not_citable"
+            item["url_error"] = (
+                "a search-provider redirect that could not be followed to its "
+                "source — these expire after a few days, so the page it named "
+                "is unrecoverable from the report"
+            )
+            counts["not_citable"] += 1
+            continue
+        result = checked.get(url)
+        if result is None:
+            # Survived extraction on the way in but not on the way out; treat as
+            # unchecked rather than claiming either verdict.
+            item["url_status"] = "unchecked"
+            continue
+
+        counts["checked"] += 1
+        origin_failure = result.get("origin_failure")
+
+        if result.get("ok"):
+            if result.get("verified_via") == "wayback_fallback":
+                item["url_status"] = "archived"
+                item["url_error"] = (
+                    f"origin did not serve it ({origin_failure or 'unknown'}); "
+                    "read from an archive.org snapshot instead"
+                )
+                if result.get("wayback_snapshot_url"):
+                    item["url_snapshot"] = result["wayback_snapshot_url"]
+                counts["archived"] += 1
+            elif _redirect_is_material(url, result.get("redirected_to")):
+                item["url_status"] = "redirected"
+                item["url_redirected_to"] = result["redirected_to"]
+                item["url_error"] = (
+                    "resolved, but the server sent us to a different page — "
+                    "confirm it is the document being described"
+                )
+                counts["resolved"] += 1
+            else:
+                item["url_status"] = "ok"
+                counts["resolved"] += 1
+            continue
+
+        status_code = result.get("status_code")
+        if origin_failure in _URL_BLOCKED_REASONS:
+            item["url_status"] = "blocked"
+            item["url_error"] = (
+                f"{origin_failure} ({status_code or 'no response'}) — the page "
+                "very likely exists; we were refused, not told it is missing"
+            )
+            counts["blocked"] += 1
+        else:
+            item["url_status"] = "missing"
+            item["url_error"] = (
+                f"HTTP {status_code}"
+                if status_code
+                else (result.get("error") or "host does not resolve")
+            )
+            counts["missing"] += 1
+
+    expansion["url_check"] = counts
+    return expansion
+
+
+#: url_status values worth spending a fetch and a model call on. A dead link
+#: has nothing to read, and a search redirector is not a source.
+_EXPANSION_VERIFIABLE_STATUSES = frozenset({"ok", "redirected", "archived"})
+
+#: Per-source budget for reading a proposed page. The resolver's own fetch
+#: timeout is 15s and the relevance call is a small mistral request, so this
+#: is a backstop for a source that hangs rather than a working limit.
+_EXPANSION_SOURCE_TIMEOUT = 90
+
+
+def _verify_expansion_sources(expansion, api_keys, call_log=None, offline=False):
+    """Check each proposed source against what the model said it establishes.
+
+    The URL check answers "does this address respond". This answers the
+    question that actually matters: **does the page say what the proposal
+    claims it says.** They are not the same, and the gap between them is where
+    this pass could otherwise mislead — a URL that returns 200 while serving
+    something unrelated is invisible to an HTTP check. Live run 3 produced
+    exactly that: a Smithsonian link that resolved and served an article about
+    the casting of The Godfather. It was caught only because the server issued
+    a redirect; had it returned 200 directly, nothing would have noticed.
+
+    Section 9 has held the rest of this pipeline to "fetched, and read, and
+    confirmed to support the claim" since the citation work landed. Proposals
+    were being held to a weaker standard than the citations they might become,
+    which is backwards — the author has *less* reason to trust a source they
+    have never seen than one they chose.
+
+    ``what_it_establishes`` is the assertion under test: it is the model's own
+    statement of what the source lets the author say. The verdict lands on each
+    item as ``source_verdict``:
+
+      supported       the page was read and backs the stated claim
+      does_not_support the page was read and does not
+      unreadable      fetched but nothing usable came out, or the relevance
+                      check could not run. **Not** evidence against the source.
+      unchecked       skipped (offline, dead link, redirector, no claim)
+
+    Nothing is dropped on any verdict, for the same reason dead URLs are not.
+    """
+    if not expansion:
+        return expansion
+
+    sources = expansion.get("sources") or []
+    counts = {
+        "checked": 0,
+        "supported": 0,
+        "does_not_support": 0,
+        "unreadable": 0,
+        "unchecked": 0,
+    }
+
+    def _skip(item, reason):
+        item["source_verdict"] = "unchecked"
+        item["source_verdict_reason"] = reason
+        counts["unchecked"] += 1
+
+    pending = []
+    for item in sources:
+        claim = (item.get("what_it_establishes") or "").strip()
+        url = item.get("url")
+        if offline:
+            _skip(item, "offline: no fetch attempted")
+        elif item.get("url_status") not in _EXPANSION_VERIFIABLE_STATUSES:
+            _skip(item, f"url_status is {item.get('url_status')!r}; nothing to read")
+        elif not (claim and url):
+            _skip(item, "no URL, or the model stated nothing for it to establish")
+        else:
+            pending.append((item, claim, url))
+
+    if pending:
+        from .adapters.citation.resolver import verify_source_supports
+
+        log.info(
+            "Expansion: verifying %d proposed source(s) actually support what "
+            "they claim to establish",
+            len(pending),
+        )
+        # run_all_bounded, not a ThreadPoolExecutor: every job gets its own
+        # daemon thread and the semaphore bounds how many are working, so a
+        # verification parked inside a call cannot join atexit and hang the
+        # process. See ci_core.concurrency for the incident that rule came from.
+        jobs = [
+            (
+                str(index),
+                (
+                    lambda c=claim, u=url: verify_source_supports(
+                        c, u, api_keys, call_log
+                    )
+                ),
+                _EXPANSION_SOURCE_TIMEOUT,
+            )
+            for index, (_item, claim, url) in enumerate(pending)
+        ]
+        outcomes = run_all_bounded(jobs, max_parallel=4)
+
+        for index, (item, _claim, _url) in enumerate(pending):
+            counts["checked"] += 1
+            result, exc = outcomes.get(str(index), (None, None))
+            if exc is not None or result is None:
+                # Never fail the run over a suggestion.
+                item["source_verdict"] = "unreadable"
+                item["source_verdict_reason"] = (
+                    f"verification error: {exc}"
+                    if exc
+                    else "verification returned nothing"
+                )
+                counts["unreadable"] += 1
+                continue
+
+            verification = result.get("verification")
+            if verification == "checksum":
+                item["source_verdict"] = "supported"
+                counts["supported"] += 1
+            elif verification == "content_mismatch":
+                item["source_verdict"] = "does_not_support"
+                counts["does_not_support"] += 1
+            else:
+                item["source_verdict"] = "unreadable"
+                counts["unreadable"] += 1
+            item["source_verdict_reason"] = (
+                result.get("relevance_reason")
+                or result.get("note")
+                or "no reason recorded"
+            )
+            if result.get("relevance_quote"):
+                item["source_verdict_quote"] = result["relevance_quote"]
+
+    expansion["source_check"] = counts
+    return expansion
+
+
+#: Buckets whose URLs are compared for cross-bucket reuse.
+_EXPANSION_REUSE_BUCKETS = ("sources", "data_points")
+
+
+def _flag_expansion_reuse(expansion):
+    """Mark data points that only re-point at a source already proposed.
+
+    The per-bucket ceiling cannot see this, because it counts per bucket. In
+    live run 1 every one of the eight data points with a URL pointed at a source
+    already listed above it, so ``34 candidates`` overstated what was actually
+    on offer by a quarter. The proposals are not illegitimate — "here is a
+    source" and "here is the figure to pull from it" are different asks — but a
+    reader deciding what to research next needs to see which are new ground.
+    """
+    if not expansion:
+        return expansion
+    source_urls = {
+        consolidation.url_key(item.get("url"))
+        for item in expansion.get("sources") or []
+        if item.get("url")
+    }
+    reused = 0
+    for item in expansion.get("data_points") or []:
+        if item.get("url") and consolidation.url_key(item["url"]) in source_urls:
+            item["reuses_proposed_source"] = True
+            reused += 1
+    expansion["cross_bucket_reuse"] = reused
+    return expansion
 
 
 # ---------------------------------------------------------------------------
@@ -1521,7 +2101,26 @@ def _run_reviews_for_names(names, runners, pipeline_cfg, model_configs, task_tim
     Shared by the recovery pass here and by ``--retry-failed``'s manual
     re-attempt — both need "the same fan-out machinery, restricted to a
     subset of calls" rather than a second implementation of it.
+
+    A requested name with no matching runner is *reported*, not silently
+    skipped. It cannot happen on the recovery path, where the names come from
+    the runners just built, but ``--retry-failed`` reads them from a capture
+    written by an earlier run — so any config change since then (a model
+    disabled, thoroughness lowered, a domain dropped from a preset) leaves
+    names behind that this run cannot schedule. Dropping them quietly made the
+    caller's "N attempted" count a claim about work that never happened.
     """
+    available = {name for name, _ in runners}
+    unschedulable = sorted(set(names) - available)
+    if unschedulable:
+        log.warning(
+            "%d requested call(s) have no runner in this configuration and were "
+            "NOT re-attempted: %s. The capture was written by a run whose "
+            "assignments differ from this one's — check thoroughness, enabled "
+            "models, and --expand.",
+            len(unschedulable),
+            ", ".join(unschedulable),
+        )
     subset = [(name, fn) for name, fn in runners if name in names]
     return _run_reviews_in_parallel(subset, pipeline_cfg, model_configs, task_timeout)
 
@@ -1703,6 +2302,14 @@ def _substitute_for_empty_domains(
         return raw_results
 
     empty = _domains_with_nothing_usable(raw_results, expected_domains)
+    # The opt-in domain is never substituted for. `expected_domains` already
+    # excludes it (see _preset_domains), but _domains_with_nothing_usable also
+    # derives domains from the *results*, and a --retry-failed capture written
+    # by an --expand run carries a failed expansion pass into a run that asked
+    # for no such thing. Substituting there buys a model call the author did not
+    # request, which is the one thing the flag exists to prevent. Reproduced by
+    # test_a_capture_naming_a_pass_this_run_cannot_schedule_says_so.
+    empty = [d for d in empty if d != _EXPANSION_DOMAIN]
     if not empty:
         return raw_results
 
@@ -1808,6 +2415,7 @@ def run_draft_pipeline(
     retry_failed_results=None,
     offline=False,
     api_key_overrides=None,
+    expand=False,
 ):
     """Run the full draft review pipeline.
 
@@ -1819,6 +2427,12 @@ def run_draft_pipeline(
     ``seo_suggestions=False`` suppresses the SEO suggestion call for this run
     only, overriding the publication config's ``seo_rules.suggestions``. None
     (the default) leaves the decision to the config.
+
+    ``expand=True`` (``--expand``) adds the ``expansion`` domain, which proposes
+    sources, topics, angles and data the draft does not have rather than judging
+    what it does. Off by default: it costs extra calls, and it is useful early
+    in a draft's life and actively unhelpful late, when the piece should be
+    converging rather than growing.
 
     ``api_key_overrides`` (``{(provider, field): value}``, from ``--api-key``
     on the CLI) is the highest tier of this project's credential precedence —
@@ -2201,6 +2815,7 @@ def run_draft_pipeline(
         api_keys,
         drafting_model,
         assignment_skips,
+        include_expansion=expand,
         # Off under a calibration filter, on the same reasoning that scopes
         # the substitution pass below: `--only-model gemini` exists to price one
         # cell, and topping gemini up to a second and third domain first is the
@@ -2226,6 +2841,29 @@ def run_draft_pipeline(
     # is the run whose silence is hardest to account for.
     for skip_line in custom_skips:
         log.info("  Custom skipped: %s", skip_line)
+
+    # --expand that scheduled nothing. At `standard` the domain is one model
+    # deep, so an author without that provider configured gets a flag that
+    # silently does nothing: the skip line explains it, among every other skip
+    # line in the run. Asking for a pass and getting no pass deserves its own
+    # warning.
+    if expand:
+        _warn_on_ungrounded_expansion(assignments, model_configs)
+
+    if expand and not any(d == _EXPANSION_DOMAIN for _, d in assignments):
+        wanted = _THOROUGHNESS_PRESETS.get(
+            thoroughness, _THOROUGHNESS_PRESETS["standard"]
+        ).get(_EXPANSION_DOMAIN, [])
+        log.warning(
+            "--expand was requested but no model is available to run it. The "
+            "%s preset assigns expansion to: %s. Each was disabled, missing "
+            "credentials, or drafted this article (the drafting model cannot "
+            "propose for it). Configure one of those providers or raise "
+            "thoroughness; Section 10 will otherwise be empty because it never "
+            "ran, not because there was nothing to propose.",
+            thoroughness,
+            ", ".join(wanted) or "no model",
+        )
 
     if not assignments:
         # The reasons matter most here — this is the run that produced nothing.
@@ -2258,12 +2896,23 @@ def run_draft_pipeline(
         expected_domains = set(_preset_domains(thoroughness))
 
     if (only_model or only_domain) and not (assignments or custom_assignments):
-        log.error(
-            "No assignments match the calibration filters (--only-model=%r --only-domain=%r). "
-            "Check spelling against the configured models and domain names.",
-            only_model,
-            only_domain,
-        )
+        # The spelling advice is wrong for exactly one input, and it is an easy
+        # one to type: `--only-domain expansion` without `--expand`. The domain
+        # name is correct, it was simply never scheduled, and sending the author
+        # to check their spelling costs them the one hint that would fix it.
+        if only_domain == _EXPANSION_DOMAIN and not expand:
+            log.error(
+                "--only-domain=expansion needs --expand as well. The expansion "
+                "domain is opt-in, so it was never scheduled for this run and "
+                "there was nothing for the filter to keep."
+            )
+        else:
+            log.error(
+                "No assignments match the calibration filters (--only-model=%r --only-domain=%r). "
+                "Check spelling against the configured models and domain names.",
+                only_model,
+                only_domain,
+            )
         sys.exit(1)
 
     all_assignments = assignments + custom_assignments
@@ -2818,6 +3467,41 @@ def run_draft_pipeline(
         citation_results = []
         log.info("Citations: no actionable claims to resolve")
     report["section_9_citations"] = citation_results
+
+    # Every URL the expansion pass proposed, checked. Cheap (HEAD requests, no
+    # model calls) and it runs whenever the pass ran.
+    expansion = report.get("section_10_expansion") or {}
+    if expansion:
+        # Stamped into the report rather than read from the constant at render
+        # time, so a report saved today still says which ceiling its models
+        # were actually given after the constant moves.
+        expansion["max_per_bucket"] = _EXPANSION_MAX_PER_BUCKET
+        _verify_expansion_urls(expansion, offline=offline)
+        _verify_expansion_sources(expansion, api_keys, api_call_log, offline=offline)
+        _flag_expansion_reuse(expansion)
+        checks = expansion.get("url_check", {})
+        # Every tier by name. Spelled out rather than summarised because this
+        # line is what cross-run analysis reads later, and because the version
+        # that said "%d did not" went on reading a count the tier split had
+        # renamed away — logging a confident "0 did not" on a run with two dead
+        # links. A stale key in a log line fails silently and reads as fact.
+        log.info(
+            "Expansion: %d proposal(s) across %d bucket(s) from %s; URLs "
+            "%d resolved, %d archived, %d blocked, %d dead, %d not citable, "
+            "%d lead(s) with no URL",
+            sum(
+                len(expansion.get(b) or [])
+                for b in (*_EXPANSION_URL_BUCKETS, "topics", "angles")
+            ),
+            4,
+            ", ".join(expansion.get("models") or []) or "no model",
+            checks.get("resolved", 0),
+            checks.get("archived", 0),
+            checks.get("blocked", 0),
+            checks.get("missing", 0),
+            checks.get("not_citable", 0),
+            checks.get("no_url", 0),
+        )
 
     # The SEO calls happened back in pre-analysis, before this list existed.
     # Fold their cost in here so each lands in cost_summary under its own pass
@@ -3753,6 +4437,71 @@ def _print_draft_summary(
             )
             print("!" * 60)
 
+    # Section 10 — only on an --expand run. Silence otherwise: a line reading
+    # "0 candidates" for a pass nobody asked for is worse than no line.
+    expansion = report.get("section_10_expansion") or {}
+    if expansion:
+        counts = {
+            bucket: len(expansion.get(bucket) or [])
+            for bucket in ("sources", "topics", "angles", "data_points")
+        }
+        checks = expansion.get("url_check") or {}
+        breakdown = ", ".join(
+            f"{bucket.replace('_', ' ')}: {n}" for bucket, n in counts.items()
+        )
+        proposers = ", ".join(expansion.get("models") or []) or "no model"
+        print(
+            f"\nSection 10 — Expansion candidates: {sum(counts.values())} "
+            f"({breakdown}) from {proposers}"
+        )
+        if checks.get("checked") or checks.get("not_citable"):
+            print(
+                f"  Links: {checks.get('resolved', 0)}/{checks.get('checked', 0)} "
+                "resolved"
+            )
+            # Only `missing` is evidence of invention. `blocked` is the origin
+            # refusing us, and saying so here matters as much as in the report —
+            # otherwise the summary keeps making the accusation the report
+            # itself no longer makes.
+            for key, phrasing in (
+                ("archived", "  {} read from an archive snapshot instead"),
+                (
+                    "blocked",
+                    "  {} could not be read (403/401/429/timeout) — blocked, "
+                    "not disproved",
+                ),
+                (
+                    "missing",
+                    "  {} DEAD (404 or no such host) — very likely invented; "
+                    "treat that model's unlinked suggestions with the same "
+                    "suspicion",
+                ),
+                ("not_citable", "  {} were search redirects, not citable URLs"),
+                ("no_url", "  {} lead(s) named without a URL"),
+            ):
+                if checks.get(key):
+                    print(phrasing.format(checks[key]))
+
+        # The deeper check. It was reaching the markdown report but not the
+        # terminal, which is the summary most runs are actually read from.
+        source_check = expansion.get("source_check") or {}
+        if source_check.get("checked"):
+            print(
+                f"  Sources read: {source_check.get('supported', 0)}/"
+                f"{source_check['checked']} support the claim made for them"
+            )
+            for key, phrasing in (
+                ("does_not_support", "  {} page(s) read and do NOT support it"),
+                ("unreadable", "  {} page(s) could not be read — no opinion formed"),
+            ):
+                if source_check.get(key):
+                    print(phrasing.format(source_check[key]))
+        if expansion.get("cross_bucket_reuse"):
+            print(
+                f"  {expansion['cross_bucket_reuse']} data point(s) only re-point "
+                "at a source already proposed"
+            )
+
     # Derive the directory from the file actually written rather than re-slugging
     # the title. A handoff with a `History key:` saves under that key, so
     # re-slugging the title printed a path that does not exist.
@@ -4086,6 +4835,14 @@ def build_parser():
         help="Calibration: run only this provider (e.g. openai) instead of the full ensemble",
     )
     parser.add_argument(
+        "--expand",
+        action="store_true",
+        help="Add the expansion pass: propose additional sources, topics, angles "
+        "and data that fit the draft's existing claim, instead of only reviewing "
+        "what is already there. Off by default — it costs extra model calls, and "
+        "it earns them early in a draft rather than on a final revision",
+    )
+    parser.add_argument(
         "--only-domain",
         metavar="DOMAIN",
         help="Calibration: run only this domain (e.g. fact_check, voice_style, completeness, "
@@ -4185,6 +4942,7 @@ def main():
                 no_timeout=args.no_timeout,
                 only_model=args.only_model,
                 only_domain=args.only_domain,
+                expand=args.expand,
                 seo_suggestions=False if args.no_seo_suggestions else None,
                 replay_results=args.replay,
                 retry_failed_results=args.retry_failed,
@@ -4201,6 +4959,7 @@ def main():
                 no_timeout=args.no_timeout,
                 only_model=args.only_model,
                 only_domain=args.only_domain,
+                expand=args.expand,
                 seo_suggestions=False if args.no_seo_suggestions else None,
                 replay_results=args.replay,
                 retry_failed_results=args.retry_failed,
@@ -4227,6 +4986,7 @@ def main():
                 no_timeout=args.no_timeout,
                 only_model=args.only_model,
                 only_domain=args.only_domain,
+                expand=args.expand,
                 seo_suggestions=False if args.no_seo_suggestions else None,
                 replay_results=args.replay,
                 retry_failed_results=args.retry_failed,

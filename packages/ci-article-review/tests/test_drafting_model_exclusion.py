@@ -18,7 +18,7 @@ from ci_article_review import report_markdown
 from ci_article_review.consolidation import build_report
 from ci_article_review.handoff_parser import parse_draft_submission
 from ci_article_review.pipeline import (
-    _THOROUGHNESS_PRESETS,
+    _preset_domains,
     _build_assignments,
     _domains_never_attempted,
     _drafter_is_excluded,
@@ -188,7 +188,11 @@ class TestTheUnreviewedDomainReachesTheReport:
     clean render were byte-identical, both `_No flags._`.
     """
 
-    STANDARD_DOMAINS = set(_THOROUGHNESS_PRESETS["standard"])
+    # Via _preset_domains, not the raw preset dict: that function is the
+    # contract for "which domains did this run owe a review of", and it excludes
+    # the opt-in expansion domain, which reviews nothing. Reading the dict
+    # directly made this fixture disagree with the production caller.
+    STANDARD_DOMAINS = set(_preset_domains("standard"))
 
     def _results(self, drafter):
         """Results for a real `standard` run, keyed as consolidation keys them.

@@ -929,6 +929,27 @@ def _resolve_known_url(
     return _check_drift(result, checksum_index)
 
 
+def verify_source_supports(claim, url, api_keys=None, call_log=None, timeout=15):
+    """Does the page at ``url`` actually support ``claim``? One URL, one answer.
+
+    ``resolve_citations`` is the Pass 3 entry point and does considerably more:
+    adapter fallback, a checksum-drift index over every prior run, and
+    submitting unarchived URLs to archive.org. None of that is wanted for a
+    *proposed* source the author has not adopted — submitting a suggestion for
+    permanent archiving is presumptuous, and drift against prior runs is
+    meaningless for a URL this article has never cited.
+
+    So this exposes the part that matters on its own: SSRF-guarded fetch, text
+    extraction, the archive fallback when the origin refuses, and the relevance
+    check. Same result shape as ``_resolve_known_url``, and the same honesty
+    rules — a page that could not be read is ``unverifiable``, never
+    "does not support".
+    """
+    return _resolve_known_url(
+        claim, url, api_keys=api_keys, call_log=call_log, timeout=timeout
+    )
+
+
 #: How informative each failed outcome is, when several candidate sources were
 #: checked and none of them supported the claim. The reported entry is the most
 #: informative one, not the first tried.

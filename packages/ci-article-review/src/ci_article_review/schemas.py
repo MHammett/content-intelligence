@@ -174,6 +174,38 @@ RED_TEAM = _obj(
 )
 
 
+EXPANSION = _obj(
+    sources=_array_of(
+        title=_STR,
+        url=_NULLABLE_STR,
+        where_to_look=_STR,
+        what_it_establishes=_STR,
+        supports=_STR,
+        why_it_fits=_STR,
+    ),
+    topics=_array_of(
+        topic=_STR,
+        why_it_fits=_STR,
+        audience_served=_STR,
+        where_it_would_go=_STR,
+        closes_known_gap=_NULLABLE_STR,
+    ),
+    angles=_array_of(
+        angle=_STR,
+        why_it_fits=_STR,
+        extends_or_complicates={"type": "string", "enum": ["extends", "complicates"]},
+        cost_to_adopt=_STR,
+    ),
+    data_points=_array_of(
+        data_point=_STR,
+        why_it_strengthens=_STR,
+        where_to_find_it=_STR,
+        url=_NULLABLE_STR,
+    ),
+    additional_observations=_ADDITIONAL_OBSERVATIONS,
+)
+
+
 #: Domain name -> schema. Keys match ``pipeline._DOMAIN_PROMPTS``.
 BY_DOMAIN = {
     "fact_check": FACT_CHECK,
@@ -181,6 +213,7 @@ BY_DOMAIN = {
     "completeness": COMPLETENESS,
     "argument_integrity": ARGUMENT_INTEGRITY,
     "red_team": RED_TEAM,
+    "expansion": EXPANSION,
 }
 
 

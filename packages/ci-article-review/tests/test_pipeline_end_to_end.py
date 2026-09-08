@@ -50,6 +50,8 @@ from ci_article_review.report_markdown import render_report_markdown
 import pytest
 
 import ci_article_review.pipeline as pipeline
+from ci_article_review import ensemble_capture
+from ci_article_review import report_markdown
 
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "draft_run_report.json"
@@ -173,6 +175,40 @@ _DOMAIN_DATA = {
             "risk": "Unsourced negative claim about named parties.",
             "attack_vector": "Demand the record.",
         },
+        "additional_observations": [],
+    },
+    # Only reached on an --expand run; absent from the golden fixture, which is
+    # a default run.
+    "expansion": {
+        "sources": [
+            {
+                "title": "EIA Form 861, 2024 utility sales",
+                "url": "https://example.org/eia-861",
+                "where_to_look": "Table 6, sales by end use",
+                "what_it_establishes": "the load growth the piece asserts",
+                "supports": "The grid served 41 percent of load from nuclear.",
+                "why_it_fits": "quantifies a claim already being made",
+            },
+            {
+                "title": "A source that does not exist",
+                "url": "https://example.org/invented",
+                "where_to_look": "n/a",
+                "what_it_establishes": "nothing — this URL is a fabrication",
+                "supports": "The grid is complex.",
+                "why_it_fits": "it does not; the link check is what catches it",
+            },
+        ],
+        "topics": [
+            {
+                "topic": "Transmission interconnection queue timelines",
+                "why_it_fits": "explains the delay the draft already asserts",
+                "audience_served": "planning staff",
+                "where_it_would_go": "after the cooling section",
+                "closes_known_gap": None,
+            }
+        ],
+        "angles": [],
+        "data_points": [],
         "additional_observations": [],
     },
 }
@@ -792,3 +828,202 @@ class TestReproducibilityAcrossRuns:
         assert second["reproducibility"]["comparable_run_count"] == 1
         assert dropped["total"] == 0, dropped["findings"]
         assert "may have missed" not in md
+
+
+class TestExpansionRunsEndToEnd:
+    """The opt-in pass, wired from the flag through to the rendered markdown.
+
+    The unit tests in ``test_expansion.py`` cover each piece. This covers the
+    wiring between them, which is the half that has broken before (PR #43): the
+    flag reaching ``_build_assignments``, the domain reaching the dispatch, its
+    output reaching consolidation, the URL check running over that output, and
+    Section 10 reaching the file the author actually reads.
+    """
+
+    def _fake_links(self, text, check_wayback=True, **kwargs):
+        """One proposed URL resolves; the fabricated one 404s."""
+        return [
+            {"url": url, "ok": True, "status_code": 200, "verified_via": "direct"}
+            if "invented" not in url
+            else {"url": url, "ok": False, "status_code": 404}
+            for url in text.split()
+        ]
+
+    def _config(self):
+        """`standard` assigns expansion to perplexity alone, so this test needs
+        it configured. Scoped here rather than added to the shared _CONFIG."""
+        cfg = copy.deepcopy(_CONFIG)
+        cfg["api_keys"]["perplexity"] = {"api_key": "k"}
+        cfg["models"]["perplexity"] = {"model": "sonar-pro"}
+        return cfg
+
+    def _run(self, tmp_path, **kwargs):
+        links = patch(
+            "ci_article_review.analysis.links.validate_links",
+            side_effect=self._fake_links,
+        )
+        cfg = patch(
+            "ci_article_review.pipeline.merge_configs", return_value=self._config()
+        )
+        return _stubbed_run(tmp_path, extra_patches=[cfg, links], expand=True, **kwargs)
+
+    def test_the_default_run_does_not_schedule_it(self, tmp_path):
+        cfg = patch(
+            "ci_article_review.pipeline.merge_configs", return_value=self._config()
+        )
+        with _stubbed_run(tmp_path, extra_patches=[cfg]) as report:
+            assert report["section_10_expansion"] == {}
+            assert not [
+                a for a in report["ensemble"]["assignments"] if "expansion" in a
+            ]
+
+    def test_the_flag_schedules_it_and_its_output_reaches_the_report(self, tmp_path):
+        with self._run(tmp_path) as report:
+            assert "perplexity:expansion" in report["ensemble"]["assignments"]
+            expansion = report["section_10_expansion"]
+            assert [s["title"] for s in expansion["sources"]] == [
+                "EIA Form 861, 2024 utility sales",
+                "A source that does not exist",
+            ]
+            assert expansion["models"] == ["perplexity"]
+
+    def test_the_fabricated_url_is_marked_and_still_present(self, tmp_path):
+        with self._run(tmp_path) as report:
+            sources = report["section_10_expansion"]["sources"]
+            assert sources[0]["url_status"] == "ok"
+            assert sources[1]["url_status"] == "missing"
+            assert report["section_10_expansion"]["url_check"] == {
+                "checked": 2,
+                "resolved": 1,
+                "archived": 0,
+                "blocked": 0,
+                "missing": 1,
+                "not_citable": 0,
+                "no_url": 0,
+                "followed_redirects": 0,
+            }
+
+    def test_it_does_not_leak_into_the_defect_sections(self, tmp_path):
+        """Section 10 is additive; nothing it proposed may be ranked as a flag."""
+        with self._run(tmp_path) as report:
+            titles = {
+                "EIA Form 861, 2024 utility sales",
+                "A source that does not exist",
+            }
+            for key in ("section_1_consensus", "section_5_completeness"):
+                rendered = json.dumps(report[key])
+                assert not any(t in rendered for t in titles)
+
+    def test_section_10_reaches_the_rendered_markdown(self, tmp_path):
+        with self._run(tmp_path) as report:
+            markdown = report_markdown.render_report_markdown(report)
+        assert "## SECTION 10: Expansion Candidates" in markdown
+        assert "EIA Form 861, 2024 utility sales" in markdown
+        assert "LINK DEAD" in markdown
+        # Last section in the file: a menu placed above the triage list is how
+        # the triage list stops being read.
+        assert markdown.index("SECTION 10") > markdown.index("SECTION 9")
+
+
+class TestExpansionSurvivesRetryFailed:
+    """``--retry-failed`` was the one entry point expansion had never taken.
+
+    ``--replay`` was covered; this is its sibling, and the one that actually
+    makes calls. A capture in which the expansion pass failed must come back
+    with Section 10 populated after the retry — the path from "capture says
+    this pass died" through the re-run to the rebuilt section.
+    """
+
+    def _capture(self, tmp_path, failed_names=()):
+        """A capture of a full run, with the named passes marked failed."""
+        raw = {}
+        for model, domain in (
+            ("gemini", "fact_check"),
+            ("openai", "voice_style"),
+            ("openai", "completeness"),
+            ("mistral", "argument_integrity"),
+            ("mistral", "red_team"),
+            ("perplexity", "expansion"),
+        ):
+            name = f"{model}:{domain}"
+            if name in failed_names:
+                raw[name] = {
+                    "failed": True,
+                    "error": "stream stalled",
+                    "model": f"{model}-test-model",
+                    "tokens": {},
+                    "_model": model,
+                    "_domain": domain,
+                }
+            else:
+                raw[name] = _fake_run_domain(model, domain)
+        path = tmp_path / "capture_results.json"
+        ensemble_capture.save(path, raw, article_title="T", run_number=1)
+        return str(path)
+
+    def _config(self):
+        """perplexity configured, so `standard` assigns expansion to it rather
+        than backfilling gemini in — this class is about the retry, and a
+        backfilled substitute would answer a different question."""
+        cfg = copy.deepcopy(_CONFIG)
+        cfg["api_keys"]["perplexity"] = {"api_key": "k"}
+        cfg["models"]["perplexity"] = {"model": "sonar-pro"}
+        return cfg
+
+    def _patches(self):
+        return [
+            patch(
+                "ci_article_review.pipeline.merge_configs", return_value=self._config()
+            ),
+            patch(
+                "ci_article_review.analysis.links.validate_links",
+                side_effect=lambda text, **kw: [
+                    {"url": u, "ok": True, "status_code": 200, "verified_via": "direct"}
+                    for u in text.split()
+                ],
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.verify_source_supports",
+                return_value={
+                    "verification": "checksum",
+                    "relevance_reason": "backs it",
+                },
+            ),
+        ]
+
+    def _run(self, tmp_path, capture):
+        return _stubbed_run(
+            tmp_path,
+            extra_patches=self._patches(),
+            expand=True,
+            retry_failed_results=capture,
+        )
+
+    def test_a_failed_expansion_pass_is_re_run_and_lands_in_section_10(self, tmp_path):
+        capture = self._capture(tmp_path, failed_names={"perplexity:expansion"})
+        with self._run(tmp_path, capture) as report:
+            expansion = report["section_10_expansion"]
+            assert expansion, "the retried pass did not reach consolidation"
+            assert expansion["models"] == ["perplexity"]
+            assert [s["title"] for s in expansion["sources"]] == [
+                "EIA Form 861, 2024 utility sales",
+                "A source that does not exist",
+            ]
+            assert "perplexity:expansion" not in report["model_failures"]
+
+    def test_a_capture_naming_a_pass_this_run_cannot_schedule_says_so(
+        self, tmp_path, caplog
+    ):
+        """The gap the preset change opened: a capture from a run whose
+        assignments differ names passes with no runner here."""
+        capture = self._capture(tmp_path, failed_names={"perplexity:expansion"})
+        # Same capture, replayed by a run that never asked for expansion.
+        with caplog.at_level("WARNING"):
+            with _stubbed_run(
+                tmp_path,
+                extra_patches=self._patches(),
+                retry_failed_results=capture,
+            ) as report:
+                assert report["section_10_expansion"] == {}
+        assert "perplexity:expansion" in caplog.text
+        assert "NOT re-attempted" in caplog.text
