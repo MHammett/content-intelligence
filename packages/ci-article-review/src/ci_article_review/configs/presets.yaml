@@ -16,7 +16,8 @@
 #   economy  : ~$0.04 – $0.10   (sanity check, no reasoning)
 #   standard : ~$0.10 – $0.40   (solid, no reasoning overhead)
 #   balanced : ~$0.50 – $1.50   (light reasoning on key models, thorough coverage)
-#   thorough : ~$1.00 – $2.50   (deep reasoning, thorough coverage)
+#   thorough : ~$0.65 – $1.65   (deep reasoning, thorough coverage; scaled down 2026-09-08
+#                                 after the claude-sonnet-5 swap below — see that entry)
 #   maximum  : ~$2.50 – $5.00   (all flagship models, all domains, max reasoning)
 #
 # Mistral note: mistral-medium-3-5 only accepts reasoning_effort "high" or "none".
@@ -201,8 +202,36 @@ thorough:
                                # tier says what it does. xhigh exists and is
                                # unmeasured, so it is not reached for here.
     claude:
-      model: claude-opus-5   # was claude-opus-4-8; 2026-08-18 refresh, same price
+      model: claude-sonnet-5   # was claude-opus-5 until 2026-09-08 — see note below
       effort: high
+
+# claude-opus-5 -> claude-sonnet-5 swap, MEASURED 2026-09-08 on a 19,457-word real
+# article (dc-environment-v26), 3 isolated runs per condition, cross-run reproducibility
+# scored with reproducibility.py against `wide` and `maximum` as anchors:
+#
+#             cost (avg)   overall repro%   fact-check repro%
+#   wide        $0.38          6.8%              0.0%
+#   thorough+sonnet-5  $1.74   16.9%             22.1%
+#   thorough (opus-5)  $2.64   [not repro-scored; single run only]
+#   maximum     $10.27        20.0%             29.6%
+#
+# The sonnet-5 swap captures 84% of `maximum`'s overall reproducibility and 75% of
+# its fact-check reproducibility at 17% of the cost -- a far better marginal trade
+# than `maximum` itself represents over `wide` (which buys +13.2 points of repro at
+# 27x cost, vs this swap's +10.1 points at 4.6x cost). Stock opus-5 `thorough` was
+# scouted at n=1 ($2.64, no clear edge over the sonnet-5 swap's findings) and was
+# not taken to a full 3-run study once the swap's numbers came back this strong --
+# see pipeline_history and the session that ran this for the n=1 comparison.
+#
+# `balanced` was measured in the same round and is NOT a good value: 6.4% overall
+# repro, statistically indistinguishable from `wide`'s 6.8%, at 3.4x the cost. It
+# has not been retired or changed here -- that is a separate decision -- and its
+# "← default" status in configs/user.example.yaml has already been moved to `wide`
+# because of this finding.
+#
+# Full research writeup -- methodology, the historical cost-drift check, vendor/
+# system currency audit, and the recommended revision-cycle practice this implies
+# -- is in PLAN.md §5.6, not just this comment.
 
 maximum:
   thoroughness: maximum
@@ -219,8 +248,22 @@ maximum:
       # gemini-2.5-pro confirmed available on Vertex AI; gemini-3.x returns 404 there.
       # Re-checked 2026-08-18: Gemini 3 Flash is public preview and Gemini 3.1 Pro is
       # preview-in-Model-Garden on Vertex AI, neither GA — left unchanged rather than
-      # move production traffic onto a preview model. gemini-2.5-pro's retirement date
-      # is 2026-10-16; revisit before then regardless of GA status.
+      # move production traffic onto a preview model.
+      #
+      # RE-CHECKED 2026-09-08, web search against third-party deprecation trackers
+      # (Google's own release-notes page was not directly fetchable): 2026-10-16 is
+      # a FLOOR, not a fixed shutoff — Google's communication says Gemini
+      # 2.5 Pro/Flash/Flash-Lite retire "no earlier than" that date, and the actual
+      # discontinuation date is only set once Gemini 3 (Pro) reaches GA, with a
+      # further 6 months' notice given after that. Gemini 3 Pro has not reached GA
+      # as of this check — 3.1 Pro launched in preview 2026-02-19 and was still
+      # preview at last check; 3.5 Pro was in limited enterprise preview as of
+      # 2026-06-23. (Gemini 3.8 *Flash* did reach GA 2026-09-02 — a different line
+      # from the Pro model this tier uses, not evidence Pro is close.) Practical
+      # reading: real retirement is very unlikely to land on 2026-10-16 as a hard
+      # wall, but re-verify this — including via Google's own release-notes page
+      # directly, not just third-party trackers — well before relying on it,
+      # since "no earlier than" is not a promise of exactly how much later.
       stream_read_timeout: 260   # grounding (160s default) + thinking_budget 16000 stacks
                                   # extra silent time on top of search latency; observed a
                                   # real timeout at 205.78s on a maximum-preset Vertex AI

@@ -271,10 +271,19 @@ pipeline:
   # Preset    Thoroughness  Reasoning     Est. $/article
   # --------  -----------   -----------   ---------------
   # economy   standard      off           $0.04 - $0.10
-  # standard  standard      off           $0.10 - $0.40
-  # balanced  thorough      light (low)   $0.50 - $1.50   ← default
-  # thorough  thorough      deep          $1.00 - $2.50
+  # wide      thorough      off (cheap models, wide coverage)   $0.10 - $0.40   ← default
+  # balanced  thorough      light (low)   $0.50 - $1.50
+  # thorough  thorough      deep          $0.65 - $1.65   (claude-sonnet-5, see configs/presets.yaml)
   # maximum   maximum       max           $2.50 - $5.00
+  #
+  # `standard` was retired 2026-09-05 in favour of `wide`, which beat it on every
+  # measured axis at 55% of the cost; an existing `cost_preset: standard` still
+  # runs (as `wide`) and warns rather than erroring.
+  #
+  # DEFAULT CHANGED 2026-09-08 from `balanced` to `wide`: `balanced`'s measured
+  # reproducibility (6.4%) is statistically no better than `wide`'s (6.8%) despite
+  # costing 3.4x more. See configs/presets.yaml, the note above the `maximum:`
+  # block, for the full comparison across all four tiers.
   #
   # Reasoning presets (balanced+) automatically switch to reasoning-capable models.
   # The exact model/effort per preset lives in configs/presets.yaml; current bundle:
@@ -287,7 +296,7 @@ pipeline:
   # All estimates assume a 1500-word article.  Perplexity and thinking-enabled
   # Claude have higher variance due to reasoning trace token overhead.
   #
-  cost_preset: balanced
+  cost_preset: wide
 
   # Preset overrides — selectively adjust individual settings from the preset
   # without rebuilding the full config.  Only keys you list are changed; all
