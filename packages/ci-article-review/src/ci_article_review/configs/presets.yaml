@@ -229,6 +229,18 @@ thorough:
 # "← default" status in configs/user.example.yaml has already been moved to `wide`
 # because of this finding.
 #
+# claude-fable-5.1 was considered and CLOSED, 2026-09-09, without a live test.
+# Pricing (litellm's cost map, sourced from Anthropic's own docs): $10/$50 per
+# MTok in/out, thinking_always_on (cannot be dialed down the way opus-5/sonnet-5
+# can) -- 2x opus-5's price, 5x sonnet-5's. Anthropic positions Fable for
+# long-horizon agentic work (coding, unattended agent runs, research), explicitly
+# recommending sonnet-5/opus-5 for chat and drafting instead; a published
+# head-to-head found opus-5 already wins the closest analogous category
+# ("knowledge-work" Elo) at half Fable's price. Chained with this file's own
+# finding that opus-5 wasn't the best value pick for this task, Fable starts from
+# a worse position than a model already shown to lose here -- not worth a
+# scouting run.
+#
 # Full research writeup -- methodology, the historical cost-drift check, vendor/
 # system currency audit, and the recommended revision-cycle practice this implies
 # -- is in PLAN.md §5.6, not just this comment.
