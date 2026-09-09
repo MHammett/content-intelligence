@@ -647,8 +647,18 @@ around its output. 239 lines is not where the pain is.
    Mistral (`mistral-medium-3-5`), Grok (`grok-4.6`), and Perplexity
    (`sonar-reasoning-pro`) are all still current, nothing superseded. Claude has
    an unevaluated newer family — `claude-fable-5-1` (11 days old at measurement
-   time) and `claude-fable-5` — neither assessed for suitability on this task;
-   still open. Gemini can't be checked this way (Vertex AI has no models-list
+   time) and `claude-fable-5` — flagged as open at measurement time. **Closed
+   2026-09-09, without a live test**, once actual pricing and positioning were
+   checked: $10/$50 per MTok in/out (litellm's cost map, sourced from Anthropic's
+   docs) — 2x opus-5, 5x sonnet-5 — with `thinking_always_on` (no low-effort mode
+   the way opus-5/sonnet-5 have). Anthropic positions Fable for long-horizon
+   agentic work (coding, unattended agents, research), recommending sonnet-5/
+   opus-5 for chat and drafting instead; a published head-to-head found opus-5
+   already wins the closest analogous category ("knowledge-work" Elo) at half
+   Fable's price. Chained with this section's own finding that opus-5 wasn't the
+   best value pick for this task, Fable starts from a worse position than a model
+   already shown to lose here — not worth a scouting run. Gemini can't be checked
+   this way (Vertex AI has no models-list
    endpoint here); `gemini-2.5-pro`'s documented retirement is 2026-10-16, about
    five weeks out from this measurement — a pre-existing flag in `presets.yaml`,
    re-surfaced rather than newly found. **Corrected the same day, via web search
