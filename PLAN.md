@@ -536,6 +536,156 @@ around its output. 239 lines is not where the pain is.
    drafting-model exclusion: `pipeline.drafting_model` (or `Drafted with:` in a
    handoff) drops the declared drafter from `voice_style` only, so Claude can be
    enabled without judging its own phrasing habits.
+6. ~~**Is `maximum` worth its cost over `wide`, and is there a better middle
+   tier?**~~ **Done, 2026-09-08.** PR #145 ("Make cheap presets degrade legibly,
+   not silently") built the archive/replay/`reproducibility.py` infrastructure
+   this measurement reused and named this comparison "the only open item" —
+   never run until this session. Full writeup here because `presets.yaml` and
+   `CLAUDE.md` only carry the terse decision-record version, and #2 above is a
+   direct example of what happens when that context lives nowhere durable.
+
+   **Draft and methodology.** Ran on `dc-environment-v26` (19,457 words, the
+   largest real draft on disk, gitignored under `handoff_templates/` in the main
+   checkout) — *not* the 1,392-word draft the 2026-09-05 `wide`-vs-`standard`
+   measurement used, which is undocumented by filename anywhere in that PR/commit
+   history. So this is not literally the same draft, only the same method: 3
+   isolated live runs per condition (separate `History key:` per run, so no prior
+   report's findings feed back as review context and contaminate independence —
+   the same isolation PR #145 used), cross-run reproducibility scored by
+   importing `reproducibility.py`'s own `draft_fingerprint`/`ensemble_signature`/
+   `finding_keys` directly against the resulting report JSONs (the CLI's
+   automatic in-report annotation only compares runs sharing one `History key:`,
+   so it can't score across isolated runs on its own — this reuses the same
+   matching logic by hand instead of writing new logic).
+
+   **Cost scales worse than nominal estimates at this draft's size.** `presets.yaml`'s
+   comment table assumes a 1,500-word article. At 19,457 words: `wide` landed
+   close to nominal ($0.32–0.50 vs $0.10–0.40), but `maximum` came in at 2–4x its
+   nominal ceiling ($9.5–10.9 vs $2.50–5.00). Output/reasoning tokens dominate
+   cost more than input length, so bigger drafts cost proportionally less extra
+   than a linear scaling would predict, but the nominal ranges still undersold
+   `maximum`'s real cost here badly enough to be worth flagging for anyone sizing
+   a budget off that table alone.
+
+   **A same-word-count historical comparison (free, no new runs) found cost had
+   already risen ~85% independent of anything this session did.** `pipeline_history/`
+   in the main checkout had a `maximum` run of this same article from 2026-08-18 at
+   the identical word count (19,457) — $5.14 then vs $9.54 measured here, three
+   weeks apart. Confounded, not a clean regression: 4 of 6 providers got new
+   flagship models in between (the 2026-08-18 refresh), and the Mistral figure
+   specifically ($0.12 → $0.93, *same* model both times) is more consistent with
+   the old number reflecting silent truncation — this window is exactly when the
+   streaming stall-detector was split from the first-byte timeout (`0d6b2cc`) and
+   several read-gap timeouts were raised — than with the work actually costing
+   8x more. Net: most of the 85% is vendor pricing/model churn, not this
+   project's code getting less efficient; isolating the two further was not
+   pursued (would need more live runs, not requested).
+
+   **Full comparison, `wide` vs `maximum`, 3 runs each:**
+
+   |            | cost (avg) | overall repro% | fact-check repro% |
+   |------------|-----------:|----------------:|--------------------:|
+   | `wide`     | $0.38      | 6.8%            | 0.0%                |
+   | `maximum`  | $10.27     | 20.0%           | 29.6%               |
+
+   `maximum` is ~3x more reproducible overall, not just more prolific — and its
+   pairwise agreement across any 2 of the 3 runs is stable (15.5–16.5% regardless
+   of which two), while `wide`'s swings 1.8–9.4% depending on the pair and its
+   3-way unanimous agreement is 0.4%, essentially nothing. Practical reading:
+   repeating `maximum` converges toward a trustworthy answer; repeating `wide`
+   does not, so a "run wide twice, only trust what agrees" strategy doesn't work
+   the way the same idea does for `maximum`. Completeness is broken in *both*
+   (0.0% / 3.8%) — neither preset produces a reliable completeness finding from a
+   single run; that domain's weakness is not a cost-tier problem. Fact-check is
+   where nearly the entire quality gap lives: `wide`'s 2-model fact-check
+   ensemble (gemini + perplexity) is flatly unreproducible with itself.
+
+   **Scouted `balanced` and stock `thorough` (opus-5) at n=1 before committing to
+   full studies of either — this is the decision-gate step, and it worked:**
+   stock `thorough` ($2.64) showed no clear edge over a `thorough`+sonnet-5
+   variant at n=1 and was dropped rather than taken to a full 3-run study. Note
+   the asymmetry this leaves: the "swap wins" conclusion below rests on a robust
+   n=3 result for sonnet-5 against only an n=1 result for opus-5, not a
+   symmetric measurement — a real limitation, accepted deliberately to avoid
+   ~$8 on a baseline the n=1 pass and the pricing/reasoning-effort literature
+   both already argued against.
+
+   **Full comparison, all four conditions, 3 runs each (except stock `thorough`,
+   n=1, excluded from this table for the reason above):**
+
+   |            | cost (avg) | overall repro% | fact-check repro% |
+   |------------|-----------:|----------------:|--------------------:|
+   | `wide`     | $0.38      | 6.8%            | 0.0%                |
+   | `balanced` | $1.28      | 6.4%            | 1.1%                |
+   | `thorough` + sonnet-5 | $1.74 | 16.9% | 22.1%                    |
+   | `maximum`  | $10.27     | 20.0%           | 29.6%               |
+
+   Two decisions followed, both implemented the same day:
+
+   - **`thorough`'s Claude model changed from `claude-opus-5` to `claude-sonnet-5`**
+     (`packages/ci-article-review/src/ci_article_review/configs/presets.yaml`,
+     same `effort: high`). The swap alone captures 84% of `maximum`'s overall
+     reproducibility and 75% of its fact-check reproducibility at 17% of the
+     cost — a far better marginal trade than `maximum` represents over `wide`
+     (`maximum` buys +13.2 points of repro over `wide` at 27x cost; this swap
+     buys +10.1 points at 4.6x cost). Real pricing behind it, from
+     `ci-core`'s `configs/model_registry.yaml`: opus-5 is $5/$25 per MTok,
+     sonnet-5 $2/$10 — 2.5x cheaper on both sides, and this was the first time
+     that price gap was checked against actual review quality rather than
+     assumed either way.
+   - **The shipped default in `configs/user.example.yaml` changed from
+     `cost_preset: balanced` to `cost_preset: wide`.** `balanced`'s measured
+     reproducibility (6.4%) is statistically indistinguishable from `wide`'s
+     (6.8%) despite costing 3.4x more — as the out-of-box default for anyone
+     using this pipeline without specifying a preset, that was worth fixing
+     alongside the `thorough` change rather than leaving noted-but-unfixed.
+     `balanced` itself was **not** retired or reconfigured — only its default
+     status — so revisiting the tier itself is still open if anyone wants it.
+
+   **Vendor/system currency, checked before any of the above (free — `ci-discover`
+   queries models-list endpoints, no completions):** OpenAI (`gpt-5.6-sol`),
+   Mistral (`mistral-medium-3-5`), Grok (`grok-4.6`), and Perplexity
+   (`sonar-reasoning-pro`) are all still current, nothing superseded. Claude has
+   an unevaluated newer family — `claude-fable-5-1` (11 days old at measurement
+   time) and `claude-fable-5` — neither assessed for suitability on this task;
+   still open. Gemini can't be checked this way (Vertex AI has no models-list
+   endpoint here); `gemini-2.5-pro`'s documented retirement is 2026-10-16, about
+   five weeks out from this measurement — a pre-existing flag in `presets.yaml`,
+   re-surfaced rather than newly found. **Corrected the same day, via web search
+   against third-party deprecation trackers**: 2026-10-16 is a floor ("no earlier
+   than"), not a fixed date — Google sets the actual discontinuation only once
+   Gemini 3 Pro reaches GA, plus 6 further months' notice, and Gemini 3 Pro
+   (3.1 Pro preview since 2026-02-19, 3.5 Pro limited-preview as of 2026-06-23)
+   had not reached GA as of this check, so real retirement is unlikely to land on
+   2026-10-16 as a hard wall. `presets.yaml`'s note (above the `maximum:` block's
+   gemini entry) carries the corrected version and the caveat that this came from
+   third-party trackers, not Google's release-notes page directly — re-verify
+   before actually relying on either date. Also checked, since Grok had exactly this
+   bug (`aaeccb7`, already fixed): whether Claude's `effort` silently resolves to
+   an expensive provider-side default when unset the way Grok's
+   `reasoning_effort` did. It does not — traced into
+   `ci_core/llm/client.py`'s `_provider_params`: when `effort` is unset for
+   Claude, the client sends no reasoning parameter at all rather than leaving it
+   to the provider, so `wide`'s Claude entry (no `effort:` field) is a deliberate
+   "no reasoning" choice, not an accidental gap.
+
+   **Recommended practice, not enforced anywhere in config** (worth keeping
+   attached to this record even though it changed no file): for a long revision
+   cycle (20–30 rounds before publication), `reproducibility.py`'s own
+   comparability check requires an *exact* draft-fingerprint match, so it cannot
+   score anything across rounds where the text actually changes — every
+   actively-revised round is exactly as noisy as the single-run numbers above,
+   regardless of preset. The shape that follows: cheap `wide` passes for the
+   bulk of active revision (findings judged on their own merits, not filtered by
+   agreement across passes — `wide`'s cross-run agreement is too unstable for
+   that filter to do anything but discard real findings alongside noise), with
+   `maximum` reserved for a small number of freeze-the-draft checkpoints
+   (2 isolated passes, act only on what both agree on) near publication — because
+   only a *deliberately unrevised* rerun gets the de-noising benefit, and
+   `maximum` is the one preset whose repeats actually converge. A mid-cycle
+   `--only-domain fact_check` spot check at `maximum` is worth considering
+   separately, since `wide` is fact-check-blind (0.0% repro) for the entire
+   length of an active revision cycle otherwise.
 
 ---
 

@@ -48,4 +48,20 @@ uv run ci-review --draft packages/ci-article-review/src/ci_article_review/handof
 
 Replay is a real verification for anything in consolidation, scoring, the report, citations or history. It is **not** sufficient for changes to assignment, dispatch, retry, recovery or substitution — those decide which calls get made, and a replay makes none. Verify those live, at `--cost-preset wide` (12 calls, ~$0.12), not at `maximum`.
 
-Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset on every axis at 55% of the cost, so `wide` is a sound working default and not a degraded one. Nothing above `wide` has been measured — see `configs/presets.yaml` for what is and is not evidenced.
+Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset on every axis at 55% of the cost, so `wide` is a sound working default and not a degraded one.
+
+Measured 2026-09-08 on a 19,457-word real article (dc-environment-v26), 3 isolated runs per condition, cross-run reproducibility scored against `wide` and `maximum` as anchors — the first measurement of anything above `wide`:
+
+|            | cost (avg) | overall repro% | fact-check repro% |
+|------------|-----------:|----------------:|--------------------:|
+| `wide`     | $0.38      | 6.8%            | 0.0%                |
+| `balanced` | $1.28      | 6.4%            | 1.1%                |
+| `thorough` (claude-sonnet-5) | $1.74 | 16.9% | 22.1%      |
+| `maximum`  | $10.27     | 20.0%           | 29.6%               |
+
+Two conclusions came out of this and are now reflected in `configs/presets.yaml`:
+
+- **`thorough` was upgraded**: its Claude model changed from `claude-opus-5` to `claude-sonnet-5` (same `effort: high`), because the swap alone captures 84% of `maximum`'s overall reproducibility and 75% of its fact-check reproducibility at 17% of the cost — a far better marginal trade than `maximum` represents over `wide`. `maximum` still exists for the cases that need that last stretch of fact-check reliability and can afford 6x more for it; `thorough` is now the reasonable middle tier this repo didn't have before.
+- **`balanced` is not a good value** — 6.4% repro is statistically indistinguishable from `wide`'s 6.8% at 3.4x the cost — but it has not been retired or changed; it is still the shipped default in `configs/user.example.yaml`. That's a separate, larger decision than this measurement made on its own.
+
+See `configs/presets.yaml` (the note above the `maximum:` block) for the full comparison, including why stock opus-5 `thorough` was scouted but not taken to a full study once the sonnet-5 numbers came back this strong. Full research writeup — methodology, the historical cost-drift check, vendor/system currency audit, and the revision-cycle practice this implies — is in `PLAN.md` §5.6, not just this summary.
