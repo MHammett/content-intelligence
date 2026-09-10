@@ -102,9 +102,20 @@ models:
   # map 2026-08-18. Opus-5 is unchanged from opus-4-8's rate; sonnet-5 actually
   # dropped from sonnet-4-6's $3.00/$15.00 to $2.00/$10.00 — do not assume flat
   # carryover pricing on a version bump the way opus's did.
-  claude-fable-5:               [10.00, 50.00]
-  claude-opus-5:                [5.00,  25.00]
-  claude-sonnet-5:              [2.00,  10.00]
-  claude-opus-4-8:              [5.00,  25.00]
-  claude-sonnet-4-6:            [3.00,  15.00]
-  claude-haiku-4-5-20251001:    [1.00,   5.00]
+  #
+  # Cached-read rates added 2026-09-10, at Anthropic's published 0.1x of base
+  # input. Every Claude row was a bare [in, out] pair before, which meant
+  # cost.py billed cache reads at the FULL input rate — so turning caching on
+  # would have moved the reported cost by nothing and read as "the feature does
+  # not work". That is the same blind-instrument failure that made the
+  # pre-#103 OpenAI cache A/B worthless; see PLAN.md §5 decision 2.
+  #
+  # Note the 0.1x multiplier is not universal: Claude Fable 5.1 reads at
+  # 0.025x ($0.25/MTok). Fable *5* — the row below — is a normal 0.1x model.
+  # Check the multiplier per model when adding a row, do not copy this block.
+  claude-fable-5:               [10.00, 50.00,  1.00]
+  claude-opus-5:                [5.00,  25.00,  0.50]
+  claude-sonnet-5:              [2.00,  10.00,  0.20]
+  claude-opus-4-8:              [5.00,  25.00,  0.50]
+  claude-sonnet-4-6:            [3.00,  15.00,  0.30]
+  claude-haiku-4-5-20251001:    [1.00,   5.00,  0.10]

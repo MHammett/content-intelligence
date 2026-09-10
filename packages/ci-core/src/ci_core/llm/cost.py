@@ -136,6 +136,15 @@ def _entry_cost(entry):
     # reported by every provider that caches and was priced at the full input
     # rate until now, so any caching the pipeline benefits from was invisible in
     # the cost summary — which is also what made the caching work unmeasurable.
+    #
+    # Known gap, deliberately not modelled: cache *writes* bill at 1.25x input
+    # (2x on a 1h TTL, which this pipeline does not use). tokens.py folds
+    # ``cache_creation_input_tokens`` into ``prompt`` and only breaks out
+    # reads, so written tokens land in ``uncached_tok`` and are billed at 1.00x
+    # — an under-report of 0.25x on the written span only. Measured on the
+    # 2026-09-10 verification run that span was worth ~$0.01 against ~$0.39
+    # saved on the same call, so a fourth price slot is not worth the config
+    # surface. Revisit if a run ever writes far more than it reads.
     cached_tok = min(tokens.get("cached", 0) or 0, prompt_tok)
     uncached_tok = prompt_tok - cached_tok
     model_id = entry.get("model", "")

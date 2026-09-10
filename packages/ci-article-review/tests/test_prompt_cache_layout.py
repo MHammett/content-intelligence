@@ -161,3 +161,82 @@ class TestTheCacheablePrefix:
         a = _cache_friendly_layout("same instruction", "article one")[2]
         b = _cache_friendly_layout("same instruction", "article two")[2]
         assert a != b
+
+
+def _calls_for_claude(prompt_cache_layout):
+    """Run every domain, returning [(user, cache_prefix), ...] as sent."""
+    captured = []
+
+    def _fake_call(provider, system, user, api_key, **kwargs):
+        captured.append((user, kwargs.get("cache_prefix")))
+        return {"raw": "{}"}
+
+    with patch("ci_article_review.pipeline.llm.call_provider", side_effect=_fake_call):
+        for domain in DOMAINS:
+            _run_domain(
+                "claude",
+                domain,
+                DRAFT,
+                {"title": "A Real Article Title"},
+                {},
+                {"claude": {"api_key": "k"}},
+                {"prompt_cache_layout": prompt_cache_layout},
+                {"claude": {"model": "claude-opus-5"}},
+            )
+    return captured
+
+
+class TestTheBreakpointWithTheLayoutOff:
+    """A marker still ships when the layout is off — for a different reason.
+
+    With the layout off nothing is shared across domains (``system`` carries
+    the per-domain instruction and renders ahead of ``messages``), so this buys
+    nothing between calls. What it buys is caching *within* one call, which is
+    where the input tokens actually are: on run_2 of honda-navigation-clock
+    (2026-09-09) fact_check alone was 141,259 of claude's 169,791 input tokens,
+    because server-side web_search loops and re-reads a growing context on every
+    internal turn. The four domains without search sat at ~9,500 each.
+
+    Nothing about the prompt moves, so none of the quality question that
+    PLAN.md §5 decision 2 closed is reopened here.
+    """
+
+    def test_a_prefix_is_sent_even_with_the_layout_off(self):
+        """The regression this guards: cache_prefix was None here, so no marker
+        was ever sent and Anthropic cached nothing at all."""
+        assert all(prefix for _, prefix in _calls_for_claude(False))
+
+    def test_the_prefix_is_the_whole_user_prompt(self):
+        """Everything up to and including the marked block is what gets cached.
+        Marking less would leave the tail of the article uncached for free."""
+        for user, prefix in _calls_for_claude(False):
+            assert prefix == user
+
+    def test_the_draft_is_inside_the_cached_span(self):
+        _, prefix = _calls_for_claude(False)[0]
+        assert DRAFT.strip() in prefix
+
+    def test_no_domain_text_leaks_into_the_prefix(self):
+        """A per-domain byte in the prefix would make each domain's entry
+        unique — a write premium on every call and never a read."""
+        from ci_article_review.pipeline import _load_prompt
+
+        for domain, (_, prefix) in zip(DOMAINS, _calls_for_claude(False)):
+            first_line = _load_prompt(_DOMAIN_PROMPTS[domain]).splitlines()[0].strip()
+            assert first_line not in prefix
+
+    def test_the_layout_still_narrows_the_prefix_when_it_is_on(self):
+        """With the layout on, the domain instruction moves into the user
+        message, so the cacheable span must stop short of it rather than
+        swallow the whole prompt.
+
+        The constant ``YOUR REVIEW TASK`` header is deliberately *inside* the
+        span — it is byte-identical across domains, so excluding it would give
+        up cacheable bytes for nothing. Only the instruction itself varies.
+        """
+        from ci_article_review.pipeline import _load_prompt
+
+        for domain, (user, prefix) in zip(DOMAINS, _calls_for_claude(True)):
+            assert prefix and prefix != user
+            first_line = _load_prompt(_DOMAIN_PROMPTS[domain]).splitlines()[0].strip()
+            assert first_line not in prefix
