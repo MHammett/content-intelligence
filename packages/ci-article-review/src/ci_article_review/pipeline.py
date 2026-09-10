@@ -1422,9 +1422,43 @@ def _run_domain(
     # Off by default: it relocates the domain instruction from before the
     # article to after it, and this pipeline's output is the product. Turn it
     # on, diff a run against a prior live run, and keep it if the findings hold.
-    cache_prefix = None
     if pipeline_cfg.get("prompt_cache_layout", False):
         system, user, cache_prefix = _cache_friendly_layout(system, user)
+    else:
+        # Layout off, but the user prompt is still cacheable — all of it. It is
+        # the draft and handoff with no domain text in it, so it is
+        # byte-identical across all five domains and stable within a call.
+        #
+        # Marking it buys nothing across domains (`system` carries the
+        # per-domain instruction and renders ahead of `messages`, so each
+        # domain's prefix diverges before this block is reached). What it buys
+        # is caching *within* one request, and that is where the tokens are:
+        # measured on run_2 of honda-navigation-clock, 2026-09-09, fact_check
+        # alone was 141,259 of claude's 169,791 input tokens — 83% — because
+        # server-side web_search runs an agentic loop that re-reads a growing
+        # context on every internal turn. The four domains without search sat
+        # at ~9,500 each. Anthropic also inserts its own cache writes after
+        # tool results, but only for a request that already carries a marker.
+        #
+        # Verified live 2026-09-10, one opus-5 fact_check call on the
+        # short-example draft: 86,159 of 138,533 input tokens read from cache
+        # — 62% of a single request's input, where it had been 0 by
+        # construction. Note the draft's own user prompt is only ~3,954
+        # tokens; the other 134k is the search loop reading itself back.
+        #
+        # The four domains without search have no internal loop, so they read
+        # nothing back and pay the 1.25x write premium for an entry nobody
+        # reads: ~$0.012 a run against ~$0.39 saved. Left unconditional at
+        # that ratio rather than gated on `web_search`, which would silently
+        # stop caching the day another domain gains a tool — and a stream-stall
+        # retry (see ci_core.llm.client) re-sends the whole prompt within the
+        # 5-minute TTL, so the "wasted" write is what makes the retry cheap.
+        #
+        # This is deliberately NOT the layout change, and does not reopen the
+        # question PLAN.md §5 decision 2 closed: nothing about the prompt moves,
+        # so there is no quality question to re-litigate — only a marker on
+        # bytes that were already being sent in exactly this order.
+        cache_prefix = user
 
     api_key = api_keys.get(model_name, {}).get("api_key", "")
 
