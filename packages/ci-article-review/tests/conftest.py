@@ -4,6 +4,8 @@ import hashlib
 
 import pytest
 
+import spn_client.client as _spn_client_engine
+
 from ci_article_review import live_model_check
 from ci_article_review.adapters.citation import resolver, wayback
 from ci_article_review.analysis import links
@@ -67,9 +69,16 @@ def neutralise_wayback_pacing(monkeypatch):
     The state reset on both sides is the same one ``run_draft_pipeline`` does
     per run, for the same reason: a breaker tripped by one test would otherwise
     skip every archive lookup in the next.
+
+    ``_MIN_INTERVAL_SECONDS``/``_BACKOFF_BASE_SECONDS`` live in ``spn_client``'s
+    engine now, not in this package's ``wayback`` module — that module only
+    re-exports the public functions/constants, not these private pacing knobs
+    — so they're patched on ``spn_client.client`` directly. ``reset_rate_limit_state``
+    is still called through ``wayback`` (it's one of the re-exported names) since
+    it's the same process-wide state either way.
     """
-    monkeypatch.setattr(wayback, "_MIN_INTERVAL_SECONDS", 0.0)
-    monkeypatch.setattr(wayback, "_BACKOFF_BASE_SECONDS", 0.0)
+    monkeypatch.setattr(_spn_client_engine, "_MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(_spn_client_engine, "_BACKOFF_BASE_SECONDS", 0.0)
     wayback.reset_rate_limit_state()
     yield
     wayback.reset_rate_limit_state()

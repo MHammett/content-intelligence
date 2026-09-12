@@ -5,6 +5,11 @@ description = "Article review pipeline"
 requires-python = ">=3.10"
 dependencies = [
     "ci-core",
+    # The archive.org/SPN2 client (adapters/citation/wayback.py's engine)
+    # extracted to its own package so doc-crawler and rochelle-vendor-audit
+    # (unrelated projects independently re-implementing the same submit/check
+    # logic) can depend on it too, instead of each maintaining a copy.
+    "spn-client>=0.1.0,<0.2",
     "requests>=2.31.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "python-dotenv>=1.0.0,<2.0",
@@ -35,6 +40,9 @@ ci-markers = "ci_article_review.markers:main"
 
 [tool.uv.sources]
 ci-core = { workspace = true }
+# Temporary, until spn-client is published to PyPI — remove this override
+# once `pip install spn-client` resolves the version pin above on its own.
+spn-client = { git = "https://github.com/MHammett/spn-client", rev = "main" }
 
 [build-system]
 requires = ["hatchling"]
