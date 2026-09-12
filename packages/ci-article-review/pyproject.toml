@@ -40,9 +40,6 @@ ci-markers = "ci_article_review.markers:main"
 
 [tool.uv.sources]
 ci-core = { workspace = true }
-# Temporary, until spn-client is published to PyPI — remove this override
-# once `pip install spn-client` resolves the version pin above on its own.
-spn-client = { git = "https://github.com/MHammett/spn-client", rev = "main" }
 
 [build-system]
 requires = ["hatchling"]
