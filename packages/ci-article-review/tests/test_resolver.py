@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
+import spn_client.client as _spn_client_engine
 
 from ci_core import extract
 from ci_core.http import UnsafeURLError
@@ -2301,6 +2302,14 @@ class TestWaybackRateLimitHandling:
     included, still 429 after a 45s cooldown at 1 req/6s. The 2026-08-11 run
     archived 0 of 49 resolved citations. After pacing + backoff, 6 of 6 live
     lookups succeeded in 19.8s.
+
+    The pacing/breaker engine itself now lives in ``spn_client.client`` (this
+    used to be part of this package's own ``wayback`` module before that logic
+    was extracted into a standalone package other projects share). These tests
+    poke its private internals directly, so they patch ``spn_client.client``
+    rather than ``wayback`` — ``wayback.check()``/``reset_rate_limit_state()``
+    still work as before since they're re-exports of the same underlying
+    functions/state.
     """
 
     def setup_method(self):
@@ -2313,38 +2322,43 @@ class TestWaybackRateLimitHandling:
         # The interval is patched in explicitly rather than taken from the
         # module: conftest's `neutralise_wayback_pacing` zeroes it for every
         # test, so anything asserting the pacing has to ask for it back.
-        # (`test_wayback.py::TestPacingClock` asserts the exact durations and
-        # the interaction with a 429's backoff clock; this stays here as the
-        # resolver-side statement that pacing happens at all.)
+        # (`spn-client`'s own `test_client.py::TestPacingClock` asserts the
+        # exact durations and the interaction with a 429's backoff clock;
+        # this stays here as the resolver-side statement that pacing happens
+        # at all.)
         seen = []
         with (
-            patch.object(wayback, "_MIN_INTERVAL_SECONDS", 3.0),
-            patch.object(wayback.time, "sleep", side_effect=seen.append),
+            patch.object(_spn_client_engine, "_MIN_INTERVAL_SECONDS", 3.0),
+            patch.object(_spn_client_engine.time, "sleep", side_effect=seen.append),
         ):
-            wayback._pace()
-            wayback._pace()
+            _spn_client_engine._pace()
+            _spn_client_engine._pace()
         assert seen and seen[-1] > 0, "second call must wait for the interval"
 
     def test_a_429_is_retried_with_backoff(self):
         resp = MagicMock(status_code=429, headers={}, url="https://archive.org/x")
-        with patch.object(wayback.requests, "get", return_value=resp) as mock_get:
-            with patch.object(wayback.time, "sleep"):
+        with patch.object(
+            _spn_client_engine.requests, "get", return_value=resp
+        ) as mock_get:
+            with patch.object(_spn_client_engine.time, "sleep"):
                 with pytest.raises(Exception):
-                    wayback._get_availability("https://example.org", 10)
-        assert mock_get.call_count == wayback._MAX_ATTEMPTS
+                    _spn_client_engine._get_availability("https://example.org", 10)
+        assert mock_get.call_count == _spn_client_engine._MAX_ATTEMPTS
 
     def test_retry_after_header_is_honoured(self):
         resp = MagicMock(status_code=429, headers={"Retry-After": "12"})
-        assert wayback._retry_after_seconds(resp, 0) == 12.0
+        assert _spn_client_engine._retry_after_seconds(resp, 0) == 12.0
 
     def test_retry_after_is_capped(self):
         """A hostile or absurd header must not stall the whole run."""
         resp = MagicMock(status_code=429, headers={"Retry-After": "86400"})
-        assert wayback._retry_after_seconds(resp, 0) == 60.0
+        assert _spn_client_engine._retry_after_seconds(resp, 0) == 60.0
 
     def test_the_circuit_breaker_stops_further_lookups(self):
-        wayback._rate_limited_lookups = wayback._CIRCUIT_TRIP_AFTER
-        with patch.object(wayback.requests, "get") as mock_get:
+        _spn_client_engine._rate_limited_lookups = (
+            _spn_client_engine._CIRCUIT_TRIP_AFTER
+        )
+        with patch.object(_spn_client_engine.requests, "get") as mock_get:
             result = wayback.check("https://example.org/page")
         mock_get.assert_not_called()
         assert result["archived"] is None
@@ -2359,13 +2373,13 @@ class TestWaybackRateLimitHandling:
         breaker — the exact situation it was built for. "Consecutive" is not a
         quantity eight interleaved threads can agree on; a per-run budget is.
         """
-        wayback._rate_limited_lookups = 3
+        _spn_client_engine._rate_limited_lookups = 3
         ok = MagicMock(status_code=200, headers={})
         ok.raise_for_status = MagicMock()
-        with patch.object(wayback.requests, "get", return_value=ok):
-            with patch.object(wayback.time, "sleep"):
-                wayback._get_availability("https://example.org", 10)
-        assert wayback._rate_limited_lookups == 3
+        with patch.object(_spn_client_engine.requests, "get", return_value=ok):
+            with patch.object(_spn_client_engine.time, "sleep"):
+                _spn_client_engine._get_availability("https://example.org", 10)
+        assert _spn_client_engine._rate_limited_lookups == 3
 
 
 class TestCaptureOutcomeIsRecorded:
@@ -3219,7 +3233,7 @@ class TestServiceHealthIsNotedOnFailure:
             resolver._note_service_health(entries, "AK", "SK")
         detail = entries[0]["wayback"]["archive_outcome_detail"]
         assert "degraded" in detail
-        assert "not the pipeline" in detail
+        assert "not the caller" in detail
         assert entries[0]["wayback"]["archive_service_ok"] is False
 
     def test_a_clean_run_never_asks(self):
