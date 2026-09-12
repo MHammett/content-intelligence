@@ -2337,7 +2337,9 @@ class TestWaybackRateLimitHandling:
 
     def test_a_429_is_retried_with_backoff(self):
         resp = MagicMock(status_code=429, headers={}, url="https://archive.org/x")
-        with patch.object(_spn_client_engine.requests, "get", return_value=resp) as mock_get:
+        with patch.object(
+            _spn_client_engine.requests, "get", return_value=resp
+        ) as mock_get:
             with patch.object(_spn_client_engine.time, "sleep"):
                 with pytest.raises(Exception):
                     _spn_client_engine._get_availability("https://example.org", 10)
@@ -2353,7 +2355,9 @@ class TestWaybackRateLimitHandling:
         assert _spn_client_engine._retry_after_seconds(resp, 0) == 60.0
 
     def test_the_circuit_breaker_stops_further_lookups(self):
-        _spn_client_engine._rate_limited_lookups = _spn_client_engine._CIRCUIT_TRIP_AFTER
+        _spn_client_engine._rate_limited_lookups = (
+            _spn_client_engine._CIRCUIT_TRIP_AFTER
+        )
         with patch.object(_spn_client_engine.requests, "get") as mock_get:
             result = wayback.check("https://example.org/page")
         mock_get.assert_not_called()

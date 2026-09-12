@@ -1706,7 +1706,9 @@ class TestCitationsPairLiveAndArchiveLinks:
         is what decides which branch this function takes.
         """
         wayback.reset_rate_limit_state()
-        _spn_client_engine._rate_limited_lookups = _spn_client_engine._CIRCUIT_TRIP_AFTER
+        _spn_client_engine._rate_limited_lookups = (
+            _spn_client_engine._CIRCUIT_TRIP_AFTER
+        )
         try:
             result = wayback.check("https://example.org/page")
         finally:
