@@ -599,7 +599,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0.0,<2.0" },
     { name = "pyyaml", specifier = ">=6.0,<7.0" },
     { name = "requests", specifier = ">=2.31.0,<3.0" },
-    { name = "spn-client", specifier = ">=0.2.1,<0.3" },
+    { name = "spn-client", specifier = ">=0.3.0,<0.4" },
     { name = "trafilatura", marker = "extra == 'all'", specifier = ">=1.6" },
     { name = "trafilatura", marker = "extra == 'url'", specifier = ">=1.6" },
 ]
@@ -3336,14 +3336,14 @@ wheels = [
 
 [[package]]
 name = "spn-client"
-version = "0.2.1"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/52/e690b8982e40e2f144be4f2dae0c33fdee913c80f97719c680fc16fcfc20/spn_client-0.2.1.tar.gz", hash = "sha256:59e5c993bda86a1cef5f25bacc59bac3b7c6d2486d76dd23d962ca1da6e8c967", size = 33117, upload-time = "2026-09-13T08:23:54.015Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b1/64/46ec1a91b5d93f2010130a2ac1660f1036855866fe34048511713703308b/spn_client-0.3.0.tar.gz", hash = "sha256:c01343711e513dcf2c1793bde8a3b2f81cbbcc10e6ab480614ccb539bf62336a", size = 34870, upload-time = "2026-09-13T08:58:43.036Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5e/94/b90867f40a346d1be01332efa6e5ea630306aed70b5959ae6743573d9a12/spn_client-0.2.1-py3-none-any.whl", hash = "sha256:6fc50984fb41024638660ed3db874712718a0c32c51d08fa94ca8683c16da003", size = 23184, upload-time = "2026-09-13T08:23:53.009Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/36/a52dfa01c1942cf038eab650fd06f899d1031796a0ae7caf503491d4c2fd/spn_client-0.3.0-py3-none-any.whl", hash = "sha256:ff8b02a684a867d5b221f6fdcdb34ac115baeb7ae561e86d8efadd3aa1472f8d", size = 24578, upload-time = "2026-09-13T08:58:42.007Z" },
 ]
 
 [[package]]
