@@ -3336,14 +3336,14 @@ wheels = [
 
 [[package]]
 name = "spn-client"
-version = "0.3.0"
+version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/64/46ec1a91b5d93f2010130a2ac1660f1036855866fe34048511713703308b/spn_client-0.3.0.tar.gz", hash = "sha256:c01343711e513dcf2c1793bde8a3b2f81cbbcc10e6ab480614ccb539bf62336a", size = 34870, upload-time = "2026-09-13T08:58:43.036Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/7f/0997dbbad78b677b028d7bb197a12c787af220260f96f7393205d11770e3/spn_client-0.3.1.tar.gz", hash = "sha256:2d6d9d32770a9555d455bb068838b201d74fb311fb55a4047746cded7f6aa89b", size = 41940, upload-time = "2026-09-13T09:32:58.442Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2b/36/a52dfa01c1942cf038eab650fd06f899d1031796a0ae7caf503491d4c2fd/spn_client-0.3.0-py3-none-any.whl", hash = "sha256:ff8b02a684a867d5b221f6fdcdb34ac115baeb7ae561e86d8efadd3aa1472f8d", size = 24578, upload-time = "2026-09-13T08:58:42.007Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/32/913f1a238e4ac241fa80b326754039b2e865e72569c3399105a3a8fa3e15/spn_client-0.3.1-py3-none-any.whl", hash = "sha256:b541abedddafce06a73370f9625dd69da121a2265ed851617d029e6abcec006b", size = 27769, upload-time = "2026-09-13T09:32:57.439Z" },
 ]
 
 [[package]]
