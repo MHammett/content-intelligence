@@ -9,7 +9,10 @@ dependencies = [
     # extracted to its own package so doc-crawler and rochelle-vendor-audit
     # (unrelated projects independently re-implementing the same submit/check
     # logic) can depend on it too, instead of each maintaining a copy.
-    "spn-client>=0.1.0,<0.2",
+    # 0.2.1 (not just 0.1.0) matters here: it paces/breaker-protects submit()
+    # at archive.org's own documented capture-endpoint limits, which 0.1.0
+    # did not do at all.
+    "spn-client>=0.2.1,<0.3",
     "requests>=2.31.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "python-dotenv>=1.0.0,<2.0",
