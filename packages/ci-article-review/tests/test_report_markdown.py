@@ -1946,6 +1946,36 @@ class TestEscalatedCitationsRenderReaderFriction:
         assert "CAPTURE FAILED" in out
         assert "most needed an archive" in out
 
+    def test_the_advice_follows_the_retry_category(self):
+        """This line used to tell every author "re-running will most likely fail
+        the same way" — true for a permanent code, wrong for a transient one,
+        unknowable for a code spn-client does not recognize. Asserting the
+        pessimistic case for all three sent authors off to archive by hand pages
+        the next run would have captured on its own."""
+        base = {
+            "archived": False,
+            "submitted": True,
+            "archive_outcome": "capture_failed",
+            "archive_outcome_detail": "archive.org could not capture the page",
+        }
+        permanent = self._pair(
+            wayback={
+                **base,
+                "capture_retry_category": "permanent",
+                "capture_error_code": "error:no-captures",
+            }
+        )
+        assert "the same way every time" in permanent
+        assert "error:no-captures" in permanent
+
+        transient = self._pair(wayback={**base, "capture_retry_category": "transient"})
+        assert "looks transient" in transient
+        assert "the same way every time" not in transient
+
+        uncategorized = self._pair(wayback=base)
+        assert "genuinely unknown" in uncategorized
+        assert "the same way every time" not in uncategorized
+
     def test_the_warning_is_not_stated_twice(self):
         """The ``resolved`` branch already says it for a never-submitted
         citation. Saying it again below would double-state the same fact — the

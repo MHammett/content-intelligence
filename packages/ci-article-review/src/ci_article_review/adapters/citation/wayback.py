@@ -11,6 +11,8 @@ archive copy, and how to summarize a wayback result for a human reader.
 
 import requests
 
+from ci_core.http import UnsafeURLError
+
 from spn_client import (
     ARCHIVE_ARCHIVED,
     ARCHIVE_CAPTURE_FAILED,
@@ -19,10 +21,17 @@ from spn_client import (
     ARCHIVE_PENDING,
     ARCHIVE_SUBMIT_FAILED,
     ARCHIVE_SUBMITTED,
+    DEFAULT_STALE_DAYS,
+    CaptureCapacityResult,
+    CheckResult,
+    JobStatusResult,
+    SubmitResult,
+    SystemStatusResult,
     capture_capacity,
     categorize_job_error,
     check,
     check_job_status,
+    rate_limited_out,
     reset_rate_limit_state,
     service_health_note,
     snapshot_raw_url,
@@ -38,7 +47,13 @@ __all__ = [
     "ARCHIVE_PENDING",
     "ARCHIVE_SUBMIT_FAILED",
     "ARCHIVE_SUBMITTED",
+    "DEFAULT_STALE_DAYS",
     "FALLBACK_REASON_LABELS",
+    "CaptureCapacityResult",
+    "CheckResult",
+    "JobStatusResult",
+    "SubmitResult",
+    "SystemStatusResult",
     "capture_capacity",
     "categorize_job_error",
     "check",
@@ -46,11 +61,13 @@ __all__ = [
     "fallback_reason_for_exception",
     "fallback_reason_for_status",
     "format_summary",
+    "rate_limited_out",
     "reset_rate_limit_state",
     "service_health_note",
     "snapshot_raw_url",
     "submit",
     "system_status",
+    "transport_failure_summary",
 ]
 
 #: HTTP statuses where the origin is reachable but refuses to serve *us* the
@@ -117,6 +134,46 @@ def fallback_reason_for_exception(exc):
     if isinstance(exc, requests.exceptions.ConnectionError):
         return "unreachable"
     return None
+
+
+def transport_failure_summary(exc, what):
+    """One reader-facing sentence for an archive.org fetch that did not complete.
+
+    Lives here rather than in ``spn_client`` for two reasons, and the second is
+    the operative one:
+
+    1. spn-client's README draws the responsibility line at "anything whose
+       correct answer depends on archive.org's own API behavior" — how a report
+       phrases a failure is explicitly on our side of it.
+    2. The call site this exists for does not go through spn-client at all.
+       ``_verify_archive_match`` reads a snapshot's raw bytes with ``safe_get``,
+       our own SSRF-guarded fetch, so the exception it catches can be
+       ``UnsafeURLError`` — raised when a hop resolves to a non-public address.
+       spn-client has no reason to know that type exists, and its own summary
+       would fold it into the generic "the request failed", which is exactly
+       backwards: a guard rejection is a statement about the URL, not about
+       archive.org being unreachable.
+
+    The raw exception belongs in the log. Left unfiltered it reaches whoever
+    reads the report as ``HTTPSConnectionPool(host='web.archive.org', port=443):
+    Max retries exceeded with url: /save/status/... (Caused by
+    NewConnectionError(... [WinError 10061] ...))`` — observed verbatim in a real
+    run 2026-09-06. That invites the reader to debug our networking instead of
+    telling them what it means for their citation.
+    """
+    if isinstance(exc, UnsafeURLError):
+        return f"the address {what} resolved to a non-public host and was not fetched"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return f"archive.org did not answer {what} within the timeout"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return (
+            f"could not reach archive.org {what} — the connection was refused, "
+            f"dropped, or the host did not resolve"
+        )
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status:
+        return f"archive.org answered HTTP {status} {what}"
+    return f"the request to archive.org {what} failed"
 
 
 def format_summary(wb):

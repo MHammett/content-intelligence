@@ -1560,11 +1560,38 @@ def _render_archive_pair(citation, indent="  "):
             f"it."
         )
     elif outcome == _ARCHIVE_CAPTURE_FAILED:
+        # What to do next depends on spn-client's category for archive.org's own
+        # error code, and the three answers are genuinely different. This line
+        # used to tell every author that "re-running will most likely fail the
+        # same way" — true for a permanent code, wrong for a transient one, and
+        # unknowable for a code spn-client does not recognize. Asserting the
+        # pessimistic case for all three sent authors off to archive by hand
+        # pages that the next run would have captured on its own.
+        code = wb.get("capture_error_code")
+        code_note = f", code {code}" if code else ""
+        category = wb.get("capture_retry_category")
+        if category == "permanent":
+            advice = (
+                "archive.org will refuse it the same way every time, so this "
+                "run was the last one to try. Archive it by hand, or re-source "
+                "the claim."
+            )
+        elif category == "transient":
+            advice = (
+                "the failure looks transient, and the next run will try again "
+                "on its own. Archive it by hand only if it keeps recurring."
+            )
+        else:
+            advice = (
+                "archive.org gave no error code this run maps to a known "
+                "cause, so whether a retry would help is genuinely unknown. "
+                "The next run will try again."
+            )
         out.append(
             f"{indent}- Archive: CAPTURE FAILED — archive.org accepted the "
             f"request and then could not capture the page "
-            f"({detail or 'no reason given'}). It is NOT archived, and "
-            f"re-running will most likely fail the same way. Archive it by hand."
+            f"({detail or 'no reason given'}{code_note}). It is NOT archived; "
+            f"{advice}"
         )
     elif outcome == _ARCHIVE_PENDING:
         out.append(

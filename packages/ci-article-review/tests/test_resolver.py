@@ -1,6 +1,7 @@
 """Tests for adapters.citation.resolver — parallel resolution, ordering, pointer flag."""
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1702,6 +1703,68 @@ class TestArchiveSubmission:
 
     def _unarchived_wayback(self, url, timeout=10):
         return {"archived": False}
+
+    def test_an_open_breaker_is_stated_even_when_nothing_was_submitted(self, caplog):
+        """The regression this guards: the warning first went at the end of
+        ``_submit_missing_archives``, which is unreachable in the one case it
+        exists for. A tripped breaker makes ``check()`` return ``archived:
+        None``, the submission pass selects on ``archived is False``, so the run
+        that most needs explaining is the run with zero targets — and that run
+        returns early. Driven through ``resolve_citations`` with no claims at
+        all, the emptiest possible pass."""
+
+        def fake_resolve(claim, api_key=None):
+            return {"found": True, "url": "https://x", "content": "data"}
+
+        with (
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.check",
+                # What a tripped breaker actually returns: not False, null.
+                return_value={"archived": None},
+            ),
+            patch(
+                "ci_article_review.adapters.citation.sources.fred.resolve",
+                side_effect=fake_resolve,
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.submit"
+            ) as mock_submit,
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.rate_limited_out",
+                return_value=True,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            resolver.resolve_citations(["c"], _SOURCES)
+        # The premise of the regression: nothing was submitted, so anything
+        # living at the end of the submission pass never ran.
+        mock_submit.assert_not_called()
+        assert any("breaker was open" in r.getMessage() for r in caplog.records)
+
+    def test_a_closed_breaker_says_nothing(self, caplog):
+        """A healthy run pays nothing for the line above — the warning states
+        that something happened, it is not a per-run banner."""
+
+        def fake_resolve(claim, api_key=None):
+            return {"found": True, "url": "https://x", "content": "data"}
+
+        with (
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.check",
+                side_effect=self._archived_wayback,
+            ),
+            patch(
+                "ci_article_review.adapters.citation.sources.fred.resolve",
+                side_effect=fake_resolve,
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.rate_limited_out",
+                return_value=False,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            resolver.resolve_citations(["c"], _SOURCES)
+        assert not any("breaker was open" in r.getMessage() for r in caplog.records)
 
     def test_submits_only_when_not_archived(self):
         def fake_resolve(claim, api_key=None):
@@ -3566,3 +3629,134 @@ class TestServiceHealthIsNotedOnFailure:
         ):
             resolver._note_service_health(entries, "AK", "SK")
         assert entries[0]["resolved"] is True
+
+
+class TestRetryCategoryDecidesWhetherToResubmit:
+    """spn-client sorts archive.org's ~30 documented SPN2 failure codes into
+    permanent / transient / quota_exhausted. Before this, every failure was
+    retried identically — including the ones archive.org refuses forever, at one
+    capture request each, every run, for as long as the citation exists."""
+
+    _PATH = "ci_article_review.adapters.citation.resolver.wayback.check_job_status"
+
+    def _pending(self, tmp_path, urls):
+        d = tmp_path / "a"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "run_1_report.json").write_text(
+            json.dumps(
+                {
+                    "run_number": 1,
+                    "section_9_citations": [
+                        {
+                            "url": url,
+                            "wayback": {
+                                "submission_job_id": f"spn2-{i}",
+                                "archive_outcome": wayback.ARCHIVE_PENDING,
+                            },
+                        }
+                        for i, url in enumerate(urls)
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _status(self, category, code="error:something"):
+        return {
+            "state": "failed",
+            "reason": "archive.org could not capture the page",
+            "error_code": code,
+            "retry_category": category,
+        }
+
+    def test_a_permanent_failure_is_not_resubmitted(self, tmp_path):
+        self._pending(tmp_path, ["https://x"])
+        targets = [{"url": "https://x"}]
+        with patch(
+            self._PATH, return_value=self._status("permanent", "error:no-captures")
+        ):
+            remaining = resolver._reconcile_prior_captures(
+                targets, str(tmp_path), "AK", "SK"
+            )
+        assert remaining == []
+        wb = targets[0]["wayback"]
+        assert wb["archive_outcome"] == wayback.ARCHIVE_CAPTURE_FAILED
+        assert wb["capture_error_code"] == "error:no-captures"
+        assert wb["capture_retry_category"] == "permanent"
+
+    def test_a_transient_failure_is_resubmitted(self, tmp_path):
+        self._pending(tmp_path, ["https://x"])
+        targets = [{"url": "https://x"}]
+        with patch(self._PATH, return_value=self._status("transient")):
+            remaining = resolver._reconcile_prior_captures(
+                targets, str(tmp_path), "AK", "SK"
+            )
+        assert remaining == targets
+
+    def test_an_uncategorized_code_is_still_retried(self, tmp_path):
+        """An unrecognized code is not evidence of permanence. spn-client learned
+        ``error:no-captures`` only by meeting it live — codes outside its table
+        are a normal event, and treating one as permanent would silently stop
+        archiving a page over a failure nobody has diagnosed."""
+        self._pending(tmp_path, ["https://x"])
+        targets = [{"url": "https://x"}]
+        with patch(self._PATH, return_value=self._status(None, "error:brand-new")):
+            remaining = resolver._reconcile_prior_captures(
+                targets, str(tmp_path), "AK", "SK"
+            )
+        assert remaining == targets
+
+    def test_quota_exhaustion_stops_the_rest_of_the_run(self, tmp_path):
+        """The category is a statement about the account, not the URL, so every
+        later citation is skipped without even a status call — that call is
+        itself paced, and its answer could not change the outcome."""
+        self._pending(tmp_path, ["https://x1", "https://x2", "https://x3"])
+        targets = [{"url": "https://x1"}, {"url": "https://x2"}, {"url": "https://x3"}]
+        mock = MagicMock(return_value=self._status("quota_exhausted", "error:quota"))
+        with patch(self._PATH, mock):
+            remaining = resolver._reconcile_prior_captures(
+                targets, str(tmp_path), "AK", "SK"
+            )
+        assert remaining == []
+        assert mock.call_count == 1
+        for later in targets[1:]:
+            assert later["wayback"]["archive_outcome"] == wayback.ARCHIVE_NOT_ATTEMPTED
+            assert "quota" in later["wayback"]["archive_outcome_detail"]
+
+    def test_the_prior_failure_record_carries_the_code(self, tmp_path):
+        self._pending(tmp_path, ["https://x"])
+        targets = [{"url": "https://x"}]
+        with patch(
+            self._PATH, return_value=self._status("transient", "error:bandwidth")
+        ):
+            resolver._reconcile_prior_captures(targets, str(tmp_path), "AK", "SK")
+        prior = targets[0]["wayback"]["prior_capture_failure"]
+        assert prior["error_code"] == "error:bandwidth"
+        assert prior["retry_category"] == "transient"
+
+
+class TestTransportFailureSummaryIsReaderFacing:
+    """The crash this replaces: ``wayback._transport_failure_summary`` moved into
+    spn-client with the rest of the engine, but the call site stayed — inside an
+    ``except`` handler, so the handler raised ``AttributeError`` exactly when
+    archive.org was already misbehaving."""
+
+    def test_the_snapshot_read_handler_does_not_raise(self):
+        for exc in (
+            requests.exceptions.ConnectTimeout("x"),
+            requests.exceptions.ConnectionError("x"),
+            UnsafeURLError("resolved to 127.0.0.1"),
+            RuntimeError("something else entirely"),
+        ):
+            summary = wayback.transport_failure_summary(exc, "for the snapshot")
+            assert isinstance(summary, str) and summary
+
+    def test_a_guard_rejection_is_not_reported_as_archive_org_being_down(self):
+        """``safe_get`` raises ``UnsafeURLError``, which spn-client has no reason
+        to know about; its own summary folds it into "the request failed". That
+        is backwards — a guard rejection is a fact about the URL."""
+        summary = wayback.transport_failure_summary(
+            UnsafeURLError("resolved to 127.0.0.1"), "for the snapshot"
+        )
+        assert "non-public" in summary
+        assert "archive.org" not in summary
