@@ -1704,38 +1704,58 @@ class TestArchiveSubmission:
     def _unarchived_wayback(self, url, timeout=10):
         return {"archived": False}
 
-    def test_an_open_breaker_is_stated_once_for_the_run(self, caplog):
-        """spn-client short-circuits check() and submit() itself once the breaker
-        trips, so the pass stops doing anything and every citation carries a
-        null. Reconstructing that from the per-citation nulls alone cost a
-        session an afternoon on 2026-09-17; the run names it outright now."""
-        results = [
-            {"resolved": True, "url": "https://x", "wayback": {"archived": False}}
-        ]
+    def test_an_open_breaker_is_stated_even_when_nothing_was_submitted(self, caplog):
+        """The regression this guards: the warning first went at the end of
+        ``_submit_missing_archives``, which is unreachable in the one case it
+        exists for. A tripped breaker makes ``check()`` return ``archived:
+        None``, the submission pass selects on ``archived is False``, so the run
+        that most needs explaining is the run with zero targets — and that run
+        returns early. Driven through ``resolve_citations`` with no claims at
+        all, the emptiest possible pass."""
+
+        def fake_resolve(claim, api_key=None):
+            return {"found": True, "url": "https://x", "content": "data"}
+
         with (
             patch(
-                "ci_article_review.adapters.citation.resolver.wayback.submit",
-                return_value={"submitted": False, "error_summary": "breaker open"},
+                "ci_article_review.adapters.citation.resolver.wayback.check",
+                # What a tripped breaker actually returns: not False, null.
+                return_value={"archived": None},
             ),
+            patch(
+                "ci_article_review.adapters.citation.sources.fred.resolve",
+                side_effect=fake_resolve,
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.submit"
+            ) as mock_submit,
             patch(
                 "ci_article_review.adapters.citation.resolver.wayback.rate_limited_out",
                 return_value=True,
             ),
             caplog.at_level(logging.WARNING),
         ):
-            resolver._submit_missing_archives(results)
+            resolver.resolve_citations(["c"], _SOURCES)
+        # The premise of the regression: nothing was submitted, so anything
+        # living at the end of the submission pass never ran.
+        mock_submit.assert_not_called()
         assert any("breaker was open" in r.getMessage() for r in caplog.records)
 
     def test_a_closed_breaker_says_nothing(self, caplog):
         """A healthy run pays nothing for the line above — the warning states
         that something happened, it is not a per-run banner."""
-        results = [
-            {"resolved": True, "url": "https://x", "wayback": {"archived": False}}
-        ]
+
+        def fake_resolve(claim, api_key=None):
+            return {"found": True, "url": "https://x", "content": "data"}
+
         with (
             patch(
-                "ci_article_review.adapters.citation.resolver.wayback.submit",
-                return_value={"submitted": True, "archived": False, "job_id": "j1"},
+                "ci_article_review.adapters.citation.resolver.wayback.check",
+                side_effect=self._archived_wayback,
+            ),
+            patch(
+                "ci_article_review.adapters.citation.sources.fred.resolve",
+                side_effect=fake_resolve,
             ),
             patch(
                 "ci_article_review.adapters.citation.resolver.wayback.rate_limited_out",
@@ -1743,7 +1763,7 @@ class TestArchiveSubmission:
             ),
             caplog.at_level(logging.WARNING),
         ):
-            resolver._submit_missing_archives(results)
+            resolver.resolve_citations(["c"], _SOURCES)
         assert not any("breaker was open" in r.getMessage() for r in caplog.records)
 
     def test_submits_only_when_not_archived(self):

@@ -1339,6 +1339,31 @@ def _record_quota_exhausted(entry):
     )
 
 
+def _note_breaker_state():
+    """State once, as a fact about the run, that archive.org's breaker is open.
+
+    spn-client short-circuits ``check()`` and ``submit()`` itself once the
+    breaker trips, so nothing here needs to guard against it — which is exactly
+    what makes it invisible: the pass stops doing anything and every citation
+    carries a null. Reconstructing that from the per-citation nulls cost a
+    session an afternoon on 2026-09-17.
+
+    Deliberately called from ``resolve_citations`` rather than from inside
+    ``_submit_missing_archives``, which is where it was first put and where it
+    was useless. A tripped breaker makes ``check()`` return ``archived: None``,
+    and the submission pass selects on ``archived is False`` — so the run this
+    exists to explain is precisely the run with zero targets, which returns
+    early and never reaches the end of that function. It has to sit outside.
+    """
+    if wayback.rate_limited_out():
+        log.warning(
+            "archive.org's rate-limit breaker was open at the end of the "
+            "archiving pass — lookups and submissions after it tripped were "
+            "skipped, so an unknown archive status this run is this, not a "
+            "statement about the pages"
+        )
+
+
 def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
     """Ask archive.org what became of captures an earlier run left pending.
 
@@ -1764,20 +1789,6 @@ def _submit_one_per_url(targets, history_root, access_key, secret_key):
     # are included in the question "was that us or them?".
     _note_service_health(targets, access_key, secret_key)
 
-    # State the breaker once, as a fact about the run. spn-client short-circuits
-    # check() and submit() itself once it trips, so nothing here needs to guard
-    # against it — but that is exactly what makes it invisible: the pass simply
-    # stops doing anything and every citation carries a null. Diagnosing that
-    # from the per-citation nulls alone cost a session an afternoon on
-    # 2026-09-17. One log line at the end names it.
-    if wayback.rate_limited_out():
-        log.warning(
-            "archive.org's rate-limit breaker was open at the end of the "
-            "archiving pass — lookups and submissions after it tripped were "
-            "skipped, so an unknown archive status this run is this, not a "
-            "statement about the pages"
-        )
-
     # Bounded wait on anything archive.org queued rather than captured inline.
     _poll_capture_outcomes(targets, access_key, secret_key)
 
@@ -2039,6 +2050,9 @@ def resolve_citations(
     _submit_missing_archives(
         resolved_results, (api_keys or {}).get("archive_org"), history_root
     )
+    # Outside the pass above, not inside it: see ``_note_breaker_state``. Every
+    # early return in that function is a case this still has to report on.
+    _note_breaker_state()
     # After archiving, so a snapshot this run just created is checked too — the
     # whole point is that the pairing the report offers has been verified,
     # whether the snapshot is new or was already there.
