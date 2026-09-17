@@ -1112,6 +1112,40 @@ _SNAPSHOT_FIELDS = (
 )
 
 
+def _fan_out_submission_outcomes(by_url, before):
+    """Copy each URL's archiving outcome onto the other citations sharing it.
+
+    The submission pass asks archive.org once per URL, but the answer is a fact
+    about the URL, not about the one claim that happened to be first in the
+    list. Every other citation of the same document gets the same outcome here.
+
+    Copies *what the pass changed* — the representative's ``wayback`` dict
+    diffed against ``before``, its state on the way in — rather than a fixed
+    list of field names. Two reasons, and the second is the one that bites:
+
+    1. A named list has to be maintained in step with every branch that writes
+       to ``wayback``, and the failure mode of forgetting one is silent: a
+       citation reported as archived beside its neighbour reported as not.
+    2. A named list would also copy fields the pass did *not* establish, which
+       are not shared facts at all. Each citation's ``archived``/snapshot
+       fields come from its own ``wayback.check``, and those can legitimately
+       differ for the same URL — one claim holding a stale snapshot while
+       another's lookup returned nothing. Overwriting the first with the
+       second's "not archived" would destroy a real snapshot URL to report a
+       submission failure.
+    """
+    for url, group in by_url.items():
+        if len(group) == 1:
+            continue
+        after = group[0].get("wayback") or {}
+        was = before.get(url, {})
+        established = {k: v for k, v in after.items() if k not in was or was[k] != v}
+        if not established:
+            continue
+        for entry in group[1:]:
+            entry.setdefault("wayback", {}).update(established)
+
+
 def _record_archived(wb, source):
     """Mark a citation archived from an answer that named the snapshot.
 
@@ -1443,6 +1477,12 @@ def _submit_missing_archives(results, archive_org_creds=None, history_root=None)
        also runs first here, so a still-running capture is not resubmitted and a
        failed one is reported with archive.org's own reason.
 
+    **One request per URL, not per citation.** Claims that cite the same
+    document share a single submission; the outcome is then recorded on all of
+    them (see ``_fan_out_submission_outcomes``). Submitting per claim spent
+    real capture requests re-asking a question archive.org had already been
+    asked, against a per-minute ceiling it enforces with 429s.
+
     Mutates each result's ``wayback`` dict in place: ``submitted``,
     ``archive_outcome`` (see ``wayback.ARCHIVE_*``), ``archive_outcome_detail``,
     ``submission_job_id`` where there is one, and the snapshot fields once a
@@ -1505,6 +1545,48 @@ def _submit_missing_archives(results, archive_org_creds=None, history_root=None)
     if not targets:
         return
 
+    # One submission per URL, not one per claim. Several claims routinely cite
+    # the same document, and each duplicate was a full Save Page Now capture
+    # request — against a documented ceiling of 3 captures/minute anonymous, 7
+    # authenticated. Measured on run 2 of 2026-09-09: 28 submissions covering 17
+    # distinct URLs, with one Furuno PDF submitted 8 times, in a run that ended
+    # in consecutive 429s and then a refused connection. Asking once per URL
+    # removes 39% of that batch before any pacing has to absorb it.
+    #
+    # Deduping here rather than just before the submit loop means the per-entry
+    # ``check_job_status`` call inside ``_reconcile_prior_captures`` is deduped
+    # too — that is a paced archive.org request per duplicate as well.
+    by_url = {}
+    for entry in targets:
+        by_url.setdefault(entry["url"], []).append(entry)
+
+    # What each representative knew before the pass ran, so the fan-out can copy
+    # what the pass *established* rather than everything the citation happens to
+    # carry. See ``_fan_out_submission_outcomes``.
+    before = {url: dict(group[0].get("wayback") or {}) for url, group in by_url.items()}
+
+    # ``finally``: every exit below leaves the representative carrying an
+    # outcome its duplicates need — including the early returns, where the
+    # outcome is "not attempted, and here is why".
+    try:
+        _submit_one_per_url(
+            [group[0] for group in by_url.values()],
+            history_root,
+            access_key,
+            secret_key,
+        )
+    finally:
+        _fan_out_submission_outcomes(by_url, before)
+
+
+def _submit_one_per_url(targets, history_root, access_key, secret_key):
+    """Run the archiving pass over one representative citation per URL.
+
+    Split out of ``_submit_missing_archives`` so that the deduplication and the
+    fan-out of the result sit together in one place, rather than the submission
+    machinery having to remember it is working on behalf of several citations.
+    Every ``targets`` entry here has a distinct URL.
+    """
     # Settle last run's unfinished business first: a capture still running does
     # not want a second submission queued behind it, and one that failed has a
     # reason worth reporting before we try again.

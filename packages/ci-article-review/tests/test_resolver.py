@@ -2920,6 +2920,309 @@ class TestSourceAdaptersIdentifyThemselves:
         )
 
 
+class TestOneSubmissionPerUrl:
+    """Several claims citing one document used to mean several captures.
+
+    ``targets`` was built one entry per citation with no grouping by URL, so a
+    document cited by eight claims was submitted eight times — eight real Save
+    Page Now captures of the same page, against a ceiling archive.org enforces
+    at 3/min anonymous and 7/min authenticated.
+
+    Measured on run 2 of 2026-09-09 (honda-navigation-clock…): 28 submissions
+    covering 17 distinct URLs — 11 of them redundant, 39% of the batch — with
+    one Furuno rollover PDF submitted 8 times. That run ended in consecutive
+    ``429`` responses from ``/save``, then ``WinError 10061`` (connection
+    refused), then "24 resolved URL(s) failed Wayback submission".
+    """
+
+    @pytest.fixture(autouse=True)
+    def _treat_fixture_urls_as_public(self):
+        with patch(
+            "ci_article_review.adapters.citation.resolver.classify_host",
+            return_value="public",
+        ):
+            yield
+
+    #: The URL run 2 submitted eight times.
+    URL = "https://www.furuno.com/files/document/rollover.pdf"
+
+    def _entries(self, *urls):
+        return [
+            {"resolved": True, "url": u, "wayback": {"archived": False}} for u in urls
+        ]
+
+    def _submit(self, entries, sub, creds=None, **patches):
+        with (
+            patch.object(resolver.wayback, "submit", return_value=sub) as mock_submit,
+            patch.object(
+                resolver.wayback,
+                "capture_capacity",
+                return_value=patches.get("capacity", {"daily_exhausted": False}),
+            ),
+            # Only consulted once a submission has already failed, and it is a
+            # real request when it is: never let the suite make it.
+            patch.object(resolver.wayback, "system_status", return_value={"ok": True}),
+            patch.object(resolver.wayback, "service_health_note", return_value=None),
+        ):
+            resolver._submit_missing_archives(entries, creds or {})
+        return mock_submit
+
+    def test_a_url_cited_by_several_claims_is_submitted_once(self):
+        entries = self._entries(self.URL, self.URL, self.URL, self.URL)
+
+        mock_submit = self._submit(entries, {"submitted": True})
+
+        assert mock_submit.call_count == 1
+        assert mock_submit.call_args[0][0] == self.URL
+
+    def test_distinct_urls_are_each_still_submitted(self):
+        """The guard against over-collapsing: dedup is per URL, not per batch."""
+        entries = self._entries(
+            self.URL, self.URL, "https://example.org/a", "https://example.org/b"
+        )
+
+        mock_submit = self._submit(entries, {"submitted": True})
+
+        assert mock_submit.call_count == 3
+        assert {c[0][0] for c in mock_submit.call_args_list} == {
+            self.URL,
+            "https://example.org/a",
+            "https://example.org/b",
+        }
+
+    def test_every_claim_sharing_the_url_gets_the_archived_outcome(self):
+        """The answer is a fact about the URL, not about whichever claim was
+        first in the list. Recording it on only one leaves its neighbours
+        reported as not archived — the same document, two verdicts."""
+        entries = self._entries(self.URL, self.URL, self.URL)
+
+        self._submit(
+            entries,
+            {
+                "submitted": True,
+                "archived": True,
+                "snapshot_url": "https://web.archive.org/web/2026/rollover.pdf",
+                "snapshot_stale": False,
+            },
+        )
+
+        for entry in entries:
+            wb = entry["wayback"]
+            assert wb["archived"] is True
+            assert wb["archive_outcome"] == wayback.ARCHIVE_ARCHIVED
+            assert wb["snapshot_url"] == (
+                "https://web.archive.org/web/2026/rollover.pdf"
+            )
+
+    def test_a_failure_reaches_every_claim_too(self):
+        """Fanning out only the good news would be worse than not deduping:
+        the duplicates would keep ``archived: False`` with no outcome at all,
+        which reads as "never attempted"."""
+        entries = self._entries(self.URL, self.URL)
+
+        self._submit(
+            entries, {"submitted": False, "error_summary": "archive.org said no"}
+        )
+
+        for entry in entries:
+            wb = entry["wayback"]
+            assert wb["submitted"] is False
+            assert wb["archive_outcome"] == wayback.ARCHIVE_SUBMIT_FAILED
+            assert wb["archive_outcome_detail"] == "archive.org said no"
+
+    def test_a_failure_does_not_overwrite_a_duplicate_s_own_snapshot(self):
+        """The fan-out copies what the pass *established*, not every field the
+        representative holds.
+
+        Two citations of one URL do not have to agree on ``archived`` going in:
+        each ran its own ``wayback.check``, and one can hold a stale snapshot
+        while the other's lookup found nothing. Copying the representative's
+        whole state would then overwrite a real snapshot URL with ``archived:
+        False`` in order to report a submission failure — losing a fact the run
+        had, to record one it did not.
+        """
+        no_snapshot = {
+            "resolved": True,
+            "url": self.URL,
+            "wayback": {"archived": False},
+        }
+        stale_snapshot = {
+            "resolved": True,
+            "url": self.URL,
+            "wayback": {
+                "archived": True,
+                "snapshot_stale": True,
+                "snapshot_url": "https://web.archive.org/web/2019/rollover.pdf",
+            },
+        }
+
+        self._submit(
+            [no_snapshot, stale_snapshot],
+            {"submitted": False, "error_summary": "archive.org said no"},
+        )
+
+        wb = stale_snapshot["wayback"]
+        # It learns the outcome...
+        assert wb["archive_outcome"] == wayback.ARCHIVE_SUBMIT_FAILED
+        assert wb["submitted"] is False
+        # ...without losing what it already knew.
+        assert wb["archived"] is True
+        assert wb["snapshot_url"] == "https://web.archive.org/web/2019/rollover.pdf"
+
+    def test_a_pending_job_id_reaches_every_claim(self):
+        """The job id is what the next run reconciles against. A duplicate
+        without one is resubmitted forever."""
+        entries = self._entries(self.URL, self.URL)
+
+        self._submit(entries, {"submitted": True, "job_id": "spn2-abc"})
+
+        for entry in entries:
+            assert entry["wayback"]["submission_job_id"] == "spn2-abc"
+            assert entry["wayback"]["archive_outcome"] == wayback.ARCHIVE_PENDING
+
+    def test_an_early_exit_still_reaches_every_claim(self):
+        """The quota check returns before the submit loop. Its verdict is still
+        an outcome every duplicate needs, which is why the fan-out is in a
+        ``finally`` rather than at the end of the happy path."""
+        entries = self._entries(self.URL, self.URL, self.URL)
+
+        mock_submit = self._submit(
+            entries,
+            {"submitted": True},
+            capacity={
+                "daily_exhausted": True,
+                "daily_captures": 30000,
+                "daily_captures_limit": 30000,
+            },
+        )
+
+        mock_submit.assert_not_called()
+        for entry in entries:
+            wb = entry["wayback"]
+            assert wb["archive_outcome"] == wayback.ARCHIVE_NOT_ATTEMPTED
+            assert "daily capture quota" in wb["archive_outcome_detail"]
+
+    def test_a_prior_capture_is_reconciled_once_per_url(self, tmp_path):
+        """Dedup happens before reconciliation on purpose: ``check_job_status``
+        is itself a paced archive.org request, so a URL cited eight times cost
+        eight of those as well, before a single capture was requested."""
+        entries = self._entries(self.URL, self.URL, self.URL)
+
+        with (
+            patch.object(
+                resolver,
+                "build_pending_capture_index",
+                return_value={self.URL: {"job_id": "spn2-old", "run_number": 1}},
+            ),
+            patch.object(
+                resolver.wayback,
+                "check_job_status",
+                return_value={"state": "pending", "reason": "still running"},
+            ) as mock_status,
+            patch.object(resolver.wayback, "submit") as mock_submit,
+            patch.object(
+                resolver.wayback,
+                "capture_capacity",
+                return_value={"daily_exhausted": False},
+            ),
+        ):
+            resolver._submit_missing_archives(
+                entries,
+                {"access_key": "AK", "secret_key": "SK"},
+                history_root=str(tmp_path),
+            )
+
+        assert mock_status.call_count == 1
+        # Still running on archive.org's side — resubmitting would queue a
+        # second capture behind the first.
+        mock_submit.assert_not_called()
+        for entry in entries:
+            assert entry["wayback"]["archive_outcome"] == wayback.ARCHIVE_PENDING
+            assert entry["wayback"]["submission_job_id"] == "spn2-old"
+
+
+class TestSubmissionFeedsTheRateLimitScheme:
+    """A submission 429 has to throttle the run, not just fail one call.
+
+    ``submit()`` used to read the circuit breaker and never feed it: it fired
+    bare requests at ``/save`` with no pacing clock, so a 429 there moved
+    nothing, tripped nothing, and the run kept submitting at full speed until
+    archive.org refused the connection outright (run 2, 2026-09-09).
+
+    The engine now lives in ``spn_client`` and paces submissions at
+    archive.org's documented capture limits, so these are boundary tests over
+    the dependency rather than over code in this repo — they fail if that
+    behaviour regresses or if the floor in ``pyproject.toml`` is ever lowered
+    below the 0.2.0 that introduced it. They patch ``spn_client.client`` for
+    the same reason ``TestWaybackRateLimitHandling`` above does.
+    """
+
+    def setup_method(self):
+        wayback.reset_rate_limit_state()
+
+    def teardown_method(self):
+        wayback.reset_rate_limit_state()
+
+    def _throttled_submit(self, **creds):
+        """Drive a real ``wayback.submit`` against a stubbed 429."""
+        resp = MagicMock(
+            status_code=429,
+            headers={"Retry-After": "30"},
+            url="https://web.archive.org/save",
+        )
+        slept = []
+        with (
+            patch.object(_spn_client_engine.requests, "post", return_value=resp),
+            patch.object(_spn_client_engine.requests, "get", return_value=resp),
+            # The capture interval is 20s anonymous; never actually wait it out.
+            patch.object(_spn_client_engine.time, "sleep", side_effect=slept.append),
+        ):
+            result = wayback.submit("https://example.org/doc.pdf", **creds)
+        return result, slept
+
+    def test_a_submission_429_moves_the_shared_backoff_clock(self):
+        """The clock every other archive.org call waits on — not a second
+        scheme private to submissions."""
+        before = _spn_client_engine._blocked_until
+
+        self._throttled_submit()
+
+        assert _spn_client_engine._blocked_until > before
+
+    def test_a_submission_429_counts_against_the_circuit_breaker(self):
+        assert _spn_client_engine._rate_limited_lookups == 0
+
+        self._throttled_submit()
+
+        assert _spn_client_engine._rate_limited_lookups == 1
+
+    def test_enough_throttled_submissions_trip_the_breaker(self):
+        """The end state that matters: the run stops asking. Before this, the
+        breaker could only ever be tripped by lookups, so a run throttled
+        entirely at ``/save`` never stopped."""
+        for _ in range(_spn_client_engine._CIRCUIT_TRIP_AFTER):
+            self._throttled_submit()
+
+        # Read off the engine: this package's ``wayback`` re-exports the
+        # archiving API, not the breaker's own query function.
+        assert _spn_client_engine.rate_limited_out()
+        # And the next submission costs archive.org nothing at all.
+        with patch.object(_spn_client_engine.requests, "post") as mock_post:
+            result = wayback.submit("https://example.org/other.pdf")
+        mock_post.assert_not_called()
+        assert result["submitted"] is False
+        assert result["rate_limited"] is True
+
+    def test_a_submission_is_paced_at_the_capture_limit(self):
+        """Not the generic 3s lookup interval: archive.org documents captures
+        separately at 3/min anonymous, and exceeding it is what produced the
+        429 storm in the first place."""
+        _, slept = self._throttled_submit()
+
+        assert slept, "a retried submission must wait before asking again"
+        assert max(slept) >= _spn_client_engine._ANONYMOUS_SUBMIT_INTERVAL_SECONDS
+
+
 class TestSubmissionRespectsRealCapacity:
     """archive.org reports how much capture capacity the account has. Before
     this, every concurrency number was invented and the run discovered limits by
