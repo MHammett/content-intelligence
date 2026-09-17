@@ -666,6 +666,118 @@ class TestProviderStagger:
         )
 
 
+class TestAnEmptyPassIsNotLoggedAsOK:
+    """A well-formed empty result is a third outcome, not a success.
+
+    Observed on the 2026-09-09 honda-navigation run (thorough preset):
+
+        mistral:argument_integrity: OK (55.18s, mistral-medium-3-5)
+
+    followed, minutes later and hundreds of lines further down, by the
+    end-of-run block reporting that same pass had returned nothing after
+    spending 9,172 completion tokens. Section 4 had quietly dropped from three
+    voters to two. The per-pass line is where a reader looks to see whether a
+    pass ran, so it is the line that has to be right.
+    """
+
+    def _empty_one_pass(self, emptied):
+        """Stub ``_run_domain`` so exactly one pass returns an empty payload.
+
+        Which pass comes out of the dispatch rather than being named here, so
+        this keeps testing something real if the preset's assignments change.
+        The lock matters: ``parallel_review_calls`` is on in the stub config, so
+        without it two threads can both claim to be first.
+        """
+        import threading
+
+        lock = threading.Lock()
+
+        def _run(model_name, domain, *a, **kw):
+            result = _fake_run_domain(model_name, domain, *a, **kw)
+            with lock:
+                first = not emptied
+                if first:
+                    emptied.append(f"{model_name}:{domain}")
+            if first:
+                # Replaced, never mutated in place — _DOMAIN_DATA is shared
+                # module state and every other test reads the same dicts.
+                result["data"] = {key: [] for key in result["data"]}
+            return result
+
+        return _run
+
+    def test_the_per_pass_line_says_empty_rather_than_ok(self, tmp_path, caplog):
+        emptied = []
+        stub = patch(
+            "ci_article_review.pipeline._run_domain",
+            side_effect=self._empty_one_pass(emptied),
+        )
+        with caplog.at_level("INFO"):
+            with _stubbed_run(tmp_path, extra_patches=[stub], offline=True) as report:
+                pass
+
+        (name,) = emptied
+        assert f"  {name}: EMPTY" in caplog.text, (
+            f"{name} returned nothing and its status line did not say so:\n"
+            f"{caplog.text}"
+        )
+        assert f"  {name}: OK (" not in caplog.text
+        # The end-of-run block still says it too — this fix adds a line, it does
+        # not move the warning.
+        assert name in report["empty_results"]
+
+    def test_the_call_log_records_it_as_empty_rather_than_ok(self, tmp_path):
+        emptied = []
+        stub = patch(
+            "ci_article_review.pipeline._run_domain",
+            side_effect=self._empty_one_pass(emptied),
+        )
+        with _stubbed_run(tmp_path, extra_patches=[stub], offline=True) as report:
+            pass
+
+        (name,) = emptied
+        entry = next(e for e in report["api_call_log"] if e["pass"] == name)
+        assert entry["status"] == "empty"
+        # Still not a failure: it did not fail, and calling it one would send a
+        # reader looking for an error that never happened.
+        assert entry["failed"] is False
+        assert report["model_failures"] == []
+
+    def test_the_empty_pass_is_dropped_from_the_reported_width(self, tmp_path):
+        """The width block claims to count what `_find_consensus` counts, and an
+        empty payload casts no vote there."""
+        emptied = []
+        stub = patch(
+            "ci_article_review.pipeline._run_domain",
+            side_effect=self._empty_one_pass(emptied),
+        )
+        with _stubbed_run(tmp_path, extra_patches=[stub], offline=True) as report:
+            pass
+
+        (name,) = emptied
+        model, domain = name.split(":", 1)
+        width = report["ensemble"]["width"]
+        assert model not in width["models_by_domain"][domain], (
+            f"{name} returned nothing but is still counted as reviewing "
+            f"{domain}: {width['models_by_domain'][domain]}"
+        )
+
+    def test_a_populated_pass_still_says_ok(self, tmp_path, caplog):
+        """The control: nothing here reclassifies a pass that did find things."""
+        with caplog.at_level("INFO"):
+            with _stubbed_run(tmp_path, offline=True) as report:
+                pass
+
+        assert report["empty_results"] == []
+        review_passes = [
+            e["pass"] for e in report["api_call_log"] if ":" in (e.get("pass") or "")
+        ]
+        assert review_passes, "no review passes ran, so this proves nothing"
+        for name in review_passes:
+            assert f"  {name}: OK (" in caplog.text
+            assert f"  {name}: EMPTY" not in caplog.text
+
+
 class TestADomainWithNoReviewerReachesTheReport:
     """The drafter exclusion can empty a domain; the run must not hide it.
 

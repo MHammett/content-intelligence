@@ -1548,7 +1548,7 @@ def find_contradictions(results):
 # ---------------------------------------------------------------------------
 
 
-def _result_is_empty(result):
+def result_is_empty(result):
     """True if a successful call returned a payload with nothing in it.
 
     Schema-valid and empty is indistinguishable from "reviewed and found
@@ -1557,6 +1557,12 @@ def _result_is_empty(result):
     buckets) plus, for red_team, a few dicts, so "no list has an entry and no
     dict has a value" covers all of them without a per-domain table that would
     drift as the schemas change.
+
+    Public because the pipeline's per-pass status line needs the same answer
+    this module's end-of-run warning gives. They disagreed for as long as this
+    was private and consolidation-only: a pass that returned nothing logged
+    ``OK`` while it ran, and was contradicted several minutes later by a
+    warning nobody re-reads the scrollback for.
     """
     data = result.get("data")
     if not isinstance(data, dict) or not data:
@@ -1706,11 +1712,21 @@ def _ensemble_width(results, ensemble_cfg, lt_voted=False):
     Voters are counted per *model*, not per call, because that is what
     ``_find_consensus`` counts — two findings from one model are one voter, and
     LanguageTool is a voter in its own right when it flagged anything.
+
+    A pass that returned a well-formed empty payload is excluded for the same
+    reason a failed one is: ``_extract_passages`` guards every entry on a
+    non-empty passage string, so an empty result contributes no entries, no
+    weight, and is never in ``_find_consensus``'s ``voters`` set. Counting it
+    here made this block claim a width the run could not vote with — and
+    ``consensus_reachable`` is derived from that count, so a run whose real
+    pool had dropped below ``consensus_min_models`` could still report Section
+    1 as reachable. Excluding empties is what makes this function's stated
+    contract — mirror what ``_find_consensus`` counts — actually true.
     """
     ran = {
         (model, domain)
         for (model, domain), r in results.items()
-        if not r.get("failed") and not r.get("skipped")
+        if not r.get("failed") and not r.get("skipped") and not result_is_empty(r)
     }
     models_by_domain: dict[str, list[str]] = {}
     for model, domain in sorted(ran):
@@ -1915,7 +1931,7 @@ def build_report(
     empty_results = [
         f"{model}:{domain}"
         for (model, domain), r in results.items()
-        if not r.get("failed") and not r.get("skipped") and _result_is_empty(r)
+        if not r.get("failed") and not r.get("skipped") and result_is_empty(r)
     ]
     empty_result_details = [
         {
@@ -1927,7 +1943,7 @@ def build_report(
             "elapsed_seconds": r.get("elapsed_seconds"),
         }
         for (model, domain), r in results.items()
-        if not r.get("failed") and not r.get("skipped") and _result_is_empty(r)
+        if not r.get("failed") and not r.get("skipped") and result_is_empty(r)
     ]
 
     # Delta from prior run
