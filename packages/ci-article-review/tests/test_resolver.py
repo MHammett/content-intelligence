@@ -3760,3 +3760,177 @@ class TestTransportFailureSummaryIsReaderFacing:
         )
         assert "non-public" in summary
         assert "archive.org" not in summary
+
+
+class TestCaptureOptionsReachArchiveOrg:
+    """Config plumbed from ``pipeline.wayback_capture`` through to ``submit()``.
+    Four layers of parameter passing, and a break anywhere is silent — because
+    ``submit()`` works perfectly well with none of them."""
+
+    @pytest.fixture(autouse=True)
+    def _treat_fixture_urls_as_public(self):
+        with patch(
+            "ci_article_review.adapters.citation.resolver.classify_host",
+            return_value="public",
+        ):
+            yield
+
+    def _results(self):
+        return [{"resolved": True, "url": "https://x", "wayback": {"archived": False}}]
+
+    def test_configured_options_are_passed_to_submit(self):
+        with patch(
+            "ci_article_review.adapters.citation.resolver.wayback.submit",
+            return_value={"submitted": True, "job_id": None},
+        ) as mock_submit:
+            resolver._submit_missing_archives(
+                self._results(),
+                capture_settings={
+                    "js_behavior_timeout": 20,
+                    "skip_first_archive": True,
+                },
+            )
+        kwargs = mock_submit.call_args.kwargs
+        assert kwargs["js_behavior_timeout"] == 20
+        assert kwargs["skip_first_archive"] is True
+
+    def test_no_configuration_sends_no_capture_options(self):
+        """A default run must look exactly as it did before this existed."""
+        with patch(
+            "ci_article_review.adapters.citation.resolver.wayback.submit",
+            return_value={"submitted": True, "job_id": None},
+        ) as mock_submit:
+            resolver._submit_missing_archives(self._results())
+        assert set(mock_submit.call_args.kwargs) == {"access_key", "secret_key"}
+
+    def test_secret_options_travel_with_the_credentials(self):
+        with (
+            # Real-looking creds make the pass ask archive.org about capacity,
+            # which the other tests here never reach because that call returns
+            # "unknown, no credentials" without a request.
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.capture_capacity",
+                return_value={"known": False, "daily_exhausted": False},
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.wayback.submit",
+                return_value={"submitted": True, "job_id": None},
+            ) as mock_submit,
+        ):
+            resolver._submit_missing_archives(
+                self._results(),
+                archive_org_creds={
+                    "access_key": "AK",
+                    "secret_key": "SK",
+                    "target_username": "u",
+                    "target_password": "p",
+                },
+            )
+        kwargs = mock_submit.call_args.kwargs
+        assert kwargs["target_username"] == "u"
+        assert kwargs["target_password"] == "p"
+        assert kwargs["access_key"] == "AK"
+
+    def test_a_bad_option_does_not_stop_the_submission(self):
+        """An unusable capture setting is a config problem, not a reason to stop
+        archiving. The citation is still submitted, with archive.org's own
+        defaults for the option that was rejected."""
+        with patch(
+            "ci_article_review.adapters.citation.resolver.wayback.submit",
+            return_value={"submitted": True, "job_id": None},
+        ) as mock_submit:
+            resolver._submit_missing_archives(
+                self._results(), capture_settings={"js_behavior_timeout": 900}
+            )
+        mock_submit.assert_called_once()
+        assert "js_behavior_timeout" not in mock_submit.call_args.kwargs
+
+
+class TestCaptureDiagnosticsAreKept:
+    """What archive.org reported about the capture itself. spn-client has
+    surfaced all of it since 0.2.0/0.3.0; this pipeline discarded every field."""
+
+    def _success(self, **extra):
+        return {
+            "state": "success",
+            "snapshot_url": "https://web.archive.org/x",
+            **extra,
+        }
+
+    def test_resources_is_stored_as_a_count_not_the_list(self):
+        """archive.org returns every sub-resource it fetched — routinely hundreds
+        of CDN asset URLs for one news page. This dict is serialized into every
+        report and read back by the history index; the number answers the
+        reader's question, the list would dwarf the citation it belongs to."""
+        entry = {}
+        resolver._record_job_status(entry, self._success(resources=["https://a"] * 3))
+        assert entry["wayback"]["capture_resource_count"] == 3
+        assert "resources" not in entry["wayback"]
+
+    def test_partial_progress_is_kept_on_a_failure_too(self):
+        """On a failure the count separates "archive.org never reached the page"
+        from "it fetched 200 resources and then gave up"."""
+        entry = {}
+        resolver._record_job_status(
+            entry,
+            {"state": "failed", "reason": "gave up", "resources": ["https://a"] * 200},
+        )
+        assert entry["wayback"]["capture_resource_count"] == 200
+
+    def test_duration_and_requested_extras_are_kept(self):
+        entry = {}
+        resolver._record_job_status(
+            entry,
+            self._success(
+                duration_seconds=14.2,
+                screenshot_url="https://web.archive.org/shot.png",
+                outlinks=["https://out"],
+            ),
+        )
+        wb = entry["wayback"]
+        assert wb["capture_duration_seconds"] == 14.2
+        assert wb["capture_screenshot_url"] == "https://web.archive.org/shot.png"
+        assert wb["capture_outlinks"] == ["https://out"]
+
+    def test_absent_extras_are_not_invented(self):
+        entry = {}
+        resolver._record_job_status(entry, self._success())
+        for key in (
+            "capture_resource_count",
+            "capture_duration_seconds",
+            "capture_screenshot_url",
+            "capture_outlinks",
+        ):
+            assert key not in entry["wayback"]
+
+    def test_an_uncategorized_code_is_categorized_from_the_table(self):
+        """``check_job_status`` normally fills ``retry_category`` itself, but the
+        two fields are independent in the response shape. A code arriving without
+        one is classified here rather than reported as "no known cause" — the
+        difference between telling an author to re-source a claim and telling
+        them to wait."""
+        entry = {}
+        resolver._record_job_status(
+            entry,
+            {
+                "state": "failed",
+                "reason": "no captures",
+                "error_code": "error:no-captures",
+            },
+        )
+        expected = wayback.categorize_job_error("error:no-captures")
+        assert expected is not None
+        assert entry["wayback"]["capture_retry_category"] == expected
+
+    def test_a_live_category_is_never_overridden(self):
+        entry = {}
+        resolver._record_job_status(
+            entry,
+            {
+                "state": "failed",
+                "reason": "x",
+                "error_code": "error:no-captures",
+                "retry_category": "transient",
+            },
+        )
+        assert entry["wayback"]["capture_retry_category"] == "transient"

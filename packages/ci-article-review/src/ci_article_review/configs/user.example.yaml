@@ -263,6 +263,47 @@ pipeline:
   wayback_link_check: true          # also query the Wayback Machine for each URL
   wayback_snapshot_stale_days: 180  # snapshots older than this are flagged [STALE]
 
+  # Optional Save Page Now capture options, passed straight through to
+  # archive.org when this run submits a citation for archiving. Every one is
+  # off unless set here — these are archive.org's own documented SPN2 options,
+  # not settings this pipeline invents, and the defaults are archive.org's.
+  #
+  # An unknown key, a wrong type, or a js_behavior_timeout outside 0-30 is
+  # ignored with a warning in the run log rather than failing the review.
+  #
+  # wayback_capture:
+  #   js_behavior_timeout: 5       # seconds (0-30) archive.org lets a page's JS
+  #                                # settle before capturing. Raise it for a
+  #                                # source that renders its content client-side
+  #                                # and archives as an empty shell.
+  #   skip_first_archive: true     # skip archive.org's check for whether this is
+  #                                # the URL's first-ever capture. Slightly
+  #                                # faster; no effect on what gets captured.
+  #   outlinks_availability: false # also report whether the page's outbound
+  #                                # links are archived. Costs capture time and
+  #                                # nothing in this pipeline reads it yet.
+  #   capture_screenshot: false    # also save a PNG of the page. Citation review
+  #                                # verifies text, so this buys a slower capture
+  #                                # and a URL nothing here checks.
+  #   delay_wb_availability: false # do NOT enable while archive_match
+  #                                # verification is on: it hides the new
+  #                                # snapshot from the Wayback Machine for ~12h,
+  #                                # and this run reads the snapshot back to
+  #                                # checksum it against the live page. The
+  #                                # verification would report "could not read
+  #                                # the snapshot" for every URL archived today.
+  #   use_user_agent: ""           # what archive.org's capture bot presents to
+  #                                # the source site. Some publishers serve a bot
+  #                                # wall to the default and a real page to a
+  #                                # named crawler.
+  #
+  # The three capture options that carry a secret — target_username,
+  # target_password and capture_cookie, for a page behind a login form — are
+  # credentials, so they go under credentials.archive_org alongside the S3 key
+  # pair, never here. Worth thinking about before using them: a source that
+  # needs a login to read is one your readers cannot verify, and archiving it
+  # produces a snapshot nobody else can reach.
+
   # Cost preset — sets model variants, reasoning flags, and thoroughness as a bundle.
   # When set, the preset overrides model names and reasoning flags for all configured
   # providers.  Provider infrastructure settings (vertex_ai, azure, credentials) are

@@ -3407,6 +3407,7 @@ def run_draft_pipeline(
             # publication default covers everything else, including --raw-draft,
             # which carries no metadata at all.
             author=citation_author,
+            capture_settings=pipeline_cfg.get("wayback_capture"),
         )
         verified_count = sum(
             1 for r in citation_results if r.get("verification") == "checksum"
@@ -3479,6 +3480,7 @@ def run_draft_pipeline(
                         verification_call_log=api_call_log,
                         history_root=HISTORY_ROOT,
                         author=citation_author,
+                        capture_settings=pipeline_cfg.get("wayback_capture"),
                     )
                     citation_reask.attach_source_checks(pending, checked)
                 log.info(

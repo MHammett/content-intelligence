@@ -9,6 +9,8 @@ which HTTP failures on a citation's live link justify falling back to an
 archive copy, and how to summarize a wayback result for a human reader.
 """
 
+import logging
+
 import requests
 
 from ci_core.http import UnsafeURLError
@@ -54,7 +56,10 @@ __all__ = [
     "JobStatusResult",
     "SubmitResult",
     "SystemStatusResult",
+    "CAPTURE_SECRET_OPTIONS",
+    "CAPTURE_SETTING_OPTIONS",
     "capture_capacity",
+    "capture_options",
     "categorize_job_error",
     "check",
     "check_job_status",
@@ -69,6 +74,92 @@ __all__ = [
     "system_status",
     "transport_failure_summary",
 ]
+
+log = logging.getLogger(__name__)
+
+
+#: The SPN2 capture options spn-client exposes on ``submit()`` that carry no
+#: secret, with the type each must be. Safe to read from ``user.yaml``.
+#:
+#: ``js_behavior_timeout`` is bounded 0-30 by archive.org, not by us; a value
+#: outside it is rejected by archive.org rather than clamped, which would cost
+#: a capture request to discover.
+CAPTURE_SETTING_OPTIONS = {
+    "js_behavior_timeout": int,
+    "skip_first_archive": bool,
+    "capture_screenshot": bool,
+    "outlinks_availability": bool,
+    "delay_wb_availability": bool,
+    "use_user_agent": str,
+}
+
+#: The three that carry a secret: a login for the page being captured, and a
+#: cookie sent to it. These are read from the archive.org *credentials* entry,
+#: never from ``pipeline.wayback_capture`` — a password belongs in the channel
+#: the rest of this repo's secrets already use, not in a settings file that gets
+#: copied between checkouts and pasted into issues.
+#:
+#: Worth knowing before enabling any of them: a source that needs a login to
+#: read is one a reader cannot verify. Archiving it produces a snapshot of a
+#: page nobody else can reach, which is a weaker citation than an honest "this
+#: is paywalled". They exist here because archive.org supports them and the
+#: choice is the author's, not because this pipeline recommends them.
+CAPTURE_SECRET_OPTIONS = ("target_username", "target_password", "capture_cookie")
+
+
+def capture_options(settings=None, creds=None):
+    """Assemble ``submit()`` capture kwargs from config and credentials.
+
+    Returns only keys the caller actually set. Every option archive.org offers
+    defaults to off, and an omitted key is how spn-client is told "use the
+    default" — passing an explicit ``False`` for each would send archive.org a
+    capture request full of fields nobody asked about.
+
+    An unknown or mistyped key is dropped with a warning rather than raising. A
+    typo in an optional capture setting should not fail a review that would
+    otherwise complete; but it must not pass silently either, because the
+    failure mode is a run that quietly ignores what the author configured.
+    """
+    out = {}
+    for key, value in (settings or {}).items():
+        expected = CAPTURE_SETTING_OPTIONS.get(key)
+        if expected is None:
+            log.warning(
+                "Ignoring unknown wayback_capture option %r (known: %s)",
+                key,
+                ", ".join(sorted(CAPTURE_SETTING_OPTIONS)),
+            )
+            continue
+        # bool is a subclass of int, so an explicit bool check has to come first
+        # or `capture_screenshot: true` would satisfy an int-typed option.
+        if isinstance(value, bool) != (expected is bool) or not isinstance(
+            value, expected
+        ):
+            log.warning(
+                "Ignoring wayback_capture.%s: expected %s, got %r",
+                key,
+                expected.__name__,
+                value,
+            )
+            continue
+        if key == "js_behavior_timeout" and not 0 <= value <= 30:
+            log.warning(
+                "Ignoring wayback_capture.js_behavior_timeout=%r: archive.org "
+                "accepts 0-30 seconds and refuses anything else",
+                value,
+            )
+            continue
+        if value in (False, ""):
+            # Off is the default; saying so explicitly buys nothing.
+            continue
+        out[key] = value
+
+    for key in CAPTURE_SECRET_OPTIONS:
+        value = (creds or {}).get(key)
+        if value:
+            out[key] = value
+    return out
+
 
 #: HTTP statuses where the origin is reachable but refuses to serve *us* the
 #: document. The resource itself is not claimed to be gone, so reading
