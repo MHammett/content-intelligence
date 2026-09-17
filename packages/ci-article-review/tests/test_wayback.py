@@ -2,6 +2,8 @@
 that stays local (fallback-status scoping, human-readable summaries), on top
 of the shared archive.org engine now tested in the spn-client package."""
 
+import logging
+
 import requests
 from unittest.mock import MagicMock
 
@@ -115,3 +117,112 @@ class TestReExports:
         assert wayback.ARCHIVE_CAPTURE_FAILED == "capture_failed"
         assert wayback.ARCHIVE_SUBMIT_FAILED == "submit_failed"
         assert wayback.ARCHIVE_NOT_ATTEMPTED == "not_attempted"
+
+    def test_every_public_spn_client_name_is_reachable(self):
+        """The migration left `rate_limited_out` behind and nobody noticed until
+        a run needed it. This fails the next time the library grows a name this
+        module does not pass on, rather than leaving it to be rediscovered."""
+        import spn_client
+
+        public = {n for n in dir(spn_client) if not n.startswith("_") and n != "client"}
+        missing = sorted(n for n in public if not hasattr(wayback, n))
+        assert missing == [], f"not re-exported from spn_client: {missing}"
+
+
+class TestCaptureOptions:
+    """``submit()``'s optional SPN2 capture arguments, assembled from config."""
+
+    def test_nothing_configured_sends_nothing(self):
+        """An omitted key is how spn-client is told "archive.org's default".
+        Sending an explicit False for each would put fields in the capture
+        request that nobody asked about."""
+        assert wayback.capture_options(None, None) == {}
+        assert wayback.capture_options({}, {}) == {}
+
+    def test_off_and_empty_values_are_omitted_not_sent(self):
+        opts = wayback.capture_options(
+            {"capture_screenshot": False, "use_user_agent": ""}, None
+        )
+        assert opts == {}
+
+    def test_set_values_pass_through(self):
+        opts = wayback.capture_options(
+            {"js_behavior_timeout": 15, "skip_first_archive": True}, None
+        )
+        assert opts == {"js_behavior_timeout": 15, "skip_first_archive": True}
+
+    def test_an_unknown_key_is_dropped_with_a_warning(self, caplog):
+        """A typo must not fail a review that would otherwise complete — but it
+        must not pass silently either, or the run quietly ignores what the
+        author configured."""
+        with caplog.at_level(logging.WARNING):
+            opts = wayback.capture_options({"capture_screenshots": True}, None)
+        assert opts == {}
+        assert any("capture_screenshots" in r.getMessage() for r in caplog.records)
+
+    def test_a_wrong_type_is_dropped_with_a_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            opts = wayback.capture_options({"js_behavior_timeout": "fifteen"}, None)
+        assert opts == {}
+        assert any("js_behavior_timeout" in r.getMessage() for r in caplog.records)
+
+    def test_a_bool_does_not_satisfy_an_int_option(self):
+        """bool subclasses int, so a naive isinstance check would let
+        ``js_behavior_timeout: true`` through and send archive.org a 1."""
+        assert wayback.capture_options({"js_behavior_timeout": True}, None) == {}
+
+    def test_a_timeout_outside_archive_orgs_range_is_dropped(self, caplog):
+        """0-30 is archive.org's bound, not ours. Sending 60 spends a capture
+        request to be told no."""
+        with caplog.at_level(logging.WARNING):
+            assert wayback.capture_options({"js_behavior_timeout": 60}, None) == {}
+            assert wayback.capture_options({"js_behavior_timeout": -1}, None) == {}
+        assert wayback.capture_options({"js_behavior_timeout": 0}, None) == {}
+        assert wayback.capture_options({"js_behavior_timeout": 30}, None) == {
+            "js_behavior_timeout": 30
+        }
+
+    def test_secret_options_come_from_credentials_not_settings(self):
+        """A password belongs in the channel the rest of this repo's secrets use,
+        not in a settings file that gets copied between checkouts."""
+        from_settings = wayback.capture_options(
+            {"target_password": "hunter2", "capture_cookie": "session=abc"}, None
+        )
+        assert from_settings == {}
+
+        from_creds = wayback.capture_options(
+            None,
+            {
+                "access_key": "AK",
+                "secret_key": "SK",
+                "target_username": "u",
+                "target_password": "hunter2",
+                "capture_cookie": "session=abc",
+            },
+        )
+        assert from_creds == {
+            "target_username": "u",
+            "target_password": "hunter2",
+            "capture_cookie": "session=abc",
+        }
+        # The S3 keys are passed separately by the caller and must not be
+        # duplicated into the capture options.
+        assert "access_key" not in from_creds
+        assert "secret_key" not in from_creds
+
+    def test_every_documented_option_is_accepted(self):
+        """Guards against the list here drifting from spn-client's signature."""
+        import inspect
+
+        import spn_client
+
+        params = set(inspect.signature(spn_client.submit).parameters)
+        known = set(wayback.CAPTURE_SETTING_OPTIONS) | set(
+            wayback.CAPTURE_SECRET_OPTIONS
+        )
+        assert known <= params, f"not real submit() kwargs: {sorted(known - params)}"
+        # Everything submit() takes beyond the plumbing should be reachable.
+        plumbing = {"url", "access_key", "secret_key", "timeout", "stale_days"}
+        assert not (params - plumbing - known), (
+            f"submit() option not exposed: {sorted(params - plumbing - known)}"
+        )

@@ -694,6 +694,12 @@ def merge_configs(user_config, pub_config):
 #: archive_org splits into an access/secret pair — both still addressable,
 #: just via the explicit PROVIDER.FIELD form instead of the PROVIDER
 #: shorthand (which always means the common case, `api_key`).
+#:
+#: archive_org also carries the three SPN2 capture options that hold a secret
+#: (a login for the page being captured, and a cookie sent to it). They are
+#: credentials, so they travel the same channel as every other credential here
+#: rather than sitting in ``pipeline.wayback_capture`` alongside the settings
+#: that are safe to commit. See ``wayback.CAPTURE_SECRET_OPTIONS``.
 _PROVIDER_FIELDS = {
     "openai": {"api_key"},
     "gemini": {"api_key"},
@@ -702,7 +708,13 @@ _PROVIDER_FIELDS = {
     "perplexity": {"api_key"},
     "claude": {"api_key"},
     "languagetool": {"username", "api_key"},
-    "archive_org": {"access_key", "secret_key"},
+    "archive_org": {
+        "access_key",
+        "secret_key",
+        "target_username",
+        "target_password",
+        "capture_cookie",
+    },
 }
 
 

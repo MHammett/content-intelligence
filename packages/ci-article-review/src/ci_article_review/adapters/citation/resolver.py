@@ -1162,7 +1162,7 @@ def _record_archived(wb, source):
     wb["archive_outcome_detail"] = None
 
 
-def _record_submission(entry, sub):
+def _record_submission(entry, sub: wayback.SubmitResult) -> None:
     """Fold one ``wayback.submit`` result into the citation's ``wayback`` dict.
 
     Records an outcome, not just a flag. ``submitted: True`` was the entire
@@ -1210,7 +1210,7 @@ def _record_submission(entry, sub):
         )
 
 
-def _record_job_status(entry, status):
+def _record_job_status(entry, status: wayback.JobStatusResult) -> str | None:
     """Fold a ``wayback.check_job_status`` answer in. Returns its ``state``.
 
     ``not_checked`` and ``unknown`` both leave the citation *pending* carrying
@@ -1237,12 +1237,60 @@ def _record_job_status(entry, status):
         wb["archive_outcome_detail"] = status.get("reason")
         if status.get("error_code"):
             wb["capture_error_code"] = status["error_code"]
-        if status.get("retry_category"):
-            wb["capture_retry_category"] = status["retry_category"]
+        # spn-client's own ``check_job_status`` fills ``retry_category`` from
+        # ``categorize_job_error`` whenever it sets a code, so the fallback is
+        # normally unused. It is here because the two fields are independent in
+        # the response shape, and a code that arrives uncategorized would
+        # otherwise be reported as "no known cause" while the table on disk
+        # could in fact classify it — the difference between telling an author
+        # to re-source a claim and telling them to wait.
+        category = status.get("retry_category") or wayback.categorize_job_error(
+            status.get("error_code")
+        )
+        if category:
+            wb["capture_retry_category"] = category
     else:
         wb["archive_outcome"] = wayback.ARCHIVE_PENDING
         wb["archive_outcome_detail"] = status.get("reason")
+    _record_capture_detail(wb, status)
     return state
+
+
+def _record_capture_detail(wb, status: wayback.JobStatusResult) -> None:
+    """Keep the capture diagnostics spn-client surfaces but this pipeline had
+    been discarding.
+
+    ``resources`` is stored as a **count**, not the list. archive.org returns
+    every sub-resource it fetched — for a modern news page that is routinely
+    hundreds of URLs of CDN assets, and this dict is serialized into every run's
+    report and read back by the history index. The number answers the question a
+    reader has ("did it capture a page or an error stub?"); the list answers
+    nothing and would dwarf the citation it belongs to.
+
+    ``resources`` is recorded on pending and failed states too, not just
+    success: on a failure it is the partial progress, which is what distinguishes
+    "archive.org never reached the page" from "it fetched 200 resources and then
+    gave up".
+
+    ``screenshot_url`` and ``outlinks`` only exist when the run asked for them
+    (``pipeline.wayback_capture``), so both are normally absent.
+
+    Everything here shares the ``capture_`` prefix, with ``capture_error_code``
+    and ``capture_retry_category``: these describe the capture archive.org ran,
+    not the citation, and the flat ``wayback`` dict gives no other way to say so.
+    """
+    resources = status.get("resources")
+    if isinstance(resources, (list, tuple)):
+        wb["capture_resource_count"] = len(resources)
+    # Spelled out rather than looped over (src, dest) pairs: ``status`` is a
+    # TypedDict, and a variable key defeats the checking that is the whole
+    # reason for annotating it. mypy rejected the loop outright.
+    if status.get("duration_seconds") is not None:
+        wb["capture_duration_seconds"] = status["duration_seconds"]
+    if status.get("screenshot_url") is not None:
+        wb["capture_screenshot_url"] = status["screenshot_url"]
+    if status.get("outlinks") is not None:
+        wb["capture_outlinks"] = status["outlinks"]
 
 
 #: How long a queued capture stays worth asking about.
@@ -1553,7 +1601,9 @@ def _poll_capture_outcomes(entries, access_key, secret_key):
         pending = still_pending
 
 
-def _submit_missing_archives(results, archive_org_creds=None, history_root=None):
+def _submit_missing_archives(
+    results, archive_org_creds=None, history_root=None, capture_settings=None
+):
     """Follow-up pass: request Wayback archiving for resolved citations whose
     URL isn't archived yet, and establish what became of the request.
 
@@ -1593,6 +1643,9 @@ def _submit_missing_archives(results, archive_org_creds=None, history_root=None)
     creds = archive_org_creds or {}
     access_key = creds.get("access_key")
     secret_key = creds.get("secret_key")
+    # Built once per run, not per submission: the same options apply to every
+    # URL, and the warnings for a bad value are about the config, not the URL.
+    options = wayback.capture_options(capture_settings, creds)
 
     # A stale snapshot is submitted for re-capture alongside an absent one. The
     # run already detects staleness and reported it ("N resolved URL(s) have a
@@ -1675,12 +1728,13 @@ def _submit_missing_archives(results, archive_org_creds=None, history_root=None)
             history_root,
             access_key,
             secret_key,
+            options,
         )
     finally:
         _fan_out_submission_outcomes(by_url, before)
 
 
-def _submit_one_per_url(targets, history_root, access_key, secret_key):
+def _submit_one_per_url(targets, history_root, access_key, secret_key, options=None):
     """Run the archiving pass over one representative citation per URL.
 
     Split out of ``_submit_missing_archives`` so that the deduplication and the
@@ -1737,7 +1791,10 @@ def _submit_one_per_url(targets, history_root, access_key, secret_key):
     def _submit_one(entry):
         try:
             sub = wayback.submit(
-                entry["url"], access_key=access_key, secret_key=secret_key
+                entry["url"],
+                access_key=access_key,
+                secret_key=secret_key,
+                **(options or {}),
             )
         except Exception as e:
             log.warning(f"Wayback submission raised for {entry['url']}: {e}")
@@ -1961,6 +2018,7 @@ def resolve_citations(
     verification_call_log=None,
     history_root=None,
     author=None,
+    capture_settings=None,
 ):
     """
     For each claim, resolve a primary source. If the claim entry carries
@@ -2048,7 +2106,10 @@ def resolve_citations(
             result["fact_check_bucket"] = bucket
         resolved_results.append(result)
     _submit_missing_archives(
-        resolved_results, (api_keys or {}).get("archive_org"), history_root
+        resolved_results,
+        (api_keys or {}).get("archive_org"),
+        history_root,
+        capture_settings,
     )
     # Outside the pass above, not inside it: see ``_note_breaker_state``. Every
     # early return in that function is a case this still has to report on.
