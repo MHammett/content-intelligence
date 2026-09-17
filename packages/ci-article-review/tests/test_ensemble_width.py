@@ -321,6 +321,45 @@ class TestWidthMetrics:
         assert width["distinct_models"] == ["mistral"]
         assert width["models_by_domain"]["fact_check"] == []
 
+    def test_an_empty_pass_is_not_a_voter(self):
+        """Same rule as a failed pass, for the same reason.
+
+        ``_extract_passages`` guards every entry on a non-empty passage string,
+        so a well-formed empty payload contributes no entries and is never in
+        ``_find_consensus``'s voter set. This block claims to mirror that count,
+        so it has to drop the pass too.
+        """
+        results = self._results([("gemini", "fact_check"), ("mistral", "red_team")])
+        results[("gemini", "fact_check")] = {
+            "failed": False,
+            "data": {"flags": [], "low_confidence": []},
+        }
+        width = _ensemble_width(results, {"preset_domains": ["fact_check", "red_team"]})
+        assert width["distinct_models"] == ["mistral"]
+        assert width["models_by_domain"]["fact_check"] == []
+
+    def test_an_empty_pass_does_not_prop_up_the_voter_pool(self):
+        """The consequential half: ``consensus_reachable`` is derived from this
+        count, so counting an empty pass let a run report Section 1 as reachable
+        when its real voter pool had dropped below the minimum."""
+        results = self._results([("gemini", "fact_check"), ("mistral", "fact_check")])
+        results[("gemini", "fact_check")] = {"failed": False, "data": {"flags": []}}
+        width = _ensemble_width(
+            results,
+            {"preset_domains": ["fact_check"], "consensus_min_models": 2},
+        )
+        assert width["voter_pool"] == 1
+        assert width["consensus_reachable"] is False
+
+    def test_a_model_empty_in_one_domain_still_counts_from_another(self):
+        """Exclusion is per pass, not per model — the pair is dropped, and the
+        model survives on the strength of the domain it did contribute to."""
+        results = self._results([("mistral", "fact_check"), ("mistral", "red_team")])
+        results[("mistral", "fact_check")] = {"failed": False, "data": {"flags": []}}
+        width = _ensemble_width(results, {"preset_domains": ["fact_check", "red_team"]})
+        assert width["distinct_models"] == ["mistral"]
+        assert width["models_by_domain"]["red_team"] == ["mistral"]
+
     def test_a_domain_nobody_reviewed_still_appears_in_the_table(self):
         """Naming it is `domains_not_run`'s job — that block carries the reason
         and puts a note above the empty section itself. The width table still

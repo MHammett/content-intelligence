@@ -3111,8 +3111,20 @@ def run_draft_pipeline(
         out_tokens = (result.get("tokens") or {}).get("completion")
         timed_out = "timed out" in str(result.get("error", "")).lower()
         truncated = bool(result.get("truncated"))
+        # A call that succeeded and returned a schema-valid payload with nothing
+        # in it is a third outcome, and the status line is where a reader looks
+        # to see whether a pass ran. Same predicate consolidation uses to build
+        # the end-of-run `empty_results` warning, so the two cannot disagree —
+        # they did until now, and the earlier line is the one people read.
+        is_empty = (
+            status_ok
+            and not result.get("skipped")
+            and consolidation.result_is_empty(result)
+        )
         status = (
-            "ok"
+            "empty"
+            if is_empty
+            else "ok"
             if status_ok and not truncated
             else "partial"
             if status_ok and truncated
@@ -3168,7 +3180,19 @@ def run_draft_pipeline(
             status,
             headroom,
         )
-        if status_ok and not truncated:
+        if is_empty:
+            # Deliberately a warning, and deliberately not the word "OK". This
+            # is the line that told a reader argument_integrity had three
+            # voters on the 2026-09-09 honda-navigation run when it had two.
+            # The end-of-run block says the same thing at more length; this one
+            # has to survive being the only line anyone sees.
+            also_truncated = " (response was also truncated)" if truncated else ""
+            log.warning(
+                f"  {model_name}:{domain}: EMPTY — well-formed response with no "
+                f"findings; contributed nothing{also_truncated} "
+                f"({result.get('elapsed_seconds', '?')}s, {model_tag}{grounding})"
+            )
+        elif status_ok and not truncated:
             log.info(
                 f"  {model_name}:{domain}: OK "
                 f"({result.get('elapsed_seconds', '?')}s, {model_tag}{grounding})"
