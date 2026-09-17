@@ -157,8 +157,8 @@ _SUBMIT_TIMEOUT_SECONDS = 45
 #: rest in the next one.** Both halves are needed, and neither is sufficient.
 #:
 #:   * Waiting for every capture is not an option. SPN2 captures take seconds to
-#:     minutes, every status call goes through the shared 3s pacing clock
-#:     (``wayback._MIN_INTERVAL_SECONDS``), and a run with 20 unarchived
+#:     minutes, every status call goes through spn-client's shared pacing clock
+#:     (``spn_client.client._MIN_INTERVAL_SECONDS``), and a run with 20 unarchived
 #:     citations would spend minutes of the author's wall clock watching
 #:     somebody else's crawler. The pipeline does not block on that.
 #:   * Not waiting at all is what produced the problem this fixes: the report
@@ -1217,6 +1217,16 @@ def _record_job_status(entry, status):
     the reason we could not find out, rather than downgrading it to failed. We
     did not establish a failure; we established nothing, and saying so is the
     point of this whole change.
+
+    A failure also carries archive.org's own ``error_code`` and spn-client's
+    ``retry_category`` for it. Both are recorded even though only the category
+    changes what this pipeline *does*, because the code is what makes a repeated
+    failure diagnosable: ``error:no-captures`` and ``error:invalid-url-syntax``
+    are both "permanent", and they call for completely different fixes from the
+    author. spn-client learned ``error:no-captures`` only by observing it live
+    (0.2.1) — it is absent from archive.org's own SPN2 documentation — so an
+    unrecognized code arriving here is a normal event, not a bug, and
+    ``retry_category`` is None for it.
     """
     wb = entry.setdefault("wayback", {})
     state = status.get("state")
@@ -1225,6 +1235,10 @@ def _record_job_status(entry, status):
     elif state == "failed":
         wb["archive_outcome"] = wayback.ARCHIVE_CAPTURE_FAILED
         wb["archive_outcome_detail"] = status.get("reason")
+        if status.get("error_code"):
+            wb["capture_error_code"] = status["error_code"]
+        if status.get("retry_category"):
+            wb["capture_retry_category"] = status["retry_category"]
     else:
         wb["archive_outcome"] = wayback.ARCHIVE_PENDING
         wb["archive_outcome_detail"] = status.get("reason")
@@ -1307,6 +1321,24 @@ def build_pending_capture_index(history_root=None):
     return index
 
 
+def _record_quota_exhausted(entry):
+    """Mark a citation as not archived because the run ran out of capture quota.
+
+    Deliberately ``ARCHIVE_NOT_ATTEMPTED`` rather than a failure: nothing was
+    asked about this URL, so nothing is known about it. Reporting it as a
+    capture failure would blame the page for a limit that belongs to the
+    account, and would send the author off re-sourcing a citation that is
+    probably fine.
+    """
+    wb = entry.setdefault("wayback", {})
+    wb["archive_outcome"] = wayback.ARCHIVE_NOT_ATTEMPTED
+    wb["archive_outcome_detail"] = (
+        "archive.org's daily capture quota for this account was already "
+        "exhausted when this run reached the citation, so no capture was "
+        "requested for it"
+    )
+
+
 def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
     """Ask archive.org what became of captures an earlier run left pending.
 
@@ -1317,6 +1349,15 @@ def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
     gets resubmitted, is dropped again, and every report in the sequence says
     the same reassuring thing while nothing is ever archived. Asking the job
     what happened turns that into a stated reason.
+
+    A failed job's ``retry_category`` decides whether trying again is worth a
+    capture request at all. ``permanent`` is dropped from the returned list —
+    archive.org will refuse it identically next time — and ``quota_exhausted``
+    stops the rest of the run, since it is a statement about the account, not
+    about the URL. Anything else, including a code spn-client does not
+    recognize, is retried exactly as before: an unknown code is not evidence of
+    permanence, and treating it as such would silently stop archiving a page
+    over a failure nobody has diagnosed.
 
     Never raises: a citation whose prior job cannot be read is simply submitted
     again, which is exactly what would have happened before this existed.
@@ -1332,7 +1373,14 @@ def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
         return targets
 
     still_to_submit = []
+    quota_exhausted = False
     for entry in targets:
+        if quota_exhausted:
+            # Set by a prior job reporting the account's daily capture quota
+            # spent. Everything after it is skipped without a status call: that
+            # call is itself paced, and the answer cannot change the outcome.
+            _record_quota_exhausted(entry)
+            continue
         prior = pending.get(entry["url"])
         if not prior:
             still_to_submit.append(entry)
@@ -1358,14 +1406,42 @@ def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
             entry["wayback"]["submission_job_id"] = prior["job_id"]
         else:
             if state == "failed":
-                # Worth carrying into the report even though we are about to try
+                category = status.get("retry_category")
+                # Worth carrying into the report even where we are about to try
                 # again: "this keeps failing, and here is what archive.org said"
                 # is the fact a repeated non-archival is hiding.
                 entry.setdefault("wayback", {})["prior_capture_failure"] = {
                     "job_id": prior["job_id"],
                     "reason": status.get("reason"),
                     "run_number": prior.get("run_number"),
+                    "error_code": status.get("error_code"),
+                    "retry_category": category,
                 }
+                if category == "permanent":
+                    # archive.org cannot capture this page — not this run, not
+                    # any run. Resubmitting spends a capture request against a
+                    # 3/min (anonymous) or 7/min (authenticated) ceiling to buy
+                    # the identical answer, and it does it again every future
+                    # run, because nothing else in this pipeline ever concludes
+                    # "stop asking". Recording the outcome is the whole value:
+                    # the author needs to re-source the claim, and no amount of
+                    # patience substitutes for that.
+                    _record_job_status(entry, status)
+                    entry["wayback"]["submission_job_id"] = prior["job_id"]
+                    continue
+                if category == "quota_exhausted":
+                    # Not about this URL. The account's daily capture quota is
+                    # spent, so every remaining submission this run would fail
+                    # the same way — spn-client's README is explicit that this
+                    # category means back off the whole run, not just this one.
+                    quota_exhausted = True
+                    log.warning(
+                        "archive.org capture quota exhausted (%s); "
+                        "skipping the remaining submissions this run",
+                        status.get("error_code") or "no error code given",
+                    )
+                    _record_quota_exhausted(entry)
+                    continue
             still_to_submit.append(entry)
     return still_to_submit
 
@@ -1688,6 +1764,20 @@ def _submit_one_per_url(targets, history_root, access_key, secret_key):
     # are included in the question "was that us or them?".
     _note_service_health(targets, access_key, secret_key)
 
+    # State the breaker once, as a fact about the run. spn-client short-circuits
+    # check() and submit() itself once it trips, so nothing here needs to guard
+    # against it — but that is exactly what makes it invisible: the pass simply
+    # stops doing anything and every citation carries a null. Diagnosing that
+    # from the per-citation nulls alone cost a session an afternoon on
+    # 2026-09-17. One log line at the end names it.
+    if wayback.rate_limited_out():
+        log.warning(
+            "archive.org's rate-limit breaker was open at the end of the "
+            "archiving pass — lookups and submissions after it tripped were "
+            "skipped, so an unknown archive status this run is this, not a "
+            "statement about the pages"
+        )
+
     # Bounded wait on anything archive.org queued rather than captured inline.
     _poll_capture_outcomes(targets, access_key, secret_key)
 
@@ -1695,7 +1785,7 @@ def _submit_one_per_url(targets, history_root, access_key, secret_key):
 #: Bound on concurrent snapshot reads for archive-match verification, and the
 #: per-call safety net. These are ordinary reads of an already-captured page —
 #: the same kind of fetch ``_wayback_fallback_content`` makes, and deliberately
-#: not routed through ``wayback._pace``: that clock exists for the availability
+#: not routed through spn-client's pacing clock: that clock exists for the availability
 #: API and Save Page Now, which are the throttled endpoints. Serialising cheap
 #: snapshot reads behind a 3-second interval would add minutes to a run for no
 #: protection anybody asked for.
@@ -1768,7 +1858,7 @@ def _verify_archive_matches(results):
             entry["archive_match"] = ARCHIVE_MATCH_UNCHECKED
             entry["archive_match_detail"] = (
                 f"the snapshot could not be read this run "
-                f"({wayback._transport_failure_summary(exc, 'for the snapshot')})"
+                f"({wayback.transport_failure_summary(exc, 'for the snapshot')})"
             )
             return
 
