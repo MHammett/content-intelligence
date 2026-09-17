@@ -75,6 +75,50 @@
 # wire, not even a keep-alive — while the model reasons before emitting visible
 # output. That is a first-byte problem, so it belongs to stream_read_timeout.
 #
+# ── CONCURRENCY IS THE AXIS, NOT DRAFT SIZE (measured 2026-09-09) ─────────────
+#
+# Two maximum-preset runs on an 18,167-char draft produced eight stalls across
+# three providers and BOTH phases. Run 1 lost grok:red_team outright (it stalled
+# twice, at 337.56s and 302.16s); run 2 stalled seven calls, all of which then
+# recovered:
+#
+#   provider / model     phase         elapsed when it gave up
+#   grok-4.6             first-byte    337.56s, 302.16s (run 1) · 314.10s (run 2)
+#   claude-opus-5        first-byte    253.31s, 343.85s
+#   gpt-5.6-sol          mid-stream    355.87s, 358.90s, 399.74s, 531.59s
+#
+# None of these was short of WALL-CLOCK budget. grok:red_team was killed with
+# 782.8s of its 1085s budget unspent — dead at 28% utilisation, 0 output tokens.
+# The socket budgets, not timeouts.yaml, ended every one of these calls.
+#
+# DO NOT "FIX" THIS BY SCALING THESE VALUES WITH DRAFT SIZE. That is the
+# intuitive move — timeouts.yaml scales its wall-clock budget that way — and on
+# this evidence it makes things strictly WORSE. 18,167 chars lands in the
+# `max_chars: 20000` bucket, whose multiplier is 0.8. A size-scaled first-byte
+# allowance would have been 120 x 0.8 = 96s, and every failure above would have
+# been killed EARLIER. The draft here was small; the failures were not.
+#
+# What they correlate with is FAN-OUT, and the repo already measured that axis:
+# see client.py's openai provider entry, 2026-08-16 — "gpt-5.5 at xhigh exceeds
+# 60s between reasoning-summary deltas when the pipeline runs six of them at
+# once (a single call shows a 1.3s worst gap; concurrency is what stretches
+# it)". maximum fans out to 29 in-flight ensemble calls, and run 2's recovery
+# pass re-ran 7 of them and got all 7 back. That is the same mechanism one tier
+# further along, not a new one.
+#
+# CONSEQUENCE FOR CALIBRATION: measuring ONE call at a time (--only-model /
+# --only-domain / --no-timeout) is the correct method for the WALL-CLOCK cells
+# in timeouts.yaml, and cannot measure these two knobs at all. By the 2026-08-16
+# number above, an isolated call shows a ~1.3s gap — it reproduces the healthy
+# case by construction, and a value set from it would be calibrated against the
+# condition that never fails. To size these, vary CONCURRENCY at fixed draft
+# size and record worst first-byte and worst inter-chunk gap per provider; the
+# per-call [CALIBRATION] lines already carry elapsed and out_tokens, but neither
+# gap is instrumented today, so that experiment needs the two gaps recorded
+# first. Nothing here is changed until that measurement exists — this file's
+# perplexity entry is the standing reminder of what guessing costs (160 -> 280
+# -> 350 -> 500, three bumps that each looked marginal within days).
+#
 # OpenAI: originally hit this hard — gpt-5.5 at xhigh failed 5/5 calls at ~121s
 # with 0 output tokens against the default 120s read-gap under Chat Completions,
 # which carries no signal at all during the reasoning phase. Fixed by migrating
@@ -251,9 +295,22 @@ maximum:
     openai:
       model: gpt-5.6-sol   # was gpt-5.5; matching price tier, 2026-08-18 refresh
       reasoning_effort: xhigh
-      # No stream_read_timeout override — live-verified against xhigh (see the
-      # note above); Responses API reasoning.summary deltas keep the socket
-      # active well inside the 120s default.
+      # No stream_read_timeout override — and note that first-byte is NOT this
+      # tier's openai problem. The note above ("live-verified against xhigh,
+      # reasoning.summary deltas keep the socket active well inside the 120s
+      # default") was verified on gpt-5.5 with 2 calls and does NOT hold for
+      # gpt-5.6-sol under full fan-out: on 2026-09-09 four sol calls died
+      # "stream stalled MID-STREAM: nothing received for 120.0s" at 355.87s,
+      # 358.90s, 399.74s and 531.59s elapsed.
+      #
+      # Mid-stream is stream_gap_timeout (120 for openai, set in client.py's
+      # provider table), NOT this knob. Raising stream_read_timeout would not
+      # have saved one of them. No value is set here because the correct one is
+      # not known — see the CONCURRENCY note at the top of this file. What is
+      # known is that the same run completed a sol call that ran 796.93s and
+      # emitted 42,016 tokens, so these are not slow-but-alive calls hitting a
+      # wall-clock limit; the wall-clock budget (1085s) was never the binding
+      # constraint on any of them.
     gemini:
       model: gemini-2.5-pro
       thinking_budget: 16000

@@ -30,7 +30,22 @@ This repo sees frequent concurrent PRs — a branch that opened cleanly can go `
 
 ## Verifying a change without spending `maximum` money
 
-`configs/user.yaml` sets `cost_preset: maximum`, so a bare `ci-review` makes 30 calls at **$2.50–5.00**. That is the right preset for reviewing a real article and the wrong one for checking that your code works. With several sessions active at once, each verifying once, that default is the single largest avoidable cost in this repo.
+`configs/user.yaml` sets `cost_preset: maximum`, so a bare `ci-review` is the most expensive thing you can run. **Cost scales with draft size, so never quote it without one.** The old line here — "30 calls at $2.50–5.00" — was unsized, undercounted the calls, and used a stale price. Two `maximum` runs, both 2026-09-09, both re-costed 2026-09-17:
+
+| draft | API calls | reported then | **corrected** |
+|-------|----------:|--------------:|--------------:|
+| 18,167 chars (~2,900 words) | 100 | $7.37 | **$6.09** |
+| 135,514 chars (19,457 words) | 217 | $10.96 | **$9.56** |
+
+Three things to carry from that table:
+
+- **"30 calls" counted only the ensemble** (6 models x 5 domains). The real total is 3–7x that once citation verification, citation re-asks and the two SEO passes are counted — 100 calls on the small draft, 217 on the large one.
+- **Every figure is a floor, not a total.** Retried attempts that the provider billed while reporting zero usage are priced at $0.00 (`uncosted_calls` in `cost_summary`: 3 on the small run, 8 on the large). The report says so itself — "at least — 3 retried attempt(s) were billed by the provider with no usage reported". The true bill is above the corrected number by an unknown amount; closing that gap needs provider billing, not the call log.
+- **Cost is sub-linear in draft size.** 7.5x the characters cost 1.6x the money, because generation time tracks output length and output is bounded by what each domain prompt asks for — the same reason `configs/timeouts.yaml` uses a sub-linear size multiplier.
+
+Both corrected figures come from re-pricing `gpt-5.6-sol`, which sat at a stale pre-price-cut rate until 2026-09-17 (see its block in `configs/pricing.yaml`). **Only `maximum` uses sol** — `thorough`/`balanced` run terra, `wide`/`economy` run luna — so of the four measured rows in the table below, only the `maximum` one is overstated; that $10.27 average is uncorrected and its corrected value is near $9.56. Any other pre-2026-09-17 cost figure in this repo is high only if sol ran.
+
+That is the right preset for reviewing a real article and the wrong one for checking that your code works. With several sessions active at once, each verifying once, that default is the single largest avoidable cost in this repo.
 
 **Most changes need no model calls at all.** `--replay` re-runs everything downstream of ensemble dispatch — re-keying, consolidation, citations, the report — over a previously captured ensemble, and makes zero API calls. Every run writes its own capture to `pipeline_history/<key>/run_N_..._results.json`, so one live run per worktree buys unlimited free re-verification:
 
@@ -57,7 +72,9 @@ Measured 2026-09-08 on a 19,457-word real article (dc-environment-v26), 3 isolat
 | `wide`     | $0.38      | 6.8%            | 0.0%                |
 | `balanced` | $1.28      | 6.4%            | 1.1%                |
 | `thorough` (claude-sonnet-5) | $1.74 | 16.9% | 22.1%      |
-| `maximum`  | $10.27     | 20.0%           | 29.6%               |
+| `maximum`  | $10.27 †   | 20.0%           | 29.6%               |
+
+† Priced with the stale `gpt-5.6-sol` rate — see above; corrected it is near $9.56. The other three rows do not use sol and are unaffected, so the *ratios* this table was built to compare still hold; `maximum` is ~25x `wide`, not 27x.
 
 Two conclusions came out of this and are now reflected in `configs/presets.yaml`:
 
