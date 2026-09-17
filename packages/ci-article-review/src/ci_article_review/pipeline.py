@@ -4709,19 +4709,37 @@ def run_publish_pipeline(
             or pub_handoff["publication_parameters"].get("author")
         ),
         "seo": pub_handoff.get("seo", {}),
+        # "Post type:" selects post (default) vs page. Absent means post, so
+        # every handoff written before the field existed still publishes as an
+        # article.
+        "post_type": pub_handoff["publication_parameters"].get("post_type"),
     }
 
     content = pub_handoff["final_draft"]
 
-    log.info(f"Pushing to WordPress (status={'publish' if publish_live else 'draft'})")
+    log.info(
+        "Pushing to WordPress (type=%s, status=%s)",
+        pub_params["post_type"] or "post",
+        "publish" if publish_live else "draft",
+    )
     result = wp.push(
         content, pub_params, wp_config, rank_math_config, publish_live=publish_live
     )
 
     if result["success"]:
         print("\nWordPress push successful.")
+        print(f"Type:     {result.get('post_type', 'post')}")
         print(f"Post URL: {result['post_url']}")
         print(f"Post ID:  {result['post_id']}")
+        if result.get("ignored_terms"):
+            # A page cannot carry them. Said plainly, because the handoff named
+            # them and the author would otherwise assume they applied.
+            print(
+                "NOTE: a page has no categories or tags. These were named in "
+                "the handoff and NOT applied:"
+            )
+            for term in result["ignored_terms"]:
+                print(f"  - {term}")
         if result.get("unresolved_terms"):
             # Loud, and next to the success line rather than in a log above it.
             # The post exists but is missing metadata the author asked for.

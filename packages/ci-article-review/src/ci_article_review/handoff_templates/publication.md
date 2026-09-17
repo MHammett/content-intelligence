@@ -5,6 +5,9 @@ Publication: [publication config name]
 
 PUBLICATION PARAMETERS
 Status: draft [change to: publish-live only with explicit intent]
+Post type: [post (default) | page -- use page for standing pages such as
+About or Contact: no date, no category, not in the blog feed. A page
+ignores the category and tag fields below.]
 WordPress category: [category slug]
 Tags: [comma-separated slugs]
 WordPress author: [WordPress *login username*, if a multi-author site. Not a
