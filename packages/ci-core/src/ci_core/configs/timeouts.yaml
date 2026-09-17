@@ -10,6 +10,21 @@
 # not make a long call finish faster); what it no longer absorbs is a hang/stall,
 # which the read-gap layer now catches in ~120s.
 #
+# THE TWO SOCKET BUDGETS DELIBERATELY DO NOT SCALE THE WAY THIS FILE DOES.
+# `stream_read_timeout` (first-byte) and `stream_gap_timeout` (inter-chunk) are
+# flat per-model constants with no size term, and that asymmetry is not an
+# oversight to be tidied up. This file scales with draft size because generation
+# time tracks output volume, which tracks the draft. A stall does not: the eight
+# stalls measured on 2026-09-09 all happened on an 18,167-char draft — the
+# 0.8 size bucket — so giving those knobs a size term would have shortened them
+# to 96s and killed the same calls sooner. They track CONCURRENCY instead. The
+# evidence, and what would have to be measured before changing either value, is
+# in the CONCURRENCY note in ci_article_review/configs/presets.yaml.
+#
+# Note also that a stall is not always caught "in ~120s" of real time: the 120s
+# is silence, measured from the last byte. grok:red_team burned 302.16s of
+# wall-clock before its 120s of silence elapsed, against a 1085s budget.
+#
 # A per-model timeout_seconds set explicitly in user.yaml OVERRIDES this entirely
 # (escape hatch). Otherwise the pipeline computes each model's backstop from the
 # draft's character count and the model + reasoning effort.

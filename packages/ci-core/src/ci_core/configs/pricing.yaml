@@ -8,14 +8,32 @@
 # than sixfold.
 #
 # xAI also tiers by prompt size: a request whose prompt reaches 200k tokens is
-# billed at roughly double these rates for *all* its tokens. Not modelled — the
-# drafts reviewed here run ~33k tokens, well under the threshold. Revisit if
-# that stops being true.
+# billed at roughly double these rates for *all* its tokens. Not modelled, and
+# MEASURED not to apply: grok's largest single prompt across the two 2026-09-09
+# maximum-preset runs was 8,951 tokens — 4% of the threshold, not merely "under"
+# it. The earlier "~33k tokens" in this note was an estimate of whole-draft size,
+# not of any single prompt; per-call prompts are far smaller because each domain
+# sends its own slice. OpenAI has an analogous tier — see the note on its block
+# below. Revisit either only if per-call prompts grow by more than an order of
+# magnitude.
 #
-# Last verified: OpenAI/Anthropic against litellm's model_prices_and_context_window.json
-# and public announcements, 2026-08-18; xAI against docs.x.ai 2026-08-15 (grok-4.6 base
-# rate only — see its note below). Gemini/older entries still June 2026. Update whenever
-# provider pricing changes.
+# Last verified: OpenAI against developers.openai.com/api/docs/pricing 2026-09-17
+# (gpt-5.6 sol/terra/luna — sol's rate CHANGED, see its block below); Anthropic
+# against litellm's model_prices_and_context_window.json 2026-08-18 with
+# claude-opus-5's [5.00, 25.00] re-confirmed 2026-09-17; xAI against docs.x.ai
+# 2026-08-15 (grok-4.6 base rate only — see its note below). Gemini/older entries
+# still June 2026. Update whenever provider pricing changes.
+#
+# STILL UNVERIFIED. The 2026-09-17 pass checked OpenAI and Claude only. Measured
+# against the 2026-09-09 maximum run, the exposure splits unevenly, so verify in
+# this order rather than treating the three as equal:
+#   mistral-medium-3-5   — whole row an estimate, priced $0.39 of that run
+#   gemini-*             — whole row June 2026, priced $0.31 of that run
+#   grok-4.6 cached rate — carried forward, but only 8,960 cached tokens were
+#                          billed all run, so even a 3x error here is under a
+#                          cent. grok's BASE rate was confirmed at docs.x.ai.
+# So ~$0.69 of that run's corrected $6.09 rests on unconfirmed rates — 11%, and
+# essentially all of it mistral and gemini. Each row carries the caveat inline.
 #
 # Prefix matching applies: "gemini-2.5-flash-0520" matches "gemini-2.5-flash".
 # Sort longer IDs before shorter ones if two share a prefix.
@@ -52,12 +70,47 @@ models:
   # ── OpenAI ──────────────────────────────────────────────────────────────────
   # gpt-5.6 (Sol/Terra/Luna) launched 2026-07-09, replacing 5.5/5.4/5.4-mini at
   # matching price points; Terra and Luna then got price cuts on 2026-07-30
-  # (20% and 80% respectively). Rates below confirmed against litellm's packaged
-  # model_prices_and_context_window.json 2026-08-18. 5.5/5.4/5.4-mini kept below
-  # for any config still pointing at them.
-  gpt-5.6-sol:           [5.00, 30.00,  0.50]    # = gpt-5.5's price, unchanged
+  # (20% and 80% respectively). Terra and Luna re-confirmed unchanged 2026-09-17.
+  # 5.5/5.4/5.4-mini kept below for any config still pointing at them.
+  #
+  # SOL IS PROMOTIONAL, AND MAY REVERT. Sol was [5.00, 30.00, 0.50] here — it
+  # had simply inherited gpt-5.5's price at launch and was never re-checked
+  # after OpenAI cut it. Verified against developers.openai.com/api/docs/pricing
+  # 2026-09-17: $4.00 in / $20.00 out / $0.40 cached, which OpenAI describes as
+  # "available at least through November 21, 2026". Standard (post-promotion)
+  # pricing is the old $5.00/$30.00. Re-check on or before that date: when the
+  # promotion lapses, the correct edit is to restore the 5.00/30.00/0.50 row.
+  #
+  # The stale rate was not cosmetic. Re-costing the 2026-09-09 maximum-preset
+  # run (18,167-char draft) against the corrected row moves it from $7.3741 to
+  # $6.0884 — sol alone was overstating that run by $1.2857, 17% of its total.
+  # Every cost figure this pipeline produced between the price cut and today is
+  # high by a similar proportion wherever sol ran.
+  gpt-5.6-sol:           [4.00, 20.00,  0.40]    # PROMOTIONAL — see above; reverts to 5.00/30.00/0.50
   gpt-5.6-terra:         [2.00, 12.00,  0.20]    # was 2.50/15.00 pre-cut
   gpt-5.6-luna:          [0.20,  1.20,  0.02]    # was 1.00/6.00 pre-cut
+  #
+  # OpenAI also tiers by prompt size, the same way xAI does (see the header
+  # note): a request whose prompt exceeds 272k tokens is billed at 2x input and
+  # 1.5x output for the FULL request. Not modelled, and not currently reached —
+  # the largest single OpenAI prompt in the 2026-09-09 run was 126,176 tokens,
+  # under half the threshold. Revisit if drafts roughly double.
+  #
+  # CACHE WRITES ARE UNMODELLED, AND THEY DO APPLY HERE. The third element in
+  # each row above is the cache READ rate, which is the only side cost.py knows
+  # about. For the gpt-5.6 family specifically, a cache WRITE bills at 1.25x the
+  # uncached input rate (models before 5.6 wrote to cache for free), so the
+  # first call carrying each reusable prefix is under-reported by 0.25x.
+  #
+  # Do not assume this repo's "caching is off by default" note (PLAN.md §5
+  # decision 2) covers it — that decision is about Anthropic cache_control
+  # layout, which is opt-in. OpenAI's cache is AUTOMATIC on prompts over ~1,024
+  # tokens and cannot be declined: the 2026-09-09 run shows 38,335 cached prompt
+  # tokens on sol that nothing in this repo asked for. Upper bound on the
+  # resulting under-report for that run: 38,335 x 0.25 x $4.00/MTok = ~$0.04 —
+  # real, but well inside the noise of the $6.09 total. Worth modelling only if
+  # the cached share grows a lot; worth knowing before trusting a total to the
+  # cent.
   gpt-5.5:               [5.00, 30.00,  0.50]
   gpt-5.4:               [2.50, 15.00,  0.25]
   gpt-5.4-mini:          [0.75,  4.50,  0.075]

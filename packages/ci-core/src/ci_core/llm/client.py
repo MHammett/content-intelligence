@@ -353,7 +353,24 @@ def _gap_timeout(cfg, provider=None):
 
 
 class StreamStalled(Exception):
-    """A stream that started producing chunks went silent.
+    """A stream went silent — either before or after its first chunk.
+
+    ONE exception, TWO distinct failures, governed by two different knobs. The
+    docstring used to describe only the second, which made every first-byte
+    stall look like a mid-stream one and sent at least one investigation at the
+    wrong setting:
+
+      * before the first chunk — nothing ever arrived. Bounded by
+        ``stream_read_timeout`` (``DEFAULT_READ_TIMEOUT``, 120s; grounded models
+        160s). This is the queueing/search/silent-reasoning phase.
+      * mid-stream — chunks arrived, then stopped. Bounded by
+        ``stream_gap_timeout`` (60s default, 120s for openai). This is the
+        liveness detector.
+
+    Only ``str(exc)`` distinguishes them, via the ``phase`` word chosen in
+    ``_iter_with_gap``. Read it before changing a timeout: raising
+    ``stream_read_timeout`` does nothing for a mid-stream stall, and vice versa.
+    Both were observed in a single run on 2026-09-09 (see configs/timeouts.yaml).
 
     Carries 504 so it lands in the retryable set: a stall means the connection
     died, and a new socket genuinely fixes that — the same reasoning that makes
