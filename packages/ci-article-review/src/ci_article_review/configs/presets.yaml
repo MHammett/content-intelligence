@@ -6,7 +6,8 @@
 #   - Sets thoroughness (unless user also set thoroughness: explicitly).
 #   - Overrides model name and reasoning flags for each configured provider.
 #   - Preserves infrastructure keys: provider, project, location, credentials_file,
-#     endpoint, deployment, api_version, prompts, timeout_seconds.
+#     endpoint, deployment, api_version, prompts, web_search, timeout_seconds,
+#     max_tokens.
 #   - Skips providers with no API key or no models: entry in user.yaml.
 #   - Respects enabled: false set by the user — disabled models stay disabled.
 #

@@ -1380,3 +1380,99 @@ class TestMalformedRedTeamDicts:
         build_report("T", "p", 1, "d", None, results, {}, [])
         assert data == {"most_vulnerable_claim": "none"}
         assert results[("gemini", "red_team")]["data"] is data
+
+
+class TestTruncationExtent:
+    """Where a truncated response stopped, and what it never delivered.
+
+    The tails are the shapes of honda-navigation run 3's three truncations
+    (2026-09-18), shortened.
+    """
+
+    def test_a_bucket_started_but_dropped_whole_is_where_the_cut_fell(self):
+        """mistral:fact_check: `outdated` closed empty and complete; the raw had
+        opened `contradicted` and was partway through its first entry, which
+        salvage discarded. The parsed data alone would blame `outdated`."""
+        from ci_article_review.consolidation import _truncation_extent
+
+        raw = (
+            '{"confirmed": [{"claim": "a"}], "outdated": [], '
+            '"contradicted": [{"claim": "Ten digits can count from 0 to 1,023, and'
+        )
+        data = {"confirmed": [{"claim": "a"}], "outdated": []}
+        got = _truncation_extent("fact_check", data, raw)
+        assert got == {
+            "missing_buckets": [
+                "contradicted",
+                "unverifiable",
+                "primary_source_needed",
+                "out_of_scope",
+                "additional_observations",
+            ],
+            "last_bucket": "outdated",
+            "cut_in": "contradicted",
+        }
+
+    def test_a_bucket_cut_partway_through_is_the_last_that_arrived(self):
+        """claude:fact_check: two complete primary_source_needed entries kept,
+        the third cut off; out_of_scope and additional_observations never began."""
+        from ci_article_review.consolidation import _truncation_extent
+
+        raw = (
+            '{"confirmed": [], "outdated": [], "contradicted": [], '
+            '"unverifiable": [], "primary_source_needed": [{"claim": "x"}, '
+            '{"claim": "y"}, {"claim": "A teardown of a 2012 Pilot'
+        )
+        data = {
+            "confirmed": [],
+            "outdated": [],
+            "contradicted": [],
+            "unverifiable": [],
+            "primary_source_needed": [{"claim": "x"}, {"claim": "y"}],
+        }
+        got = _truncation_extent("fact_check", data, raw)
+        assert got["missing_buckets"] == ["out_of_scope", "additional_observations"]
+        assert got["last_bucket"] == got["cut_in"] == "primary_source_needed"
+
+    def test_a_key_quoted_inside_a_finding_is_not_mistaken_for_the_bucket(self):
+        """Only `"key":` counts as opening a bucket, not the word in prose."""
+        from ci_article_review.consolidation import _truncation_extent
+
+        raw = '{"flags": [{"passage": "the \\"additional_observations\\" field'
+        got = _truncation_extent("argument_integrity", {"flags": []}, raw)
+        assert got["cut_in"] == "flags"
+
+    def test_no_raw_text_leaves_the_cut_unplaced(self):
+        from ci_article_review.consolidation import _truncation_extent
+
+        got = _truncation_extent("fact_check", {"confirmed": []}, None)
+        assert got["cut_in"] is None
+        assert got["last_bucket"] == "confirmed"
+
+    def test_a_custom_domain_has_no_schema_to_compare_against(self):
+        from ci_article_review.consolidation import _truncation_extent
+
+        assert _truncation_extent("my_domain", {"a": 1}, '{"a": 1, "b"') == {
+            "missing_buckets": [],
+            "last_bucket": None,
+            "cut_in": None,
+        }
+
+    def test_build_report_carries_it_for_a_truncated_result(self):
+        results = {
+            ("mistral", "argument_integrity"): {
+                **_ok({"flags": [{"passage": "p"}], "low_confidence": []}),
+                "truncated": True,
+                "max_tokens": 16000,
+                "tokens": {"prompt": 1, "completion": 16000},
+                "raw": '{"flags": [{"passage": "p"}], "low_confidence": [], '
+                '"additional_observations": [{"category": "fact_check", "pass',
+            }
+        }
+        report = build_report("T", "p", 1, "d", None, results, {}, [])
+        (detail,) = report["truncated_result_details"]
+        assert detail["pass"] == "mistral:argument_integrity"
+        assert detail["section"] == "SECTION 4: Argument Integrity"
+        assert detail["max_tokens"] == 16000
+        assert detail["missing_buckets"] == ["additional_observations"]
+        assert detail["cut_in"] == "additional_observations"

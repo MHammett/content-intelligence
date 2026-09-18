@@ -1,0 +1,90 @@
+# Output-token ceiling model — the `max_tokens` a reasoning review pass is sent.
+#
+#   max_tokens = reasoning_tokens[effort] + answer_tokens[domain] × size_mult(draft chars)
+#
+# clamped to the model's own output limit. `size_mult` is NOT defined here: it is
+# timeouts.yaml's size_multipliers table, read from there, so the ceiling and the
+# wall-clock budget scale with the draft in lockstep and cannot drift apart.
+#
+# WHO THIS APPLIES TO. Only claude and mistral send a ceiling at all — openai
+# (Responses API), grok, gemini and perplexity send none and run to the model's
+# own limit. And only their REASONING passes (an `effort` / `reasoning_effort`
+# other than "none"); the no-effort paths keep client.py's 8000 default, which
+# nothing has truncated since it was set. An explicit `max_tokens` in a model
+# config always wins over this.
+#
+# WHY THE FORMULA HAS TWO TERMS. Measured 2026-09-18 across every captured run on
+# this machine (1,144 ensemble calls). Before this file existed the ceiling was a
+# flat 16000, and it was being hit by REASONING, not by findings:
+#
+#   pass                          draft   output  visible JSON  so reasoning was
+#   mistral:argument_integrity   27,113   16,000   ~1,900 tok     ~14,000
+#   mistral:fact_check            2,182   16,000   ~1,900 tok     ~14,100
+#   mistral:fact_check            4,121   16,000   ~1,400 tok     ~14,600
+#   mistral:fact_check           27,113   16,000   ~4,000 tok     ~12,000
+#   claude:fact_check [grounded] 27,113   20,215   ~5,000 tok     ~15,200
+#
+# (visible = raw JSON chars / 3.6.) Two of those drafts are under 5,000 chars:
+# reasoning does not shrink with the draft, so it is a flat term. What the pass
+# WRITES does grow with the draft — fact_check emits one entry per claim, and its
+# visible answer ran 1,600 tokens on a 2,182-char draft and 5,000-8,000 on
+# 18-27k — so that term scales. A single size-scaled number would have starved
+# the small drafts, which truncated just as reliably as the large ones.
+#
+# Both reasoning figures above are FLOORS: those calls were cut off, so they
+# report the ceiling rather than what the model wanted. Same trap timeouts.yaml
+# describes for timed-out calls — "measure it, do not nudge it". `--no-timeout`
+# now lifts this ceiling as well as the wall clock, so a calibration run records
+# the uncensored length.
+
+# By effort. A ceiling, not a target: the model is never told it, so raising it
+# changes nothing about a call that finishes on its own — it only moves where a
+# long one is cut off, and bills only the tokens actually generated.
+reasoning_tokens:
+  # MEASURED at high. ~2x the largest reasoning count seen on the current
+  # prompts (15,200 claude-opus-5, 14,600 mistral-medium-3-5, both still
+  # censored), and it alone covers the largest uncapped mistral fact_check
+  # ever recorded (30,740 total output, 2026-08-11, before any ceiling existed).
+  high: 32000
+  # UNMEASURED — no preset runs claude above high. 2x high, a smaller step
+  # than timeouts.yaml's 3x wall-clock ratio for xhigh because Anthropic's
+  # own output limit (128,000 on opus-5) caps the table long before that
+  # matters. Measure with --no-timeout before relying on either.
+  xhigh: 64000
+  max: 64000
+  # low and medium: the flat ceiling every claude effort level was sent before
+  # this file, which nothing at those levels has truncated against.
+  default: 16000
+
+# The visible JSON the domain returns, in tokens, at timeouts.yaml's 1.0 size
+# bucket (50-80k chars). Scaled by that same table, so 0.7x under 5k chars and
+# 1.4x at 80-150k.
+answer_tokens:
+  # MEASURED: largest visible fact_check answer on record was 8,061 tokens
+  # (mistral, 18,167 chars — the 0.8 bucket), so 10,000 at the anchor puts
+  # the 0.8 bucket right on it. The reasoning term is the real headroom.
+  fact_check: 10000
+  # Every other domain returns a handful of flags. Largest visible answers on
+  # record: ~4,300 tokens (claude-opus-5 argument_integrity, haiku-4-5 with no
+  # reasoning at all).
+  default: 5000
+
+# Throughput used to turn a ceiling back into seconds: output tokens per second
+# over the WHOLE call (first byte and any search included), a little under the
+# slowest healthy call measured since the 2026-08-18 migration to litellm, with
+# calls that carried a discarded (stalled, retried) attempt excluded — their
+# elapsed time includes a dead attempt and says nothing about generation speed.
+#
+#   claude-opus-5 high           min 56.4 (grounded) / 60.3, median 68.9-72.4
+#   claude-haiku-4-5             min 54.7, median 72.9
+#   mistral-medium-3-5 high      min 54.0, p10 124.4, median 165.7
+#
+# Used by timeout_model.compute_all: a capped model's wall-clock budget is
+# raised, if it has to be, to the time a healthy call needs to reach its
+# ceiling. Without that, raising the ceiling turns a truncation — which keeps
+# every complete finding — into a timeout, which keeps none. Prefix match,
+# longest key first.
+floor_tokens_per_second:
+  claude: 50
+  mistral: 50
+  default: 40

@@ -7,6 +7,7 @@
       "error": null,
       "failed": false,
       "headroom_seconds": "<volatile>",
+      "max_tokens": null,
       "model": "gemini-test-model [grounded]",
       "pass": "gemini:fact_check",
       "status": "ok",
@@ -24,6 +25,7 @@
       "error": null,
       "failed": false,
       "headroom_seconds": "<volatile>",
+      "max_tokens": null,
       "model": "gemini-test-model",
       "pass": "gemini:argument_integrity",
       "status": "ok",
@@ -41,6 +43,7 @@
       "error": null,
       "failed": false,
       "headroom_seconds": "<volatile>",
+      "max_tokens": null,
       "model": "gemini-test-model",
       "pass": "gemini:red_team",
       "status": "ok",
@@ -58,6 +61,7 @@
       "error": null,
       "failed": false,
       "headroom_seconds": "<volatile>",
+      "max_tokens": null,
       "model": "mistral-test-model",
       "pass": "mistral:argument_integrity",
       "status": "ok",
@@ -75,6 +79,7 @@
       "error": null,
       "failed": false,
       "headroom_seconds": "<volatile>",
+      "max_tokens": null,
       "model": "mistral-test-model",
       "pass": "mistral:red_team",
       "status": "ok",
@@ -92,6 +97,7 @@
       "error": null,
       "failed": false,
       "headroom_seconds": "<volatile>",
+      "max_tokens": null,
       "model": "openai-test-model",
       "pass": "openai:completeness",
       "status": "ok",
@@ -109,6 +115,7 @@
       "error": null,
       "failed": false,
       "headroom_seconds": "<volatile>",
+      "max_tokens": null,
       "model": "openai-test-model",
       "pass": "openai:voice_style",
       "status": "ok",
@@ -891,5 +898,6 @@
       }
     }
   ],
+  "truncated_result_details": [],
   "truncated_results": []
 }

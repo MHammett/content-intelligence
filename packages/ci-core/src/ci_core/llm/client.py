@@ -673,6 +673,10 @@ def _provider_params(provider, cfg, response_schema=None):
             default_max_tokens = int(budget) + 4096
         elif effort:
             params["reasoning_effort"] = effort
+            # Fallback only. Adaptive thinking spends from this same ceiling,
+            # and on a grounded call every search iteration gets it afresh, so
+            # the review pipeline sizes it per pass instead — see
+            # ci_core/llm/output_tokens.py for why 16000 truncated fact_check.
             default_max_tokens = 16000
         else:
             # Was a flat 4096, and `cfg["max_tokens"]` was ignored on all three
@@ -716,11 +720,14 @@ def _provider_params(provider, cfg, response_schema=None):
             # that finished used 7231, just under the old ceiling. The model
             # itself supports far more (mistral-medium-3-5's real
             # max_output_tokens is 262144 per litellm's model map) — 8000 was
-            # a self-imposed cap, not a provider limit. 16000 matches the
-            # budget claude's own effort="high" path already uses
-            # (_provider_params above) and is still 16x below the real
-            # ceiling; raise cfg["max_tokens"] explicitly if a domain still
-            # truncates at 16000.
+            # a self-imposed cap, not a provider limit.
+            #
+            # 16000 is now only the fallback for a caller that passes no
+            # ceiling. The review pipeline sizes each reasoning pass from the
+            # draft and the domain (ci_core/llm/output_tokens.py), because
+            # 16000 still truncated 4 of the last 7 mistral fact_checks —
+            # on drafts as small as 2,182 chars, the reasoning alone ran past
+            # it. A cfg["max_tokens"] set explicitly wins over both.
             default_max_tokens = 16000 if effort == "high" else 8000
             params["max_tokens"] = int(cfg.get("max_tokens", default_max_tokens))
 
@@ -1273,6 +1280,17 @@ def _stream_timing_field(streams):
     return {"stream_timing": [s.as_dict() for s in streams]} if streams else {}
 
 
+def _ceiling_field(params):
+    """``{"max_tokens": n}`` for the output ceiling this call was sent, else ``{}``.
+
+    Read off the request rather than recomputed, so it is the value the provider
+    actually enforced. Absent for the providers that send none — openai, grok,
+    gemini and perplexity run to the model's own limit.
+    """
+    ceiling = (params or {}).get("max_tokens")
+    return {"max_tokens": int(ceiling)} if ceiling else {}
+
+
 def _summarise_discarded(discarded):
     """Fold recorded discarded attempts into counts and recoverable tokens.
 
@@ -1571,6 +1589,7 @@ def _attempt(
             "tokens": tokens,
             "elapsed_seconds": elapsed,
             **_extras_from(assembled),
+            **_ceiling_field(params),
             # A call that failed, retried and failed again was billed twice.
             # Attaching this only to the success path would have left the
             # most expensive outcome — two full attempts, no usable result —
@@ -1613,10 +1632,15 @@ def _attempt(
     # the salvage path recovered parseable JSON from what arrived.
     truncated = truncated or assembled["finish_reason"] == "length"
     if truncated:
+        # The ceiling named, not just the count: a grounded claude call reports
+        # the SUM of its search iterations' output, so "20,215 tokens" alone
+        # read as though a 16,000 ceiling had never been the cause.
+        ceiling = params.get("max_tokens")
+        against = f" against a {ceiling}-token ceiling" if ceiling else ""
         log.warning(
             f"{label} response was truncated (hit the output-token ceiling at "
-            f"{tokens['completion']} output tokens) after {elapsed}s; kept the "
-            f"complete elements, discarded the rest."
+            f"{tokens['completion']} output tokens{against}) after {elapsed}s; "
+            f"kept the complete elements, discarded the rest."
         )
     else:
         log.debug(f"{label} call succeeded in {elapsed}s")
@@ -1629,6 +1653,7 @@ def _attempt(
         "tokens": tokens,
         "elapsed_seconds": elapsed,
         **extras,
+        **_ceiling_field(params),
     }
     if truncated:
         result["truncated"] = True

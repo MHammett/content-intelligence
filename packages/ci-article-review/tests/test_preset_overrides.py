@@ -147,3 +147,18 @@ class TestPresetPreservesUserCapabilityFlags:
         models_raw = {"claude": {"model": "claude-opus-4-8", "prompts": ["red_team"]}}
         _, models = _apply_cost_preset({"cost_preset": "maximum"}, models_raw)
         assert models["claude"]["prompts"] == ["red_team"]
+
+    def test_an_explicit_output_ceiling_survives_like_the_timeout_does(self):
+        """client.py's own comments said to raise `max_tokens` if a domain
+        still truncated. Under any cost_preset — every real configuration — the
+        preset rebuilt the dict and dropped it, so the advice did nothing."""
+        models_raw = {
+            "claude": {"model": "claude-opus-4-8", "max_tokens": 48000},
+            "mistral": {"model": "mistral-large-latest", "timeout_seconds": 400},
+        }
+        _, models = _apply_cost_preset({"cost_preset": "maximum"}, models_raw)
+        assert models["claude"]["max_tokens"] == 48000
+        assert models["mistral"]["timeout_seconds"] == 400
+        # The preset still owns the model and its reasoning depth.
+        assert models["claude"]["model"] == "claude-opus-5"
+        assert models["claude"]["effort"] == "high"

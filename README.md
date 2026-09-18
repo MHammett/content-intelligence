@@ -12,7 +12,8 @@ per capability (see [docs/NAMING.md](docs/NAMING.md) for the naming convention):
   text extraction (`ci_core.extract`), secret redaction
   (`ci_core.redact`), and the shared config helpers (`ci_core.config_helpers`). The
   provider/model reference data those read — `pricing.yaml`, `timeouts.yaml`,
-  `model_registry.yaml` — lives in `ci_core/configs/` alongside its loaders.
+  `output_tokens.yaml`, `model_registry.yaml` — lives in `ci_core/configs/`
+  alongside its loaders.
   Dependencies flow one way, and the applications do not depend on each other; see
   [docs/NAMING.md](docs/NAMING.md#dependency-direction).
 
@@ -861,6 +862,8 @@ content-intelligence/
 │   │   │   │   │                      {prompt, completion, cached}
 │   │   │   │   ├── cost.py            token-based cost estimation, incl. cache hits
 │   │   │   │   ├── timeout_model.py   sliding-scale timeout from size × model × effort
+│   │   │   │   ├── output_tokens.py   output-token ceiling for claude/mistral reasoning
+│   │   │   │   │                      passes: reasoning + answer × the same size table
 │   │   │   │   ├── model_registry.py  current/superseded model detection
 │   │   │   │   └── watermarking.py    which providers mark generated text;
 │   │   │   │                          provenance bookkeeping, not detection
@@ -880,8 +883,8 @@ content-intelligence/
 │   │   │   │                     decode damage in article text, by Unicode class rather
 │   │   │   │                     than a denylist; inventory() censuses the rest
 │   │   │   ├── config_helpers.py load_yaml, resolve_env_recursive, normalize_model_configs
-│   │   │   ├── configs/          pricing.yaml, timeouts.yaml, model_registry.yaml,
-│   │   │   │                     watermarking.yaml
+│   │   │   ├── configs/          pricing.yaml, timeouts.yaml, output_tokens.yaml,
+│   │   │   │                     model_registry.yaml, watermarking.yaml
 │   │   │   ├── config.py         pydantic settings (no production consumer yet)
 │   │   │   ├── db.py             async SQLAlchemy engine/session (no production consumer yet)
 │   │   │   ├── models.py         ORM models (no production consumer yet)

@@ -526,6 +526,75 @@ class TestTruncation:
         assert "truncated" not in result
 
 
+class TestTheCeilingSentIsRecorded:
+    """The result says which output-token ceiling the provider enforced.
+
+    A truncated pass used to report only its output count, and on a grounded
+    claude call that count is the SUM of the search loop's iterations — 20,215
+    tokens against a 16,000 ceiling read as though the ceiling could not have
+    been the cause. The report cannot explain a truncation it cannot size.
+    """
+
+    def test_a_capped_provider_records_the_value_it_sent(self):
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream()
+        ):
+            result = _call(
+                "mistral",
+                provider_config={"reasoning_effort": "high", "max_tokens": 40500},
+            )
+        assert result["max_tokens"] == 40500
+
+    def test_the_client_default_is_recorded_too(self):
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream()
+        ):
+            result = _call("claude", provider_config={"effort": "high"})
+        assert result["max_tokens"] == 16000
+
+    def test_a_provider_that_sends_none_records_none(self):
+        """openai's Responses path and grok send no ceiling; claiming one would
+        misstate what bounded the call."""
+        with patch.object(
+            client.litellm, "responses", return_value=_responses_stream()
+        ):
+            assert "max_tokens" not in _call("openai")
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream()
+        ):
+            assert "max_tokens" not in _call("grok")
+
+    def test_a_response_that_never_parsed_still_says_what_cut_it(self):
+        """Cut off before a single complete element: salvage has nothing, the
+        call fails as malformed — and the ceiling is the reason."""
+        with patch.object(
+            client.litellm,
+            "completion",
+            return_value=_completion_stream(
+                '{"flags": [{"pass', finish_reason="length"
+            ),
+        ):
+            result = _call(
+                "mistral",
+                provider_config={"reasoning_effort": "high", "max_tokens": 40500},
+            )
+        assert result["failed"] is True
+        assert result["max_tokens"] == 40500
+
+    def test_the_truncation_warning_names_the_ceiling(self, caplog):
+        with patch.object(
+            client.litellm,
+            "completion",
+            return_value=_completion_stream('{"flags": []}', finish_reason="length"),
+        ):
+            with caplog.at_level("WARNING"):
+                _call(
+                    "mistral",
+                    provider_config={"reasoning_effort": "high", "max_tokens": 40500},
+                )
+        assert "against a 40500-token ceiling" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # Provider extras
 # ---------------------------------------------------------------------------

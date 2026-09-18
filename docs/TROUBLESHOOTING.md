@@ -151,7 +151,10 @@ To find the true (untruncated) time a model needs, run with `--no-timeout --only
 **"stream stalled before the first chunk" / "stream stalled mid-stream"**  
 Not the wall-clock budget above: raising `timeout_seconds` does nothing for either. The first is `stream_read_timeout` (nothing arrived before real output began), the second `stream_gap_timeout` (output began, then stopped). The call's `[CALIBRATION]` line shows how long each silence lasted — `first_byte=` and `max_gap=`, with a stall written as a lower bound like `>120.02s`; see [the three timeout layers](CONFIGURATION.md#the-three-timeout-layers-streaming). Do not raise either value after one stall, and do not size them from a single-call run: stalls track concurrency, not draft size.
 
-`timeout_seconds` (when set as an override) and `prompts:` are **infrastructure keys** preserved when `cost_preset` overrides model IDs.
+`timeout_seconds` and `max_tokens` (when set as overrides) and `prompts:` are **infrastructure keys** preserved when `cost_preset` overrides model IDs.
+
+**A model pass came back PARTIAL (truncated)**  
+The call hit its output-token ceiling. Everything it finished writing is kept; whatever it had not reached yet is lost, and the report says which buckets those were — in the *Truncated model passes* block at the top and above the affected section. The ceiling includes reasoning, and on a grounded Claude call each search iteration gets the full ceiling while the reported output is their sum — so an output count *above* the ceiling can still be a truncation. Claude's and Mistral's reasoning passes are sized per call by ci-core's `output_tokens.yaml`; if one still truncates, measure the real length with `--no-timeout --only-model PROVIDER --only-domain DOMAIN` (it lifts the ceiling too) and raise the table from that number. Set `max_tokens` on the model in `user.yaml` to override it for one provider.
 
 **All model passes failed**  
 By default the pipeline produces a partial report rather than aborting. To make it abort when all calls fail, set `abort_if_all_provider_calls_fail: true` in the pipeline config.

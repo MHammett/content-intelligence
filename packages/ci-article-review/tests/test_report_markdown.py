@@ -169,6 +169,146 @@ class TestFailedModelPassesAreExplained:
         assert "Failed model passes" in md
 
 
+class TestTruncatedPassesAreExplained:
+    """A truncated fact-check read exactly like a finished one.
+
+    Its findings were well-formed and nothing said the model had stopped before
+    `contradicted`. The whole record was one header line naming the pass. The
+    details below are the two honda-navigation run 3 truncations, 2026-09-18.
+    """
+
+    _MISTRAL = {
+        "pass": "mistral:fact_check",
+        "model": "mistral-medium-3-5",
+        "domain": "fact_check",
+        "section": "SECTION 2: Factual Verification",
+        "completion_tokens": 16000,
+        "max_tokens": 16000,
+        "missing_buckets": [
+            "contradicted",
+            "unverifiable",
+            "primary_source_needed",
+            "out_of_scope",
+            "additional_observations",
+        ],
+        "last_bucket": "outdated",
+        # Its raw had opened `contradicted` and was partway through the first
+        # entry; salvage dropped that entry, and with it the whole bucket.
+        "cut_in": "contradicted",
+    }
+    _CLAUDE = {
+        "pass": "claude:fact_check",
+        "model": "claude-opus-5",
+        "domain": "fact_check",
+        "section": "SECTION 2: Factual Verification",
+        "completion_tokens": 20215,
+        "max_tokens": 16000,
+        "missing_buckets": ["out_of_scope", "additional_observations"],
+        "last_bucket": "primary_source_needed",
+        "cut_in": "primary_source_needed",
+    }
+
+    def _report(self, *details):
+        details = details or (self._MISTRAL,)
+        return _base_report(
+            truncated_results=[d["pass"] for d in details],
+            truncated_result_details=list(details),
+        )
+
+    def test_the_header_names_where_it_stopped_and_what_never_started(self):
+        md = render_report_markdown(self._report())
+        assert "## ⚠ Truncated model passes (1)" in md
+        assert (
+            "cut off inside `contradicted` before a single entry of it was "
+            "complete; `unverifiable`, `primary_source_needed`, `out_of_scope` "
+            "and `additional_observations` never started" in md
+        )
+
+    def test_a_complete_bucket_is_not_called_short(self):
+        """`outdated` arrived whole (empty). Saying it 'may be short' was the
+        first draft of this, and it was wrong: the cut was one bucket later."""
+        md = render_report_markdown(self._report())
+        assert (
+            "`outdated`"
+            not in md.split("## ⚠ Truncated model passes")[1].split("## ")[0]
+        )
+
+    def test_the_header_names_the_ceiling_and_the_count(self):
+        md = render_report_markdown(self._report())
+        assert "hit its 16,000-token output ceiling after 16,000 output tokens" in md
+
+    def test_an_output_count_above_the_ceiling_is_explained(self):
+        """20,215 against 16,000 reads as though the ceiling could not have
+        been the cause. It was: a grounded call's search iterations each get
+        the full ceiling and the count is their sum."""
+        md = render_report_markdown(self._report(self._CLAUDE))
+        assert "after 20,215 output tokens across its search iterations" in md
+
+    def test_a_bucket_cut_partway_through_is_flagged_as_possibly_short(self):
+        md = render_report_markdown(self._report(self._CLAUDE))
+        assert (
+            "cut off partway through `primary_source_needed`, which may be short; "
+            "`out_of_scope` and `additional_observations` never started" in md
+        )
+
+    def test_without_raw_text_it_says_only_what_the_data_shows(self):
+        """A result with no raw text cannot place the cut."""
+        detail = {**self._MISTRAL, "cut_in": None}
+        md = render_report_markdown(self._report(detail))
+        assert (
+            "`additional_observations` never arrived, and `outdated`, the last "
+            "bucket that did, may be short" in md
+        )
+
+    def test_the_affected_section_carries_its_own_note(self):
+        """Reading Section 2 should not require having read the header."""
+        md = render_report_markdown(self._report(self._MISTRAL, self._CLAUDE))
+        section = md.split("## SECTION 2")[1].split("## SECTION 3")[0]
+        assert "Incomplete: mistral-medium-3-5 hit its output-token ceiling" in section
+        assert "Incomplete: claude-opus-5 hit its output-token ceiling" in section
+        assert "`contradicted`" in section
+
+    def test_an_unaffected_section_is_not_annotated(self):
+        md = render_report_markdown(self._report())
+        section = md.split("## SECTION 4")[1].split("## SECTION 5")[0]
+        assert "Incomplete:" not in section
+
+    def test_a_clean_run_says_nothing(self):
+        md = render_report_markdown(_base_report())
+        assert "Truncated model passes" not in md
+        assert "Incomplete:" not in md
+
+    def test_a_report_predating_the_details_still_renders(self):
+        """Old reports carry only the bare list."""
+        md = render_report_markdown(
+            _base_report(truncated_results=["mistral:fact_check"])
+        )
+        assert "Truncated model passes (1)" in md
+        assert "mistral:fact_check" in md
+
+    def test_a_cut_inside_the_final_bucket_says_only_that(self):
+        detail = {
+            **self._CLAUDE,
+            "missing_buckets": [],
+            "last_bucket": "additional_observations",
+            "cut_in": "additional_observations",
+        }
+        md = render_report_markdown(self._report(detail))
+        assert (
+            "cut off partway through `additional_observations`, which may be short."
+            in md
+        )
+        assert "never started" not in md
+
+    def test_an_unrecorded_ceiling_is_not_called_the_models_limit(self):
+        """Captures from before the ceiling was recorded hit a 16,000 ceiling
+        that was never written down. 'The model's output limit' would be false."""
+        detail = {**self._MISTRAL, "max_tokens": None}
+        md = render_report_markdown(self._report(detail))
+        assert "hit its output-token ceiling after 16,000 output tokens" in md
+        assert "model's output limit" not in md
+
+
 class TestHeader:
     def test_header_fields_present(self):
         md = render_report_markdown(_base_report())

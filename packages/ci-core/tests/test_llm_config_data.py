@@ -199,3 +199,24 @@ class TestTimeoutsStructure:
         assert vm >= 1.0, (
             "variance_margin below 1.0 would shrink timeouts below the central estimate"
         )
+
+
+class TestOutputTokensStructure:
+    def test_every_table_has_a_default_and_positive_values(self):
+        data = _load("output_tokens.yaml")
+        for table in ("reasoning_tokens", "answer_tokens", "floor_tokens_per_second"):
+            assert "default" in data[table], (
+                f"output_tokens.yaml {table} needs a default"
+            )
+            for key, value in data[table].items():
+                assert isinstance(value, (int, float)) and value > 0, (table, key)
+
+    def test_reasoning_room_does_not_shrink_as_effort_rises(self):
+        r = _load("output_tokens.yaml")["reasoning_tokens"]
+        ladder = [r.get(k, r["default"]) for k in ("low", "medium", "high", "xhigh")]
+        assert ladder == sorted(ladder), f"reasoning_tokens decreases: {ladder}"
+
+    def test_it_defines_no_size_table_of_its_own(self):
+        """The ceiling scales with timeouts.yaml's buckets so the two cannot
+        drift. A second table here would be read by nothing and mislead."""
+        assert "size_multipliers" not in _load("output_tokens.yaml")

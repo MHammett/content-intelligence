@@ -773,6 +773,126 @@ def _render_domains_not_run(report):
     return lines
 
 
+def _code_list(names):
+    """Bucket names as a reader-facing list: `a`, `b` and `c`."""
+    quoted = [f"`{n}`" for n in names]
+    if len(quoted) < 3:
+        return " and ".join(quoted)
+    return ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
+
+
+def _cut_description(detail):
+    """Where a truncated pass stopped, in one clause, or ''.
+
+    ``cut_in`` — the bucket the raw text was inside — says which of two very
+    different things happened: cut partway through a bucket that therefore
+    arrived short, or cut inside the first entry of the next one, which salvage
+    then dropped whole. The parsed data alone cannot tell them apart.
+    """
+    missing = detail.get("missing_buckets") or []
+    last = detail.get("last_bucket")
+    cut_in = detail.get("cut_in")
+    if cut_in and cut_in in missing:
+        rest = [b for b in missing if b != cut_in]
+        text = f"cut off inside `{cut_in}` before a single entry of it was complete"
+        return text + (f"; {_code_list(rest)} never started" if rest else "")
+    if cut_in and cut_in == last:
+        text = f"cut off partway through `{cut_in}`, which may be short"
+        return text + (f"; {_code_list(missing)} never started" if missing else "")
+    # No raw text to place the cut: say only what the parsed data shows.
+    if missing and last:
+        return (
+            f"{_code_list(missing)} never arrived, and `{last}`, the last bucket "
+            f"that did, may be short"
+        )
+    if missing:
+        return f"none of its output arrived intact ({_code_list(missing)})"
+    if last:
+        return f"only its last bucket, `{last}`, was cut short"
+    return ""
+
+
+def _render_truncations(report):
+    """The passes cut off at their output-token ceiling, and what each one lost.
+
+    This was one line naming the passes, and it was the only place a
+    truncation showed. A truncated fact-check reads exactly like a finished
+    one below it — its findings are well-formed and nothing says the model
+    stopped before `contradicted` — so the part a reader needs is which
+    buckets never arrived, not just which pass.
+    """
+    truncated = report.get("truncated_results") or []
+    if not truncated:
+        return []
+
+    details = report.get("truncated_result_details") or []
+    lines = [f"## ⚠ Truncated model passes ({len(truncated)})", ""]
+    if not details:
+        # A report written before the details existed. Say what is known.
+        lines.append(
+            "These hit their output-token ceiling: complete findings were kept, "
+            f"the rest lost. Passes: {', '.join(truncated)}"
+        )
+        lines.append("")
+        return lines
+
+    lines.append(
+        "Each of these hit its output-token ceiling before it finished. Every "
+        "complete finding it wrote is in the sections below; whatever it had not "
+        "written yet is not, and nothing in those sections marks where."
+    )
+    lines.append("")
+    for detail in details:
+        used = detail.get("completion_tokens")
+        ceiling = detail.get("max_tokens")
+        used_str = f" after {used:,} output tokens" if isinstance(used, int) else ""
+        # Unknown is not "the model's own limit": a capture from before the
+        # ceiling was recorded hit a 16,000 ceiling it simply did not write down.
+        limit = (
+            f"its {ceiling:,}-token output ceiling"
+            if isinstance(ceiling, int)
+            else "its output-token ceiling"
+        )
+        if isinstance(used, int) and isinstance(ceiling, int) and used > ceiling:
+            # Not a contradiction: a grounded claude call runs a server-side
+            # search loop, each iteration gets the full ceiling, and the
+            # reported output is their sum. Said here because the bare numbers
+            # read as though the ceiling could not have been the cause.
+            used_str += (
+                " across its search iterations, each of which gets the full ceiling"
+            )
+        line = (
+            f"- **{detail.get('pass')}** ({detail.get('model')}) hit {limit}{used_str}"
+        )
+        cut = _cut_description(detail)
+        lines.append(f"{line} — {cut}." if cut else f"{line}.")
+        if detail.get("section"):
+            lines.append(
+                f"  - {detail['section']} is missing anything only this model "
+                f"would have added there."
+            )
+    lines.append("")
+    return lines
+
+
+def _truncated_models_note(report, domain):
+    """One line per model cut off on ``domain``, saying what never arrived, or []."""
+    lines = []
+    for detail in report.get("truncated_result_details") or []:
+        if detail.get("domain") != domain:
+            continue
+        cut = _cut_description(detail)
+        lines.append(
+            f"> **Incomplete: {detail.get('model') or detail.get('pass')} hit its "
+            f"output-token ceiling before it finished**"
+            + (f" — {cut}" if cut else "")
+            + ". Anything only that model would have put there is missing here, "
+            "not absent from the draft (see *Truncated model passes* above)."
+        )
+        lines.append("")
+    return lines
+
+
 def _missing_models_note(report, domain):
     """One line naming the models that failed on ``domain``, or []."""
     missing = [
@@ -820,6 +940,7 @@ def _domain_notes(report, domain):
     """
     return (
         _missing_models_note(report, domain)
+        + _truncated_models_note(report, domain)
         + _not_run_note(report, domain)
         + _metadata_gap_note(report, domain)
     )
@@ -2970,14 +3091,7 @@ def render_report_markdown(report):
     lines.extend(_render_model_failures(report))
     lines.extend(_render_domains_not_run(report))
     lines.extend(_render_degradations(report))
-
-    if report.get("truncated_results"):
-        lines.append(
-            "WARNING — truncated model responses (output-token ceiling hit; "
-            "some findings were recovered, some were lost): "
-            f"{', '.join(report['truncated_results'])}"
-        )
-        lines.append("")
+    lines.extend(_render_truncations(report))
 
     if report.get("empty_results"):
         lines.append(

@@ -842,7 +842,10 @@ class TestStreamTimingReachesTheReport:
         lines = _calibration_lines(caplog)
         assert lines, "no [CALIBRATION] lines were logged"
         for line in lines:
-            assert line.endswith(" first_byte=>120.02s,14.5s max_gap=-,3.25s"), line
+            # max_tokens follows them: appended after, for the same reason.
+            assert line.endswith(
+                " first_byte=>120.02s,14.5s max_gap=-,3.25s max_tokens=-"
+            ), line
             # Appended, not interleaved: the nine fields anything already
             # splits this line into keep their positions.
             keys = [field.split("=", 1)[0] for field in line.split()[1:]]
@@ -858,6 +861,7 @@ class TestStreamTimingReachesTheReport:
                 "headroom",
                 "first_byte",
                 "max_gap",
+                "max_tokens",
             ]
 
     def test_a_call_with_no_timing_says_so_rather_than_inventing_one(
@@ -870,7 +874,9 @@ class TestStreamTimingReachesTheReport:
 
         lines = _calibration_lines(caplog)
         assert lines, "no [CALIBRATION] lines were logged"
-        assert all(line.endswith(" first_byte=- max_gap=-") for line in lines)
+        assert all(
+            line.endswith(" first_byte=- max_gap=- max_tokens=-") for line in lines
+        )
         assert not any("stream_timing" in e for e in report["api_call_log"])
 
 
@@ -966,6 +972,144 @@ class TestARecoveredCallStillCostsWhatItCost:
             every_attempt["by_pass"][0]["total_usd"], abs=1e-6
         )
         assert summary["total_usd"] > clean["total_usd"]
+
+
+class TestATruncatedPassIsReportedAsIncomplete:
+    """A pass cut off at its output ceiling, carried to every place it is read.
+
+    Shaped like honda-navigation run 3's mistral:fact_check (2026-09-18): the
+    salvaged JSON held `confirmed` and `outdated`, and nothing after — no
+    `contradicted` at all. The report said so in one header line, and the
+    end-of-run summary not at all.
+    """
+
+    _PASS = "gemini:fact_check"  # the fixture's only fact_check assignment
+    _LOST = [
+        "contradicted",
+        "unverifiable",
+        "primary_source_needed",
+        "out_of_scope",
+        "additional_observations",
+    ]
+
+    @staticmethod
+    def _truncated(model_name, domain, *a, **kw):
+        result = _fake_run_domain(model_name, domain, *a, **kw)
+        if domain == "fact_check":
+            full = _DOMAIN_DATA["fact_check"]
+            result["data"] = {k: full[k] for k in ("confirmed", "outdated")}
+            result["truncated"] = True
+            result["max_tokens"] = 16000
+            result["tokens"] = {"prompt": 1000, "completion": 16000}
+            # Stopped inside the first `contradicted` entry, as run 3 did.
+            result["raw"] = (
+                json.dumps(result["data"])[:-1]
+                + ', "contradicted": [{"claim": "Ten digits can count'
+            )
+        return result
+
+    def _stub(self):
+        return patch(
+            "ci_article_review.pipeline._run_domain", side_effect=self._truncated
+        )
+
+    def test_the_call_log_records_the_ceiling_it_hit(self, tmp_path, caplog):
+        with caplog.at_level("INFO"):
+            with _stubbed_run(
+                tmp_path, extra_patches=[self._stub()], offline=True
+            ) as report:
+                pass
+        entry = next(e for e in report["api_call_log"] if e["pass"] == self._PASS)
+        assert entry["status"] == "partial"
+        assert entry["max_tokens"] == 16000
+        assert "against a 16000-token ceiling" in caplog.text
+        line = next(
+            ln for ln in _calibration_lines(caplog) if "domain=fact_check" in ln
+        )
+        assert line.endswith(" max_tokens=16000"), line
+
+    def test_the_report_says_which_buckets_never_arrived(self, tmp_path):
+        with _stubbed_run(
+            tmp_path, extra_patches=[self._stub()], offline=True
+        ) as report:
+            pass
+        (detail,) = report["truncated_result_details"]
+        assert detail == {
+            "pass": self._PASS,
+            "model": "gemini-test-model",
+            "domain": "fact_check",
+            "section": "SECTION 2: Factual Verification",
+            "completion_tokens": 16000,
+            "max_tokens": 16000,
+            "missing_buckets": self._LOST,
+            "last_bucket": "outdated",
+            "cut_in": "contradicted",
+        }
+
+    def test_section_2_and_the_worklist_say_it_on_disk(self, tmp_path):
+        with _stubbed_run(tmp_path, extra_patches=[self._stub()], offline=True):
+            pass
+        (review,) = (tmp_path / "history").rglob("run_1_*_review.md")
+        section = review.read_text(encoding="utf-8").split("## SECTION 2")[1]
+        section = section.split("## SECTION 3")[0]
+        assert "Incomplete: gemini-test-model hit its output-token ceiling" in section
+        assert "cut off inside `contradicted`" in section
+        (worklist_md,) = (tmp_path / "history").rglob("run_1_*_worklist.md")
+        assert "Built from an incomplete fact-check" in worklist_md.read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_end_of_run_summary_warns(self, tmp_path, capsys):
+        with _stubbed_run(tmp_path, extra_patches=[self._stub()], offline=True):
+            pass
+        out = capsys.readouterr().out
+        assert "model pass(es) were cut off at their output-token ceiling" in out
+        assert (
+            f"{self._PASS} truncated after 16000 output tokens (ceiling 16000)" in out
+        )
+        assert f"Never arrived: {', '.join(self._LOST)}." in out
+
+    def test_a_clean_run_raises_none_of_it(self, tmp_path, capsys):
+        with _stubbed_run(tmp_path, offline=True) as report:
+            pass
+        assert report["truncated_result_details"] == []
+        assert "cut off at their output-token ceiling" not in capsys.readouterr().out
+
+
+class TestNoTimeoutLiftsTheOutputCeiling:
+    """A calibration run exists to measure a call's real length. Cut off at a
+    ceiling, a call reports the ceiling instead — so --no-timeout lifts both."""
+
+    def test_a_capped_provider_is_sent_its_models_own_limit(
+        self, tmp_path, monkeypatch
+    ):
+        from ci_core.llm import output_tokens
+
+        monkeypatch.setattr(output_tokens, "model_output_limit", lambda p, m: 128000)
+        # A copy: the pipeline writes budgets back into the config it is given,
+        # and _CONFIG is shared with every other test in this file.
+        config = copy.deepcopy(_CONFIG)
+        seen = {}
+
+        def _capture(model_name, domain, *a, **kw):
+            seen[model_name] = dict(a[5][model_name])  # the model_configs arg
+            return _fake_run_domain(model_name, domain, *a, **kw)
+
+        with _stubbed_run(
+            tmp_path,
+            extra_patches=[
+                patch("ci_article_review.pipeline.merge_configs", return_value=config),
+                patch("ci_article_review.pipeline._run_domain", side_effect=_capture),
+            ],
+            offline=True,
+            no_timeout=True,
+        ):
+            pass
+        assert seen["mistral"]["max_tokens"] == 128000
+        assert seen["mistral"]["timeout_seconds"] == 3600
+        # The providers that send no ceiling are not handed one.
+        assert "max_tokens" not in seen["openai"]
+        assert "max_tokens" not in seen["gemini"]
 
 
 class TestADomainWithNoReviewerReachesTheReport:

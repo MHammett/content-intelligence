@@ -80,6 +80,7 @@ from ci_core.concurrency import (
 )
 from ci_core.http import impersonation_available
 from ci_core.llm.model_registry import check_model_currency
+from ci_core.llm import output_tokens
 from ci_core.llm import timeout_model
 from . import live_model_check
 from .analysis import readability as readability_analysis
@@ -1442,6 +1443,19 @@ def _run_domain(
         provider_config["web_search"] = _web_search_enabled(
             provider_config["web_search"], domain
         )
+
+    # The output-token ceiling, sized for this pass rather than per provider:
+    # fact_check writes one entry per claim and needs more room than a domain
+    # returning a handful of flags. Sized here for the same reason the search
+    # flag is — this is the first point that knows the domain. An explicit
+    # max_tokens (user.yaml, preset_overrides, or --no-timeout's calibration
+    # lift) is left alone.
+    if "max_tokens" not in provider_config:
+        ceiling = output_tokens.compute_max_tokens(
+            model_name, provider_config, domain, len(draft)
+        )
+        if ceiling:
+            provider_config["max_tokens"] = ceiling
 
     result = llm.call_provider(
         model_name,
@@ -2919,8 +2933,16 @@ def run_draft_pipeline(
         for _prov, _cfg in model_configs.items():
             if isinstance(_cfg, dict) and _cfg.get("enabled", True):
                 _cfg["timeout_seconds"] = CALIBRATION_TIMEOUT
+                # And the output ceiling, for the same reason: a call cut off at
+                # its ceiling reports the ceiling, not its real length, so a
+                # measurement taken under one is censored. The largest value
+                # the model accepts; left alone where that is unknown.
+                _lift = output_tokens.calibration_ceiling(_prov, _cfg)
+                if _lift:
+                    _cfg["max_tokens"] = _lift
         log.info(
-            "Timeouts DISABLED for calibration (--no-timeout): all models set to %ds",
+            "Timeouts DISABLED for calibration (--no-timeout): all models set to "
+            "%ds; claude/mistral output ceilings lifted to the model's own limit",
             CALIBRATION_TIMEOUT,
         )
     else:
@@ -3301,6 +3323,9 @@ def run_draft_pipeline(
             if (budget is not None and elapsed is not None)
             else None
         )
+        # The output ceiling the call was actually sent — the token-side twin
+        # of the timeout budget. None for the providers that send none.
+        ceiling = result.get("max_tokens")
         log_entry = {
             "pass": f"{model_name}:{domain}",
             "model": f"{model_tag}{grounding}",
@@ -3313,6 +3338,7 @@ def run_draft_pipeline(
             "effort": effort,
             "timeout_budget_seconds": budget,
             "headroom_seconds": headroom,
+            "max_tokens": ceiling,
             "char_count": char_count,
             "status": status,
         }
@@ -3337,13 +3363,14 @@ def run_draft_pipeline(
         api_call_log.append(log_entry)
         # Machine-facing structured record — one grep-able line per call, persisted
         # to pipeline_history/pipeline_<date>.log for cross-run calibration analysis.
-        # first_byte/max_gap are appended rather than interleaved so the first
-        # nine fields keep their positions for anything that splits the line.
+        # first_byte/max_gap, then max_tokens, are appended rather than
+        # interleaved so the first nine fields keep their positions for anything
+        # that splits the line.
         first_byte, max_gap = _calibration_timing(result.get("stream_timing"))
         log.info(
             "[CALIBRATION] model=%s domain=%s effort=%s chars=%s budget=%ss "
             "elapsed=%ss out_tokens=%s status=%s headroom=%ss "
-            "first_byte=%s max_gap=%s",
+            "first_byte=%s max_gap=%s max_tokens=%s",
             model_tag.split(" ")[0],
             domain,
             effort,
@@ -3355,6 +3382,8 @@ def run_draft_pipeline(
             headroom,
             first_byte,
             max_gap,
+            # "-" for none sent, the way first_byte/max_gap write an absence.
+            ceiling if ceiling else "-",
         )
         if is_empty:
             # Deliberately a warning, and deliberately not the word "OK". This
@@ -3374,9 +3403,11 @@ def run_draft_pipeline(
                 f"({result.get('elapsed_seconds', '?')}s, {model_tag}{grounding})"
             )
         elif status_ok and truncated:
+            against = f" against a {ceiling}-token ceiling" if ceiling else ""
             log.warning(
-                f"  {model_name}:{domain}: PARTIAL — response was truncated "
-                f"(output-token ceiling); some findings recovered, some lost"
+                f"  {model_name}:{domain}: PARTIAL — cut off at the output-token "
+                f"ceiling after {out_tokens} output tokens{against}; complete "
+                f"findings kept, the rest lost"
             )
             if "raw_excerpt" in log_entry:
                 log.debug(
@@ -4141,6 +4172,36 @@ def _print_draft_summary(
         print(
             "  A well-formed empty response is not the same claim as "
             "'reviewed and found nothing' — treat these as missing coverage."
+        )
+
+    # Truncations, beside failures and empties because they are the same kind
+    # of news: a section built from less than the run intended. They were in
+    # the per-call log and the report's header, and nowhere in this block — the
+    # one people read — so a fact-check cut off before `contradicted` finished
+    # the run looking exactly like one that completed.
+    if report.get("truncated_results"):
+        print(
+            f"\nWARNING: {len(report['truncated_results'])} model pass(es) were "
+            f"cut off at their output-token ceiling:"
+        )
+        details = report.get("truncated_result_details") or []
+        if details:
+            for detail in details:
+                used = detail.get("completion_tokens")
+                ceiling = detail.get("max_tokens")
+                at = f" (ceiling {ceiling})" if ceiling else ""
+                spent = f" after {used} output tokens{at}" if used else at
+                print(f"  - {detail['pass']} truncated{spent}.")
+                missing = detail.get("missing_buckets") or []
+                if missing:
+                    print(f"    Never arrived: {', '.join(missing)}.")
+                if detail.get("section"):
+                    print(f"    {detail['section']} is incomplete for this model.")
+        else:
+            print(f"  {', '.join(report['truncated_results'])}")
+        print(
+            "  Complete findings were kept; the rest is missing, not absent "
+            "from the draft."
         )
 
     # Knock-on effects of those failures. Printed adjacent to the failure list
@@ -5063,7 +5124,9 @@ def build_parser():
     parser.add_argument(
         "--no-timeout",
         action="store_true",
-        help="Calibration: disable timeout truncation so true completion times are measured",
+        help="Calibration: disable timeout truncation, and lift claude's and "
+        "mistral's output-token ceilings to the model's own limit, so true "
+        "completion times and lengths are measured",
     )
     parser.add_argument(
         "--only-model",
