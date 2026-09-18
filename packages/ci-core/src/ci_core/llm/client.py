@@ -112,6 +112,7 @@ import httpx
 from .. import redact
 from .. import text_repair
 from . import cache as cache_mod
+from . import output_tokens
 from . import schema as schema_mod
 from .json_utils import extract_json_with_salvage
 from .tokens import normalize_tokens
@@ -645,12 +646,17 @@ def _qualified(provider, model):
     return f"{prefix}{model}"
 
 
-def _provider_params(provider, cfg, response_schema=None):
+def _provider_params(provider, cfg, response_schema=None, model=None):
     """Per-provider request parameters drawn from the model config.
 
     Only parameters the presets actually set are mapped. Anything unrecognised
     in the model config is left out rather than forwarded blindly — a stray key
     reaching a provider is a 400 mid-run, which costs a whole domain's review.
+
+    ``model`` is the model this attempt calls, which is a fallback's once the
+    chain has moved on. It matters where one request means different things to
+    different models: the same no-effort claude request thinks on one model and
+    not on the next.
     """
     cfg = cfg or {}
     params = {}
@@ -677,6 +683,16 @@ def _provider_params(provider, cfg, response_schema=None):
             # and on a grounded call every search iteration gets it afresh, so
             # the review pipeline sizes it per pass instead — see
             # ci_core/llm/output_tokens.py for why 16000 truncated fact_check.
+            default_max_tokens = 16000
+        elif output_tokens.effort_when_unset(
+            provider, _resolve_model(provider, model, cfg)
+        ):
+            # Nothing is sent, and the model thinks anyway: claude-opus-5 and
+            # claude-sonnet-5 run adaptive thinking at effort high when the
+            # request names neither, exactly as `effort: high` does (see
+            # output_tokens._EFFORT_WHEN_UNSET). That thinking spends from this
+            # ceiling, so it gets the reasoning fallback above rather than the
+            # 8000 below, which is sized for a model that answers without it.
             default_max_tokens = 16000
         else:
             # Was a flat 4096, and `cfg["max_tokens"]` was ignored on all three
@@ -1402,7 +1418,11 @@ def _attempt(
 ):
     """One model call, start to finish, as a result dict. Never raises."""
     spec = _PROVIDERS[provider]
-    params = _provider_params(provider, cfg, response_schema) if with_reasoning else {}
+    params = (
+        _provider_params(provider, cfg, response_schema, model=model)
+        if with_reasoning
+        else {}
+    )
     label = f"{provider} {model}"
     # Two budgets, two jobs: the socket read timeout is the first-byte
     # allowance, and the gap is the liveness detector applied after the stream

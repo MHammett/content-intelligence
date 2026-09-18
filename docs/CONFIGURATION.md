@@ -257,7 +257,7 @@ Under streaming the adapter passes `timeout=(connect, read_gap)` to the HTTP req
 
 #### Output-token ceiling is automatic too
 
-Claude and Mistral are the two providers whose requests carry an output-token ceiling (`max_tokens`); the other four run to the model's own limit. On a reasoning pass (`effort` / `reasoning_effort` set) the pipeline sizes that ceiling per call, from [`ci-core`'s `output_tokens.yaml`](../packages/ci-core/src/ci_core/configs/output_tokens.yaml):
+Claude and Mistral are the two providers whose requests carry an output-token ceiling (`max_tokens`); the other four run to the model's own limit. On a reasoning pass (`effort` / `reasoning_effort` set, or a Claude model that thinks with none set — see [below](#claude--adaptive-vs-extended-thinking)) the pipeline sizes that ceiling per call, from [`ci-core`'s `output_tokens.yaml`](../packages/ci-core/src/ci_core/configs/output_tokens.yaml):
 
 ```
 max_tokens = reasoning_tokens[effort] + answer_tokens[domain] × size_mult
@@ -293,14 +293,16 @@ models:
 
 **Critical distinction:** the mode depends on the model. Using the wrong mode causes a 400 error.
 
-| Model | Thinking mode | How to configure |
-|---|---|---|
-| claude-opus-4-8 | Adaptive (always on) | `effort: low/medium/high` — controls depth |
-| claude-fable-5 | Adaptive (always on, not configurable) | No config needed |
-| claude-sonnet-4-6 | Adaptive (always on) | `effort: low/medium/high` — controls depth |
-| claude-haiku-4-5-20251001 | Extended (opt-in) | `thinking_budget: N` — token ceiling |
+| Model | Thinking mode | With no `effort` set | How to configure |
+|---|---|---|---|
+| claude-opus-5, claude-sonnet-5 | Adaptive | **Thinks, at `high`** | `effort: low/medium/high` — controls depth |
+| claude-fable-5 | Adaptive (always on, cannot be turned off) | Thinks, at `high` | `effort:` controls depth |
+| claude-opus-4-8, claude-sonnet-4-6 | Adaptive | Does not think | `effort: low/medium/high` — turns it on and controls depth |
+| claude-haiku-4-5-20251001 | Extended (opt-in) | Does not think | `thinking_budget: N` — token ceiling |
 
-**Do not** set `thinking_budget` on Opus 4.8, Fable 5, or Sonnet 4.6 — they use adaptive thinking and the parameter is ignored (or causes an error). Use `effort:` instead. Only Haiku 4.5 uses extended thinking with `thinking_budget`.
+Leaving `effort` unset is not "no reasoning" on Opus 5 or Sonnet 5: Anthropic's API thinks by default on those models, at its default effort of `high`, so the run is the same as `effort: high`, and the pipeline sizes its output ceiling and wall-clock budget the same way. Set `effort: low` or `medium` to spend less. (Per-model defaults: Anthropic's [thinking troubleshooting](https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting) page.)
+
+**Do not** set `thinking_budget` on Opus 5, Sonnet 5, Opus 4.8, Fable 5, or Sonnet 4.6 — they use adaptive thinking and the parameter is ignored (or causes an error). Use `effort:` instead. Only Haiku 4.5 uses extended thinking with `thinking_budget`.
 
 ```yaml
 # Opus 4.8 or Sonnet 4.6 — adaptive thinking, control effort level

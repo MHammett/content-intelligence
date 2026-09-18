@@ -10,8 +10,11 @@
 # (Responses API), grok, gemini and perplexity send none and run to the model's
 # own limit. And only their REASONING passes (an `effort` / `reasoning_effort`
 # other than "none"); the no-effort paths keep client.py's 8000 default, which
-# nothing has truncated since it was set. An explicit `max_tokens` in a model
-# config always wins over this.
+# nothing has truncated since it was set. A claude model that thinks with no
+# effort set (claude-opus-5, claude-sonnet-5) is a reasoning pass at `high`, the
+# API default, not a no-effort one — see _EFFORT_WHEN_UNSET in
+# ci_core/llm/output_tokens.py. An explicit `max_tokens` in a model config
+# always wins over this.
 #
 # WHY THE FORMULA HAS TWO TERMS. Measured 2026-09-18 across every captured run on
 # this machine (1,144 ensemble calls). Before this file existed the ceiling was a

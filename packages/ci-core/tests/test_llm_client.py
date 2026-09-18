@@ -2320,6 +2320,162 @@ class TestClaudeOutputCeiling:
         to the ceiling would trade one silent failure for a cost surprise."""
         assert self._seen()["max_tokens"] <= 16000
 
+    @pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5"])
+    def test_a_model_that_thinks_with_no_effort_gets_the_reasoning_fallback(
+        self, model
+    ):
+        """Nothing is sent and the model thinks anyway, at high (see
+        TestClaudeRequestOnTheWire) — so it gets what `effort: high` gets, not
+        8000 to split between that thinking and the answer."""
+        seen = self._seen(model=model)
+        assert seen["max_tokens"] == 16000
+        assert "reasoning_effort" not in seen
+        assert "thinking" not in seen
+
+    def test_the_model_may_arrive_as_an_argument_rather_than_config(self):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call("claude", model="claude-opus-5", provider_config={})
+        assert seen["max_tokens"] == 16000
+
+    def test_a_fallback_is_sized_for_itself(self):
+        """One no-effort request thinks on claude-opus-5 and not on the
+        claude-sonnet-4-6 the chain falls back to."""
+        sent = []
+
+        def _primary_at_capacity(**kwargs):
+            sent.append((kwargs["model"], kwargs["max_tokens"]))
+            if len(sent) == 1:
+                raise _http_error(503, "model overloaded")
+            return _completion_stream()
+
+        with patch.object(
+            client.litellm, "completion", side_effect=_primary_at_capacity
+        ):
+            result = _call("claude", provider_config={"model": "claude-opus-5"})
+
+        assert result["fallback_from"] == "claude-opus-5"
+        assert sent == [
+            ("anthropic/claude-opus-5", 16000),
+            ("anthropic/claude-sonnet-4-6", 8000),
+        ]
+
+
+def _anthropic_sse(text):
+    """A complete Anthropic Messages stream, as it arrives on the wire."""
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 5},
+        },
+        {"type": "message_stop"},
+    ]
+    return "".join(
+        f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events
+    ).encode()
+
+
+class TestClaudeRequestOnTheWire:
+    """What reaches Anthropic, captured below litellm rather than at it.
+
+    Every other test in this file stops at the kwargs handed to litellm, which
+    is the seam this file is for. These go one layer lower because the question
+    is litellm's: does a claude config with no effort reach Anthropic with no
+    `thinking` at all? In litellm 1.96.2 it does — and on that request
+    claude-opus-5 and claude-sonnet-5 think, at effort high, by Anthropic's
+    per-model table. That is why their ceiling is sized for thinking; see
+    output_tokens._EFFORT_WHEN_UNSET.
+
+    ``httpx.Client.send`` is replaced, so litellm's own request transformation
+    runs in full and nothing leaves the machine.
+    """
+
+    @pytest.fixture
+    def wire(self, monkeypatch):
+        bodies = []
+
+        def _send(http_client, request, *args, **kwargs):
+            bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                content=_anthropic_sse('{"flags": []}'),
+            )
+
+        monkeypatch.setattr(httpx.Client, "send", _send)
+        return bodies
+
+    def _body(self, wire, **provider_config):
+        result = _call("claude", provider_config=provider_config)
+        assert result["failed"] is False, result
+        (body,) = wire
+        return body
+
+    @pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5"])
+    def test_no_effort_sends_no_thinking_under_a_ceiling_sized_for_it(
+        self, wire, model
+    ):
+        body = self._body(wire, model=model)
+        assert body["model"] == model
+        assert "thinking" not in body
+        assert "output_config" not in body
+        assert body["max_tokens"] == 16000
+
+    def test_effort_high_is_the_same_request_with_the_default_spelled_out(self, wire):
+        body = self._body(wire, model="claude-opus-5", effort="high")
+        assert body["thinking"] == {"type": "adaptive"}
+        assert body["output_config"] == {"effort": "high"}
+        assert body["max_tokens"] == 16000
+
+    def test_a_claude_none_is_dropped_before_it_is_sent(self, wire):
+        """So on claude-opus-5 it is unset, not off, and output_tokens.effort_of
+        sizes it as high on the strength of this."""
+        body = self._body(wire, model="claude-opus-5", effort="none")
+        assert "thinking" not in body
+        assert "output_config" not in body
+
+    @pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-haiku-4-5-20251001"])
+    def test_a_model_that_thinks_only_when_asked_keeps_8000(self, wire, model):
+        body = self._body(wire, model=model)
+        assert "thinking" not in body
+        assert body["max_tokens"] == 8000
+
+    def test_the_pipelines_computed_ceiling_is_what_is_sent(self, wire):
+        body = self._body(wire, model="claude-opus-5", max_tokens=40500)
+        assert body["max_tokens"] == 40500
+        assert "thinking" not in body
+
 
 class TestLitellmIsImportedLazily:
     """litellm must not be imported just because this module was.
