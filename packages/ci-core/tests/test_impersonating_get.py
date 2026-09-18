@@ -44,25 +44,51 @@ def _resp(status_code=200, url="https://example.com/doc", location=None, body=b"
     )()
 
 
+class _FakeCurlOpt:
+    """Stands in for ``curl_cffi.const.CurlOpt``: only the member used here."""
+
+    SSL_OPTIONS = "CURLOPT_SSL_OPTIONS"
+
+
+class _CurlError(Exception):
+    """curl_cffi's exceptions carry curl's error number as ``code``."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 @contextmanager
 def _fake_curl_cffi(responses):
     """Stand in for the optional ``curl_cffi`` extra.
 
     ``impersonating_get`` imports it inside the function body, so the module
-    only has to be in ``sys.modules`` by the time it is called.
+    only has to be in ``sys.modules`` by the time it is called. An exception
+    in ``responses`` is raised by that call instead of returned.
     """
     calls = []
 
     def _get(url, **kwargs):
         calls.append((url, kwargs))
-        return responses[len(calls) - 1]
+        outcome = responses[len(calls) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
     requests_mod = types.ModuleType("curl_cffi.requests")
     requests_mod.get = _get
+    const_mod = types.ModuleType("curl_cffi.const")
+    const_mod.CurlOpt = _FakeCurlOpt
     module = types.ModuleType("curl_cffi")
     module.requests = requests_mod
+    module.const = const_mod
     with patch.dict(
-        sys.modules, {"curl_cffi": module, "curl_cffi.requests": requests_mod}
+        sys.modules,
+        {
+            "curl_cffi": module,
+            "curl_cffi.requests": requests_mod,
+            "curl_cffi.const": const_mod,
+        },
     ):
         yield calls
 
@@ -190,18 +216,11 @@ class TestFailuresAllLookTheSame:
             assert http.impersonating_get("https://example.com/doc") is None
 
     def test_a_raising_transport_is_not_content(self):
-        class _Boom(types.ModuleType):
-            pass
-
-        requests_mod = types.ModuleType("curl_cffi.requests")
-        requests_mod.get = lambda url, **kw: (_ for _ in ()).throw(OSError("tls fail"))
-        module = _Boom("curl_cffi")
-        module.requests = requests_mod
-        with (
-            _hosts({}),
-            patch.dict(sys.modules, {"curl_cffi": module}),
-        ):
+        with _hosts({}), _fake_curl_cffi([OSError("tls fail")]) as calls:
             assert http.impersonating_get("https://example.com/doc") is None
+        # The request was actually attempted: None came from the transport
+        # raising, not from an import failing before it.
+        assert len(calls) == 1
 
     def test_the_optional_extra_being_absent_is_not_an_error(self):
         """The dependency ships as ``ci-core[unblock]``, so an end user who
@@ -288,3 +307,93 @@ class TestAbsentIsNotTheSameAsBlocked:
             with caplog.at_level("WARNING", logger=http.log.name):
                 assert http.impersonating_get("https://example.com/doc") is None
         assert "uv sync --extra unblock" not in caplog.text
+
+
+#: CURLSSLOPT_NATIVE_CA (1<<4) | CURLSSLOPT_NO_PARTIALCHAIN (1<<2), spelled out
+#: from curl/curl.h rather than read back from the module, so a wrong bit in
+#: ci_core.http fails here instead of agreeing with itself.
+_NATIVE_CA_WITHOUT_PARTIAL_CHAINS = (1 << 4) | (1 << 2)
+
+
+class TestTheEscalationTrustsWhatTheOSTrusts:
+    """curl_cffi does its own TLS, so the truststore fix to ``os_trust_get``
+    never reached this tier. On www.ntia.gov, whose chain ends at a root
+    Windows trusts and certifi dropped, it failed with curl error 60 — and
+    ``impersonating_get`` turned that into a silent ``None``.
+    """
+
+    def test_on_windows_curl_uses_the_os_store_and_refuses_partial_chains(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(http, "_CURL_NATIVE_CA", True)
+        with _hosts({}), _fake_curl_cffi([_resp()]) as calls:
+            assert http.impersonating_get("https://www.ntia.gov/") is not None
+
+        kwargs = calls[0][1]
+        assert kwargs["curl_options"] == {
+            _FakeCurlOpt.SSL_OPTIONS: _NATIVE_CA_WITHOUT_PARTIAL_CHAINS
+        }
+        # curl_cffi verifies unless told not to, and ``verify`` is the only way
+        # to tell it. A source fetch that can be intercepted proves nothing.
+        assert "verify" not in kwargs
+
+    def test_elsewhere_curl_keeps_its_default_bundle(self, monkeypatch):
+        """curl documents NATIVE_CA for OpenSSL-family backends on Windows
+        only, so no other platform is handed it."""
+        monkeypatch.setattr(http, "_CURL_NATIVE_CA", False)
+        with _hosts({}), _fake_curl_cffi([_resp()]) as calls:
+            http.impersonating_get("https://www.ntia.gov/")
+
+        assert calls[0][1]["curl_options"] == {}
+        assert "verify" not in calls[0][1]
+
+    def test_every_redirect_hop_carries_the_same_trust(self, monkeypatch):
+        monkeypatch.setattr(http, "_CURL_NATIVE_CA", True)
+        with (
+            _hosts({}),
+            _fake_curl_cffi(
+                [
+                    _resp(301, location="https://www.ntia.gov/moved"),
+                    _resp(200, url="https://www.ntia.gov/moved"),
+                ]
+            ) as calls,
+        ):
+            assert http.impersonating_get("https://www.ntia.gov/doc") is not None
+
+        assert [c[1]["curl_options"] for c in calls] == [
+            {_FakeCurlOpt.SSL_OPTIONS: _NATIVE_CA_WITHOUT_PARTIAL_CHAINS}
+        ] * 2
+
+    def test_a_certificate_failure_is_reported_not_swallowed(self, caplog):
+        """Still ``None`` — callers treat that as "the block held" and fall
+        through to the archive — but a certificate failure means the request
+        never reached the page, so it is said out loud."""
+        err = _CurlError(
+            60,
+            "Failed to perform, curl: (60) SSL certificate OpenSSL verify "
+            "result: unable to get local issuer certificate (20).",
+        )
+        with _hosts({}), _fake_curl_cffi([err]):
+            with caplog.at_level("WARNING", logger=http.log.name):
+                assert http.impersonating_get("https://www.ntia.gov/doc") is None
+
+        assert "failed certificate verification" in caplog.text
+        assert "https://www.ntia.gov/doc" in caplog.text
+        assert "unable to get local issuer certificate" in caplog.text
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            _CurlError(28, "curl: (28) Operation timed out"),
+            _CurlError(6, "curl: (6) Could not resolve host"),
+            OSError("connection reset"),
+            _resp(403),
+        ],
+        ids=["timeout", "dns", "no-code", "held-block"],
+    )
+    def test_other_failures_do_not_claim_a_certificate_problem(self, outcome, caplog):
+        with _hosts({}), _fake_curl_cffi([outcome]):
+            with caplog.at_level("WARNING", logger=http.log.name):
+                assert http.impersonating_get("https://example.com/doc") is None
+
+        assert "certificate" not in caplog.text

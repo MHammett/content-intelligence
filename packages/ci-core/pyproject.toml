@@ -16,6 +16,14 @@ dependencies = [
     # Still used by ci_core.extract and ci_core.http (link checking), and by
     # redact.capture_error_body's requests.HTTPError handling.
     "requests>=2.31.0,<3.0",
+    # ci_core.http verifies fetched sources against the OS trust store rather
+    # than certifi: on certifi alone, www.ntia.gov (a chain ending at a root
+    # Windows trusts and certifi dropped) failed on every citation. Required,
+    # not an extra, because the failure is silent in the output — the citation
+    # just reads as unreachable. The floor is 0.10.4 for its fix to a
+    # thread-safety bug in configuring the internal SSLContext; the resolver
+    # fetches from a thread pool.
+    "truststore>=0.10.4",
     "pyyaml>=6.0,<7.0",
     # ci_core.extract — text extraction from PDF citation sources. Many of the
     # primary documents this pipeline verifies against (ICNIRP guidelines, NIOSH

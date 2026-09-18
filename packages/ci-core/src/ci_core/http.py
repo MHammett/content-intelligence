@@ -9,10 +9,14 @@ the string from drifting back to per-package values.
 import ipaddress
 import logging
 import socket
+import ssl
+import sys
 from importlib import metadata
 from urllib.parse import urlparse
 
 import requests
+import truststore
+from requests.adapters import HTTPAdapter
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +52,99 @@ DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+# ---------------------------------------------------------------------------
+# Certificate verification: the operating system's trust store
+# ---------------------------------------------------------------------------
+#
+# Third-party pages — citation sources, the links an article cites, a --url
+# article — are fetched through ``os_trust_get``/``os_trust_head`` below, which
+# verify TLS against the operating system's trust store instead of certifi's
+# copy of Mozilla's. Measured 2026-09-17 on Windows: three hosts the OS store
+# verifies failed under certifi with "unable to get local issuer certificate",
+# for two different reasons.
+#
+#   * www.ntia.gov and www.ntia.doc.gov send a *complete* chain (Cloudflare,
+#     via an SSL.com transit CA) that ends at the Comodo root "AAA Certificate
+#     Services". Windows trusts that root for server auth; certifi 2026.6.17
+#     no longer ships it. Nothing is missing from the handshake — the two
+#     stores disagree about the root. NTIA runs the BEAD broadband program, a
+#     primary source for this publication, so every citation to it failed.
+#   * techinfo.honda.com sends the wrong intermediate. Windows fetches the
+#     right one from the leaf's AIA caIssuers URL; a static bundle cannot.
+#
+# truststore (the verifier pip adopted as its default in 24.2) is passed here
+# as an explicit ``truststore.SSLContext``, not via ``inject_into_ssl()``.
+# truststore's docs reserve injection for applications, and ci_core is a
+# library; injection is also process-global, so it would swap the verifier
+# under litellm's provider traffic — which works — to fix a problem that exists
+# only in source fetching. Doing it here covers every console script and every
+# direct caller (tests, replay scripts that import ``pipeline.main``) with
+# nothing to remember at an entry point.
+#
+# This only ever widens trust relative to certifi. requests still loads certifi
+# into the context, and truststore falls back to those certificates when the
+# platform verifier rejects a chain.
+#
+# Not a fix on Linux, where the OS store is itself Mozilla-derived and NTIA
+# fails the same way. What would fix it there is AIA chasing: the Cloudflare
+# intermediate's caIssuers URL serves a cross-sign of the SSL.com transit CA to
+# "SSL.com TLS ECC Root CA 2022", which certifi does ship (verified 2026-09-17).
+# Not built, because this pipeline runs on Windows.
+
+
+def _os_trust_context():
+    """A fresh TLS context that verifies against the OS trust store.
+
+    Fresh per session rather than shared: urllib3 sets ``verify_mode`` on the
+    context it is handed and loads CA files into it, so one context shared by
+    the resolver's worker threads would let one request's settings reach
+    another's.
+    """
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+class _OSTrustAdapter(HTTPAdapter):
+    """An ``HTTPAdapter`` whose connection pools all use ``_os_trust_context``."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = _os_trust_context()
+        super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        # HTTPS tunnelled through a proxy takes its context from the proxy
+        # manager, not from init_poolmanager's pools. Without this, setting
+        # HTTPS_PROXY would silently put every fetch back on certifi.
+        proxy_kwargs.setdefault("ssl_context", _os_trust_context())
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
+def _os_trust_session():
+    session = requests.Session()
+    session.mount("https://", _OSTrustAdapter())
+    return session
+
+
+def os_trust_get(url, **kwargs):
+    """``requests.get``, verifying TLS against the operating system's trust store.
+
+    A drop-in replacement: same arguments, same defaults, same exceptions. Like
+    ``requests.get`` it opens a session per call, so it is as safe to call from
+    concurrent threads as the function it replaces.
+    """
+    with _os_trust_session() as session:
+        return session.get(url, **kwargs)
+
+
+def os_trust_head(url, **kwargs):
+    """``requests.head``, verifying TLS against the OS trust store.
+
+    Same drop-in contract as ``os_trust_get``, including requests' default of
+    not following redirects on a HEAD.
+    """
+    with _os_trust_session() as session:
+        return session.head(url, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +286,7 @@ def safe_get(url, *, timeout=15, headers=None, allow_redirects=True, **kwargs):
     current = url
     for _hop in range(_MAX_REDIRECTS + 1):
         _guard(current)
-        resp = requests.get(
+        resp = os_trust_get(
             current, timeout=timeout, headers=headers, allow_redirects=False, **kwargs
         )
         if not allow_redirects or not resp.is_redirect:
@@ -212,7 +309,7 @@ def safe_head(url, *, timeout=15, headers=None, **kwargs):
     current = url
     for _hop in range(_MAX_REDIRECTS + 1):
         _guard(current)
-        resp = requests.head(
+        resp = os_trust_head(
             current, timeout=timeout, headers=headers, allow_redirects=False, **kwargs
         )
         if not resp.is_redirect:
@@ -233,6 +330,8 @@ __all__ = [
     "HOST_UNRESOLVABLE",
     "classify_host",
     "is_public_host",
+    "os_trust_get",
+    "os_trust_head",
     "safe_get",
     "safe_head",
     "impersonation_available",
@@ -303,6 +402,47 @@ def _warn_impersonation_unavailable():
     )
 
 
+#: Bits of curl's ``CURLOPT_SSL_OPTIONS`` (curl/curl.h). curl_cffi exposes the
+#: option but not its bits.
+_CURLSSLOPT_NO_PARTIALCHAIN = 1 << 2
+_CURLSSLOPT_NATIVE_CA = 1 << 4
+
+#: curl documents ``CURLSSLOPT_NATIVE_CA`` for OpenSSL-family backends on
+#: Windows only. Elsewhere curl_cffi keeps its own default bundle (certifi).
+_CURL_NATIVE_CA = sys.platform == "win32"
+
+#: ``CURLE_PEER_FAILED_VERIFICATION``: the server's certificate did not verify.
+_CURLE_PEER_FAILED_VERIFICATION = 60
+
+
+def _curl_trust_options(curl_opt):
+    """``curl_options`` giving the escalation tier the same trust as ``os_trust_get``.
+
+    curl_cffi does its own TLS (BoringSSL inside libcurl), so truststore never
+    reaches it: after ``os_trust_get`` fixed NTIA's plain fetch, this tier still
+    failed there with curl error 60, "unable to get local issuer certificate".
+    ``NATIVE_CA`` has curl import the Windows certificate stores next to its
+    CA bundle. Measured 2026-09-17 with curl_cffi 0.16.3: NTIA went from that
+    error to HTTP 200 with 91,944 bytes of page.
+
+    ``NO_PARTIALCHAIN`` is not optional alongside it. ``NATIVE_CA`` imports the
+    Windows *intermediate* store as well as the roots — which is how
+    techinfo.honda.com verified, since its missing intermediate is cached there
+    — and curl otherwise accepts any certificate in its store as a trust
+    anchor. Measured: with a bundle holding only an intermediate and no root,
+    curl's default verified static.nhtsa.gov, and ``NO_PARTIALCHAIN`` refused
+    it. With the bit set, cached intermediates only help build a chain, and
+    every chain must still end at a root.
+
+    Verification is never disabled. A source that cannot be verified stays
+    unverified: this pipeline fact-checks against what it fetches, and a fetch
+    that can be intercepted proves nothing.
+    """
+    if not _CURL_NATIVE_CA:
+        return {}
+    return {curl_opt.SSL_OPTIONS: _CURLSSLOPT_NATIVE_CA | _CURLSSLOPT_NO_PARTIALCHAIN}
+
+
 def impersonating_get(url, timeout=30):
     """Fetch ``url`` with a browser TLS fingerprint, or return ``None``.
 
@@ -343,12 +483,20 @@ def impersonating_get(url, timeout=30):
     challenge`` means the fingerprint was rejected and the fix is a newer
     curl_cffi; its absence means the origin refuses browsers too, which is a
     subscription or JS gate and not worth chasing.
+
+    A certificate failure also returns ``None``, but is logged as a warning:
+    it means the request never reached the page, so it says nothing about
+    whether the site blocks. curl_cffi verifies TLS itself, independently of
+    Python's ``ssl`` — see ``_curl_trust_options`` for how it is given the same
+    trust as ``os_trust_get``.
     """
     try:
         from curl_cffi import requests as _cffi
+        from curl_cffi.const import CurlOpt
     except ImportError:
         _warn_impersonation_unavailable()
         return None
+    curl_options = _curl_trust_options(CurlOpt)
     current = url
     try:
         for _hop in range(_MAX_REDIRECTS + 1):
@@ -359,6 +507,7 @@ def impersonating_get(url, timeout=30):
                 timeout=timeout,
                 headers=BROWSER_HEADERS,
                 allow_redirects=False,
+                curl_options=curl_options,
             )
             if not 300 <= resp.status_code < 400:
                 break
@@ -369,7 +518,19 @@ def impersonating_get(url, timeout=30):
             current = requests.compat.urljoin(current, location)
         else:
             return None
-    except Exception:
+    except Exception as exc:
+        # Still None, as for every other failure, but not silently. A block is
+        # an answer from the site; a certificate failure means the request
+        # never reached it, so the escalation was not really attempted. That is
+        # how this tier failed on every NTIA citation, invisibly.
+        if getattr(exc, "code", None) == _CURLE_PEER_FAILED_VERIFICATION:
+            log.warning(
+                "TLS-impersonation fetch of %s failed certificate verification, "
+                "so it never reached the page — a trust-store problem, not a "
+                "block: %s",
+                current,
+                exc,
+            )
         return None
     # >= 300 rather than >= 400: the loop also breaks on a 3xx carrying no
     # Location, which is a redirect we cannot follow rather than a document.

@@ -139,11 +139,11 @@ class TestWaybackFallbackOnUnreadableOrigin:
 
         with (
             patch(
-                "ci_article_review.analysis.links.requests.head",
+                "ci_article_review.analysis.links.os_trust_head",
                 return_value=self._head_response(403),
             ),
             patch(
-                "ci_article_review.analysis.links.requests.get",
+                "ci_article_review.analysis.links.os_trust_get",
                 return_value=self._get_response(403),
             ),
             patch(
@@ -167,11 +167,11 @@ class TestWaybackFallbackOnUnreadableOrigin:
     def test_403_with_no_snapshot_stays_blocked(self):
         with (
             patch(
-                "ci_article_review.analysis.links.requests.head",
+                "ci_article_review.analysis.links.os_trust_head",
                 return_value=self._head_response(403),
             ),
             patch(
-                "ci_article_review.analysis.links.requests.get",
+                "ci_article_review.analysis.links.os_trust_get",
                 return_value=self._get_response(403),
             ),
             patch(
@@ -189,7 +189,7 @@ class TestWaybackFallbackOnUnreadableOrigin:
     def test_404_does_not_attempt_wayback_fallback(self):
         with (
             patch(
-                "ci_article_review.analysis.links.requests.head",
+                "ci_article_review.analysis.links.os_trust_head",
                 return_value=self._head_response(404),
             ),
             patch("ci_article_review.analysis.links.wayback_check") as mock_wb,
@@ -204,7 +204,7 @@ class TestWaybackFallbackOnUnreadableOrigin:
     def test_410_does_not_attempt_wayback_fallback(self):
         with (
             patch(
-                "ci_article_review.analysis.links.requests.head",
+                "ci_article_review.analysis.links.os_trust_head",
                 return_value=self._head_response(410),
             ),
             patch("ci_article_review.analysis.links.wayback_check") as mock_wb,
@@ -219,7 +219,7 @@ class TestWaybackFallbackOnUnreadableOrigin:
         for — see wayback._FALLBACK_STATUSES for the reasoning."""
         with (
             patch(
-                "ci_article_review.analysis.links.requests.head",
+                "ci_article_review.analysis.links.os_trust_head",
                 return_value=self._head_response(503),
             ),
             patch("ci_article_review.analysis.links.wayback_check") as mock_wb,
@@ -233,7 +233,7 @@ class TestWaybackFallbackOnUnreadableOrigin:
         """Run _check_http where the HEAD request raises ``exc``."""
         snap_resp = MagicMock(status_code=200)
         with (
-            patch("ci_article_review.analysis.links.requests.head", side_effect=exc),
+            patch("ci_article_review.analysis.links.os_trust_head", side_effect=exc),
             patch(
                 "ci_article_review.analysis.links.safe_get",
                 return_value=snap_resp,
@@ -295,7 +295,7 @@ class TestWaybackFallbackOnUnreadableOrigin:
         """Only unreachable-origin failures qualify; a malformed URL doesn't."""
         with (
             patch(
-                "ci_article_review.analysis.links.requests.head",
+                "ci_article_review.analysis.links.os_trust_head",
                 side_effect=requests.exceptions.InvalidURL("bad url"),
             ),
             patch("ci_article_review.analysis.links.wayback_check") as mock_wb,
@@ -320,7 +320,7 @@ class TestWaybackFallbackOnUnreadableOrigin:
         snap_resp = MagicMock(status_code=200)
         with (
             patch(
-                "ci_article_review.analysis.links.requests.head",
+                "ci_article_review.analysis.links.os_trust_head",
                 side_effect=requests.exceptions.Timeout("timed out"),
             ),
             patch(
