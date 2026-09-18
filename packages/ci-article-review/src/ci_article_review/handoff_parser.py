@@ -334,7 +334,17 @@ def parse_publication_handoff(text):
 
 
 def _extract_field(text, label):
-    match = re.search(rf"^{re.escape(label)}\s*(.+)$", text, re.MULTILINE)
+    # [ \t]*, not \s*: \s crosses the newline, so a label left blank took the
+    # whole next line as its value — a blank "Author:" above "History key:
+    # a-piece" became the author "History key: a-piece", and citation
+    # verification was told that is who "I" refers to.
+    #
+    # (.*), not (.+). This searches the whole document, so a blank label that
+    # failed to match here would let the search run on to the next line that
+    # starts with the same label: an "Author:" in SOURCES ALREADY CITED, or in
+    # the draft itself. The first occurrence is the field, and blank reads as
+    # "", the same as absent.
+    match = re.search(rf"^{re.escape(label)}[ \t]*(.*)$", text, re.MULTILINE)
     return match.group(1).strip() if match else ""
 
 
