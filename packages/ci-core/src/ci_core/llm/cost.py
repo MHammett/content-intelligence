@@ -111,6 +111,10 @@ def call_log_entry(pass_name, result, default_model=""):
     # the overwhelming majority of calls, so only present when it happened.
     if result.get("discarded_attempts"):
         entry["discarded_attempts"] = result["discarded_attempts"]
+    # One record per stream the call opened: how long it went silent before
+    # and after real output. See ci_core.llm.client._StreamTiming.
+    if result.get("stream_timing"):
+        entry["stream_timing"] = result["stream_timing"]
     return entry
 
 

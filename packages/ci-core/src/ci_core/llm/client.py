@@ -95,6 +95,11 @@ report generator all read it:
 plus per-provider extras: ``citations`` / ``search_results`` (Perplexity),
 ``grounding_chunks`` / ``grounding_available`` (Gemini), ``truncated``,
 ``fallback_from``, ``misconfiguration_warning``.
+
+And ``stream_timing``: one record per stream the call opened, retries
+included — the longest the stream went without receiving anything before and
+after real output began, each flagged when it is only a lower bound. See
+:class:`_StreamTiming`.
 """
 
 import logging
@@ -371,6 +376,8 @@ class StreamStalled(Exception):
     ``_iter_with_gap``. Read it before changing a timeout: raising
     ``stream_read_timeout`` does nothing for a mid-stream stall, and vice versa.
     Both were observed in a single run on 2026-09-09 (see configs/timeouts.yaml).
+    Each stall is also recorded in the call's ``stream_timing``, as a lower
+    bound on the silence that caused it rather than a value equal to the budget.
 
     Carries 504 so it lands in the retryable set: a stall means the connection
     died, and a new socket genuinely fixes that — the same reasoning that makes
@@ -422,7 +429,125 @@ def _close_stream(stream):
     return False
 
 
-def _iter_with_gap(stream, first_byte, gap, is_progress=None):
+class _StreamTiming:
+    """The silences in one stream, measured the way its budgets enforce them.
+
+    A *silence* is any stretch in which nothing reached us: from calling
+    litellm until the stream opens, then from each chunk to the next, and from
+    the last chunk to the end of the stream. The budgets are per-silence, not
+    cumulative — the socket timeout restarts on every read, and
+    ``_iter_with_gap`` restarts its clock on every chunk — so the longest
+    silence in a phase is exactly what that phase's budget has to exceed:
+
+      ``first_byte_s``    longest silence before real output began. Bounded
+                          by ``stream_read_timeout``.
+      ``max_gap_s``       longest silence after it began. Bounded by
+                          ``stream_gap_timeout``. None if it never began.
+      ``first_output_s``  request to first real output. Not what a budget
+                          bounds (see below), but what "is red_team slower to
+                          its first token" asks.
+
+    "Chunk" means two things here because the detector uses it two ways. Only
+    a chunk ``is_progress`` accepts ends the first-byte phase, since that is
+    where the detector switches budgets: count any chunk and OpenAI's
+    ``response.created``, sent inside a second, would report a sub-second first
+    byte for a call that then reasoned in silence. But *every* chunk ends a
+    silence, since every chunk restarts the detector's clock: mistral's
+    reasoning arrives as ``{"type": "thinking"}`` chunks that are not progress,
+    so its time to first output can be long while no single silence is — and
+    only the silence says anything about the budget. That is why
+    ``first_output_s`` cannot stand in for ``first_byte_s``.
+
+    A stream that stops early — stalled, errored, abandoned — leaves the phase
+    it was in unfinished, so that phase's value is only a LOWER BOUND and is
+    flagged ``first_byte_censored`` / ``max_gap_censored`` (``first_output_s``
+    shares the first flag). The stalls are what this exists to measure, and
+    each is worth "longer than the budget", never "equal to it": record the
+    budget as the measurement and every dataset caps out at exactly the current
+    setting, appearing to confirm it.
+    """
+
+    def __init__(self, first_byte_budget, gap_budget, clock=time.monotonic):
+        self._clock = clock
+        self._sent = self._last = clock()
+        self._budgets = (first_byte_budget, gap_budget)
+        self._started = False
+        self._finished = False
+        self._first_byte = 0.0
+        self._max_gap = 0.0
+        self._first_output = None
+        self._cut_short_by = None
+
+    def _end_silence(self):
+        now = self._clock()
+        waited, self._last = now - self._last, now
+        if self._started:
+            self._max_gap = max(self._max_gap, waited)
+        else:
+            self._first_byte = max(self._first_byte, waited)
+        return now
+
+    def opened(self):
+        """Reading begins, which is where the detector's own clock starts.
+
+        For most providers litellm has sent the request and had the response
+        begin by now, so this ends a real wait. gemini's request is only sent
+        on the first read, so there the wait lands in the next silence instead
+        — inside the same first-byte phase either way.
+        """
+        self._end_silence()
+
+    def arrived(self, first_output=False):
+        """A chunk arrived; ``first_output`` when it is the first real output."""
+        now = self._end_silence()
+        if first_output and not self._started:
+            self._started = True
+            self._first_output = now - self._sent
+
+    def completed(self):
+        """The stream ended normally. Waiting for its end was a silence too."""
+        if not self._finished:
+            self._end_silence()
+            self._finished = True
+
+    def cut_short(self, cause):
+        """The stream stopped early, leaving its current phase a lower bound.
+
+        A no-op once the stream has ended, so a caller further up can report
+        the same exception without overwriting the record made where it was
+        raised — for a stall, before the socket was closed, so the bound is
+        what was actually waited and not that plus the close.
+        """
+        if self._finished:
+            return
+        now = self._end_silence()
+        self._finished = True
+        self._cut_short_by = cause if isinstance(cause, str) else type(cause).__name__
+        if not self._started:
+            self._first_output = now - self._sent
+
+    def as_dict(self):
+        """Plain values only: the result dict is json-dumped into the capture."""
+        # Unfinished means nothing reported how the stream ended, which no path
+        # in _attempt allows. Treated as cut short rather than trusted.
+        censored = self._cut_short_by is not None or not self._finished
+        record = {
+            "first_byte_s": round(self._first_byte, 2),
+            "first_byte_censored": censored and not self._started,
+            "first_output_s": (
+                None if self._first_output is None else round(self._first_output, 2)
+            ),
+            "max_gap_s": round(self._max_gap, 2) if self._started else None,
+            "max_gap_censored": censored and self._started,
+            "stream_read_timeout": self._budgets[0],
+            "stream_gap_timeout": self._budgets[1],
+        }
+        if self._cut_short_by:
+            record["cut_short_by"] = self._cut_short_by
+        return record
+
+
+def _iter_with_gap(stream, first_byte, gap, is_progress=None, timing=None):
     """Yield chunks, aborting if the stream goes quiet for too long.
 
     Two separate allowances: ``first_byte`` until the stream produces real work,
@@ -445,7 +570,13 @@ def _iter_with_gap(stream, first_byte, gap, is_progress=None):
     pipeline's six concurrent xhigh calls on a real draft blew straight through
     a 60s gap and every OpenAI domain failed. The thinking phase is what the
     first-byte allowance is *for*; only real output ends it.
+
+    ``timing`` is told as each silence ends and how the stream ended; see
+    :class:`_StreamTiming` for why every chunk ends a silence but only real
+    output ends the first-byte phase — the same split this loop makes.
     """
+    if timing is None:
+        timing = _StreamTiming(first_byte, gap)
     chunks = queue.Queue()  # unbounded: a bounded queue could block the reader
     # in ``put`` after the consumer has given up and stopped draining.
     done = object()
@@ -460,27 +591,40 @@ def _iter_with_gap(stream, first_byte, gap, is_progress=None):
             chunks.put(done)
 
     reader = threading.Thread(target=_read, name="litellm-stream-reader", daemon=True)
+    timing.opened()
     reader.start()
 
     budget = first_byte
     started = False
-    while True:
-        try:
-            item = chunks.get(timeout=budget)
-        except queue.Empty:
-            _close_stream(stream)
-            phase = "mid-stream" if started else "before the first chunk"
-            raise StreamStalled(
-                f"stream stalled {phase}: nothing received for {budget}s"
-            )
-        if item is done:
-            return
-        if isinstance(item, BaseException):
-            raise item
-        if not started and (is_progress is None or is_progress(item)):
-            started = True
-            budget = gap
-        yield item
+    try:
+        while True:
+            try:
+                item = chunks.get(timeout=budget)
+            except queue.Empty:
+                # Recorded before the close, which can block: the lower bound
+                # is what was waited, not that plus however long closing took.
+                timing.cut_short(StreamStalled.__name__)
+                _close_stream(stream)
+                phase = "mid-stream" if started else "before the first chunk"
+                raise StreamStalled(
+                    f"stream stalled {phase}: nothing received for {budget}s"
+                )
+            if item is done:
+                timing.completed()
+                return
+            if isinstance(item, BaseException):
+                raise item
+            first_output = not started and (is_progress is None or is_progress(item))
+            timing.arrived(first_output)
+            if first_output:
+                started = True
+                budget = gap
+            yield item
+    except BaseException as exc:
+        # A provider error relayed from the reader, or the consumer abandoning
+        # the stream (GeneratorExit). A no-op after a stall, recorded above.
+        timing.cut_short(exc)
+        raise
 
 
 def _resolve_model(provider, model_arg, cfg):
@@ -766,7 +910,7 @@ def _url_citations(annotations):
     return urls
 
 
-def _consume_completion_stream(stream, first_byte, gap):
+def _consume_completion_stream(stream, first_byte, gap, timing=None):
     """Drain a ``litellm.completion(stream=True)`` response.
 
     Returns the assembled text plus everything the pipeline reads off the
@@ -785,7 +929,9 @@ def _consume_completion_stream(stream, first_byte, gap):
     search_results = []
     grounding_meta = {}
 
-    for chunk in _iter_with_gap(stream, first_byte, gap, _completion_is_progress):
+    for chunk in _iter_with_gap(
+        stream, first_byte, gap, _completion_is_progress, timing
+    ):
         for choice in getattr(chunk, "choices", None) or []:
             delta = getattr(choice, "delta", None)
             if delta is not None:
@@ -835,7 +981,7 @@ def _consume_completion_stream(stream, first_byte, gap):
     )
 
 
-def _consume_responses_stream(stream, first_byte, gap):
+def _consume_responses_stream(stream, first_byte, gap, timing=None):
     """Drain a ``litellm.responses(stream=True)`` response (OpenAI).
 
     The Responses API streams typed events. ``response.output_text.delta``
@@ -852,7 +998,9 @@ def _consume_responses_stream(stream, first_byte, gap):
     usage = None
     status = None
 
-    for event in _iter_with_gap(stream, first_byte, gap, _responses_is_progress):
+    for event in _iter_with_gap(
+        stream, first_byte, gap, _responses_is_progress, timing
+    ):
         etype = getattr(event, "type", None)
         if etype == "response.output_text.delta":
             parts.append(getattr(event, "delta", "") or "")
@@ -1115,6 +1263,16 @@ def _discarded_field(discarded):
     return {"discarded_attempts": _summarise_discarded(discarded)} if discarded else {}
 
 
+def _stream_timing_field(streams):
+    """``{"stream_timing": [...]}``, one record per stream and oldest first.
+
+    Spread into all three result shapes, like ``_discarded_field`` above: a
+    call that stalled on both attempts and failed is the case the timing
+    exists for, so the failure path has to carry it too.
+    """
+    return {"stream_timing": [s.as_dict() for s in streams]} if streams else {}
+
+
 def _summarise_discarded(discarded):
     """Fold recorded discarded attempts into counts and recoverable tokens.
 
@@ -1234,8 +1392,30 @@ def _attempt(
     first_byte = timeout.read
     gap = _gap_timeout(cfg, provider)
     t0 = time.monotonic()
+    # One record per request this attempt sends, the retried ones included. A
+    # stall that the retry got past is exactly the observation the timing is
+    # for, and keeping only the final stream's numbers would report that call
+    # as clean. Scoped to this model: an earlier model in ``call``'s fallback
+    # chain is a different model, so its streams are not carried into the
+    # fallback's result (no fallback appears in any run log to 2026-09-17).
+    streams = []
 
     def _invoke():
+        # Started before litellm is called, so no wait for the provider goes
+        # unmeasured — including the one inside completion() itself, which is
+        # bounded by the socket timeout rather than by _iter_with_gap.
+        timing = _StreamTiming(first_byte, gap)
+        streams.append(timing)
+        try:
+            return _request(timing)
+        except BaseException as exc:
+            # Raised before any stream existed — an HTTP error, or the socket
+            # timing out while waiting for the response — so nothing below
+            # recorded how it ended. A no-op when _iter_with_gap already did.
+            timing.cut_short(exc)
+            raise
+
+    def _request(timing):
         if spec["surface"] == "responses":
             kwargs = {
                 "model": _qualified(provider, model),
@@ -1292,7 +1472,7 @@ def _attempt(
                 )
 
             return _consume_responses_stream(
-                _litellm().responses(**kwargs), first_byte, gap
+                _litellm().responses(**kwargs), first_byte, gap, timing
             )
 
         if provider in _SENDS_TEMPERATURE:
@@ -1324,6 +1504,7 @@ def _attempt(
             ),
             first_byte,
             gap,
+            timing,
         )
 
     def _extras_from(assembled):
@@ -1395,6 +1576,7 @@ def _attempt(
             # most expensive outcome — two full attempts, no usable result —
             # as the one the cost summary still could not see.
             **_discarded_field(discarded),
+            **_stream_timing_field(streams),
         }
     except Exception as exc:
         elapsed = round(time.monotonic() - t0, 2)
@@ -1419,6 +1601,7 @@ def _attempt(
             "_status": _status_of(exc),
             "_terminal": _is_terminal_quota_error(exc),
             **_discarded_field(discarded),
+            **_stream_timing_field(streams),
         }
 
     elapsed = round(time.monotonic() - t0, 2)
@@ -1453,6 +1636,7 @@ def _attempt(
     # threw away and replaced. Kept separate from ``tokens`` so the successful
     # call's own numbers stay honest; cost accounting adds them.
     result.update(_discarded_field(discarded))
+    result.update(_stream_timing_field(streams))
     return result
 
 

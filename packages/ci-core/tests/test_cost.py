@@ -496,6 +496,23 @@ class TestCallLogEntryBuilder:
         entry = cost.call_log_entry("x", {"model": "gpt-5.4", "tokens": {}})
         assert "discarded_attempts" not in entry
 
+    def test_it_carries_stream_timing(self):
+        """The same trap as discarded_attempts: the ensemble writes its own
+        entries, so without this every other pass would drop the field."""
+        streams = [
+            {"first_byte_s": 160.03, "first_byte_censored": True},
+            {"first_byte_s": 41.2, "first_byte_censored": False},
+        ]
+        entry = cost.call_log_entry(
+            "citation_verification:known_url",
+            {"model": "sonar", "tokens": {}, "stream_timing": streams},
+        )
+        assert entry["stream_timing"] == streams
+
+    def test_stream_timing_is_absent_when_the_call_recorded_none(self):
+        entry = cost.call_log_entry("x", {"model": "gpt-5.4", "tokens": {}})
+        assert "stream_timing" not in entry
+
     def test_the_default_model_is_used_when_the_result_has_none(self):
         entry = cost.call_log_entry("x", {"tokens": {}}, "fallback-model")
         assert entry["model"] == "fallback-model"
