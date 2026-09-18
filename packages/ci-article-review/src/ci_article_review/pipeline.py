@@ -2146,6 +2146,98 @@ def _keep_earlier_streams(failed, fresh):
     ] + list(fresh.get("stream_timing") or [])
 
 
+#: The client's own exceptions, by the text of the failure each one becomes —
+#: which says what happened but not which class raised it. Read from the text
+#: for the reason ``_PERMANENT_FAILURE_MARKERS`` is: a recovery pass sees the
+#: string a failure was turned into, never the exception.
+_CLIENT_FAILURE_MARKERS = (
+    ("stream stalled", llm.client.StreamStalled.__name__),
+    ("malformed json response", llm.client.MalformedJSONError.__name__),
+)
+
+#: litellm leads its exceptions' text with their class:
+#: "litellm.RateLimitError: RateLimitError: MistralException - ...".
+_ERROR_CLASS_PREFIX = re.compile(r"(?:litellm\.)?([A-Z]\w*):")
+
+#: The TimeoutError ci_core.concurrency raises when the pipeline stops waiting
+#: on a call: "Timed out after 300s", "Exceeded global timeout of 1100s".
+_TIMEOUT_MARKERS = ("timed out", "exceeded global timeout")
+
+
+def _failure_reason(error_text):
+    """The exception class a failed result's ``error`` text names, if any.
+
+    A class the text names outranks the timeout wording, which a provider's
+    own message can contain too. ``unknown`` is what the client's summary
+    already records for an attempt with no reason.
+    """
+    text = str(error_text or "")
+    lowered = text.lower()
+    for marker, reason in _CLIENT_FAILURE_MARKERS:
+        if marker in lowered:
+            return reason
+    named = _ERROR_CLASS_PREFIX.match(text)
+    if named:
+        return named.group(1)
+    if any(marker in lowered for marker in _TIMEOUT_MARKERS):
+        return TimeoutError.__name__
+    return "unknown"
+
+
+def _keep_earlier_billing(failed, fresh):
+    """Carry what a failed dispatch was billed for into the result replacing it.
+
+    The wholesale replacement ``_keep_earlier_streams`` repairs for timing
+    also dropped the billing. A failed result carries two kinds: the attempts
+    its own retry already threw away (``discarded_attempts``), and the attempt
+    that failed last, whose usage is its ``tokens``. ``cost.calculate`` sees
+    only the results that reach ``api_call_log``, so the 2026-09-09 ``maximum``
+    run reported 3 unpriced attempts while the fourteen stalled attempts behind
+    its seven recovered calls appeared nowhere. A malformed-JSON failure is
+    worse: its response is complete and billed with real usage, and that
+    dropped out of the dollar total itself.
+
+    Folded into the replacement's own ``discarded_attempts``, which cost
+    accounting already prices and counts: tokens are billed at the
+    replacement's model rate, and an attempt with none — a stall reports no
+    usage — is counted in ``uncosted_calls``, where it marks the total as a
+    floor. That rate is the failed model's in every run on record — no run log
+    in any checkout shows a fallback, to 2026-09-18 — and would differ only if
+    a capacity fallback answered one of the two calls and not the other.
+
+    Recovery only replaces failed results, so ``failed`` always is one. Not
+    applied to ``--retry-failed``: a capture's attempts were billed in the
+    report of the run that made them.
+    """
+    if not isinstance(failed, dict) or not isinstance(fresh, dict):
+        return
+    tokens = failed.get("tokens") or {}
+    last_attempt = {
+        "count": 1,
+        "costed": 1 if tokens.get("prompt") or tokens.get("completion") else 0,
+        "reasons": [_failure_reason(failed.get("error"))],
+        "tokens": tokens,
+    }
+    summaries = [
+        failed.get("discarded_attempts") or {},
+        last_attempt,
+        fresh.get("discarded_attempts") or {},
+    ]
+    total = {"prompt": 0, "completion": 0}
+    for summary in summaries:
+        for key, value in (summary.get("tokens") or {}).items():
+            total[key] = total.get(key, 0) + (value or 0)
+    fresh["discarded_attempts"] = {
+        "count": sum(s.get("count", 0) for s in summaries),
+        "costed": sum(s.get("costed", 0) for s in summaries),
+        "reasons": sorted({r for s in summaries for r in s.get("reasons") or ()}),
+        # Summed key by key, so a failed attempt's `cached` share keeps its
+        # cheaper rate; the client's own summary records none, and cost.py
+        # prices a missing share at the full input rate.
+        "tokens": total,
+    }
+
+
 def _recover_failed_calls(
     raw_results, runners, pipeline_cfg, model_configs, task_timeout
 ):
@@ -2186,6 +2278,7 @@ def _recover_failed_calls(
         )
         for name, fresh in retried.items():
             _keep_earlier_streams(raw_results.get(name), fresh)
+            _keep_earlier_billing(raw_results.get(name), fresh)
         raw_results.update(retried)
 
     still_failed = [name for name, r in raw_results.items() if r.get("failed")]
