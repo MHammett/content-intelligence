@@ -18,6 +18,9 @@ here for existing documents.]
 
 SEO METADATA
 Focus keyword: [keyword or phrase | or: derive from primary claim]
+SEO title: [the search-facing title, 20-60 chars | or: use OG title.
+Separate from the post title, so a short title such as "About" can stay
+short on the page and still be descriptive in search results.]
 Meta description: [under 155 characters | or: derive from opening paragraph]
 OG title: [or: use article title]
 OG description: [or: use meta description]

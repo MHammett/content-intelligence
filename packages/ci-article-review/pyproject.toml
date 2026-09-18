@@ -16,6 +16,11 @@ dependencies = [
     "requests>=2.31.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "python-dotenv>=1.0.0,<2.0",
+    # Drafts are Markdown end to end; WordPress stores HTML. Publishing sent
+    # the Markdown verbatim until 2026-09, so headings arrived as literal "##".
+    # Python-Markdown does the parsing; the block wrapping in adapters/cms/
+    # blocks.py uses the stdlib, which is why beautifulsoup4 is not here too.
+    "markdown>=3.4,<4.0",
 ]
 
 [project.optional-dependencies]

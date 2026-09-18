@@ -38,7 +38,13 @@ def _created_response():
 
 
 def _push(pub_params, **kw):
-    """Push with the network stubbed; returns (result, post_mock, get_mock)."""
+    """Push with the network stubbed; returns (result, post_mock, get_mock).
+
+    ``push`` issues more than one POST: the create, then Rank Math's
+    ``updateMeta``. Read the create with ``_created_call`` rather than
+    ``call_args``, which is the *last* call and would silently start asserting
+    against the SEO request instead.
+    """
     with (
         patch("ci_article_review.adapters.cms.wordpress.requests.post") as mock_post,
         patch("ci_article_review.adapters.cms.wordpress.requests.get") as mock_get,
@@ -49,6 +55,11 @@ def _push(pub_params, **kw):
         )
         result = push("<p>body</p>", pub_params, WP_CONFIG, RANK_MATH, **kw)
     return result, mock_post, mock_get
+
+
+def _created_call(mock_post):
+    """The POST that created the post/page — always the first one."""
+    return mock_post.call_args_list[0]
 
 
 class TestResolvePostType:
@@ -104,7 +115,14 @@ class TestPayload:
         assert "categories" not in payload
         assert "tags" not in payload
 
-    def test_page_still_carries_rank_math_meta(self):
+    def test_rank_math_keys_are_not_in_the_create_payload(self):
+        """This asserted the opposite until the fields were found never to apply.
+
+        Rank Math does not register its meta keys with the core REST API, and
+        core silently drops unregistered keys — so sending them here set
+        nothing while the publish returned 200. They go to Rank Math's own
+        endpoint after creation now; see test_wordpress_content_rendering.py.
+        """
         payload = _build_post_payload(
             {
                 "title": "About",
@@ -117,8 +135,7 @@ class TestPayload:
             tag_ids=[],
             post_type="page",
         )
-        assert payload["meta"]["rank_math_focus_keyword"] == "mike hammett"
-        assert payload["meta"]["rank_math_schema_type"] == "AboutPage"
+        assert not [k for k in payload.get("meta", {}) if k.startswith("rank_math_")]
 
     def test_page_is_still_a_draft_by_default(self):
         payload = _build_post_payload(
@@ -137,7 +154,7 @@ class TestPushRouting:
     def test_default_goes_to_posts(self):
         result, mock_post, _ = _push({"title": "Article", "tags": []})
         assert result["success"] is True
-        assert mock_post.call_args[0][0].endswith("/wp-json/wp/v2/posts")
+        assert _created_call(mock_post)[0][0].endswith("/wp-json/wp/v2/posts")
         assert result["post_type"] == "post"
 
     def test_page_goes_to_pages(self):
@@ -145,7 +162,7 @@ class TestPushRouting:
             {"title": "About", "post_type": "page", "tags": []}
         )
         assert result["success"] is True
-        assert mock_post.call_args[0][0].endswith("/wp-json/wp/v2/pages")
+        assert _created_call(mock_post)[0][0].endswith("/wp-json/wp/v2/pages")
         assert result["post_type"] == "page"
 
     def test_page_skips_term_lookup_calls(self):
@@ -190,4 +207,4 @@ class TestPushRouting:
         _, mock_post, _ = _push(
             {"title": "About", "post_type": "page", "tags": []}, publish_live=True
         )
-        assert mock_post.call_args[1]["json"]["status"] == "publish"
+        assert _created_call(mock_post)[1]["json"]["status"] == "publish"

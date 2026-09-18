@@ -350,6 +350,7 @@ def _parse_seo_block(text):
     seo = {}
     field_map = {
         "Focus keyword": "focus_keyword",
+        "SEO title": "seo_title",
         "Meta description": "meta_description",
         "OG title": "og_title",
         "OG description": "og_description",
