@@ -1303,10 +1303,16 @@ summary under `SEO issues`, an `## SEO Suggestions` section at the end of
 JSON.
 
 At publish time it runs only as a backstop: if a publication handoff reaches
-`--publish` with SEO METADATA still missing a focus keyword or meta description
-(including the template's `derive from primary claim` placeholders, which the
-parser drops), suggestions print before the WordPress confirmation prompt so you
-can cancel, fill the handoff in, and re-run.
+`--publish` with SEO METADATA still missing a focus keyword or meta description,
+suggestions print before the WordPress confirmation prompt so you can cancel,
+fill the handoff in, and re-run. A field counts as missing when it is blank,
+still on the template's bracketed placeholder
+(`[keyword or phrase | or: derive from primary claim]`), or one of the
+template's alternatives written out bare (`derive from primary claim`). The
+parser drops all three rather than send them to Rank Math. A value written
+entirely inside brackets reads as a placeholder too, and is logged as dropped,
+so write a real value without them. One that only begins with a bracketed tag,
+such as `[Case Study] How We Cut Costs`, is kept.
 
 **Nothing here is applied automatically** — not to a config, not to a handoff,
 not to WordPress. Keyword choice is a strategic decision about what you want to

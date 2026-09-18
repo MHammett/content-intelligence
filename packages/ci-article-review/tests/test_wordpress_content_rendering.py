@@ -103,11 +103,15 @@ PUBLICATION_TEMPLATE = (
 )
 
 
+def _template_seo_block():
+    """publication.md's SEO METADATA block, unfilled, as the template ships it."""
+    text = PUBLICATION_TEMPLATE.read_text(encoding="utf-8")
+    return text.split("\nSEO METADATA\n", 1)[1].split("\nEMBEDS AND", 1)[0]
+
+
 def _template_seo_labels():
     """The ``Label:`` lines publication.md's SEO METADATA block offers."""
-    text = PUBLICATION_TEMPLATE.read_text(encoding="utf-8")
-    block = text.split("\nSEO METADATA\n", 1)[1].split("\nEMBEDS AND", 1)[0]
-    return re.findall(r"^([A-Z][A-Za-z ]*):", block, re.MULTILINE)
+    return re.findall(r"^([A-Z][A-Za-z ]*):", _template_seo_block(), re.MULTILINE)
 
 
 def _handoff_from_seo_block(seo_lines):
@@ -159,6 +163,23 @@ class TestRankMathMeta:
         sentinel = f"sentinel for {label}"
         meta = _meta_from_handoff(f"{label}: {sentinel}")
         assert sentinel in meta.values()
+
+    def test_the_unfilled_seo_block_sends_no_bracketed_text(self):
+        """The template writes every SEO placeholder in brackets, and a field
+        left on one went to Rank Math verbatim: all seven fields, from a
+        publish that reported success.
+
+        The block is the template's own, so a placeholder reworded there is
+        covered too. Left unfilled, focus keyword and description must arrive
+        absent, which is what the publish-time suggestion backstop checks for.
+        The titles fall back to the article title, which the helper supplies.
+        """
+        meta = _meta_from_handoff(_template_seo_block())
+
+        assert not [v for v in meta.values() if "[" in v or "]" in v]
+        assert "rank_math_focus_keyword" not in meta
+        assert "rank_math_description" not in meta
+        assert meta["rank_math_title"] == "About"
 
     def test_a_leftover_schema_type_line_is_not_sent(self):
         """Nothing sets schema from a handoff, so the template stopped asking.
