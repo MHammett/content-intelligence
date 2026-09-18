@@ -36,12 +36,9 @@ and the subprocesses they spawn, which inherit the environment.
 Each package's root ``conftest.py`` sets the same two variables, for the same
 reason each package's ``pyproject.toml`` repeats the socket guard: pytest reads
 only the conftest files on the path to the tests it was given. The package root
-is on that path in every invocation, and a conftest there is outside any Python
-package, so pytest names it after its path and the three can never collide. A
-``tests/conftest.py`` can: whenever the ``tests/`` directories are packages they
-are all called ``tests``, and under ``--import-mode=importlib`` a second
-``tests/conftest.py`` resolves to the module the first one registered, which
-stops the repo-wide run at collection.
+is on that path in every invocation, and pytest imports a conftest there before
+anything under ``tests/``, ``tests/conftest.py`` included. It is outside any
+Python package, so pytest names it after its path and the three cannot collide.
 """
 
 import os

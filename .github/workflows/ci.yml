@@ -31,5 +31,13 @@ jobs:
       - name: Type check
         run: uv run mypy packages/${{ matrix.package }}/src
 
+      # Each leg runs one package, and one package's tests cannot collide with
+      # another's: that takes the repo-wide session `make test` runs, which is
+      # where conftest.py's guard against same-named test modules acts.
+      # Collecting that session once runs the guard; it needs no fourth job.
+      - name: Collect all packages' tests in one session
+        if: matrix.package == 'ci-core'
+        run: uv run pytest packages/ --collect-only -qq
+
       - name: Test
         run: uv run pytest packages/${{ matrix.package }} --cov=packages/${{ matrix.package }}/src --cov-report=term-missing

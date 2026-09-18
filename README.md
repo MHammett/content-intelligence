@@ -605,6 +605,22 @@ slow test this suite has had was slow by accident — a real `time.sleep`, an
 unstubbed network call, or a per-test fixture doing shared work — and those
 should be fixed, not marked.
 
+### Test directories are not packages
+
+No `packages/*/tests/` has an `__init__.py`, and none should. The repo-wide run
+uses `--import-mode=importlib`, which names each test module after its path —
+`packages.ci-core.tests.test_import` — only while its directory is not a
+package. With an `__init__.py`, the module is named after its package instead:
+every package's tests become `tests`, and a file that shares a name with one in
+another package silently runs that other file's code. Until 2026-09-17 that is
+how ci-style-profile's `test_import.py` ran ci-core's, under the same test name
+and the same count. [`conftest.py`](conftest.py) at the repo root now stops the
+run, naming the files, if it happens again.
+
+Each package's `pyproject.toml` sets the same import mode, so relative imports
+between test modules resolve the same way whether a package runs alone or with
+the others.
+
 ---
 
 ## Marking claims out of scope for fact-checking

@@ -7,11 +7,13 @@ setup:
 	uv sync
 	uv run python -m ci_article_review.setup
 
-# mypy gets each package's `src` explicitly rather than the whole tree. All
-# three packages ship a top-level `tests` package, so `mypy packages/` aborts
-# with "Duplicate module named tests" having checked nothing at all — a silent
-# no-op, not a warning. CI (.github/workflows/ci.yml) and the pre-commit hook
-# scope it to src/ for the same reason; keep all three in agreement.
+# mypy gets each package's `src` explicitly rather than the whole tree. The
+# test directories are not packages (see conftest.py) and share file names
+# across packages, so `mypy packages/` aborts on a duplicate module — today
+# "test_import", in ci-core and ci-style-profile — having checked nothing at
+# all: a silent no-op, not a warning. CI (.github/workflows/ci.yml) and the
+# pre-commit hook scope it to src/ for the same reason; keep all three in
+# agreement.
 #
 # One invocation rather than one per package: make stops at the first failing
 # recipe line, so per-package calls would hide the later packages' errors until

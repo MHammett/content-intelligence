@@ -70,7 +70,14 @@ markers = [
 # package's tests are run directly or a single file is passed. Without it
 # the socket guard silently does not apply to exactly the invocation a
 # developer iterating on one file uses.
-addopts = "--disable-socket --allow-hosts=127.0.0.1,::1"
+#
+# `--import-mode=importlib` too, so tests import the same way here as they do
+# repo-wide. tests/ is deliberately not a package (no __init__.py; conftest.py
+# at the repo root has why), and under pytest's default prepend mode a module
+# outside a package has no parent to be relative to: this suite's
+# `from .test_pipeline_end_to_end import ...` lines would raise ImportError
+# when the package is run on its own, and pass in the repo-wide run.
+addopts = "--import-mode=importlib --disable-socket --allow-hosts=127.0.0.1,::1"
 
 [tool.mypy]
 python_version = "3.10"
