@@ -148,6 +148,9 @@ If a pass still times out, in order of preference:
 
 To find the true (untruncated) time a model needs, run with `--no-timeout --only-model PROVIDER --only-domain DOMAIN` and read the `[CALIBRATION]` log line. Then size the multiplier from the measured value.
 
+**"stream stalled before the first chunk" / "stream stalled mid-stream"**  
+Not the wall-clock budget above: raising `timeout_seconds` does nothing for either. The first is `stream_read_timeout` (nothing arrived before real output began), the second `stream_gap_timeout` (output began, then stopped). The call's `[CALIBRATION]` line shows how long each silence lasted — `first_byte=` and `max_gap=`, with a stall written as a lower bound like `>120.02s`; see [the three timeout layers](CONFIGURATION.md#the-three-timeout-layers-streaming). Do not raise either value after one stall, and do not size them from a single-call run: stalls track concurrency, not draft size.
+
 `timeout_seconds` (when set as an override) and `prompts:` are **infrastructure keys** preserved when `cost_preset` overrides model IDs.
 
 **All model passes failed**  

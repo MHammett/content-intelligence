@@ -241,6 +241,103 @@ class TestRecoverFailedCalls:
         assert result["claude:accuracy"] == {"failed": False, "data": {"flags": []}}
         assert result["openai:structure"]["failed"] is False
 
+    # The stalls a recovered call survived are the observations stream timing
+    # exists for; recovery used to replace them with the healthy retry.
+    _STALLED = {
+        "first_byte_s": 120.02,
+        "first_byte_censored": True,
+        "cut_short_by": "StreamStalled",
+    }
+    _ANSWERED = {"first_byte_s": 14.5, "first_byte_censored": False}
+
+    def test_a_recovered_call_keeps_the_streams_that_stalled(self):
+        """2026-09-09, maximum: seven calls lost both streams to stalls under
+        the full fan-out and recovery got all seven back. Replaced as-is, the
+        report said none of them had ever stalled."""
+        raw_results = {
+            "claude:accuracy": {
+                "failed": True,
+                "error": "stream stalled before the first chunk",
+                "stream_timing": [dict(self._STALLED), dict(self._STALLED)],
+            }
+        }
+        runners = [
+            (
+                "claude:accuracy",
+                lambda: {"failed": False, "stream_timing": [dict(self._ANSWERED)]},
+            )
+        ]
+
+        result = pipeline._recover_failed_calls(
+            raw_results, runners, self._cfg(), {}, task_timeout=5
+        )
+
+        streams = result["claude:accuracy"]["stream_timing"]
+        assert len(streams) == 3
+        # Oldest first, and marked: they ran under a heavier fan-out than the
+        # stream that finally answered, and fan-out is what is being measured.
+        assert [s.get("before_recovery", False) for s in streams] == [
+            True,
+            True,
+            False,
+        ]
+        assert streams[0]["first_byte_censored"] is True
+        assert streams[2] == self._ANSWERED
+
+    def test_streams_accumulate_across_recovery_passes(self):
+        passes = []
+
+        def _fails_then_answers():
+            passes.append(1)
+            if len(passes) == 1:
+                return {
+                    "failed": True,
+                    "error": "stream stalled",
+                    "stream_timing": [dict(self._STALLED)],
+                }
+            return {"failed": False, "stream_timing": [dict(self._ANSWERED)]}
+
+        raw_results = {
+            "claude:accuracy": {
+                "failed": True,
+                "error": "stream stalled",
+                "stream_timing": [dict(self._STALLED)],
+            }
+        }
+
+        result = pipeline._recover_failed_calls(
+            raw_results,
+            [("claude:accuracy", _fails_then_answers)],
+            self._cfg(recovery_passes=2),
+            {},
+            task_timeout=5,
+        )
+
+        streams = result["claude:accuracy"]["stream_timing"]
+        assert [s.get("before_recovery", False) for s in streams] == [
+            True,
+            True,
+            False,
+        ]
+
+    def test_a_failure_with_no_streams_recovers_as_before(self):
+        """A call abandoned at the wall-clock budget never returned its timing;
+        there is nothing to carry, and nothing to crash on."""
+        raw_results = {
+            "claude:accuracy": {"failed": True, "error": "timed out after 420s"}
+        }
+        answered = {"failed": False, "stream_timing": [dict(self._ANSWERED)]}
+
+        result = pipeline._recover_failed_calls(
+            raw_results,
+            [("claude:accuracy", lambda: dict(answered))],
+            self._cfg(),
+            {},
+            task_timeout=5,
+        )
+
+        assert result["claude:accuracy"] == answered
+
 
 class TestMergeRecoveredResults:
     """``_merge_recovered_results`` — the ``--retry-failed`` merge step."""
@@ -271,6 +368,72 @@ class TestMergeRecoveredResults:
         merged = pipeline._merge_recovered_results(prior, retried)
         assert merged["claude:accuracy"] == {"failed": False, "data": {}}
         assert merged["openai:structure"]["failed"] is False
+
+    def test_a_prior_runs_streams_are_not_carried_into_this_one(self):
+        """Unlike in-run recovery: the capture's stalls are already in the
+        report of the run that captured them, and carrying them here would
+        count them twice across reports."""
+        prior = {
+            "openai:structure": {
+                "failed": True,
+                "error": "stream stalled",
+                "stream_timing": [{"first_byte_s": 120.0, "first_byte_censored": True}],
+            }
+        }
+        retried = {"openai:structure": {"failed": False, "stream_timing": []}}
+        merged = pipeline._merge_recovered_results(prior, retried)
+        assert merged["openai:structure"]["stream_timing"] == []
+
+
+class TestCalibrationTiming:
+    """The ``first_byte=`` / ``max_gap=`` values on a [CALIBRATION] line."""
+
+    def test_a_clean_stream_prints_its_two_measurements(self):
+        streams = [
+            {
+                "first_byte_s": 14.5,
+                "first_byte_censored": False,
+                "max_gap_s": 3.25,
+                "max_gap_censored": False,
+            }
+        ]
+        assert pipeline._calibration_timing(streams) == ("14.5s", "3.25s")
+
+    def test_a_censored_value_is_written_as_a_lower_bound(self):
+        """Never as the budget presented as a measurement: a dataset that did
+        that would cap out at exactly the current setting and confirm it."""
+        first_byte_stall = {
+            "first_byte_s": 120.02,
+            "first_byte_censored": True,
+            "max_gap_s": None,
+            "max_gap_censored": False,
+        }
+        gap_stall = {
+            "first_byte_s": 30.0,
+            "first_byte_censored": False,
+            "max_gap_s": 120.01,
+            "max_gap_censored": True,
+        }
+        assert pipeline._calibration_timing([first_byte_stall]) == (">120.02s", "-")
+        assert pipeline._calibration_timing([gap_stall]) == ("30.0s", ">120.01s")
+
+    def test_every_stream_is_listed_oldest_first(self):
+        """A stall the retry got past stays visible on a line reading ok."""
+        streams = [
+            {"first_byte_s": 120.02, "first_byte_censored": True, "max_gap_s": None},
+            {"first_byte_s": 41.2, "first_byte_censored": False, "max_gap_s": 2.5},
+        ]
+        assert pipeline._calibration_timing(streams) == (
+            ">120.02s,41.2s",
+            "-,2.5s",
+        )
+
+    def test_a_call_with_nothing_recorded_prints_dashes(self):
+        """Replays of older captures, and calls abandoned at the wall clock."""
+        assert pipeline._calibration_timing(None) == ("-", "-")
+        assert pipeline._calibration_timing([]) == ("-", "-")
+        # A hand-edited capture must not crash the line.
+        assert pipeline._calibration_timing(["junk", None]) == ("-", "-")
 
 
 class TestSameProviderStagger:

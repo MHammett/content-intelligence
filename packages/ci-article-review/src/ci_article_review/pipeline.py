@@ -2125,6 +2125,27 @@ def _run_reviews_for_names(names, runners, pipeline_cfg, model_configs, task_tim
     return _run_reviews_in_parallel(subset, pipeline_cfg, model_configs, task_timeout)
 
 
+def _keep_earlier_streams(failed, fresh):
+    """Carry a failed dispatch's ``stream_timing`` into the result replacing it.
+
+    The recovery pass replaces a failed result wholesale, and the streams that
+    failed are the observations stream timing exists for. On the 2026-09-09
+    ``maximum`` run, seven calls lost both of their streams to stalls under the
+    full 29-call fan-out; the recovery pass got all seven back with only seven
+    in flight, and the report kept no trace of the fourteen stalls. Replaced
+    as-is, a dataset built from reports would say ``maximum`` never stalls.
+
+    Marked ``before_recovery``: those streams ran under a heavier fan-out than
+    the one that finally answered, and fan-out is the variable being measured.
+    """
+    earlier = failed.get("stream_timing") if isinstance(failed, dict) else None
+    if not earlier or not isinstance(fresh, dict):
+        return
+    fresh["stream_timing"] = [
+        {**s, "before_recovery": True} for s in earlier if isinstance(s, dict)
+    ] + list(fresh.get("stream_timing") or [])
+
+
 def _recover_failed_calls(
     raw_results, runners, pipeline_cfg, model_configs, task_timeout
 ):
@@ -2160,11 +2181,12 @@ def _recover_failed_calls(
             ", ".join(sorted(names_to_retry)),
         )
         time.sleep(recovery_delay)
-        raw_results.update(
-            _run_reviews_for_names(
-                names_to_retry, runners, pipeline_cfg, model_configs, task_timeout
-            )
+        retried = _run_reviews_for_names(
+            names_to_retry, runners, pipeline_cfg, model_configs, task_timeout
         )
+        for name, fresh in retried.items():
+            _keep_earlier_streams(raw_results.get(name), fresh)
+        raw_results.update(retried)
 
     still_failed = [name for name, r in raw_results.items() if r.get("failed")]
     recovered = len(originally_failed) - len(still_failed)
@@ -2399,6 +2421,32 @@ def _merge_recovered_results(prior_results, retried_results):
     merged = dict(prior_results)
     merged.update(retried_results)
     return merged
+
+
+def _calibration_timing(streams):
+    """The ``first_byte=`` and ``max_gap=`` values of a [CALIBRATION] line.
+
+    One value per stream the call opened, oldest first, comma-separated — so a
+    stall that a retry or the recovery pass got past stays visible on a line
+    whose status says ok. A value the stream was cut short during is written
+    ``>X``: a lower bound, never a measurement. ``-`` where there is nothing
+    to report: no stream was recorded (a capture from before this existed, or
+    a call abandoned at the wall-clock budget), or real output never began.
+    """
+    records = [s for s in streams or () if isinstance(s, dict)]
+    if not records:
+        return "-", "-"
+
+    def _value(record, key):
+        value = record.get(f"{key}_s")
+        if value is None:
+            return "-"
+        return f"{'>' if record.get(f'{key}_censored') else ''}{value}s"
+
+    return (
+        ",".join(_value(r, "first_byte") for r in records),
+        ",".join(_value(r, "max_gap") for r in records),
+    )
 
 
 def run_draft_pipeline(
@@ -3152,6 +3200,10 @@ def run_draft_pipeline(
         }
         if result.get("discarded_attempts"):
             log_entry["discarded_attempts"] = result["discarded_attempts"]
+        # How long each stream went silent, before and after real output — the
+        # numbers the socket budgets bound. See ci_core.llm.client._StreamTiming.
+        if result.get("stream_timing"):
+            log_entry["stream_timing"] = result["stream_timing"]
         if replay_results:
             # These token counts came out of a capture file — they are the
             # captured run's spend, not this one's. Marked so the cost summary
@@ -3167,9 +3219,13 @@ def run_draft_pipeline(
         api_call_log.append(log_entry)
         # Machine-facing structured record — one grep-able line per call, persisted
         # to pipeline_history/pipeline_<date>.log for cross-run calibration analysis.
+        # first_byte/max_gap are appended rather than interleaved so the first
+        # nine fields keep their positions for anything that splits the line.
+        first_byte, max_gap = _calibration_timing(result.get("stream_timing"))
         log.info(
             "[CALIBRATION] model=%s domain=%s effort=%s chars=%s budget=%ss "
-            "elapsed=%ss out_tokens=%s status=%s headroom=%ss",
+            "elapsed=%ss out_tokens=%s status=%s headroom=%ss "
+            "first_byte=%s max_gap=%s",
             model_tag.split(" ")[0],
             domain,
             effort,
@@ -3179,6 +3235,8 @@ def run_draft_pipeline(
             out_tokens,
             status,
             headroom,
+            first_byte,
+            max_gap,
         )
         if is_empty:
             # Deliberately a warning, and deliberately not the word "OK". This

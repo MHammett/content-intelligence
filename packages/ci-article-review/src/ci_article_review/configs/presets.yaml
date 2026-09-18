@@ -112,12 +112,17 @@
 # number above, an isolated call shows a ~1.3s gap — it reproduces the healthy
 # case by construction, and a value set from it would be calibrated against the
 # condition that never fails. To size these, vary CONCURRENCY at fixed draft
-# size and record worst first-byte and worst inter-chunk gap per provider; the
-# per-call [CALIBRATION] lines already carry elapsed and out_tokens, but neither
-# gap is instrumented today, so that experiment needs the two gaps recorded
-# first. Nothing here is changed until that measurement exists — this file's
-# perplexity entry is the standing reminder of what guessing costs (160 -> 280
-# -> 350 -> 500, three bumps that each looked marginal within days).
+# size and record worst first-byte and worst inter-chunk gap per provider.
+# Both are recorded as of 2026-09-17: each [CALIBRATION] line ends with
+# `first_byte=` and `max_gap=`, the longest silence before and after real
+# output began — the numbers these two knobs bound — one value per stream, and
+# a stall written as a lower bound (`>120.02s`), never as the budget. The same
+# values, with the budgets in force, are in each report's
+# api_call_log[].stream_timing, including the streams of calls the recovery
+# pass later got back. The experiment itself has not been run. Nothing here is
+# changed until it has — this file's perplexity entry is the standing reminder
+# of what guessing costs (160 -> 280 -> 350 -> 500, three bumps that each looked
+# marginal within days).
 #
 # OpenAI: originally hit this hard — gpt-5.5 at xhigh failed 5/5 calls at ~121s
 # with 0 output tokens against the default 120s read-gap under Chat Completions,

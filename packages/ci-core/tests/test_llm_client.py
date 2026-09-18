@@ -18,6 +18,7 @@ everything that would break silently if the shim mapped something wrong:
     empty rather than by raising.
 """
 
+import json
 import subprocess
 import sys
 import threading
@@ -1380,6 +1381,408 @@ class TestFirstByteEndsOnRealOutput:
 
     def test_a_per_model_override_beats_the_provider_default(self):
         assert client._gap_timeout({"stream_gap_timeout": 15}, "openai") == 15
+
+
+# ---------------------------------------------------------------------------
+# Stream timing — what the two budgets would have had to exceed
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """A clock that reads whatever the test last set it to."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class TestStreamTiming:
+    """The bookkeeping, on a clock the test controls.
+
+    The numbers exist to size ``stream_read_timeout`` and ``stream_gap_timeout``
+    at a concurrency no single-call run reproduces, so each has to be the
+    quantity its budget is compared against — and a stall has to read as
+    *longer* than the budget, never as equal to it.
+    """
+
+    def test_each_phase_reports_its_longest_silence(self):
+        clock = _Clock()
+        timing = client._StreamTiming(120.0, 60.0, clock=clock)  # request at 0
+        for now, event in [
+            (0.4, timing.opened),  # headers: 0.4
+            (1.0, timing.arrived),  # framing: 0.6
+            (11.0, lambda: timing.arrived(first_output=True)),  # 10.0
+            (12.0, timing.arrived),  # 1.0
+            (16.0, timing.arrived),  # 4.0
+            (16.5, timing.completed),  # waiting for the end: 0.5
+        ]:
+            clock.now = now
+            event()
+
+        record = timing.as_dict()
+        assert record["first_byte_s"] == 10.0
+        assert record["first_output_s"] == 11.0
+        assert record["max_gap_s"] == 4.0
+        assert record["first_byte_censored"] is False
+        assert record["max_gap_censored"] is False
+        assert "cut_short_by" not in record
+
+    def test_a_chunk_that_is_not_output_ends_a_silence_but_not_the_phase(self):
+        """Every chunk restarts the detector's clock; only output switches it.
+
+        mistral's reasoning streams as thinking chunks that are not progress.
+        Here that goes on for 150s, one chunk a second: 150s to first output,
+        yet no silence came near a 120s first-byte budget — and first_byte_s
+        must say so, or the budget reads as nearly exhausted when it never was.
+        """
+        clock = _Clock()
+        timing = client._StreamTiming(120.0, 60.0, clock=clock)
+        clock.now = 0.2
+        timing.opened()
+        for second in range(1, 151):
+            clock.now = 0.2 + second
+            timing.arrived()
+        clock.now = 151.0
+        timing.arrived(first_output=True)
+        clock.now = 151.5
+        timing.completed()
+
+        record = timing.as_dict()
+        assert record["first_output_s"] == 151.0
+        assert record["first_byte_s"] == 1.0
+
+    def test_a_stall_before_real_output_is_a_lower_bound_not_the_budget(self):
+        clock = _Clock()
+        timing = client._StreamTiming(120.0, 60.0, clock=clock)
+        clock.now = 0.3
+        timing.opened()
+        clock.now = 0.9
+        timing.arrived()  # response.created, say
+        clock.now = 120.95
+        timing.cut_short("StreamStalled")
+
+        record = timing.as_dict()
+        assert record["first_byte_censored"] is True
+        assert record["first_byte_s"] == 120.05
+        # Also only a lower bound: output never came.
+        assert record["first_output_s"] == 120.95
+        assert record["max_gap_s"] is None
+        assert record["max_gap_censored"] is False
+        assert record["cut_short_by"] == "StreamStalled"
+
+    def test_a_stall_after_real_output_is_a_lower_bound_on_the_gap(self):
+        clock = _Clock()
+        timing = client._StreamTiming(120.0, 60.0, clock=clock)
+        for now, event in [
+            (0.5, timing.opened),
+            (30.0, lambda: timing.arrived(first_output=True)),
+            (31.0, timing.arrived),
+            (91.2, lambda: timing.cut_short("StreamStalled")),
+        ]:
+            clock.now = now
+            event()
+
+        record = timing.as_dict()
+        assert record["first_byte_s"] == 29.5
+        assert record["first_byte_censored"] is False
+        assert record["first_output_s"] == 30.0
+        assert record["max_gap_s"] == 60.2
+        assert record["max_gap_censored"] is True
+
+    def test_a_request_that_fails_before_any_stream_is_cut_short(self):
+        """No stream ever opened: the socket timed out waiting for the reply.
+
+        The shape of perplexity on 2026-09-05, `litellm.Timeout` at 170.67s —
+        the first-byte allowance firing in the socket rather than in the
+        detector, which only a timing started at the request can see.
+        """
+        clock = _Clock()
+        timing = client._StreamTiming(160.0, 60.0, clock=clock)
+        clock.now = 170.67
+        timing.cut_short(TimeoutError("Request timed out"))
+
+        record = timing.as_dict()
+        assert record["first_byte_s"] == 170.67
+        assert record["first_byte_censored"] is True
+        assert record["cut_short_by"] == "TimeoutError"
+
+    def test_a_stream_that_ends_without_output_is_complete_not_censored(self):
+        clock = _Clock()
+        timing = client._StreamTiming(120.0, 60.0, clock=clock)
+        for now, event in [
+            (0.5, timing.opened),
+            (2.0, timing.arrived),
+            (2.5, timing.completed),
+        ]:
+            clock.now = now
+            event()
+
+        record = timing.as_dict()
+        assert record["first_byte_s"] == 1.5
+        assert record["first_byte_censored"] is False
+        assert record["first_output_s"] is None
+        assert record["max_gap_s"] is None
+
+    def test_the_first_account_of_how_a_stream_ended_wins(self):
+        """_iter_with_gap stamps a stall before closing the socket; the same
+        exception then passes _attempt, which must not re-stamp it later."""
+        clock = _Clock()
+        stalled = client._StreamTiming(120.0, 60.0, clock=clock)
+        clock.now = 120.0
+        stalled.cut_short("StreamStalled")
+        clock.now = 125.0
+        stalled.cut_short(client.StreamStalled("seen again further up"))
+        assert stalled.as_dict()["first_byte_s"] == 120.0
+        assert stalled.as_dict()["cut_short_by"] == "StreamStalled"
+
+        finished = client._StreamTiming(120.0, 60.0, clock=clock)
+        finished.completed()
+        clock.now = 200.0
+        finished.cut_short(RuntimeError("raised after the stream ended"))
+        assert finished.as_dict()["first_byte_censored"] is False
+        assert "cut_short_by" not in finished.as_dict()
+
+    def test_the_record_is_plain_json_and_carries_its_budgets(self):
+        """ensemble_capture json-dumps results as they are; an object in one
+        would cost the capture, and every free replay of the run with it."""
+        timing = client._StreamTiming(500.0, 60.0, clock=_Clock())
+        timing.opened()
+        timing.completed()
+
+        record = json.loads(json.dumps(timing.as_dict()))
+        assert record["stream_read_timeout"] == 500.0
+        assert record["stream_gap_timeout"] == 60.0
+
+
+class _RecordingTiming:
+    """Stands in for _StreamTiming and records what _iter_with_gap tells it."""
+
+    def __init__(self):
+        self.events = []
+
+    def opened(self):
+        self.events.append("opened")
+
+    def arrived(self, first_output=False):
+        self.events.append("output" if first_output else "chunk")
+
+    def completed(self):
+        self.events.append("completed")
+
+    def cut_short(self, cause):
+        name = cause if isinstance(cause, str) else type(cause).__name__
+        self.events.append(f"cut_short:{name}")
+
+
+class TestStreamTimingWiring:
+    """What _iter_with_gap reports, independent of any clock."""
+
+    def test_framing_ends_silences_and_only_output_ends_the_phase(self):
+        timing = _RecordingTiming()
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.in_progress"),
+            SimpleNamespace(type="response.reasoning_summary_text.delta", delta="…"),
+            SimpleNamespace(type="response.output_text.delta", delta="{}"),
+            SimpleNamespace(type="response.completed"),
+        ]
+        list(
+            client._iter_with_gap(
+                iter(events), 5.0, 5.0, client._responses_is_progress, timing
+            )
+        )
+        assert timing.events == [
+            "opened",
+            "chunk",
+            "chunk",
+            "output",
+            # Once output has begun the predicate is not consulted again, same
+            # as the detector: these are gap-phase chunks.
+            "chunk",
+            "chunk",
+            "completed",
+        ]
+
+    def test_a_stall_is_reported_as_a_stall(self):
+        timing = _RecordingTiming()
+        stream = _slow_stream([_chunk(content="late")], first_delay=5.0)
+        with pytest.raises(client.StreamStalled):
+            list(
+                client._iter_with_gap(
+                    stream, 0.05, 30.0, client._completion_is_progress, timing
+                )
+            )
+        assert timing.events[:2] == ["opened", "cut_short:StreamStalled"]
+
+    def test_a_relayed_provider_error_cuts_the_stream_short(self):
+        def _explodes():
+            yield _chunk(content="{")
+            raise RuntimeError("provider blew up")
+
+        timing = _RecordingTiming()
+        with pytest.raises(RuntimeError):
+            list(
+                client._iter_with_gap(
+                    _explodes(), 5.0, 5.0, client._completion_is_progress, timing
+                )
+            )
+        assert timing.events == ["opened", "output", "cut_short:RuntimeError"]
+
+    def test_a_consumer_that_stops_reading_cuts_the_stream_short(self):
+        timing = _RecordingTiming()
+        chunks = client._iter_with_gap(
+            iter([_chunk(content="a"), _chunk(content="b")]),
+            5.0,
+            5.0,
+            client._completion_is_progress,
+            timing,
+        )
+        next(chunks)
+        chunks.close()
+        assert timing.events == ["opened", "output", "cut_short:GeneratorExit"]
+
+
+class TestStreamTimingReachesTheResult:
+    """Real streams that go silent, through _iter_with_gap and call()."""
+
+    def test_a_stream_silent_before_output_is_recorded_as_longer_than_budget(self):
+        timing = client._StreamTiming(0.2, 30.0)
+        stream = _slow_stream([_chunk(content="late")], first_delay=5.0)
+        with pytest.raises(client.StreamStalled, match="before the first chunk"):
+            list(
+                client._iter_with_gap(
+                    stream, 0.2, 30.0, client._completion_is_progress, timing
+                )
+            )
+        record = timing.as_dict()
+        assert record["first_byte_censored"] is True
+        assert record["first_byte_s"] >= 0.2
+        assert record["max_gap_s"] is None
+        assert record["cut_short_by"] == "StreamStalled"
+
+    def test_a_stream_silent_mid_stream_is_recorded_as_longer_than_the_gap(self):
+        timing = client._StreamTiming(30.0, 0.1)
+        stream = _slow_stream(
+            [_chunk(content="{"), _chunk(content='"a": 1}')], gap_delay=5.0
+        )
+        with pytest.raises(client.StreamStalled, match="mid-stream"):
+            list(
+                client._iter_with_gap(
+                    stream, 30.0, 0.1, client._completion_is_progress, timing
+                )
+            )
+        record = timing.as_dict()
+        assert record["max_gap_censored"] is True
+        assert record["max_gap_s"] >= 0.1
+        assert record["first_byte_censored"] is False
+
+    def test_a_stall_is_timed_before_the_socket_close_not_after_it(self):
+        """Closing can block; the bound is what was waited, not that plus it."""
+
+        def _slow_close(stream):
+            time.sleep(1.0)
+            return True
+
+        timing = client._StreamTiming(30.0, 0.1)
+        stream = _slow_stream(
+            [_chunk(content="{"), _chunk(content='"a": 1}')], gap_delay=5.0
+        )
+        with patch.object(client, "_close_stream", side_effect=_slow_close):
+            with pytest.raises(client.StreamStalled):
+                list(
+                    client._iter_with_gap(
+                        stream, 30.0, 0.1, client._completion_is_progress, timing
+                    )
+                )
+        assert 0.1 <= timing.as_dict()["max_gap_s"] < 0.8
+
+    def test_a_stall_the_retry_recovered_from_stays_in_the_result(self):
+        """The retry succeeding must not erase the stall before it: that
+        stall is the observation the timing exists for."""
+        attempts = []
+
+        def _stall_once(**kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return _slow_stream([_chunk(content="late")], first_delay=5.0)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_stall_once):
+            result = _call(
+                "mistral",
+                retry=True,
+                retry_delay=0,
+                provider_config={"stream_read_timeout": 0.2},
+            )
+
+        assert result["failed"] is False
+        stalled, answered = result["stream_timing"]
+        assert stalled["first_byte_censored"] is True
+        assert stalled["first_byte_s"] >= 0.2
+        assert stalled["cut_short_by"] == "StreamStalled"
+        assert answered["first_byte_censored"] is False
+        assert answered["max_gap_censored"] is False
+        assert "cut_short_by" not in answered
+
+    def test_a_call_that_fails_before_any_stream_still_has_a_record(self):
+        with patch.object(
+            client.litellm, "completion", side_effect=_http_error(400, "bad")
+        ):
+            result = _call("mistral")
+
+        assert result["failed"] is True
+        (record,) = result["stream_timing"]
+        assert record["first_byte_censored"] is True
+        assert record["max_gap_s"] is None
+        assert record["cut_short_by"] == "Exception"
+
+    def test_a_malformed_response_still_streamed_to_completion(self):
+        with patch.object(
+            client.litellm,
+            "completion",
+            return_value=_completion_stream("I'd be happy to help!"),
+        ):
+            result = _call("mistral")
+
+        assert result["error"] == "Malformed JSON response"
+        (record,) = result["stream_timing"]
+        assert record["first_byte_censored"] is False
+        assert record["max_gap_censored"] is False
+
+    def test_openai_is_timed_on_the_responses_surface_too(self):
+        with patch.object(
+            client.litellm, "responses", return_value=_responses_stream()
+        ):
+            result = _call("openai")
+
+        (record,) = result["stream_timing"]
+        assert record["first_output_s"] is not None
+        assert record["max_gap_s"] is not None
+        assert record["stream_gap_timeout"] == 120.0
+
+    def test_the_budgets_in_force_are_recorded_with_each_stream(self):
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream()
+        ):
+            result = _call(
+                "mistral",
+                provider_config={"stream_read_timeout": 222, "stream_gap_timeout": 15},
+            )
+
+        (record,) = result["stream_timing"]
+        assert record["stream_read_timeout"] == 222
+        assert record["stream_gap_timeout"] == 15
+
+    def test_the_result_survives_the_capture_file(self):
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream()
+        ):
+            result = _call("mistral")
+
+        round_tripped = json.loads(json.dumps(result))
+        assert round_tripped["stream_timing"] == result["stream_timing"]
 
 
 class TestStructuredOutput:

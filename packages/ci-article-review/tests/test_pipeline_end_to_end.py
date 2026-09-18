@@ -778,6 +778,101 @@ class TestAnEmptyPassIsNotLoggedAsOK:
             assert f"  {name}: EMPTY" not in caplog.text
 
 
+def _calibration_lines(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("[CALIBRATION]")
+    ]
+
+
+class TestStreamTimingReachesTheReport:
+    """The socket-budget measurements, from a result to where they are read.
+
+    The client records one entry per stream on the result; this is the wiring
+    after that: the report's ``api_call_log``, which history gets mined from,
+    and the [CALIBRATION] line, which a person reads.
+    """
+
+    #: A stall the retry got past, then the stream that answered.
+    _STREAMS = [
+        {
+            "first_byte_s": 120.02,
+            "first_byte_censored": True,
+            "first_output_s": 121.37,
+            "max_gap_s": None,
+            "max_gap_censored": False,
+            "stream_read_timeout": 120.0,
+            "stream_gap_timeout": 60.0,
+            "cut_short_by": "StreamStalled",
+        },
+        {
+            "first_byte_s": 14.5,
+            "first_byte_censored": False,
+            "first_output_s": 14.93,
+            "max_gap_s": 3.25,
+            "max_gap_censored": False,
+            "stream_read_timeout": 120.0,
+            "stream_gap_timeout": 60.0,
+        },
+    ]
+
+    def _timed(self, model_name, domain, *a, **kw):
+        result = _fake_run_domain(model_name, domain, *a, **kw)
+        result["stream_timing"] = copy.deepcopy(self._STREAMS)
+        return result
+
+    def test_every_review_entry_in_the_call_log_carries_its_streams(self, tmp_path):
+        stub = patch("ci_article_review.pipeline._run_domain", side_effect=self._timed)
+        with _stubbed_run(tmp_path, extra_patches=[stub], offline=True) as report:
+            pass
+
+        review = [e for e in report["api_call_log"] if "status" in e]
+        assert review, "no review passes ran, so this proves nothing"
+        for entry in review:
+            assert entry["stream_timing"] == self._STREAMS
+
+    def test_the_calibration_line_gains_both_fields_at_its_end(self, tmp_path, caplog):
+        stub = patch("ci_article_review.pipeline._run_domain", side_effect=self._timed)
+        with caplog.at_level("INFO"):
+            with _stubbed_run(tmp_path, extra_patches=[stub], offline=True):
+                pass
+
+        lines = _calibration_lines(caplog)
+        assert lines, "no [CALIBRATION] lines were logged"
+        for line in lines:
+            assert line.endswith(" first_byte=>120.02s,14.5s max_gap=-,3.25s"), line
+            # Appended, not interleaved: the nine fields anything already
+            # splits this line into keep their positions.
+            keys = [field.split("=", 1)[0] for field in line.split()[1:]]
+            assert keys == [
+                "model",
+                "domain",
+                "effort",
+                "chars",
+                "budget",
+                "elapsed",
+                "out_tokens",
+                "status",
+                "headroom",
+                "first_byte",
+                "max_gap",
+            ]
+
+    def test_a_call_with_no_timing_says_so_rather_than_inventing_one(
+        self, tmp_path, caplog
+    ):
+        """What a replay of a capture from before this existed looks like."""
+        with caplog.at_level("INFO"):
+            with _stubbed_run(tmp_path, offline=True) as report:
+                pass
+
+        lines = _calibration_lines(caplog)
+        assert lines, "no [CALIBRATION] lines were logged"
+        assert all(line.endswith(" first_byte=- max_gap=-") for line in lines)
+        assert not any("stream_timing" in e for e in report["api_call_log"])
+
+
 class TestADomainWithNoReviewerReachesTheReport:
     """The drafter exclusion can empty a domain; the run must not hide it.
 
