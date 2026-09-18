@@ -543,6 +543,20 @@ keys required.
 `addopts` passes `--disable-socket --allow-hosts=127.0.0.1,::1`, so a unit test
 that opens a connection to anything but loopback fails instead of waiting on it.
 
+That covers collection as well as the tests. pytest-socket on its own guards a
+test's setup and call, and nothing before the first test, so every conftest and
+test module used to be imported with the network open: `import litellm` at the
+top of ci-style-profile's `test_callers.py` downloaded a tokenizer file
+mid-collection on a fresh Windows venv, while the same import inside a test was
+blocked. `-p socket_guard`
+([`pytest_plugins/socket_guard.py`](pytest_plugins/socket_guard.py))
+applies the same restrictions from before the first conftest is imported until
+collection ends, so a network call made at import time now fails the run — as a
+collection error, or as a conftest that could not be loaded. There is no test to
+mark at that point, so `--force-enable-socket` is the way past it. Subprocesses
+are not covered, by decision; the plugin's docstring says why, and what would
+change that.
+
 This is a correctness guard first. Twenty tests were reaching the real network
 without meaning to — fifteen of them opening TCP connections to archive.org on
 every single run — and all twenty passed either way, because the production code
@@ -559,16 +573,16 @@ layer below the one you already wrote — the collaborator that runs *after* the
 thing you are asserting on. `pytest --force-enable-socket` will show you what it
 was reaching for.
 
-The guard is installed around each test's setup, call and teardown — not during
-collection, and not in subprocesses — so a network call made while a test module
-is being imported, or from a child process, goes out unguarded. `import litellm`
-makes two such calls, and a `conftest.py` at each package's root switches both
-off before anything can import it: `LITELLM_LOCAL_MODEL_COST_MAP=True` skips the
-model-cost-map fetch, and `CUSTOM_TIKTOKEN_CACHE_DIR` points tiktoken at a
-byte-exact `cl100k_base` vendored in `packages/ci-core/tests/fixtures/tiktoken_cache/`.
-litellm bundles that file too, but its Windows wheel ships it with CRLF line
-endings that fail tiktoken's hash check, so a fresh Windows venv downloads it
-again on first import — or, under the guard, fails every test that touches
+`import litellm` makes two network calls as a side effect, and a `conftest.py`
+at each package's root switches both off before anything can import it — in
+this process, where the guard would otherwise fail collection, and in any child
+process, which inherits the environment but not the guard.
+`LITELLM_LOCAL_MODEL_COST_MAP=True` skips the model-cost-map fetch, and
+`CUSTOM_TIKTOKEN_CACHE_DIR` points tiktoken at a byte-exact `cl100k_base`
+vendored in `packages/ci-core/tests/fixtures/tiktoken_cache/`. litellm bundles
+that file too, but its Windows wheel ships it with CRLF line endings that fail
+tiktoken's hash check, so a fresh Windows venv downloads it again on first
+import — or, under the guard, fails collection and every test that touches
 litellm. `packages/ci-core/conftest.py` has the details, including why those
 files sit at the package root rather than in `tests/`.
 
@@ -594,13 +608,15 @@ To run just those tests:
 uv run pytest packages/ -m slow
 ```
 
-The marker and the socket guard are both registered in the root
-`pyproject.toml` **and** in each package's own `pyproject.toml`. The duplication
+The marker and the socket guard — `-p socket_guard` and its `pythonpath`
+included — are registered in the root `pyproject.toml` **and** in
+each package's own `pyproject.toml`. The duplication
 is load-bearing: pytest picks the nearest config file to the paths you pass, so
 the root file is the inifile only for the repo-wide `pytest packages/` run. Pass
 a single package or a single file and the root `addopts` is not read at all —
 which is exactly the invocation you use while iterating, and exactly where an
-unguarded suite would go back to dialling out. Reach for the marker sparingly: almost every
+unguarded suite would go back to dialling out. `test_socket_guard.py` fails if
+an inifile drops the guard or the plugin. Reach for the marker sparingly: almost every
 slow test this suite has had was slow by accident — a real `time.sleep`, an
 unstubbed network call, or a per-test fixture doing shared work — and those
 should be fixed, not marked.
@@ -748,6 +764,7 @@ content-intelligence/
 ├── alembic.ini                   Alembic config for the ci-core database schema
 ├── alembic/                      migrations for ci_core.models (not used at runtime yet)
 ├── .github/                      CI workflows
+├── pytest_plugins/               socket_guard.py — extends pytest-socket's guard to collection
 │
 ├── packages/
 │   ├── ci-article-review/        the article-review pipeline (the bulk of the code)

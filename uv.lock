@@ -23,7 +23,7 @@ dev = [
     { name = "httpx2", specifier = ">=2.4.0" },
     { name = "mypy", specifier = ">=1.9" },
     { name = "pre-commit", specifier = ">=3.0" },
-    { name = "pytest", specifier = ">=7.4.0,<9.0" },
+    { name = "pytest", specifier = ">=8.4,<9.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
     { name = "pytest-cov", specifier = ">=5.0" },
     { name = "pytest-socket", specifier = ">=0.8.1" },

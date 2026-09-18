@@ -3,7 +3,10 @@ members = ["packages/*"]
 
 [dependency-groups]
 dev = [
-    "pytest>=7.4.0,<9.0",
+    # 8.4 is the first pytest to put `pythonpath` on sys.path before it loads
+    # `-p` plugins, which is how every inifile here loads socket_guard. Older
+    # ones fail at startup with an ImportError.
+    "pytest>=8.4,<9.0",
     # ci-core's persistence cluster is an optional extra for end users (audit
     # finding 13) but must stay installed for development, so its tests keep
     # running in CI rather than silently skipping.
@@ -51,6 +54,12 @@ asyncio_mode = "strict"
 # A test that legitimately needs the network opts back in with
 # `@pytest.mark.enable_socket`. Today nothing does.
 #
+# pytest-socket guards a test's setup and call and nothing before the first
+# test, so on its own it leaves every conftest and test module to be imported
+# with the network open. `-p socket_guard` extends the same guard back to the
+# first conftest import; pytest_plugins/socket_guard.py says why it has to be a
+# `-p` plugin, and `pythonpath` is what makes it importable.
+#
 # `--import-mode=importlib` is what lets one session hold three packages'
 # tests. It names each test module after its path from here
 # (`packages.ci-core.tests.test_import`), but only while no packages/*/tests/
@@ -58,7 +67,8 @@ asyncio_mode = "strict"
 # every package's tests become `tests`, and a file sharing a name with one in
 # another package silently runs that package's code. conftest.py at the repo
 # root has the history, and stops the run if it happens again.
-addopts = "--import-mode=importlib --disable-socket --allow-hosts=127.0.0.1,::1"
+addopts = "--import-mode=importlib --disable-socket --allow-hosts=127.0.0.1,::1 -p socket_guard"
+pythonpath = ["pytest_plugins"]
 markers = [
     # Tests whose wall-clock cost is inherent, not accidental: the three that
     # prove something *hangs*, which is only showable by waiting one out — the
