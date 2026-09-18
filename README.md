@@ -559,6 +559,19 @@ layer below the one you already wrote — the collaborator that runs *after* the
 thing you are asserting on. `pytest --force-enable-socket` will show you what it
 was reaching for.
 
+The guard is installed around each test's setup, call and teardown — not during
+collection, and not in subprocesses — so a network call made while a test module
+is being imported, or from a child process, goes out unguarded. `import litellm`
+makes two such calls, and a `conftest.py` at each package's root switches both
+off before anything can import it: `LITELLM_LOCAL_MODEL_COST_MAP=True` skips the
+model-cost-map fetch, and `CUSTOM_TIKTOKEN_CACHE_DIR` points tiktoken at a
+byte-exact `cl100k_base` vendored in `packages/ci-core/tests/fixtures/tiktoken_cache/`.
+litellm bundles that file too, but its Windows wheel ships it with CRLF line
+endings that fail tiktoken's hash check, so a fresh Windows venv downloads it
+again on first import — or, under the guard, fails every test that touches
+litellm. `packages/ci-core/conftest.py` has the details, including why those
+files sit at the package root rather than in `tests/`.
+
 ### The `slow` marker
 
 Three tests are inherently wall-clock-bound, because each proves that something

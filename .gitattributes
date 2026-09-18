@@ -1,3 +1,10 @@
 # Lockfiles are tool-generated with LF. Pin them so line endings don't depend on
 # a contributor's core.autocrlf setting (avoids spurious whole-file diffs).
 *.lock text eol=lf
+
+# The test suite's offline tiktoken cache (see packages/ci-core/conftest.py).
+# tiktoken sha256-checks it, so it must reach disk byte for byte. It looks like
+# text, and Git for Windows' default core.autocrlf=true would check it out with
+# CRLF — which is exactly how litellm's own copy of this file broke in its
+# Windows wheel. `binary` also keeps a 100,000-line diff out of every review.
+packages/ci-core/tests/fixtures/tiktoken_cache/* binary
