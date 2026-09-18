@@ -543,9 +543,10 @@ keys required.
 `addopts` passes `--disable-socket --allow-hosts=127.0.0.1,::1`, so a unit test
 that opens a connection to anything but loopback fails instead of waiting on it.
 
-That covers collection as well as the tests. pytest-socket on its own guards a
-test's setup and call, and nothing before the first test, so every conftest and
-test module used to be imported with the network open: `import litellm` at the
+That covers collection and fixture teardown as well as the tests. pytest-socket
+on its own guards a test's setup and call, and nothing before the first test, so
+every conftest and test module used to be imported with the network open:
+`import litellm` at the
 top of ci-style-profile's `test_callers.py` downloaded a tokenizer file
 mid-collection on a fresh Windows venv, while the same import inside a test was
 blocked. `-p socket_guard`
@@ -556,6 +557,18 @@ collection error, or as a conftest that could not be loaded. There is no test to
 mark at that point, so `--force-enable-socket` is the way past it. Subprocesses
 are not covered, by decision; the plugin's docstring says why, and what would
 change that.
+
+Fixture teardown was open too, though pytest-socket lifts its guard in the
+teardown hook itself: it lifts it before pytest has torn down a single fixture,
+so every yield fixture's teardown and every `addfinalizer` callback, at every
+scope, ran unguarded while the same code in the fixture's setup was blocked. The
+same plugin holds pytest-socket's lift back until the fixtures are gone, so a
+teardown runs under the restrictions its test ran with — markers included — and
+a network call made there fails the run, as an error at teardown. The one-line
+upstream fix is filed as
+[miketheman/pytest-socket#537](https://github.com/miketheman/pytest-socket/issues/537)
+([UPSTREAM.md](UPSTREAM.md) entry 7); when it ships, this part of the plugin
+goes.
 
 This is a correctness guard first. Twenty tests were reaching the real network
 without meaning to — fifteen of them opening TCP connections to archive.org on

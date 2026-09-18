@@ -1,4 +1,4 @@
-"""Extend pytest-socket's network guard to collection.
+"""Extend pytest-socket's network guard to collection and fixture teardown.
 
 pytest-socket applies its restrictions in ``pytest_runtest_setup`` and lifts
 them in ``pytest_runtest_teardown``, so they cover a test's setup and call, and
@@ -34,6 +34,32 @@ pytest 8.4, the first release to apply ``pythonpath`` before loading ``-p``
 plugins (pytest-dev/pytest#11118). pytest-socket's tracker has no issue or pull
 request about collection (checked 2026-09-17), so there was no upstream
 approach to adopt.
+
+Fixture teardown falls outside the window too, though pytest-socket lifts its
+restrictions in the teardown hook itself: pytest's runner runs the fixture
+finalizers from its own ``pytest_runtest_teardown``, after pytest-socket's.
+Both are plain hook implementations, which pluggy calls newest-registered
+first, and pytest-socket always registers after pytest's built-in runner. So
+every yield fixture's teardown and every ``addfinalizer`` callback, at every
+scope, ran with the network open, while the same code in the fixture's setup
+was blocked (measured 2026-09-18, pytest-socket 0.8.1, pytest 8.4.2 and 9.1.1).
+
+This plugin's ``pytest_runtest_teardown`` wraps both, and holds pytest-socket's
+lift back until every finalizer has run — what marking pytest-socket's hook
+``trylast`` would do. That one-line fix is miketheman/pytest-socket#537
+(UPSTREAM.md entry 7), and this goes when it ships. Holding the lift, rather
+than re-applying anything, means
+teardown runs under exactly the restrictions pytest-socket chose for the test's
+setup — an ``enable_socket`` or ``allow_hosts`` marker, the ``socket_enabled``
+or ``socket_disabled`` fixture — with no copy of its rules here to drift from
+them, and it works whichever of the two plugins registered first: the repo's
+inifiles and this plugin's tests register them in opposite orders. What it
+relies on is pytest-socket lifting through ``pytest_socket._remove_restrictions``,
+a private name; the teardown tests fail if it stops doing so. Fixtures a run
+leaves set up when it stops early — on a teardown error under ``-x`` or
+``--maxfail``, say — are torn down later, by pytest's own
+``pytest_sessionfinish``, with no test running, so the global restrictions
+apply there, as they do during collection.
 
 Subprocesses are not covered, deliberately. A guard installed here lives in
 this interpreter, and a child starts a fresh one. Reaching into it takes a
@@ -114,6 +140,43 @@ def pytest_load_initial_conftests(
 def pytest_collection(session: pytest.Session) -> Generator[None, object, object]:
     # Normally already applied, since the initial conftests. This covers a run
     # that loaded the plugin too late for that hook.
+    _apply(session.config, session.config.option)
+    try:
+        return (yield)
+    finally:
+        _lift(session.config)
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown() -> Generator[None, object, object]:
+    # Innermost of the wrappers, so every plain implementation runs inside this
+    # one: pytest-socket's lift, which is noted rather than done, and the
+    # runner's finalizers. The lift happens once they have all returned, and
+    # only if pytest-socket asked for it: with pytest-socket switched off,
+    # nothing here touches the socket module.
+    lift = pytest_socket._remove_restrictions
+    lift_requested = False
+
+    def hold() -> None:
+        nonlocal lift_requested
+        lift_requested = True
+
+    pytest_socket._remove_restrictions = hold
+    try:
+        return (yield)
+    finally:
+        pytest_socket._remove_restrictions = lift
+        if lift_requested:
+            lift()
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_sessionfinish(session: pytest.Session) -> Generator[None, object, object]:
+    # pytest's own pytest_sessionfinish tears down whatever is still set up:
+    # nothing after a full run, whose last test took everything with it, but
+    # after an early stop, the fixtures the next test would have shared. No test
+    # is running, so the global restrictions apply. Innermost of the wrappers,
+    # so the terminal summary is outside it.
     _apply(session.config, session.config.option)
     try:
         return (yield)
