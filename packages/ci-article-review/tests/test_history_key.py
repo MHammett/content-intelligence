@@ -76,3 +76,15 @@ class TestHandoffParsing:
 
     def test_handoff_without_the_line_still_keys_on_title(self):
         assert _history_key(self._handoff()) == "A Real Title Here"
+
+    def test_an_unfilled_key_still_keys_on_title(self):
+        """The template's own placeholder, left in. It used to be the key, so
+        every handoff that left it filed under one shared directory, as a
+        blank key did before it stopped taking the next line."""
+        got = self._handoff(
+            "History key: [Optional but recommended. A short stable name for "
+            "this piece, used\n"
+            "as its history directory.]\n"
+        )
+        assert got["history_key"] == ""
+        assert _history_key(got) == "A Real Title Here"

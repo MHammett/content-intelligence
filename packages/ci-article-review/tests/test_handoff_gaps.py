@@ -164,7 +164,7 @@ class TestImpactNamesTheSpecificCost:
 class TestUnfilledTemplatePlaceholders:
     """A left-in placeholder is worse than a blank: the brackets get sent.
 
-    ``_extract_field`` returns "[One or two sentences: ...]" as happily as it
+    ``_extract_section`` returns "[One or two sentences: ...]" as happily as it
     returns a real claim, so the run looks fully specified while every domain
     reasons about an instruction addressed to the author.
     """

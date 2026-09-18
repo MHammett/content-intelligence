@@ -4984,6 +4984,25 @@ def run_publish_pipeline(
         )
         sys.exit(1)
 
+    if not pub_handoff["title"]:
+        # Refused rather than published untitled, which a blank line used to do
+        # without a word. WordPress accepts a post with no title, and the push
+        # drops the draft's leading "# " heading because the theme renders the
+        # title itself, so the post would carry no title anywhere. Rank Math's
+        # title falls back to this one as well. Checked before the SEO
+        # suggestion call is paid for, and before the checklist asks for a yes.
+        heading = re.match(r"# (.+)", pub_handoff["final_draft"])
+        log.error(
+            "The publication handoff has no title: 'Article:' is missing, blank, "
+            "or still the template's bracketed placeholder, and WordPress would "
+            "create the post untitled. Set it and re-run.%s",
+            f" If the FINAL DRAFT's heading is the title, the line is: "
+            f"Article: {heading.group(1).strip()}"
+            if heading
+            else "",
+        )
+        sys.exit(1)
+
     from .adapters.cms import wordpress as wp
 
     if seo_suggestions is not False:
