@@ -442,9 +442,9 @@ def _generate(data, pub_config=None, **kwargs):
 
 
 class TestEveryFieldReportsAnOutcome:
-    """The SEO METADATA block has five fields. A field with no proposal still
-    has to say which default the WordPress push would apply — silence reads as
-    'not considered'."""
+    """A field with no proposal still has to say what applies instead — the
+    WordPress push's default, or for schema type Rank Math's own — because
+    silence reads as 'not considered'."""
 
     def test_all_single_value_fields_are_present(self):
         suggestions, _ = _generate({})
@@ -532,9 +532,9 @@ class TestSchemaType:
         )
         assert suggestions["fields"]["schema_type"]["differs_from_default"] is False
 
-    def test_default_falls_back_to_the_wordpress_adapter_default(self):
-        # Same fallback as _build_post_payload, so the report describes what
-        # would actually be pushed.
+    def test_default_falls_back_when_the_config_is_silent(self):
+        # The config's default_schema_type records Rank Math's own default;
+        # this is what the comparison uses when it is not set.
         suggestions, _ = _generate({"schema_type": "Article"}, pub_config={})
         assert (
             suggestions["fields"]["schema_type"]["configured_default"] == "BlogPosting"
@@ -559,6 +559,8 @@ class TestSchemaType:
         field = suggestions["fields"]["schema_type"]
         assert field["value"] == ""
         assert "BlogPosting" in field["default_note"]
+        # It said "is what the push would set". The push sets no schema.
+        assert "push does not set schema" in field["default_note"]
 
 
 class TestOutline:

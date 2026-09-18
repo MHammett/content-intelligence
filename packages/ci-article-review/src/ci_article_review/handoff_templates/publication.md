@@ -24,7 +24,11 @@ short on the page and still be descriptive in search results.]
 Meta description: [under 155 characters | or: derive from opening paragraph]
 OG title: [or: use article title]
 OG description: [or: use meta description]
-Schema type: [Article | NewsArticle | BlogPosting | other]
+[No schema field: the script does not set schema. Rank Math applies its own
+default for each post type, set under Rank Math SEO > Titles & Meta > Posts
+(or Pages) > Schema Type. To change it for one post, use the Schema tab in
+the editor after the push. AboutPage and ContactPage are site-wide instead:
+Titles & Meta > Local SEO.]
 
 EMBEDS AND SPECIAL ELEMENTS
 [List any shortcodes, React components, charts, iframes, or interactive elements]

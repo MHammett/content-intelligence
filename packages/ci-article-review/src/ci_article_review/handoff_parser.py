@@ -326,6 +326,7 @@ def parse_publication_handoff(text):
         "publication": publication,
         "publication_parameters": _parse_key_value_block(pub_params_raw),
         "seo": _parse_seo_block(seo_raw),
+        "ignored_schema_type": _ignored_schema_type(seo_raw),
         "embeds": section("EMBEDS AND SPECIAL ELEMENTS"),
         "disposition_log": section("DISPOSITION LOG"),
         "final_draft": section("FINAL DRAFT"),
@@ -354,12 +355,32 @@ def _parse_seo_block(text):
         "Meta description": "meta_description",
         "OG title": "og_title",
         "OG description": "og_description",
-        "Schema type": "schema_type",
     }
     for label, key in field_map.items():
-        match = re.search(rf"^{re.escape(label)}:\s*(.+)$", text, re.MULTILINE)
+        # [ \t]*, not \s*: \s crosses the newline, so a label left blank to
+        # mean "use the default" took the whole next line as its value — a
+        # blank "SEO title:" put "Meta description: ..." in the <title> tag.
+        match = re.search(rf"^{re.escape(label)}:[ \t]*(.+)$", text, re.MULTILINE)
         if match:
             value = match.group(1).strip()
-            if not value.startswith("derive") and not value.startswith("use "):
+            if (
+                value
+                and not value.startswith("derive")
+                and not value.startswith("use ")
+            ):
                 seo[key] = value
     return seo
+
+
+#: The SEO METADATA line the template used to offer for structured data. It is
+#: not an SEO field: nothing sets schema from a handoff (see
+#: ``adapters.cms.wordpress.rank_math_meta``), so it never enters ``seo``. It
+#: is still looked for, because handoffs written from an older copy of the
+#: template carry it, and a line dropped in silence reads as a line applied.
+_SCHEMA_TYPE_LINE = re.compile(r"^Schema type:[ \t]*(.*)$", re.MULTILINE)
+
+
+def _ignored_schema_type(text):
+    """The value of a leftover ``Schema type:`` line, or "" if there is none."""
+    match = _SCHEMA_TYPE_LINE.search(text)
+    return match.group(1).strip() if match else ""

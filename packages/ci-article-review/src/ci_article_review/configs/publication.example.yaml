@@ -156,6 +156,9 @@ wordpress:
   rest_api_endpoint: /wp-json/wp/v2
 
 rank_math:
+  # What Rank Math's own default schema is set to (Rank Math SEO > Titles &
+  # Meta > Posts > Schema Type). Nothing pushes it — publishing never sets
+  # schema — so it only tells the SEO suggestion pass what to compare against.
   default_schema_type: BlogPosting
   # A focus keyword and meta description are never derived and written for
   # you — see seo_rules.suggestions, which proposes both for you to choose

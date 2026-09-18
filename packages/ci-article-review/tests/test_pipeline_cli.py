@@ -5,7 +5,7 @@ patch-and-assert pattern used in test_webpage.py's TestUrlModeFlowsIntoReview.
 """
 
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -545,6 +545,83 @@ class TestSeoSuggestionsAtPublishTime:
         assert seo_result["mode"] == "publish"
 
 
+class TestPublishReportsAnUnappliedSchemaType:
+    """A leftover `Schema type:` line is reported next to the post, not dropped.
+
+    The template no longer offers the line, because nothing sets schema from a
+    handoff. Older copies of it do, and so does at least one real handoff. Run
+    through the real publish path with only the network mocked, so the check
+    is on what actually leaves the process.
+    """
+
+    _HANDOFF = (
+        "PUBLICATION HANDOFF\n"
+        "Article: About\n"
+        "Publication: testpub\n\n"
+        "PUBLICATION PARAMETERS\n"
+        "Status: draft\n"
+        "Post type: page\n\n"
+        "SEO METADATA\n"
+        "Focus keyword: mike hammett\n"
+        "Schema type: other — AboutPage\n\n"
+        "FINAL DRAFT\n"
+        "# About\n\nBody.\n"
+    )
+
+    def _publish(self, tmp_path, handoff_text):
+        from ci_article_review.pipeline import run_publish_pipeline
+
+        path = tmp_path / "about-publication.md"
+        path.write_text(handoff_text, encoding="utf-8")
+        config = {
+            "publication": {
+                "wordpress": {
+                    "site_url": "https://example.com",
+                    "username": "editor",
+                    "application_password": "pass word here",
+                },
+                "rank_math": {"auto_set_og_tags": True},
+            },
+            "api_keys": {},
+        }
+        created = MagicMock()
+        created.json.return_value = {"id": 7, "link": "https://example.com/about/"}
+        wp_module = "ci_article_review.adapters.cms.wordpress"
+        with (
+            patch("ci_article_review.pipeline.load_user_config", return_value={}),
+            patch(
+                "ci_article_review.pipeline.load_publication_config", return_value={}
+            ),
+            patch("ci_article_review.pipeline.merge_configs", return_value=config),
+            patch(f"{wp_module}.print_checklist_and_confirm", return_value=True),
+            patch(
+                f"{wp_module}.requests.post", side_effect=[created, MagicMock()]
+            ) as mock_post,
+        ):
+            run_publish_pipeline(str(path), "testpub", seo_suggestions=False)
+        return [c.kwargs["json"] for c in mock_post.call_args_list]
+
+    def test_the_author_is_told_it_was_not_applied(self, tmp_path, capsys):
+        sent = self._publish(tmp_path, self._HANDOFF)
+        out = capsys.readouterr().out
+
+        assert "WordPress push successful." in out
+        assert "(other — AboutPage) was NOT applied" in out
+        assert "Schema tab" in out
+        # The page and its Rank Math fields both went out; the schema did not.
+        assert len(sent) == 2
+        assert sent[1]["meta"]["rank_math_focus_keyword"] == "mike hammett"
+        assert "AboutPage" not in repr(sent)
+
+    def test_no_note_without_the_line(self, tmp_path, capsys):
+        self._publish(
+            tmp_path, self._HANDOFF.replace("Schema type: other — AboutPage\n", "")
+        )
+        out = capsys.readouterr().out
+        assert "WordPress push successful." in out
+        assert "schema" not in out.lower()
+
+
 class TestSeoSuggestionConsoleOutput:
     """The suggestion has to reach the terminal, next to the SEO issues it answers."""
 
@@ -647,6 +724,7 @@ class TestSeoSuggestionConsoleOutput:
         assert "Schema type" in out and "NewsArticle" in out
         assert "reporting tied to a pending vote" in out
         assert "Differs from the configured default: BlogPosting" in out
+        assert "Schema tab" in out
 
     def test_unavailable_suggestions_still_leave_a_finding_that_makes_sense(
         self, capsys
