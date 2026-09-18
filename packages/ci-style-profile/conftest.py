@@ -1,7 +1,7 @@
 """Test setup for ci-style-profile: litellm must import without the network.
 
-This suite blocks the network, and test_callers.py imports litellm during
-collection, before pytest-socket's guard is even installed. The whole story,
+This suite blocks the network, collection included, and test_callers.py imports
+litellm during collection. The whole story,
 including why this file is not in tests/, is in packages/ci-core/conftest.py,
 which sets the same two variables.
 """

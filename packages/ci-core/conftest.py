@@ -24,14 +24,15 @@ makes: without it, every ``import litellm`` fetches the model cost map from
 raw.githubusercontent.com, and falls back to the bundled copy only once that
 fails. Nothing in this repo reads the map.
 
-Both must be set before anything imports litellm, and pytest-socket does not
-cover that moment on its own. It installs its guard for each test's setup, call
-and teardown — not during collection, and not in subprocesses. A test module
-that imports litellm at the top (ci-style-profile's ``test_callers.py`` does) is
-imported with the network wide open, which is how a repo-wide run from a fresh
-venv used to pass: collection quietly downloaded the file for everyone else.
-Setting these in ``os.environ`` at conftest import covers collection, the tests,
-and the subprocesses they spawn, which inherit the environment.
+Both must be set before anything imports litellm, and that moment is often
+collection: a test module that imports litellm at the top (ci-style-profile's
+``test_callers.py`` does) is imported then. pytest-socket guards only a test's
+setup and call, so collection used to run with the network open, which is how a
+repo-wide run from a fresh venv used to pass: collection quietly downloaded the
+file for everyone else. pytest_plugins/socket_guard.py now guards collection
+too, so without these that import fails the run instead. Setting them in
+``os.environ`` at conftest import covers collection, the tests, and the
+subprocesses they spawn, which inherit the environment but not the guard.
 
 Each package's root ``conftest.py`` sets the same two variables, for the same
 reason each package's ``pyproject.toml`` repeats the socket guard: pytest reads
