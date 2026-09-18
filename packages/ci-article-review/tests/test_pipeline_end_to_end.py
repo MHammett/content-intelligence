@@ -974,6 +974,190 @@ class TestARecoveredCallStillCostsWhatItCost:
         assert summary["total_usd"] > clean["total_usd"]
 
 
+class TestRetryFailedBillsOnlyTheCallsItMakes:
+    """A ``--retry-failed`` run's cost is its own calls, not its capture's.
+
+    The capture's other results pass through unchanged, and the run that made
+    them already paid for them. Until 2026-09-18 only ``--replay`` marked a
+    capture's entries as history, so re-running one failed call worth $0.0045
+    reported ``incurred_usd`` $0.0315 — the whole ensemble — plus any attempts
+    the carried-over calls had discarded in their own run.
+    """
+
+    _RETRIED = "openai:completeness"
+    #: Carried over, having discarded two attempts in the run that made it.
+    _CARRIER = "gemini:red_team"
+    _CARRIER_BILLING = {
+        "count": 2,
+        "costed": 1,
+        "reasons": ["MalformedJSONError", "StreamStalled"],
+        "tokens": {"prompt": 1000, "completion": 600},
+    }
+
+    def _capture(self, tmp_path):
+        """A stubbed run's own capture, with ``_RETRIED`` marked failed."""
+        with _stubbed_run(tmp_path / "original", offline=True):
+            pass
+        written = next((tmp_path / "original" / "history").rglob("*_results.json"))
+        raw = ensemble_capture.load(written)
+        assert {self._RETRIED, self._CARRIER} <= set(raw), (
+            f"the stub preset no longer assigns both passes: {sorted(raw)}"
+        )
+        model, domain = self._RETRIED.split(":")
+        raw[self._RETRIED] = {
+            "failed": True,
+            "error": "stream stalled mid-stream: nothing received for 120.0s",
+            "model": f"{model}-test-model",
+            "tokens": {"prompt": 0, "completion": 0},
+            "_model": model,
+            "_domain": domain,
+        }
+        raw[self._CARRIER]["discarded_attempts"] = copy.deepcopy(self._CARRIER_BILLING)
+        path = tmp_path / "capture_results.json"
+        ensemble_capture.save(path, raw, article_title="T", run_number=1)
+        return str(path)
+
+    def _retry(self, tmp_path, capture, extra_patches=()):
+        with _stubbed_run(
+            tmp_path / "retry",
+            extra_patches=extra_patches,
+            offline=True,
+            retry_failed_results=capture,
+        ) as report:
+            pass
+        return report
+
+    def test_only_the_retried_call_is_incurred(self, tmp_path):
+        capture = self._capture(tmp_path)
+        report = self._retry(tmp_path, capture)
+
+        this_run = [e["pass"] for e in report["api_call_log"] if not e.get("replayed")]
+        assert this_run == [self._RETRIED]
+        summary = report["cost_summary"]
+        retried = next(p for p in summary["by_pass"] if p["pass"] == self._RETRIED)
+        assert retried["total_usd"] > 0, (
+            "the retry cost nothing, so this proves nothing"
+        )
+        # --offline, so the retried call is the only thing this run bought.
+        assert summary["incurred_usd"] == pytest.approx(retried["total_usd"], abs=1e-4)
+        assert report["retry_failed_from"] == capture
+        assert "replayed_from" not in report
+
+    def test_what_the_capture_paid_for_is_reported_as_history(self, tmp_path):
+        capture = self._capture(tmp_path)
+        summary = self._retry(tmp_path, capture)["cost_summary"]
+
+        carried = [p for p in summary["by_pass"] if p["pass"] != self._RETRIED]
+        assert carried, "nothing was carried over, so this proves nothing"
+        assert all(p.get("replayed") for p in carried)
+        assert summary["replayed_usd"] == pytest.approx(
+            sum(p["total_usd"] for p in carried), abs=1e-4
+        )
+        # The carrier's discarded attempts are history too: its own run paid
+        # for them, with the answer they preceded.
+        carrier = next(p for p in carried if p["pass"] == self._CARRIER)
+        every_attempt = cost.calculate(
+            [
+                {
+                    "model": "gemini-test-model",
+                    "tokens": {"prompt": 2000, "completion": 800},
+                }
+            ]
+        )
+        assert carrier["total_usd"] == pytest.approx(
+            every_attempt["by_pass"][0]["total_usd"], abs=1e-6
+        )
+        split = summary["replayed_usd"] + summary["incurred_usd"]
+        assert abs(split - summary["total_usd"]) < 0.0002
+
+    def test_a_call_recovered_during_the_retry_is_this_runs_spend(self, tmp_path):
+        """``--retry-failed`` runs the recovery pass too. What recovery buys is
+        a new result, so neither it nor the attempt it replaced is history."""
+        capture = self._capture(tmp_path)
+        failed_once = []
+
+        def _run_domain(model_name, domain, *a, **kw):
+            if f"{model_name}:{domain}" == self._RETRIED and not failed_once:
+                failed_once.append(True)
+                return {
+                    "failed": True,
+                    "error": "Malformed JSON response",
+                    "model": f"{model_name}-test-model",
+                    "tokens": {"prompt": 1000, "completion": 700},
+                    "_model": model_name,
+                    "_domain": domain,
+                }
+            return _fake_run_domain(model_name, domain, *a, **kw)
+
+        stub = patch("ci_article_review.pipeline._run_domain", side_effect=_run_domain)
+        report = self._retry(tmp_path, capture, extra_patches=[stub])
+        assert failed_once, "the retried call never failed, so this proves nothing"
+
+        entry = next(e for e in report["api_call_log"] if e["pass"] == self._RETRIED)
+        assert not entry.get("replayed")
+        # The answer's 1000/200 and the malformed attempt's 1000/700.
+        every_attempt = cost.calculate(
+            [
+                {
+                    "model": "openai-test-model",
+                    "tokens": {"prompt": 2000, "completion": 900},
+                }
+            ]
+        )
+        assert report["cost_summary"]["incurred_usd"] == pytest.approx(
+            every_attempt["total_usd"], abs=1e-4
+        )
+
+    def test_the_printed_cost_leads_with_what_this_run_bought(self, tmp_path, capsys):
+        capture = self._capture(tmp_path)
+        capsys.readouterr()  # the capture's own run printed a summary too
+        summary = self._retry(tmp_path, capture)["cost_summary"]
+        out = capsys.readouterr().out
+
+        block = out[out.index("\nEstimated cost: ") :].strip().split("\n\n")[0]
+        headline, *lines = block.splitlines()
+        assert headline.startswith(f"Estimated cost: ${summary['incurred_usd']:.4f}")
+        priced = [
+            line.split()[0] for line in lines if not line.lstrip().startswith("(")
+        ]
+        assert priced == [self._RETRIED]
+        carried = sum(1 for p in summary["by_pass"] if p.get("replayed"))
+        assert lines[-1] == (
+            f"  ({carried} call(s) carried over from the capture were not re-run "
+            f"— the capture's own run paid ${summary['replayed_usd']:.4f} for them)"
+        )
+
+    def test_a_plain_run_still_prints_its_whole_bill(self, tmp_path, capsys):
+        """The control: a run that carried nothing over prints as it did."""
+        with _stubbed_run(tmp_path, offline=True) as report:
+            pass
+        out = capsys.readouterr().out
+
+        summary = report["cost_summary"]
+        block = out[out.index("\nEstimated cost: ") :].strip().split("\n\n")[0]
+        headline, *lines = block.splitlines()
+        assert headline.startswith(f"Estimated cost: ${summary['total_usd']:.4f}")
+        assert [line.split()[0] for line in lines] == [
+            p["pass"] for p in summary["by_pass"]
+        ]
+        assert "carried over" not in block
+
+    def test_a_replay_of_the_same_capture_still_incurs_nothing(self, tmp_path, capsys):
+        """The control: the path that already marked history is unchanged."""
+        capture = self._capture(tmp_path)
+        capsys.readouterr()
+        with _stubbed_run(
+            tmp_path / "replay", offline=True, replay_results=capture
+        ) as report:
+            pass
+
+        assert all(e.get("replayed") for e in report["api_call_log"])
+        assert report["cost_summary"]["incurred_usd"] == 0.0
+        assert report["replayed_from"] == capture
+        assert "retry_failed_from" not in report
+        assert "\nCost: $0.0000 — replayed from a capture" in capsys.readouterr().out
+
+
 class TestATruncatedPassIsReportedAsIncomplete:
     """A pass cut off at its output ceiling, carried to every place it is read.
 

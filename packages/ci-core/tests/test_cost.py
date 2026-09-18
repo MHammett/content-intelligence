@@ -408,6 +408,28 @@ class TestReplayedSpendIsSeparated:
         )
         assert summary["incurred_usd"] == 0.0
 
+    def test_by_pass_says_which_passes_were_replayed(self):
+        """A --retry-failed run mixes the two in one log, and its printed cost
+        lists only the passes it paid for."""
+        summary = calculate(
+            [
+                {
+                    "pass": "openai:fact_check",
+                    "model": "gpt-5.4",
+                    "tokens": {"prompt": 1000, "completion": 1000},
+                    "replayed": True,
+                },
+                {
+                    "pass": "openai:voice_style",
+                    "model": "gpt-5.4",
+                    "tokens": {"prompt": 1000, "completion": 1000},
+                },
+            ]
+        )
+        replayed, bought = summary["by_pass"]
+        assert replayed["replayed"] is True
+        assert "replayed" not in bought
+
 
 class TestDiscardedSummaryShape:
     """`_summarise_discarded` is what the cost layer consumes, so its shape is

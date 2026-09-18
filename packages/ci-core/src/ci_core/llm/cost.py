@@ -161,10 +161,17 @@ def calculate(api_call_log):
       total_usd         float  — grand total across all calls
       total_input_usd   float
       total_output_usd  float
-      by_pass           list   — [{pass, model, input_usd, output_usd, total_usd}]
+      by_pass           list   — [{pass, model, input_usd, output_usd, total_usd}],
+                                 each also ``replayed: True`` if its entry is
       pricing_known     bool   — False when any model fell back to unknown pricing
       discarded_calls   int    — retried attempts whose output was thrown away
       uncosted_calls    int    — of those, how many carried no usage to price
+      replayed_usd      float  — of total_usd, what ``replayed`` entries cost:
+                                 a capture's spend, re-reported, not re-spent
+      incurred_usd      float  — the rest: what this run actually bought
+
+    The two attempt counts describe total_usd, so a replayed entry's attempts
+    are counted too — they are what makes that history a floor.
 
     Discarded attempts are real spend. A retry replaces the failed attempt's
     result with the next one's, and the provider still billed for what it had
@@ -218,6 +225,9 @@ def calculate(api_call_log):
         total_out += out_usd
         if entry.get("replayed"):
             replayed_usd += in_usd + out_usd
+            # So a reader of by_pass can tell history from spend pass by pass,
+            # not only in total. Present only when true, like the entry's own.
+            by_pass[-1]["replayed"] = True
         else:
             incurred_usd += in_usd + out_usd
 
