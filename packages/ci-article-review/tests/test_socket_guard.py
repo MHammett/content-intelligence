@@ -209,7 +209,10 @@ class TestTheGuardGetsOutOfTheWay:
 # REFUSED), none at all (REFUSED, REFUSED) — and a teardown can be checked
 # against the restrictions it should have run under, not just for being
 # guarded. REFUSED is the OSError the operating system answers port 0 with, as
-# for DIALS_OUT: the connect really ran, and nothing left the machine.
+# for DIALS_OUT: the connect really ran, and nothing left the machine. Its
+# subclass differs by platform — ConnectionRefusedError on Linux, a bare OSError
+# on Windows — so it is recorded as OSError on both. pytest-socket's own errors
+# are RuntimeErrors, never OSErrors, so they keep their names.
 
 BLOCKED = "SocketConnectBlockedError"  # connect() refused by the allow-list
 SOCKET_BLOCKED = "SocketBlockedError"  # the socket refused outright
@@ -229,7 +232,9 @@ RECORDS_DIALS = textwrap.dedent(
         try:
             with socket.socket() as sock:
                 sock.connect((host, 0))
-        except (RuntimeError, OSError) as exc:
+        except OSError:
+            return "OSError"
+        except RuntimeError as exc:
             return type(exc).__name__
         return "connected"
 
