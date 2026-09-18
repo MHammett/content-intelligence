@@ -21,7 +21,7 @@ repos:
         args: [--ignore-missing-imports]
         additional_dependencies: [types-requests, types-PyYAML]
         # CI runs `mypy packages/<pkg>/src`, so scope the hook to the same files.
-        # Without this the hook also picks up the three identically-named `tests`
-        # packages, and mypy aborts on a duplicate-module error before checking
-        # anything at all.
+        # Without this the hook also picks up the test files, which share names
+        # across packages, and mypy aborts on a duplicate-module error before
+        # checking anything at all.
         files: ^packages/[^/]+/src/

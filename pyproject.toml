@@ -50,6 +50,14 @@ asyncio_mode = "strict"
 #
 # A test that legitimately needs the network opts back in with
 # `@pytest.mark.enable_socket`. Today nothing does.
+#
+# `--import-mode=importlib` is what lets one session hold three packages'
+# tests. It names each test module after its path from here
+# (`packages.ci-core.tests.test_import`), but only while no packages/*/tests/
+# has an __init__.py: with one, the module is named after its package instead,
+# every package's tests become `tests`, and a file sharing a name with one in
+# another package silently runs that package's code. conftest.py at the repo
+# root has the history, and stops the run if it happens again.
 addopts = "--import-mode=importlib --disable-socket --allow-hosts=127.0.0.1,::1"
 markers = [
     # Tests whose wall-clock cost is inherent, not accidental: the three that
