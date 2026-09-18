@@ -30,7 +30,7 @@ SEO
 [ ] Focus keyword set in Rank Math
 [ ] Meta description under 155 characters
 [ ] OG tags set
-[ ] Schema type correct for content type
+[ ] Schema type correct for content type (set in Rank Math, not by this script)
 
 PUBLICATION
 [ ] WordPress category correct

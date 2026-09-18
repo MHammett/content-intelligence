@@ -12,13 +12,15 @@ This module fills both: it drafts the values, at draft-review time, where they
 feed the chat revision round-trip and where seeing the intended keyword early
 can reveal that the article never actually uses the phrase it should rank for.
 
-It covers the whole SEO METADATA block, not a subset — every field
-``handoff_parser._parse_seo_block`` reads and ``adapters/cms/wordpress.py``
-pushes to Rank Math. Two of those fields have sensible defaults in the push
-(OG title falls back to the article title, OG description to the meta
-description), so for those a suggestion is offered only when it would beat the
-default; the field still reports an outcome either way, because "the default
-applies, and here is what it is" is information and silence is not.
+It covers the SEO METADATA fields ``adapters/cms/wordpress.py`` pushes to Rank
+Math (all but the SEO title, which falls back to the OG title), plus a schema
+type. The schema type is advice only: the push does not set schema and the
+handoff has no field for it, so the author applies it in Rank Math's Schema
+tab. Two of the pushed fields have sensible defaults (OG title falls back to
+the article title, OG description to the meta description), so for those a
+suggestion is offered only when it would beat the default; the field still
+reports an outcome either way, because "the default applies, and here is what
+it is" is information and silence is not.
 
 Everything here is advisory. Keyword choice is strategic — what the author
 wants to rank for — so candidates are returned for a human to pick from, and
@@ -63,19 +65,21 @@ _MAX_OUTLINE_ENTRIES = 40
 #: Model is asked for 3-5; this is the hard cap applied to whatever comes back.
 _MAX_KEYWORD_CANDIDATES = 5
 
-#: Schema types publication.md offers the author. Rank Math accepts more, so
-#: anything outside this set is surfaced rather than dropped — flagged as
-#: needing confirmation instead of silently discarded.
+#: Rank Math's three article types, which the prompt asks the model to choose
+#: between. Rank Math has more schema types than these, so anything outside
+#: this set is surfaced rather than dropped — flagged as needing confirmation
+#: instead of silently discarded.
 _KNOWN_SCHEMA_TYPES = ("Article", "NewsArticle", "BlogPosting")
 
 #: Fallback when the publication config sets no rank_math.default_schema_type.
-#: Matches the same fallback in adapters/cms/wordpress.py, so what the report
-#: says would be pushed is what would actually be pushed.
+#: That key records what Rank Math's own default is set to; nothing pushes it,
+#: so it is only what a suggestion is compared against.
 _DEFAULT_SCHEMA_TYPE = "BlogPosting"
 
-#: Single-value SEO METADATA fields, in the order publication.md lists them.
-#: The focus keyword is handled separately — it is a set of candidates for a
-#: human to choose between, not one proposed value.
+#: Single-value fields, in the order publication.md's SEO METADATA block lists
+#: them, then schema type, which that block no longer carries. The focus
+#: keyword is handled separately — it is a set of candidates for a human to
+#: choose between, not one proposed value.
 FIELD_ORDER = ("meta_description", "og_title", "og_description", "schema_type")
 
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
@@ -234,10 +238,10 @@ def _schema_type_field(data, schema_default):
 
     Always reports: confirming that the publication's default is right for
     this piece is as useful as naming a different type, and the author has no
-    other prompt to think about it. A type outside the set publication.md
-    offers is kept but flagged — Rank Math accepts more types than the
-    template lists, so an unfamiliar answer may be right, but it is not
-    something to act on unchecked.
+    other prompt to think about it. A type outside Rank Math's three article
+    types is kept but flagged — Rank Math has more schema types than those, so
+    an unfamiliar answer may be right, but it is not something to act on
+    unchecked.
     """
     raw = str(data.get("schema_type") or "").strip()
     rationale = str(data.get("schema_type_rationale") or "").strip()
@@ -246,8 +250,9 @@ def _schema_type_field(data, schema_default):
         return _field(
             "Schema type",
             default_note=(
-                f"No type proposed — the configured default ({schema_default}) "
-                f"is what the push would set."
+                f"No type proposed — Rank Math's default applies "
+                f"({schema_default} in this publication's config). The push "
+                f"does not set schema."
             ),
         )
 

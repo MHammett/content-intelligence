@@ -5,6 +5,8 @@ build_handoff_from_raw_draft_and_metadata, added alongside the --raw-draft /
 --metadata CLI flags (commit 803440c) but previously untested.
 """
 
+import pytest
+
 from ci_article_review.handoff_parser import (
     build_handoff_from_raw_draft_and_metadata,
     build_handoff_from_raw_text,
@@ -333,6 +335,52 @@ class TestParsePublicationHandoff:
         result = parse_publication_handoff(doc)
         assert result["embeds"] == "An embedded chart."
         assert result["disposition_log"] == "Approved by editor."
+
+
+class TestSeoMetadataBlock:
+    def _parse(self, seo_lines):
+        return parse_publication_handoff(
+            "PUBLICATION HANDOFF\nArticle: T\n\n"
+            f"SEO METADATA\n{seo_lines}\n\n"
+            "FINAL DRAFT\nBody.\n"
+        )
+
+    def test_a_blank_field_does_not_take_the_next_line(self):
+        """Blank means "use the default", not "use the line below".
+
+        The value pattern allowed any whitespace after the colon, newlines
+        included, so a blank "SEO title:" read "Meta description: ..." as its
+        value — which the push would then send to Rank Math as the <title>.
+        """
+        seo = self._parse(
+            "SEO title:\n"
+            "Meta description: A description.\n"
+            "OG description:\n"
+            "OG title: A title"
+        )["seo"]
+        assert seo == {"meta_description": "A description.", "og_title": "A title"}
+
+    def test_placeholder_values_are_still_dropped(self):
+        seo = self._parse(
+            "Focus keyword: derive from primary claim\nOG title: use article title"
+        )["seo"]
+        assert seo == {}
+
+    def test_schema_type_is_not_an_seo_field(self):
+        """Nothing sets schema from a handoff, so it never reaches ``seo``."""
+        result = self._parse("Focus keyword: fiber\nSchema type: AboutPage")
+        assert result["seo"] == {"focus_keyword": "fiber"}
+
+    def test_a_leftover_schema_type_line_is_still_reported(self):
+        """Older template copies carry it. Found, so the publish can say so."""
+        result = self._parse("Schema type: other — AboutPage")
+        assert result["ignored_schema_type"] == "other — AboutPage"
+
+    @pytest.mark.parametrize(
+        "seo_lines", ["Focus keyword: fiber", "Schema type:\nOG title: A title"]
+    )
+    def test_nothing_to_report_without_a_schema_value(self, seo_lines):
+        assert self._parse(seo_lines)["ignored_schema_type"] == ""
 
 
 class TestAuthorIdentity:

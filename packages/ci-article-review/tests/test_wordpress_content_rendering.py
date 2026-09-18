@@ -11,12 +11,16 @@ So these assert the two things a green publish did not: what the block markup
 contains, and that the Rank Math values leave the process at all.
 """
 
+import re
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ci_article_review import handoff_parser
 from ci_article_review.adapters.cms import wordpress as wp
 from ci_article_review.adapters.cms.blocks import looks_like_block_markup, to_blocks
+from ci_article_review.handoff_parser import parse_publication_handoff
 
 WP_CONFIG = {
     "site_url": "https://example.com",
@@ -94,6 +98,34 @@ class TestToBlocks:
         assert not looks_like_block_markup("## Just markdown")
 
 
+PUBLICATION_TEMPLATE = (
+    Path(handoff_parser.__file__).parent / "handoff_templates" / "publication.md"
+)
+
+
+def _template_seo_labels():
+    """The ``Label:`` lines publication.md's SEO METADATA block offers."""
+    text = PUBLICATION_TEMPLATE.read_text(encoding="utf-8")
+    block = text.split("\nSEO METADATA\n", 1)[1].split("\nEMBEDS AND", 1)[0]
+    return re.findall(r"^([A-Z][A-Za-z ]*):", block, re.MULTILINE)
+
+
+def _handoff_from_seo_block(seo_lines):
+    return parse_publication_handoff(
+        "PUBLICATION HANDOFF\nArticle: About\n\n"
+        f"SEO METADATA\n{seo_lines}\n\n"
+        "FINAL DRAFT\nBody.\n"
+    )
+
+
+def _meta_from_handoff(seo_lines):
+    """What leaves for Rank Math, from handoff text rather than a hand-built dict."""
+    handoff = _handoff_from_seo_block(seo_lines)
+    return wp.rank_math_meta(
+        {"title": handoff["title"], "seo": handoff["seo"]}, RANK_MATH
+    )
+
+
 class TestRankMathMeta:
     def test_seo_title_sets_the_title_field(self):
         meta = wp.rank_math_meta(
@@ -111,12 +143,42 @@ class TestRankMathMeta:
         assert meta["rank_math_title"] == "About Mike | Standards"
         assert meta["rank_math_facebook_title"] == "About Mike | Standards"
 
-    def test_schema_type_is_not_claimed(self):
-        """Tried against a live install and it did not apply; don't pretend."""
-        meta = wp.rank_math_meta(
-            {"title": "About", "seo": {"schema_type": "AboutPage"}}, RANK_MATH
+    def test_the_template_block_was_found(self):
+        """Guards the parametrized test below against running on nothing."""
+        assert "Focus keyword" in _template_seo_labels()
+
+    @pytest.mark.parametrize("label", _template_seo_labels())
+    def test_every_field_the_template_offers_reaches_rank_math(self, label):
+        """The guard the schema field needed and did not have.
+
+        The template kept offering "Schema type:" after the push stopped
+        reading it, and nothing failed. Labels are read from the template, and
+        each goes through the real parser, so a field offered there but never
+        wired through to Rank Math fails here instead of vanishing.
+        """
+        sentinel = f"sentinel for {label}"
+        meta = _meta_from_handoff(f"{label}: {sentinel}")
+        assert sentinel in meta.values()
+
+    def test_a_leftover_schema_type_line_is_not_sent(self):
+        """Nothing sets schema from a handoff, so the template stopped asking.
+
+        Older copies still carry the line, and a real one was written as
+        "other — AboutPage". Its text must reach no Rank Math field — under
+        the old parser, the blank line above it made it the OG description —
+        and the parser still reports it, so the publish can say so.
+        """
+        text = (
+            "Focus keyword: mike hammett\n"
+            "OG description:\n"
+            "Schema type: other — AboutPage"
         )
+        handoff = _handoff_from_seo_block(text)
+        meta = _meta_from_handoff(text)
+
+        assert not [v for v in meta.values() if "AboutPage" in v]
         assert not [k for k in meta if "schema" in k or "rich_snippet" in k]
+        assert handoff["ignored_schema_type"] == "other — AboutPage"
 
     def test_og_fields_omitted_when_auto_set_og_tags_is_off(self):
         meta = wp.rank_math_meta(

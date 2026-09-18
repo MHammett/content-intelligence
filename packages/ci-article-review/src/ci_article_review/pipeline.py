@@ -3785,8 +3785,8 @@ def _print_seo_suggestions(suggestions):
             continue
         label = field.get("label", name)
         if not field.get("value"):
-            # Every field reports an outcome; for these two the outcome is
-            # which default the WordPress push would apply.
+            # Every field reports an outcome: for the OG fields, the default
+            # the WordPress push applies; for schema type, Rank Math's own.
             print(f"  {label}: {field.get('default_note', 'not proposed')}")
             continue
 
@@ -3801,11 +3801,15 @@ def _print_seo_suggestions(suggestions):
         if field.get("rationale"):
             print(f"      {field['rationale']}")
         if field.get("recognized") is False:
-            print("      Unrecognized type — confirm Rank Math accepts it")
+            print(
+                "      Unrecognized type — confirm Rank Math accepts it before "
+                "setting it in the post's Schema tab"
+            )
         elif field.get("differs_from_default"):
             print(
                 f"      Differs from the configured default: "
-                f"{field['configured_default']}"
+                f"{field['configured_default']} — the push does not set "
+                f"schema; change it in the post's Rank Math Schema tab"
             )
 
 
@@ -4588,10 +4592,10 @@ def _suggest_seo_for_publish(pub_handoff, pub_config, api_keys):
     so they arrive here as absent rather than as literal text).
 
     Triggered by the two SEO METADATA fields the push has no fallback for —
-    focus keyword and meta description. The other three resolve to sensible
-    defaults on their own (OG title to the article title, OG description to
-    the meta description, schema type to the configured default), so a blank
-    one is not a hole worth paying for a call over. Once the call is made
+    focus keyword and meta description. OG title and OG description resolve
+    to sensible defaults on their own (the article title, the meta
+    description), and schema type is not the push's to set at all, so none of
+    those is a hole worth paying for a call over. Once the call is made
     though, all five fields report, since they cost nothing extra.
     """
     seo_meta = pub_handoff.get("seo") or {}
@@ -4740,6 +4744,16 @@ def run_publish_pipeline(
             )
             for term in result["ignored_terms"]:
                 print(f"  - {term}")
+        if pub_handoff.get("ignored_schema_type"):
+            # The template no longer offers this line, but older copies of it
+            # still do. Said next to the post ID, which is where it gets set.
+            print(
+                f"NOTE: the handoff's schema type "
+                f"({pub_handoff['ignored_schema_type']}) was NOT applied — this "
+                "script does not set schema. Set it in the post's Rank Math "
+                "Schema tab; AboutPage and ContactPage are site-wide, under "
+                "Rank Math SEO > Titles & Meta > Local SEO."
+            )
         if result.get("unresolved_terms"):
             # Loud, and next to the success line rather than in a log above it.
             # The post exists but is missing metadata the author asked for.
