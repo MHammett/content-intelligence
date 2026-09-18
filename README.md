@@ -756,6 +756,7 @@ content-intelligence/
 │   │   │   ├── adapters/
 │   │   │   │   ├── grammar/languagetool.py   grammar correction (Pass 1)
 │   │   │   │   ├── cms/wordpress.py          WordPress REST API publisher
+│   │   │   │   ├── cms/blocks.py             Markdown -> WordPress block markup
 │   │   │   │   └── citation/
 │   │   │   │       ├── resolver.py           primary source resolution, checksums, confidence tiers
 │   │   │   │       ├── disposition.py        the one vocabulary for what happened to a citation

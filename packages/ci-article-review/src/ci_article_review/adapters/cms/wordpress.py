@@ -5,6 +5,8 @@ import requests
 
 from ci_core import redact
 
+from . import blocks
+
 log = logging.getLogger(__name__)
 
 CHECKLIST = """
@@ -192,29 +194,89 @@ def _build_post_payload(
 
     # Rank Math SEO meta fields
     meta = {}
-    seo = pub_params.get("seo", {})
-    focus_keyword = seo.get("focus_keyword")
-    meta_description = seo.get("meta_description")
-    og_title = seo.get("og_title") or pub_params.get("title", "")
-    og_description = seo.get("og_description") or meta_description
-    schema_type = seo.get("schema_type") or rank_math_config.get(
-        "default_schema_type", "BlogPosting"
-    )
-
-    if focus_keyword:
-        meta["rank_math_focus_keyword"] = focus_keyword
-    if meta_description:
-        meta["rank_math_description"] = meta_description
-    if og_title and rank_math_config.get("auto_set_og_tags"):
-        meta["rank_math_og_title"] = og_title
-    if og_description and rank_math_config.get("auto_set_og_tags"):
-        meta["rank_math_og_description"] = og_description
-    meta["rank_math_schema_type"] = schema_type
-
+    # Rank Math's fields are deliberately NOT set here. They were, via
+    # payload["meta"], and WordPress discarded every one of them: Rank Math
+    # does not register its meta keys with the core REST API, and core drops
+    # unregistered keys from a meta payload without erroring. A live page
+    # pushed that way came back with meta == ["footnotes"] and no SEO fields
+    # at all, while the publish reported success. They are set after creation
+    # instead, against Rank Math's own endpoint — see rank_math_meta() and
+    # _apply_rank_math_meta().
     if meta:
         payload["meta"] = meta
 
     return payload
+
+
+def rank_math_meta(pub_params, rank_math_config):
+    """Return the Rank Math meta fields for a handoff's SEO METADATA block.
+
+    Keys are Rank Math's own post-meta names, verified against a live install.
+    ``rank_math_title`` is the one that sets the ``<title>`` tag, which is what
+    makes a short post title (an About page's "About") publishable without
+    tripping a search-snippet length check: the SEO title is a separate field
+    from the title the theme renders.
+
+    Schema type is absent on purpose. Rank Math stores schema through its
+    ``updateSchemas`` endpoint rather than a meta key; the plausible-looking
+    ``rank_math_rich_snippet`` was tried against a live install and did not
+    change the rendered schema, so setting it would only look like it worked.
+    Set schema in Rank Math's Schema tab.
+    """
+    seo = pub_params.get("seo", {}) or {}
+    title = pub_params.get("title", "")
+    focus_keyword = seo.get("focus_keyword")
+    meta_description = seo.get("meta_description")
+    og_title = seo.get("og_title") or title
+    og_description = seo.get("og_description") or meta_description
+    # An explicit SEO title wins; otherwise the OG title does, since a handoff
+    # that bothered to write one meant it to be the search-facing title.
+    seo_title = seo.get("seo_title") or og_title
+
+    meta = {}
+    if focus_keyword:
+        meta["rank_math_focus_keyword"] = focus_keyword
+    if seo_title:
+        meta["rank_math_title"] = seo_title
+    if meta_description:
+        meta["rank_math_description"] = meta_description
+    if rank_math_config.get("auto_set_og_tags"):
+        if og_title:
+            meta["rank_math_facebook_title"] = og_title
+            meta["rank_math_twitter_title"] = og_title
+        if og_description:
+            meta["rank_math_facebook_description"] = og_description
+            meta["rank_math_twitter_description"] = og_description
+    return meta
+
+
+def _apply_rank_math_meta(site_url, headers, post_id, meta):
+    """POST the Rank Math fields to its own endpoint. Never fails the publish.
+
+    The post already exists by the time this runs, so a failure here costs the
+    SEO fields, not the article. It is reported rather than raised, and the
+    caller surfaces it next to the success line — a silently SEO-less post is
+    the failure this whole function exists to stop repeating.
+    """
+    if not meta:
+        return None
+    try:
+        resp = requests.post(
+            f"{site_url}/wp-json/rankmath/v1/updateMeta",
+            headers=headers,
+            json={"objectType": "post", "objectID": post_id, "meta": meta},
+            timeout=60,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        detail = redact.capture_error_body(e) or redact.redact_url_keys(str(e))
+        log.warning(f"Rank Math meta not applied: {detail}")
+        return str(detail)
+    except Exception as e:  # network, DNS, timeout
+        log.warning(f"Rank Math meta not applied: {e}")
+        return str(e)
+    log.info(f"Rank Math meta applied: {', '.join(sorted(meta))}")
+    return None
 
 
 def push(
@@ -298,6 +360,10 @@ def push(
             "unresolved_terms": sorted(unresolved),
         }
 
+    # WordPress stores HTML; the pipeline carries Markdown. Converting here
+    # rather than at the call site means every publish path gets it.
+    content = blocks.to_blocks(content)
+
     payload = _build_post_payload(
         pub_params,
         wp_config,
@@ -329,6 +395,11 @@ def push(
             "post_url": post_url,
             "post_type": post_type,
         }
+        rank_math_error = _apply_rank_math_meta(
+            site_url, headers, post_id, rank_math_meta(pub_params, rank_math_config)
+        )
+        if rank_math_error:
+            result["rank_math_error"] = rank_math_error
         if requested_terms:
             # Not an error: the push succeeded and the page is correct. It is
             # reported so the author learns the terms they wrote were never
