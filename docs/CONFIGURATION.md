@@ -1257,16 +1257,17 @@ seo_rules:
 ### SEO suggestions
 
 The pre-analysis SEO pass reports what's missing. The suggestion pass proposes
-values for it, covering every field in the publication handoff's SEO METADATA
-block — the same fields `adapters/cms/wordpress.py` pushes to Rank Math:
+values for it: the publication handoff's SEO METADATA fields that
+`adapters/cms/wordpress.py` pushes to Rank Math (all but SEO title, which falls
+back to the OG title), plus a schema type, which is advice only:
 
 | Field | What you get | Pushed as |
 |---|---|---|
 | Focus keyword | **3–5 candidates**, strongest first, each with a one-line rationale — including whether the article actually uses the phrase | `rank_math_focus_keyword` |
 | Meta description | A draft under `seo_rules.meta_description_max_chars` | `rank_math_description` |
-| OG title | A shorter title, but only when the article title exceeds `seo_rules.title_max_chars` — otherwise the field reports that the article title is used as-is | `rank_math_og_title` |
-| OG description | Social-card text, but only when a distinctly social framing beats reusing the meta description — otherwise the field reports that the meta description is used. Held to the same character limit | `rank_math_og_description` |
-| Schema type | `Article`, `NewsArticle`, or `BlogPosting` with a one-line rationale, flagged when it differs from `rank_math.default_schema_type` | `rank_math_schema_type` |
+| OG title | A shorter title, but only when the article title exceeds `seo_rules.title_max_chars` — otherwise the field reports that the article title is used as-is | `rank_math_facebook_title` and `rank_math_twitter_title` when `rank_math.auto_set_og_tags` is on; also `rank_math_title` when the handoff gives no SEO title |
+| OG description | Social-card text, but only when a distinctly social framing beats reusing the meta description — otherwise the field reports that the meta description is used. Held to the same character limit | `rank_math_facebook_description` and `rank_math_twitter_description` when `rank_math.auto_set_og_tags` is on |
+| Schema type | `Article`, `NewsArticle`, or `BlogPosting` with a one-line rationale, flagged when it differs from `rank_math.default_schema_type` | Not pushed, and the handoff has no field for it. Rank Math applies its default for the post type; set a different one in the post's Rank Math Schema tab. `AboutPage` and `ContactPage` are site-wide, under Rank Math SEO → Titles & Meta → Local SEO |
 
 Every field reports an outcome. The two with defaults in the push (OG title, OG
 description) name the default that would take effect rather than going silent,
