@@ -23,6 +23,21 @@ raw_excerpt, fallback_warnings, and model_currency were added at different
 times), so every field is read with .get() and missing data is treated as
 "not enough history" rather than an error.
 
+A --retry-failed run is saved in the article's own history, beside the run
+whose capture it loaded, and its report lists every call it carried over from
+that capture as well as the calls it made. Since 2026-09-18 (PR #211) the
+carried calls are marked ``replayed`` in ``api_call_log`` and
+``cost_summary.by_pass``, and the report names its capture in
+``retry_failed_from``. Every figure here counts a call once, in the run that
+made it: what it cost, whether it failed, and what it contributed. A carried
+call is left to the report of the run that made it — in this history too,
+unless the capture came from another checkout, in which case no run here paid
+for it. The cost trend also adds what a retry itself spent to the run it
+re-ran, so that a gap-fill is not read as a run (see cost_trend). A
+--retry-failed run from before that date (the flag dates from 2026-08-27) has
+no marker, and nothing else in its report tells it apart from a full run, so
+it is counted as one. This module does not guess.
+
 Reads pipeline_history/ fresh on every call — no database, no persistent
 index. That's fine at the dozens-to-low-hundreds-of-files scale this
 operates at.
@@ -31,6 +46,7 @@ operates at.
 import argparse
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -112,6 +128,21 @@ def load_reports(history_root, article_slug=None):
     return entries
 
 
+def _carried_over(report):
+    """The passes a run carried over from a capture rather than ran itself.
+
+    Read from ``api_call_log``, where the pipeline marks them; ``by_pass``
+    carries the same mark only since PR #211, while the call log has carried
+    it for a --replay since 2026-09-04. A pass name appears once per call log,
+    so it identifies the entry.
+    """
+    return {
+        call["pass"]
+        for call in report.get("api_call_log") or []
+        if call.get("replayed") and call.get("pass")
+    }
+
+
 # ---------------------------------------------------------------------------
 # Provider reliability
 # ---------------------------------------------------------------------------
@@ -122,6 +153,13 @@ def _provider_calls(entries):
     calls = {}
     for e in entries:
         for call in e["report"].get("api_call_log") or []:
+            # A call a --retry-failed run carried over from its capture was
+            # made, and succeeded or failed, in the run that wrote the capture,
+            # and is counted there. Counted again here it would be one call
+            # observed twice, the second time at the retry's timestamp, where
+            # it can move the recent window on its own.
+            if call.get("replayed"):
+                continue
             pass_key = call.get("pass") or ""
             # Expect "model:domain" (e.g. "openai:fact_check"). Some very old
             # reports recorded just the domain with no colon — that can't be
@@ -199,13 +237,82 @@ def _trend_direction(baseline_avg, recent_avg, threshold=TREND_RELATIVE_THRESHOL
     return "increasing" if change > 0 else "decreasing"
 
 
+def _spent_usd(cost_summary):
+    """What one run spent, or None when its report has no cost figure.
+
+    ``incurred_usd`` leaves out the calls a run carried over from a capture;
+    for a run that carried none it is ``total_usd``. Reports from before it
+    existed (2026-09-04) have only ``total_usd``.
+    """
+    if not isinstance(cost_summary, dict):
+        return None
+    spent = cost_summary.get("incurred_usd")
+    # Not ``or``: a --retry-failed run whose capture had nothing to retry
+    # re-ran nothing, and 0.0 is its cost, not a gap to fill with the total.
+    return spent if spent is not None else cost_summary.get("total_usd")
+
+
+def _retried_report_name(report):
+    """The report file name of the run a --retry-failed run re-ran, or None.
+
+    ``retry_failed_from`` is the capture's path as it was typed, relative or
+    not, so only its name is used. A capture is saved beside its run's report,
+    under the same stem (``ensemble_capture.capture_path_for``).
+    """
+    source = report.get("retry_failed_from")
+    name = re.split(r"[\\/]", str(source))[-1] if source else ""
+    if not name.endswith("_results.json"):
+        return None
+    return name[: -len("_results.json")] + "_report.json"
+
+
 def cost_trend(entries, recent_window=RECENT_WINDOW):
-    points = [
-        (e["timestamp"], e["report"]["cost_summary"]["total_usd"])
-        for e in entries
-        if isinstance(e["report"].get("cost_summary"), dict)
-        and e["report"]["cost_summary"].get("total_usd") is not None
-    ]
+    """Spend per run: total, average, and recent vs. baseline direction.
+
+    Each run counts at what it spent itself (``_spent_usd``). A --retry-failed
+    run spends only what it takes to fill an earlier run's gaps, so its spend
+    is added to that run rather than counted as a run of its own. Counted as
+    one, it is a run costing cents: it drags the per-run average down and, in
+    the recent window, can turn the trend by itself (2026-09-18: one $0.03
+    retry added to a 59-run history turned "flat" into "decreasing"). A retry
+    whose earlier run is not in this history, because its capture came from
+    another checkout, counts as a run of its own.
+    """
+    # Spend per run, oldest first. Entries are oldest first too, so the run a
+    # retry re-ran is already here when the retry arrives.
+    points = {}
+    # Retry -> the run it was added to, so a retry of a retry's capture lands
+    # on the run that first failed as well.
+    folded = {}
+    retry_failed_runs = 0
+    retry_failed_usd = 0.0
+    carried_over_usd = 0.0
+    unmatched = 0
+    for e in entries:
+        summary = e["report"].get("cost_summary")
+        spent = _spent_usd(summary)
+        if spent is None:
+            continue
+        key = (e["slug"], Path(e["path"]).name) if e.get("path") else id(e)
+        if e["report"].get("retry_failed_from"):
+            retry_failed_runs += 1
+            retry_failed_usd += spent
+            carried_over_usd += float(summary.get("replayed_usd") or 0.0)
+            retried = _retried_report_name(e["report"])
+            target = folded.get((e["slug"], retried), (e["slug"], retried))
+            if retried and target in points:
+                points[target] += spent
+                folded[key] = target
+                continue
+            unmatched += 1
+        points[key] = spent
+
+    retry_failed = {
+        "retry_failed_runs": retry_failed_runs,
+        "retry_failed_usd": round(retry_failed_usd, 4),
+        "carried_over_usd": round(carried_over_usd, 4),
+        "retry_failed_unmatched": unmatched,
+    }
     if not points:
         return {
             "runs": 0,
@@ -214,23 +321,26 @@ def cost_trend(entries, recent_window=RECENT_WINDOW):
             "recent_average_usd": None,
             "baseline_average_usd": None,
             "trend": "no_data",
+            **retry_failed,
         }
 
-    total = sum(v for _, v in points)
-    recent = points[-recent_window:]
-    baseline = points[:-recent_window]
-    recent_avg = sum(v for _, v in recent) / len(recent)
-    baseline_avg = (sum(v for _, v in baseline) / len(baseline)) if baseline else None
+    values = list(points.values())
+    total = sum(values)
+    recent = values[-recent_window:]
+    baseline = values[:-recent_window]
+    recent_avg = sum(recent) / len(recent)
+    baseline_avg = (sum(baseline) / len(baseline)) if baseline else None
 
     return {
-        "runs": len(points),
+        "runs": len(values),
         "total_usd": round(total, 4),
-        "average_usd": round(total / len(points), 4),
+        "average_usd": round(total / len(values), 4),
         "recent_average_usd": round(recent_avg, 4),
         "baseline_average_usd": round(baseline_avg, 4)
         if baseline_avg is not None
         else None,
         "trend": _trend_direction(baseline_avg, recent_avg),
+        **retry_failed,
     }
 
 
@@ -385,6 +495,10 @@ def pass_contribution(entries):
     value, not value itself. A red-team pass that raises one genuinely alarming
     finding nobody else spots scores badly here and is worth every cent. Read
     this to form hypotheses, then confirm with --only-model / --only-domain.
+
+    Each call counts once, in the run that made it: a pass a --retry-failed run
+    carried over from its capture adds nothing from the retry's report — not a
+    call, not its cost, not its findings. See the module docstring.
     """
     stats: dict[str, dict] = {}
 
@@ -405,10 +519,11 @@ def pass_contribution(entries):
 
     for entry in entries:
         report = entry["report"]
+        carried = _carried_over(report)
 
         for call in report.get("api_call_log") or []:
             name = call.get("pass")
-            if not name:
+            if not name or call.get("replayed"):
                 continue
             slot = _slot(name)
             slot["calls"] += 1
@@ -417,25 +532,37 @@ def pass_contribution(entries):
 
         for cost_entry in (report.get("cost_summary") or {}).get("by_pass") or []:
             name = cost_entry.get("pass")
-            if name:
+            if name and name not in carried:
                 _slot(name)["total_usd"] += float(cost_entry.get("total_usd") or 0.0)
 
         # Expansion's unit of output is a proposal, counted per model that
         # offered it — a merged candidate credits everyone in proposed_by.
+        # A carried expansion pass is skipped for the reason given for
+        # Section 1 below.
         expansion = report.get("section_10_expansion") or {}
         for bucket in ("sources", "topics", "angles", "data_points"):
             for item in expansion.get(bucket) or []:
                 if not isinstance(item, dict):
                     continue
                 for model in item.get("proposed_by") or []:
-                    _slot(f"{model}:expansion")["proposals"] += 1
+                    if f"{model}:expansion" not in carried:
+                        _slot(f"{model}:expansion")["proposals"] += 1
 
+        # A --retry-failed run's Section 1 is a real consensus over everything
+        # it carried and everything it re-ran, but a carried pass's findings are
+        # the ones it raised in the run that made it, whose own Section 1
+        # already credited them. Crediting them again would set one call's cost
+        # against its findings counted twice, so only the passes this run made
+        # are credited. That leaves out a carried pass's share of a flag that
+        # cleared the bar only with the re-run pass's vote; the re-run pass is
+        # credited with it. Whether a hit was corroborated still counts every
+        # pass that raised it, carried or not: a carried result did raise it.
         for flag in report.get("section_1_consensus") or []:
-            models = [m for m in (flag.get("models") or []) if m]
-            for name in set(models):
+            models = {m for m in (flag.get("models") or []) if m}
+            for name in models - carried:
                 slot = _slot(name)
                 slot["consensus_hits"] += 1
-                if len(set(models)) == 1:
+                if len(models) == 1:
                     slot["sole_source"] += 1
                 else:
                     slot["corroborated"] += 1
@@ -529,6 +656,20 @@ def print_history_report(result):
             f"  Total spend: ${cost['total_usd']:.4f} across {cost['runs']} run(s), "
             f"avg ${cost['average_usd']:.4f}/run"
         )
+        if cost["retry_failed_runs"]:
+            print(
+                f"  ({cost['retry_failed_runs']} --retry-failed run(s) counted "
+                "with the run whose failed calls each re-ran: "
+                f"${cost['retry_failed_usd']:.4f} spent; the "
+                f"${cost['carried_over_usd']:.4f} of calls they carried over is "
+                "not counted again)"
+            )
+            if cost["retry_failed_unmatched"]:
+                print(
+                    f"  ({cost['retry_failed_unmatched']} of those counted as "
+                    "run(s) of their own: the run each re-ran is not in this "
+                    "history)"
+                )
         if cost["baseline_average_usd"] is not None:
             print(
                 f"  Recent avg ${cost['recent_average_usd']:.4f}/run vs. "
