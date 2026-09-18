@@ -46,6 +46,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ci_article_review.report_markdown import render_report_markdown
+from ci_core.llm import cost
 
 import pytest
 
@@ -871,6 +872,100 @@ class TestStreamTimingReachesTheReport:
         assert lines, "no [CALIBRATION] lines were logged"
         assert all(line.endswith(" first_byte=- max_gap=-") for line in lines)
         assert not any("stream_timing" in e for e in report["api_call_log"])
+
+
+class TestARecoveredCallStillCostsWhatItCost:
+    """What a failed call was billed for, after recovery replaces it.
+
+    ``_recover_failed_calls`` has its unit tests in test_pipeline_timeout.py.
+    This is the wiring after it: the ``cost_summary`` a reader of the report
+    sees, and the capture a later ``--replay`` re-reports it from.
+    """
+
+    _FLAKY = ("openai", "completeness")
+
+    def _run(self, tmp_path, first_answer=None):
+        """One stubbed run, the flaky call answering ``first_answer`` once."""
+        answered = []
+
+        def _run_domain(model_name, domain, *a, **kw):
+            first_call = (model_name, domain) == self._FLAKY and not answered
+            if first_answer is not None and first_call:
+                answered.append(first_answer)
+                return {
+                    **copy.deepcopy(first_answer),
+                    "_model": model_name,
+                    "_domain": domain,
+                }
+            return _fake_run_domain(model_name, domain, *a, **kw)
+
+        stub = patch("ci_article_review.pipeline._run_domain", side_effect=_run_domain)
+        with _stubbed_run(tmp_path, extra_patches=[stub], offline=True) as report:
+            pass
+        if first_answer is not None:
+            assert answered, "the flaky call never ran, so this proves nothing"
+        return report
+
+    def _failed(self, error, last_tokens, discarded_tokens, reason):
+        return {
+            "failed": True,
+            "error": error,
+            "model": "openai-test-model",
+            "tokens": last_tokens,
+            "discarded_attempts": {
+                "count": 1,
+                "costed": 1 if any(discarded_tokens.values()) else 0,
+                "reasons": [reason],
+                "tokens": discarded_tokens,
+            },
+        }
+
+    def test_stalled_attempts_count_toward_the_floor(self, tmp_path):
+        none = {"prompt": 0, "completion": 0}
+        stalled = self._failed(
+            "stream stalled mid-stream: nothing received for 120.0s",
+            dict(none),
+            dict(none),
+            "StreamStalled",
+        )
+        clean = self._run(tmp_path / "clean")["cost_summary"]
+        summary = self._run(tmp_path / "stalled", stalled)["cost_summary"]
+
+        assert summary["discarded_calls"] == clean["discarded_calls"] + 2
+        assert summary["uncosted_calls"] == clean["uncosted_calls"] + 2
+        assert summary["total_usd"] == clean["total_usd"]
+
+        # And the capture keeps them, so a replay of this run bills them too.
+        capture = next((tmp_path / "stalled" / "history").rglob("*_results.json"))
+        replayable = ensemble_capture.load(capture)
+        assert replayable[":".join(self._FLAKY)]["discarded_attempts"]["count"] == 2
+
+    def test_a_malformed_responses_tokens_are_billed(self, tmp_path):
+        malformed = self._failed(
+            "Malformed JSON response",
+            {"prompt": 1000, "completion": 700},
+            {"prompt": 1000, "completion": 600},
+            "MalformedJSONError",
+        )
+        clean = self._run(tmp_path / "clean")["cost_summary"]
+        summary = self._run(tmp_path / "malformed", malformed)["cost_summary"]
+
+        assert summary["discarded_calls"] == clean["discarded_calls"] + 2
+        assert summary["uncosted_calls"] == clean["uncosted_calls"]
+        flaky = [p for p in summary["by_pass"] if p["pass"] == ":".join(self._FLAKY)]
+        # The answer's 1000/200 and both failed attempts, priced as one bill.
+        every_attempt = cost.calculate(
+            [
+                {
+                    "model": "openai-test-model",
+                    "tokens": {"prompt": 3000, "completion": 200 + 700 + 600},
+                }
+            ]
+        )
+        assert flaky[0]["total_usd"] == pytest.approx(
+            every_attempt["by_pass"][0]["total_usd"], abs=1e-6
+        )
+        assert summary["total_usd"] > clean["total_usd"]
 
 
 class TestADomainWithNoReviewerReachesTheReport:

@@ -13,6 +13,9 @@ import time
 
 from unittest.mock import patch
 
+import pytest
+
+from ci_core.llm import client, cost
 
 import ci_article_review.pipeline as pipeline
 
@@ -336,7 +339,251 @@ class TestRecoverFailedCalls:
             task_timeout=5,
         )
 
-        assert result["claude:accuracy"] == answered
+        # Its billing is carried all the same — see
+        # test_a_call_abandoned_at_its_budget_is_counted_but_not_priced.
+        recovered = dict(result["claude:accuracy"])
+        recovered.pop("discarded_attempts")
+        assert recovered == answered
+
+    # What a failed dispatch was billed for, which recovery used to replace
+    # along with it. Shaped as `_attempt` returns a call whose two attempts
+    # both failed: the first already summarised as discarded, the last as the
+    # result's own `tokens`.
+    _STALL = "stream stalled before the first chunk: nothing received for 120.0s"
+    _NO_TOKENS = {"prompt": 0, "completion": 0}
+
+    def _stalled_twice(self):
+        return {
+            "failed": True,
+            "error": self._STALL,
+            "model": "gpt-5.6-sol",
+            "tokens": dict(self._NO_TOKENS),
+            "discarded_attempts": {
+                "count": 1,
+                "costed": 0,
+                "reasons": ["StreamStalled"],
+                "tokens": dict(self._NO_TOKENS),
+            },
+        }
+
+    def _malformed_twice(self, **last_tokens):
+        return {
+            "failed": True,
+            "error": "Malformed JSON response",
+            "model": "gpt-5.6-sol",
+            "tokens": {"prompt": 6107, "completion": 9000, **last_tokens},
+            "discarded_attempts": {
+                "count": 1,
+                "costed": 1,
+                "reasons": ["MalformedJSONError"],
+                "tokens": {"prompt": 6107, "completion": 8000},
+            },
+        }
+
+    def _answer(self, **extra):
+        return {
+            "failed": False,
+            "model": "gpt-5.6-sol",
+            "tokens": {"prompt": 6107, "completion": 18097},
+            **extra,
+        }
+
+    def _recover(self, failed, *replies, passes=1):
+        """Recover one failed call, its runner returning ``replies`` in turn."""
+        queue = list(replies)
+        return pipeline._recover_failed_calls(
+            {"openai:red_team": failed},
+            [("openai:red_team", lambda: queue.pop(0))],
+            self._cfg(recovery_passes=passes),
+            {},
+            task_timeout=5,
+        )["openai:red_team"]
+
+    @staticmethod
+    def _cost(result):
+        """``cost_summary`` for a run whose only call is ``result``."""
+        return cost.calculate([cost.call_log_entry("openai:red_team", result)])
+
+    def test_a_recovered_call_keeps_the_attempts_that_stalled(self):
+        """2026-09-09, maximum: seven calls stalled on both attempts and
+        recovery got all seven back. The report counted 3 unpriced attempts,
+        and none of them were these fourteen."""
+        recovered = self._recover(self._stalled_twice(), self._answer())
+
+        assert recovered["discarded_attempts"] == {
+            "count": 2,
+            "costed": 0,
+            "reasons": ["StreamStalled"],
+            "tokens": self._NO_TOKENS,
+        }
+        summary = self._cost(recovered)
+        assert (summary["discarded_calls"], summary["uncosted_calls"]) == (2, 2)
+        # A stall reports no usage, so the dollars cannot move: the count is
+        # what says the total is a floor, and by how many attempts.
+        assert summary["total_usd"] == self._cost(self._answer())["total_usd"]
+
+    def test_a_malformed_response_stays_in_the_total(self):
+        """A response that would not parse was complete, and billed in full.
+        Replaced, its tokens left the dollar figure, not just the count."""
+        recovered = self._recover(self._malformed_twice(), self._answer())
+
+        summary = self._cost(recovered)
+        assert (summary["discarded_calls"], summary["uncosted_calls"]) == (2, 0)
+        # Every attempt the provider billed for, priced as one bill.
+        every_attempt = cost.calculate(
+            [
+                {
+                    "model": "gpt-5.6-sol",
+                    "tokens": {
+                        "prompt": 6107 * 3,
+                        "completion": 18097 + 9000 + 8000,
+                    },
+                }
+            ]
+        )
+        assert summary["by_pass"][0]["total_usd"] == pytest.approx(
+            every_attempt["by_pass"][0]["total_usd"], abs=1e-6
+        )
+
+    def test_a_failed_attempts_cached_input_keeps_its_rate(self):
+        """The client's own summary keeps no cached share, so cost.py bills a
+        discarded attempt's input at the full rate. The last attempt's share
+        is known, and is carried."""
+        recovered = self._recover(self._malformed_twice(cached=6104), self._answer())
+
+        assert recovered["discarded_attempts"]["tokens"] == {
+            "prompt": 6107 * 2,
+            "completion": 9000 + 8000,
+            "cached": 6104,
+        }
+
+    def test_the_replacements_own_retry_is_kept_alongside(self):
+        """A recovery attempt can need a retry of its own: grok:red_team's did,
+        on the 2026-09-09 maximum run. Both calls' billing stands, under both
+        reasons."""
+        own_retry = {
+            "count": 1,
+            "costed": 1,
+            "reasons": ["MalformedJSONError"],
+            "tokens": {"prompt": 6107, "completion": 7000},
+        }
+        recovered = self._recover(
+            self._stalled_twice(), self._answer(discarded_attempts=own_retry)
+        )
+
+        assert recovered["discarded_attempts"] == {
+            "count": 3,
+            "costed": 1,
+            "reasons": ["MalformedJSONError", "StreamStalled"],
+            "tokens": {"prompt": 6107, "completion": 7000},
+        }
+
+    def test_billing_accumulates_across_recovery_passes(self):
+        recovered = self._recover(
+            self._stalled_twice(),
+            self._stalled_twice(),
+            self._answer(),
+            passes=2,
+        )
+
+        # Two failed calls of two stalled attempts each, then the answer.
+        assert recovered["failed"] is False
+        assert recovered["discarded_attempts"]["count"] == 4
+        assert recovered["discarded_attempts"]["costed"] == 0
+
+    def test_a_call_still_failing_carries_what_came_before_it(self):
+        """2026-09-09, thorough: grok:red_team stalled on both attempts in the
+        main pass and on both again in recovery. The report kept the second
+        failure, and counted none of the first."""
+        recovered = self._recover(self._stalled_twice(), self._stalled_twice())
+
+        assert recovered["failed"] is True
+        # The main pass's two attempts and the recovery's discarded one. The
+        # recovery's last attempt is the entry's own, as on any failed call.
+        assert recovered["discarded_attempts"]["count"] == 3
+        assert self._cost(recovered)["uncosted_calls"] == 3
+
+    def test_a_call_abandoned_at_its_budget_is_counted_but_not_priced(self):
+        """The pipeline stopped waiting at its wall-clock budget; nothing told
+        the provider to stop generating, and no usage ever came back."""
+        abandoned = {
+            "failed": True,
+            "error": "Timed out after 420s",
+            "model": "gpt-5.6-sol",
+            "tokens": {},
+        }
+        recovered = self._recover(abandoned, self._answer())
+
+        assert recovered["discarded_attempts"] == {
+            "count": 1,
+            "costed": 0,
+            "reasons": ["TimeoutError"],
+            "tokens": self._NO_TOKENS,
+        }
+
+
+class TestFailureReason:
+    """``_failure_reason`` — which exception a failed result's text names.
+
+    Every non-empty string below is the ``error`` of a failed call in a saved
+    report, apart from the figures in it.
+    """
+
+    @pytest.mark.parametrize(
+        ("error", "reason"),
+        [
+            (
+                "stream stalled before the first chunk: nothing received for 120.0s",
+                "StreamStalled",
+            ),
+            ("stream stalled mid-stream: nothing received for 120.0s", "StreamStalled"),
+            ("Malformed JSON response", "MalformedJSONError"),
+            (
+                "litellm.RateLimitError: RateLimitError: MistralException - "
+                '{"object":"error","message":"Rate limit exceeded"',
+                "RateLimitError",
+            ),
+            (
+                "litellm.MidStreamFallbackError: litellm.APIError: Rate limit "
+                "reached for gpt-5.5",
+                "MidStreamFallbackError",
+            ),
+            ("TimeoutError: Timed out after 420s", "TimeoutError"),
+            ("Timed out after 420s", "TimeoutError"),
+            ("Exceeded global timeout of 1100s", "TimeoutError"),
+            (
+                "HTTPSConnectionPool(host='api.openai.com', port=443): Read timed "
+                "out. (read timeout=120)",
+                "TimeoutError",
+            ),
+            (
+                "401 Client Error: Unauthorized for url: "
+                "https://api.perplexity.ai/chat/completions",
+                "unknown",
+            ),
+            ("", "unknown"),
+            (None, "unknown"),
+        ],
+    )
+    def test_it_reads_the_exception_from_the_text_a_failure_left(self, error, reason):
+        assert pipeline._failure_reason(error) == reason
+
+    def test_the_stall_the_client_raises_is_read_as_one(self):
+        """The marker is the client's wording, not a contract. Pinned to what
+        the client actually raises, so rewording it cannot quietly file every
+        stall under ``unknown``."""
+        release = threading.Event()
+
+        def _silent():
+            release.wait(timeout=5)
+            yield from ()
+
+        try:
+            with pytest.raises(client.StreamStalled) as stalled:
+                list(client._iter_with_gap(_silent(), first_byte=0.05, gap=30.0))
+        finally:
+            release.set()
+        assert pipeline._failure_reason(str(stalled.value)) == "StreamStalled"
 
 
 class TestMergeRecoveredResults:
@@ -383,6 +630,58 @@ class TestMergeRecoveredResults:
         retried = {"openai:structure": {"failed": False, "stream_timing": []}}
         merged = pipeline._merge_recovered_results(prior, retried)
         assert merged["openai:structure"]["stream_timing"] == []
+
+    _PRIOR_BILLING = {
+        "count": 5,
+        "costed": 0,
+        "reasons": ["StreamStalled"],
+        "tokens": {"prompt": 0, "completion": 0},
+    }
+
+    def test_a_prior_runs_billing_is_not_carried_into_this_one(self):
+        """The same double count, in money: the capture's attempts are in the
+        cost summary of the run that bought them."""
+        prior = {
+            "openai:structure": {
+                "failed": True,
+                "error": "stream stalled",
+                "tokens": {"prompt": 0, "completion": 0},
+                "discarded_attempts": dict(self._PRIOR_BILLING),
+            }
+        }
+        retried = {"openai:structure": {"failed": False, "tokens": {"prompt": 9}}}
+        merged = pipeline._merge_recovered_results(prior, retried)
+        assert "discarded_attempts" not in merged["openai:structure"]
+
+    def test_recovery_after_a_retry_carries_only_what_this_run_bought(self):
+        """``--retry-failed`` runs the recovery pass too. By then every failed
+        entry recovery can retry is one this run made — the merge already
+        replaced the capture's — so the billing it carries is this run's."""
+        prior = {
+            "openai:structure": {
+                "failed": True,
+                "error": "stream stalled",
+                "discarded_attempts": dict(self._PRIOR_BILLING),
+            }
+        }
+        this_run = {
+            "openai:structure": {
+                "failed": True,
+                "error": "stream stalled mid-stream: nothing received for 120.0s",
+                "tokens": {"prompt": 0, "completion": 0},
+            }
+        }
+        merged = pipeline._merge_recovered_results(prior, this_run)
+
+        result = pipeline._recover_failed_calls(
+            merged,
+            [("openai:structure", lambda: {"failed": False})],
+            {"recovery_passes": 1, "recovery_delay_seconds": 0},
+            {},
+            task_timeout=5,
+        )
+
+        assert result["openai:structure"]["discarded_attempts"]["count"] == 1
 
 
 class TestCalibrationTiming:
