@@ -54,11 +54,12 @@ asyncio_mode = "strict"
 # A test that legitimately needs the network opts back in with
 # `@pytest.mark.enable_socket`. Today nothing does.
 #
-# pytest-socket guards a test's setup and call and nothing before the first
-# test, so on its own it leaves every conftest and test module to be imported
-# with the network open. `-p socket_guard` extends the same guard back to the
-# first conftest import; pytest_plugins/socket_guard.py says why it has to be a
-# `-p` plugin, and `pythonpath` is what makes it importable.
+# pytest-socket guards a test's setup and call, and nothing before the first
+# test or after its teardown starts: on its own it leaves every conftest and
+# test module to be imported, and every fixture to be torn down, with the
+# network open. `-p socket_guard` extends the same guard to both;
+# pytest_plugins/socket_guard.py says why it has to be a `-p` plugin, and
+# `pythonpath` is what makes it importable.
 #
 # `--import-mode=importlib` is what lets one session hold three packages'
 # tests. It names each test module after its path from here
