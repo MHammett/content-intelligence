@@ -1497,8 +1497,18 @@ _URL_REDIRECTOR_MARKERS = (
 #: impersonation attempt inside links.py before it reaches here, so by this
 #: point it means a determined block: the page is very probably real and simply
 #: refusing us.
+#:
+#: ``tls_untrusted`` — a certificate that failed verification — belongs here
+#: rather than with ``missing``, although nobody refused us. The tiers sort
+#: proposals by what we know of the page, and only ``missing`` is read as a sign
+#: of invention. A certificate failure means a server answered, and the
+#: handshake stopped before any page was asked for, so it is no evidence either
+#: way. Filed with the other "unreachable" failures, it landed in the bucket
+#: that calls a URL invented. What differs from a block — nobody refused us,
+#: and a bad certificate warns readers too — is carried on the item's
+#: ``url_error``.
 _URL_BLOCKED_REASONS = frozenset(
-    {"blocked", "auth_required", "rate_limited", "timeout"}
+    {"blocked", "auth_required", "rate_limited", "timeout", "tls_untrusted"}
 )
 
 
@@ -1586,10 +1596,11 @@ def _verify_expansion_urls(expansion: dict, offline: bool = False) -> dict:
 
       ok          — read directly
       redirected  — read, but the server sent us to a different document
-      archived    — the origin refused and an archive.org snapshot served it;
-                    the source is real either way
-      blocked     — 401/403/429/timeout with no snapshot. Existence unconfirmed,
-                    and it carries no suspicion of invention.
+      archived    — the origin was not read and an archive.org snapshot served
+                    it; the source is real either way
+      blocked     — 401/403/429/timeout, or a certificate that failed
+                    verification, with no snapshot. Existence unconfirmed, and
+                    it carries no suspicion of invention.
       missing     — 404/410, or a hostname that does not resolve. The bucket
                     that means invented, and the only one the report's warning
                     is drawn from.
@@ -1684,8 +1695,11 @@ def _verify_expansion_urls(expansion: dict, offline: bool = False) -> dict:
         if result.get("ok"):
             if result.get("verified_via") == "wayback_fallback":
                 item["url_status"] = "archived"
+                reason = wayback.FALLBACK_REASON_LABELS.get(
+                    origin_failure, origin_failure or "unknown"
+                )
                 item["url_error"] = (
-                    f"origin did not serve it ({origin_failure or 'unknown'}); "
+                    f"origin did not serve it ({reason}); "
                     "read from an archive.org snapshot instead"
                 )
                 if result.get("wayback_snapshot_url"):
@@ -1707,10 +1721,21 @@ def _verify_expansion_urls(expansion: dict, offline: bool = False) -> dict:
         status_code = result.get("status_code")
         if origin_failure in _URL_BLOCKED_REASONS:
             item["url_status"] = "blocked"
-            item["url_error"] = (
-                f"{origin_failure} ({status_code or 'no response'}) — the page "
-                "very likely exists; we were refused, not told it is missing"
-            )
+            if origin_failure == "tls_untrusted":
+                # Not a refusal, so it must not read as one — see
+                # _URL_BLOCKED_REASONS. links.py puts the verifier's reason in
+                # `error`; the raw exception it replaced used to land here.
+                item["url_error"] = (
+                    f"{result.get('error') or 'TLS certificate could not be verified'}"
+                    " — a server answered, so this is no sign the page is "
+                    "missing. Open it in a browser: if it warns too, readers "
+                    "will see that warning"
+                )
+            else:
+                item["url_error"] = (
+                    f"{origin_failure} ({status_code or 'no response'}) — the page "
+                    "very likely exists; we were refused, not told it is missing"
+                )
             counts["blocked"] += 1
         else:
             item["url_status"] = "missing"
@@ -4273,12 +4298,13 @@ def _print_draft_summary(
         links = pre.get("links", [])
         if links:
             broken = [lk for lk in links if not lk.get("ok")]
-            # A link we couldn't read — the origin refused us (401/403/429) or
-            # we never reached it (timeout, DNS/connection failure) — and that
-            # had no archive snapshot to fall back on is likely still a live
-            # page, unlike a 404/410, which is confirmed dead. Both count toward
-            # "broken" above (we couldn't verify the content either way), but a
-            # reader has to treat them differently before acting on the report.
+            # A link we couldn't read — the origin refused us (401/403/429), we
+            # never reached it (timeout, DNS/connection failure), or its
+            # certificate failed verification — and that had no archive
+            # snapshot to fall back on is likely still a live page, unlike a
+            # 404/410, which is confirmed dead. Both count toward "broken" above
+            # (we couldn't verify the content either way), but a reader has to
+            # treat them differently before acting on the report.
             unread = [lk for lk in broken if lk.get("origin_failure")]
             confirmed_dead = [
                 lk for lk in broken if lk.get("status_code") in (404, 410)
@@ -4641,15 +4667,16 @@ def _print_draft_summary(
                 "resolved"
             )
             # Only `missing` is evidence of invention. `blocked` is the origin
-            # refusing us, and saying so here matters as much as in the report —
-            # otherwise the summary keeps making the accusation the report
-            # itself no longer makes.
+            # refusing us — or never answering, or failing certificate
+            # verification — and saying so here matters as much as in the
+            # report; otherwise the summary keeps making the accusation the
+            # report itself no longer makes.
             for key, phrasing in (
                 ("archived", "  {} read from an archive snapshot instead"),
                 (
                     "blocked",
-                    "  {} could not be read (403/401/429/timeout) — blocked, "
-                    "not disproved",
+                    "  {} could not be read (403/401/429, timeout, or a "
+                    "certificate that failed verification) — not disproved",
                 ),
                 (
                     "missing",

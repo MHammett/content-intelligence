@@ -18,6 +18,8 @@ inversion is pinned here because each one is easy to "fix" back:
 
 from unittest.mock import patch
 
+import requests
+
 import ci_article_review.pipeline as pipeline
 from ci_article_review import consolidation
 from ci_article_review.consolidation import (
@@ -309,6 +311,14 @@ _NO_HOST = {
     "origin_failure": "unreachable",
 }
 _BLOCKED = {"ok": False, "status_code": 403, "origin_failure": "blocked"}
+_TLS_UNTRUSTED = {
+    "ok": False,
+    "status_code": None,
+    "error": (
+        "TLS certificate could not be verified: unable to get local issuer certificate"
+    ),
+    "origin_failure": "tls_untrusted",
+}
 _ARCHIVED = {
     "ok": True,
     "status_code": 403,
@@ -359,6 +369,70 @@ class TestUrlVerdictsAreTiered:
             "a blocked page must not count toward the invented total"
         )
         assert "invent" not in item["url_error"].lower()
+
+    def test_a_certificate_failure_is_not_called_invented(self):
+        """A server answered; the handshake stopped before the page was asked
+        for. Neither missing nor a refusal, so it lands in the not-disproved
+        tier and says what actually happened."""
+        expansion = {"sources": [_source(url="https://www.ntia.gov/doc")]}
+        self._verify(expansion, {"https://www.ntia.gov/doc": _TLS_UNTRUSTED})
+
+        item = expansion["sources"][0]
+        assert item["url_status"] == "blocked"
+        assert expansion["url_check"]["blocked"] == 1
+        assert expansion["url_check"]["missing"] == 0
+        assert item["url_error"].startswith(_TLS_UNTRUSTED["error"])
+        assert "no sign the page is missing" in item["url_error"]
+        assert "refused" not in item["url_error"], "nobody refused us"
+        assert "invent" not in item["url_error"].lower()
+
+    def test_a_certificate_failure_through_the_real_link_check(
+        self, certificate_failure
+    ):
+        """The defect lived between two layers — links.py classifying, this
+        pass bucketing — so this runs both, stubbing only the network. The
+        request fails where ``requests`` itself would raise; the archive has
+        no copy."""
+        expansion = {"sources": [_source(url="https://www.ntia.gov/doc")]}
+        with (
+            patch.object(
+                requests.sessions.Session,
+                "request",
+                side_effect=certificate_failure(),
+            ),
+            patch(
+                "ci_article_review.analysis.links._is_public_host", return_value=True
+            ),
+            patch(
+                "ci_article_review.analysis.links.wayback_check",
+                return_value={"archived": False},
+            ),
+        ):
+            _verify_expansion_urls(expansion)
+
+        item = expansion["sources"][0]
+        assert item["url_status"] == "blocked"
+        assert expansion["url_check"]["missing"] == 0
+        assert "HTTPSConnectionPool" not in item["url_error"]
+        assert "unable to get local issuer certificate" in item["url_error"]
+
+    def test_an_archive_recovery_names_the_reason_in_words(self):
+        expansion = {"sources": [_source(url="https://www.ntia.gov/doc")]}
+        self._verify(
+            expansion,
+            {
+                "https://www.ntia.gov/doc": dict(
+                    _TLS_UNTRUSTED,
+                    ok=True,
+                    verified_via="wayback_fallback",
+                    wayback_snapshot_url="https://web.archive.org/web/2020/x",
+                )
+            },
+        )
+
+        item = expansion["sources"][0]
+        assert item["url_status"] == "archived"
+        assert "(origin's TLS certificate could not be verified)" in item["url_error"]
 
     def test_an_archive_recovery_says_the_source_is_real(self):
         expansion = {"sources": [_source(url="https://x.example/doc")]}
@@ -589,10 +663,58 @@ class TestRendering:
             "models": ["gemini"],
         }
         out = "\n".join(_render_section_10(expansion))
-        assert "blocked, not disproved" in out
+        assert "could not be read (not disproved)" in out
         assert "invented" not in out, (
             "a 403 must not be reported as a likely fabrication"
         )
+
+    def test_a_certificate_failure_is_not_accused_or_called_a_refusal(self):
+        expansion = {
+            "sources": [
+                dict(
+                    _source(title="NTIA notice"),
+                    proposed_by=["gemini"],
+                    convergent=False,
+                    url_status="blocked",
+                    url_error=(
+                        "TLS certificate could not be verified: unable to get "
+                        "local issuer certificate — a server answered, so this "
+                        "is no sign the page is missing"
+                    ),
+                )
+            ],
+            "url_check": {"checked": 1, "resolved": 0, "blocked": 1, "missing": 0},
+            "models": ["gemini"],
+        }
+        out = "\n".join(_render_section_10(expansion))
+        assert "could not read — not disproved" in out
+        assert "LINK DEAD" not in out
+        assert "invented" not in out
+        assert "blocked" not in out and "refused" not in out
+
+    def test_an_archived_certificate_failure_is_not_called_a_refusal(self):
+        """The archived mark said "origin refused" for every route into the
+        archive, a timeout and a certificate failure included."""
+        expansion = {
+            "sources": [
+                dict(
+                    _source(title="NTIA notice"),
+                    proposed_by=["gemini"],
+                    convergent=False,
+                    url_status="archived",
+                    url_error=(
+                        "origin did not serve it (origin's TLS certificate could "
+                        "not be verified); read from an archive.org snapshot "
+                        "instead"
+                    ),
+                )
+            ],
+            "url_check": {"checked": 1, "resolved": 0, "archived": 1},
+            "models": ["gemini"],
+        }
+        out = "\n".join(_render_section_10(expansion))
+        assert "live page not read; read from archive" in out
+        assert "refused" not in out
 
     def test_proposals_name_who_made_them(self):
         expansion = {

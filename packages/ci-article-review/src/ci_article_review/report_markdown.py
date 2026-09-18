@@ -1174,7 +1174,10 @@ _SOURCE_VERDICT_MARK = {
 _URL_STATUS_MARK = {
     "ok": "link OK",
     "redirected": "REDIRECTED — check it is the right page",
-    "archived": "origin refused; read from archive",
+    # Not "origin refused": a timeout, an unreachable host and a certificate
+    # that failed verification reach the archive too, and none was a refusal.
+    # The item's own url_error says which it was.
+    "archived": "live page not read; read from archive",
     "blocked": "could not read — not disproved",
     "missing": "LINK DEAD — likely invented",
     "not_citable": "not citable",
@@ -1318,7 +1321,9 @@ def _render_section_10(expansion):
         parts = [f"{checks.get('resolved', 0)} of {checks.get('checked', 0)} resolved"]
         for key, phrasing in (
             ("archived", "{} read from an archive snapshot"),
-            ("blocked", "{} could not be read (blocked, not disproved)"),
+            # Not "blocked": the tier also holds timeouts and certificates
+            # that failed verification. Each item's line says which.
+            ("blocked", "{} could not be read (not disproved)"),
             ("missing", "{} dead"),
             ("not_citable", "{} were search redirects, not citable URLs"),
             ("no_url", "{} lead(s) offered without a URL"),

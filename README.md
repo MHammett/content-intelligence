@@ -234,8 +234,8 @@ of these:
 |---|---|
 | `link OK` | read directly |
 | `REDIRECTED` | read, but the server sent us to a different document — check it is the one being described |
-| `origin refused; read from archive` | the live page refused us and an archive.org snapshot served it. The source is real |
-| `could not read — not disproved` | 401/403/429/timeout. Existence unconfirmed, **no suspicion of invention** |
+| `live page not read; read from archive` | the live page could not be read and an archive.org snapshot served it. The source is real |
+| `could not read — not disproved` | 401/403/429/timeout, or a TLS certificate that failed verification. Existence unconfirmed, **no suspicion of invention** |
 | `LINK DEAD — likely invented` | 404, or a hostname that does not exist |
 | `not citable` | a search-provider redirect that could not be followed — these expire after a few days |
 | `no URL — lead only` | the model declined to guess and named the source in prose |

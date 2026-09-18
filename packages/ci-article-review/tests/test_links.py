@@ -291,6 +291,49 @@ class TestWaybackFallbackOnUnreadableOrigin:
         assert result["origin_failure"] == "timeout"
         assert "wayback_snapshot_url" not in result
 
+    def test_a_certificate_failure_recovers_via_wayback_snapshot(
+        self, certificate_failure
+    ):
+        snapshot_url = (
+            "https://web.archive.org/web/20240101000000/https://example.com/slow"
+        )
+        result, mock_get = self._check_with_head_failure(
+            certificate_failure(), {"archived": True, "snapshot_url": snapshot_url}
+        )
+
+        assert result["ok"] is True
+        assert result["verified_via"] == "wayback_fallback"
+        assert result["origin_failure"] == "tls_untrusted"
+        assert result["wayback_snapshot_url"] == snapshot_url
+        mock_get.assert_called_once()
+
+    def test_a_certificate_failure_reports_the_reason_not_the_exception(
+        self, certificate_failure
+    ):
+        """What every www.ntia.gov link carried on 2026-09-17: ``unreachable``,
+        with ``HTTPSConnectionPool(...)`` as the error."""
+        result, _ = self._check_with_head_failure(
+            certificate_failure(), {"archived": False}
+        )
+
+        assert result["ok"] is False
+        assert result["origin_failure"] == "tls_untrusted"
+        assert result["error"] == (
+            "TLS certificate could not be verified: "
+            "unable to get local issuer certificate"
+        )
+
+    def test_a_certificate_failure_is_never_escalated(self, certificate_failure):
+        """Both tiers verify against the same roots, so a browser fingerprint
+        cannot get past a certificate the plain fetch rejected."""
+        with patch("ci_article_review.analysis.links.impersonating_get") as mock_imp:
+            result, _ = self._check_with_head_failure(
+                certificate_failure(), {"archived": False}
+            )
+
+        mock_imp.assert_not_called()
+        assert result["origin_failure"] == "tls_untrusted"
+
     def test_unrelated_exception_gets_no_fallback(self):
         """Only unreachable-origin failures qualify; a malformed URL doesn't."""
         with (

@@ -1049,6 +1049,41 @@ class TestKnownUrlWaybackFallback:
         assert "could not be fetched" in result["note"]
         assert "verified_via" not in result
 
+    def test_certificate_failure_recovers_via_wayback_snapshot(
+        self, certificate_failure
+    ):
+        snapshot_url = (
+            "https://web.archive.org/web/20240101000000/https://example.com/page"
+        )
+        result, mock_get, _, _ = self._resolve_with_fetch_failure(
+            certificate_failure(), {"archived": True, "snapshot_url": snapshot_url}
+        )
+
+        assert result["resolved"] is True
+        assert result["verified_via"] == "wayback_fallback"
+        assert result["origin_failure"] == "tls_untrusted"
+        assert (
+            "(origin's TLS certificate could not be verified)"
+            in result["archive_provenance"]
+        )
+        assert "unreachable" not in result["archive_provenance"]
+        assert mock_get.call_count == 2
+
+    def test_certificate_failure_with_no_snapshot_says_why_in_plain_words(
+        self, certificate_failure
+    ):
+        result, _, _, _ = self._resolve_with_fetch_failure(
+            certificate_failure(), {"archived": False}
+        )
+
+        assert result["resolved"] is False
+        assert result["note"] == (
+            "Known source URL could not be fetched (TLS certificate could not "
+            "be verified: unable to get local issuer certificate)."
+        )
+        # archive.org was still asked, and its answer kept.
+        assert result["wayback"]["archived"] is False
+
     def test_stale_snapshot_stays_flagged_stale(self):
         """A 245-day-old snapshot satisfying a timeout is still stale."""
         result, _, mock_wb, mock_submit = self._resolve_with_fetch_failure(
@@ -1446,6 +1481,16 @@ class TestEscalationIsScopedToARefusal:
         called, result = self._escalation_attempted_for(exc)
         assert called is False
         assert result["verified_via"] == "wayback_fallback"
+
+    def test_a_certificate_failure_goes_straight_to_the_archive(
+        self, certificate_failure
+    ):
+        """Both tiers verify against the same roots, so a chain the plain fetch
+        rejected is one a browser fingerprint would be rejected on too."""
+        called, result = self._escalation_attempted_for(certificate_failure())
+        assert called is False
+        assert result["verified_via"] == "wayback_fallback"
+        assert result["origin_failure"] == "tls_untrusted"
 
     @pytest.mark.parametrize("status", [404, 500])
     def test_a_404_or_5xx_escalates_nowhere_and_asks_nobody(self, status):
