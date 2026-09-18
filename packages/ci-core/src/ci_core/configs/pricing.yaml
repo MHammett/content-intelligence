@@ -21,19 +21,28 @@
 # (gpt-5.6 sol/terra/luna — sol's rate CHANGED, see its block below); Anthropic
 # against litellm's model_prices_and_context_window.json 2026-08-18 with
 # claude-opus-5's [5.00, 25.00] re-confirmed 2026-09-17; xAI against docs.x.ai
-# 2026-08-15 (grok-4.6 base rate only — see its note below). Gemini/older entries
-# still June 2026. Update whenever provider pricing changes.
+# 2026-08-15 (grok-4.6 base rate only — see its note below); Mistral against
+# Mistral's own model card and pricing page 2026-09-18 (mistral-medium-3-5
+# only — its rate CHANGED, see its block below). Gemini/older entries still
+# June 2026. Update whenever provider pricing changes.
 #
-# STILL UNVERIFIED. The 2026-09-17 pass checked OpenAI and Claude only. Measured
-# against the 2026-09-09 maximum run, the exposure splits unevenly, so verify in
-# this order rather than treating the three as equal:
-#   mistral-medium-3-5   — whole row an estimate, priced $0.39 of that run
+# STILL UNVERIFIED. The 2026-09-17 pass checked OpenAI and Claude only, and the
+# 2026-09-18 pass checked mistral-medium-3-5 only. Measured against the
+# 2026-09-09 maximum run, what is left splits unevenly, so verify in this order
+# rather than treating the rows as equal:
 #   gemini-*             — whole row June 2026, priced $0.31 of that run
+#   sonar-*              — whole row June 2026, priced $0.15 of that run
+#   mistral-small-latest — June 2026, priced $0.01 of that run, all of it the
+#                          citation and SEO passes every preset runs (wide and
+#                          economy also put it in the ensemble). Its model
+#                          card said 0.15/0.60 on 2026-09-18, not the 0.10/0.30
+#                          below; that pass was scoped to mistral-medium-3-5.
 #   grok-4.6 cached rate — carried forward, but only 8,960 cached tokens were
 #                          billed all run, so even a 3x error here is under a
 #                          cent. grok's BASE rate was confirmed at docs.x.ai.
-# So ~$0.69 of that run's corrected $6.09 rests on unconfirmed rates — 11%, and
-# essentially all of it mistral and gemini. Each row carries the caveat inline.
+# So ~$0.47 of that run's $6.15 rests on unconfirmed rates — 8%, two thirds of
+# it gemini. ($6.15 is the sol-corrected $6.09 plus the +$0.06 mistral-medium-3-5
+# correction; see the Mistral block.)
 #
 # Prefix matching applies: "gemini-2.5-flash-0520" matches "gemini-2.5-flash".
 # Sort longer IDs before shorter ones if two share a prefix.
@@ -44,25 +53,29 @@
 # ---------------------------------------------
 # litellm ships its own cost table (`litellm.model_cost`) and the obvious move
 # was to drop this file and use it. Checked model by model on 2026-08-14
-# (litellm 1.96.2), it disagrees with the rates here on five of the models
-# actually run:
+# (litellm 1.96.2), it disagreed with the rates here on five of the models
+# actually run. The last column is the provider's own page, where checked:
 #
-#   model                   here          litellm
-#   mistral-large-latest     3.00/ 9.00    0.50/ 1.50
-#   mistral-medium-3-5       2.00/ 6.00    1.50/ 7.50
-#   mistral-small-latest     0.10/ 0.30    0.06/ 0.18
-#   sonar-pro                1.00/ 8.00    3.00/15.00
-#   sonar                    0.50/ 1.50    1.00/ 1.00
+#   model                   here          litellm       provider (2026-09-18)
+#   mistral-large-latest     3.00/ 9.00    0.50/ 1.50    0.50/ 1.50  Large 3
+#   mistral-medium-3-5       2.00/ 6.00    1.50/ 7.50    1.50/ 7.50  now fixed
+#   mistral-small-latest     0.10/ 0.30    0.06/ 0.18    0.15/ 0.60  Small 4
+#   sonar-pro                1.00/ 8.00    3.00/15.00    not checked
+#   sonar                    0.50/ 1.50    1.00/ 1.00    not checked
 #
 # The disagreements run in both directions, so adopting it wholesale would not
-# even be uniformly conservative: it would under-report Perplexity and
-# over-report Mistral on every run.
+# even be uniformly conservative. But the provider column is what counts, and
+# on Mistral it has sided with litellm twice and with neither source once. Only
+# the mistral-medium-3-5 row has been changed so far.
 #
-# One correction goes the other way and is worth recording. grok-build-0.1 was
-# [0.30, 1.00] here, which matched no published xAI rate; litellm said
-# 1.00/2.00 and docs.x.ai agreed, so the 2026-08-15 check fixed this file. The
-# lesson is not "litellm is unreliable" — it is that a second source is worth
-# having, and that the provider's own documentation settles it either way.
+# Two corrections have gone the other way — this file wrong, litellm right —
+# and both are worth recording. grok-build-0.1 was [0.30, 1.00] here, which
+# matched no published xAI rate; litellm said 1.00/2.00 and docs.x.ai agreed,
+# so the 2026-08-15 check fixed this file. mistral-medium-3-5 was [2.00, 6.00],
+# an estimate never checked against Mistral; litellm said 1.50/7.50 and
+# Mistral's model card agreed, so the 2026-09-18 check fixed it. The lesson is
+# not "litellm is unreliable" — it is that a second source is worth having, and
+# that the provider's own documentation settles it either way.
 
 unknown_price: [2.50, 10.00]   # fallback for unrecognized model IDs (conservative mid-range)
 
@@ -122,8 +135,30 @@ models:
   gemini-2.5-flash-lite:    [0.10,  0.40]
 
   # ── Mistral AI ───────────────────────────────────────────────────────────────
+  # mistral-medium-3-5 VERIFIED 2026-09-18: $1.5/M input, $7.5/M output on
+  # Mistral's model card,
+  # https://docs.mistral.ai/models/model-cards/mistral-medium-3-5-26-04
+  # and the same on https://mistral.ai/pricing/api/. litellm 1.96.2's cost map
+  # agrees. The row was [2.00, 6.00], an estimate never checked against Mistral.
+  #
+  # The cached rate is 10% of input, per
+  # https://docs.mistral.ai/studio/conversations/advanced/prompt-caching —
+  # and Mistral's cache fires for this pipeline unasked: nothing here sends a
+  # prompt_cache_key, yet the 2026-09-09 maximum run's mistral-small-latest
+  # citation calls reported 12,648 cached tokens, through the
+  # prompt_tokens_details.cached_tokens field the client reads. No
+  # mistral-medium-3-5 call on record has hit the cache yet — 0 cached tokens
+  # across 48 saved runs — so the third element changes no past figure.
+  #
+  # The old row was not uniformly low: output was $1.50/M under, input $0.50/M
+  # over, so a call was under-reported only while its prompt was under 3x its
+  # completion. Re-costing the 2026-09-09 runs moves mistral's share of the
+  # 18,167-char maximum run from $0.3876 to $0.4482 (+15.6%), taking that run's
+  # sol-corrected $6.0884 to $6.1490. On the 135,514-char draft, whose prompts
+  # are larger, maximum moves +$0.0181 and thorough -$0.0056. Of the 48 saved
+  # runs that billed this model, 45 move up.
   mistral-large-latest:     [3.00,  9.00]
-  mistral-medium-3-5:       [2.00,  6.00]   # verify at console.mistral.ai — estimate
+  mistral-medium-3-5:       [1.50,  7.50,  0.15]   # verified 2026-09-18 — see above
   mistral-small-latest:     [0.10,  0.30]
 
   # ── Perplexity ───────────────────────────────────────────────────────────────
