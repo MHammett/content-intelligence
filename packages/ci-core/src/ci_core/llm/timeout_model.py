@@ -140,14 +140,20 @@ def compute_budget(char_count, provider, cfg, task_ceiling_seconds, config=None)
     446s budget and was still cut off at the old 16,000 ceiling. A ceiling with
     room to finish needed a budget with room to reach it.
     """
-    effort = cfg.get("reasoning_effort") or cfg.get("effort")
-    budget = compute_timeout(
-        char_count, cfg.get("model", ""), effort, task_ceiling_seconds, config=config
-    )
     # Imported here, not at the top: output_tokens sizes its ceiling off this
     # module's size table, so it imports this module first.
     from ci_core.llm import output_tokens
 
+    # An unset effort is sized at the level the model runs at, as its output
+    # ceiling is: claude-opus-5 with no effort thinks at high, not at "default".
+    effort = (
+        cfg.get("reasoning_effort")
+        or cfg.get("effort")
+        or output_tokens.effort_when_unset(provider, cfg.get("model"))
+    )
+    budget = compute_timeout(
+        char_count, cfg.get("model", ""), effort, task_ceiling_seconds, config=config
+    )
     need = output_tokens.seconds_to_fill(provider, cfg, char_count)
     if need:
         cfg_ = config or _CONFIG

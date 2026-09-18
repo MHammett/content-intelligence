@@ -178,6 +178,9 @@ model_multipliers:
 # From reasoning_effort / effort in the model config. Calibration showed effort is
 # the steep, dominant axis: same model, none→high was ~5×. Models with no reasoning
 # param (grok reasoning variant, gemini thinking_budget, perplexity) use 'default'.
+# A claude model that thinks with no effort set (claude-opus-5, claude-sonnet-5)
+# does not: it runs at high, the API default, and is sized as high — see
+# _EFFORT_WHEN_UNSET in ci_core/llm/output_tokens.py.
 effort_multipliers:
   none:    1.0
   low:     1.15

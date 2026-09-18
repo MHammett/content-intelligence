@@ -1112,6 +1112,59 @@ class TestNoTimeoutLiftsTheOutputCeiling:
         assert "max_tokens" not in seen["gemini"]
 
 
+class TestTheCallLogRecordsTheEffortThatRan:
+    """The call log's `effort` sits beside the ceiling and budget sized from it.
+
+    claude-opus-5 with no effort set thinks at high and is sized as high (see
+    ci_core/llm/output_tokens.py). Logged as `effort=none`, a high-effort call's
+    length and speed would be filed under none, in the record calibration is
+    mined from.
+    """
+
+    @pytest.mark.parametrize(
+        "configured,answered,expected",
+        [
+            ("claude-opus-5", "claude-opus-5", "high"),
+            ("claude-sonnet-5", "claude-sonnet-5", "high"),
+            ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001", "none"),
+            # Read off the model that answered: this fallback thinks only when
+            # asked, so the same config ran it at none.
+            ("claude-opus-5", "claude-sonnet-4-6", "none"),
+        ],
+    )
+    def test_claude_with_no_effort_set(self, tmp_path, configured, answered, expected):
+        config = copy.deepcopy(_CONFIG)
+        config["api_keys"]["claude"] = {"api_key": "k"}
+        config["models"]["claude"] = {"model": configured}
+
+        def _answered_by(model_name, domain, *a, **kw):
+            result = _fake_run_domain(model_name, domain, *a, **kw)
+            if model_name == "claude":
+                result["model"] = answered
+                if answered != configured:
+                    result["fallback_from"] = configured
+            return result
+
+        with _stubbed_run(
+            tmp_path,
+            extra_patches=[
+                patch("ci_article_review.pipeline.merge_configs", return_value=config),
+                patch(
+                    "ci_article_review.pipeline._run_domain", side_effect=_answered_by
+                ),
+            ],
+            offline=True,
+        ) as report:
+            pass
+
+        passes = [e for e in report["api_call_log"] if e["pass"].startswith("claude:")]
+        assert passes, "claude reviewed nothing, so this proves nothing"
+        assert {e["effort"] for e in passes} == {expected}
+        # A provider off the list, with no effort set, still logs none.
+        others = [e for e in report["api_call_log"] if e["pass"].startswith("openai:")]
+        assert others and {e["effort"] for e in others} == {"none"}
+
+
 class TestADomainWithNoReviewerReachesTheReport:
     """The drafter exclusion can empty a domain; the run must not hide it.
 

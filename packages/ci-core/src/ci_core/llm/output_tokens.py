@@ -10,7 +10,8 @@ are in configs/output_tokens.yaml.
 Only two providers send a ceiling at all: claude (Anthropic requires one) and
 mistral. The other four run to the model's own limit and are left alone here.
 Of those two, only reasoning passes get a computed ceiling; the no-effort paths
-keep ``client._provider_params``'s defaults.
+keep ``client._provider_params``'s defaults. A claude model that thinks with no
+effort set is a reasoning pass, not a no-effort one — see ``_EFFORT_WHEN_UNSET``.
 
 The ceiling counts thinking. On Anthropic, "thinking tokens count toward the
 max_tokens limit for the turn" (platform.claude.com, extended thinking), and a
@@ -39,6 +40,39 @@ CAPPED_PROVIDERS = frozenset({"claude", "mistral"})
 #: key ``client._provider_params`` reads, so this agrees with what is sent.
 _EFFORT_KEY = {"claude": "effort", "mistral": "reasoning_effort"}
 
+#: The effort a model reasons at when its config sets none. Unset is not "none":
+#: it is the provider's default, and for these models the default is to think.
+#: Anthropic's per-model table lists thinking as "On" (Opus 5, Sonnet 5) or
+#: "Always on" (Fable, Mythos) when the request omits it, and every other claude
+#: model this repo has run as "Off"; and "setting effort to "high" produces
+#: exactly the same behavior as omitting the effort parameter entirely"
+#: (platform.claude.com, build-with-claude/thinking-troubleshooting and
+#: build-with-claude/effort, read 2026-09-18). With no effort, litellm sends
+#: neither ``thinking`` nor ``output_config`` (captured on the wire in
+#: tests/test_llm_client.py), so these run exactly as ``effort: high`` does and
+#: need the same ceiling. claude-opus-5 at high has spent over 15,000 tokens
+#: reasoning on one pass (configs/output_tokens.yaml, a censored floor) — before
+#: this list, the no-effort path sent it 8000 for reasoning and answer together.
+#:
+#: A list rather than litellm's model map, which cannot tell these apart: the one
+#: thinking flag it carries on claude-opus-5 and claude-sonnet-5,
+#: ``supports_adaptive_thinking``, is just as true of claude-opus-4-8, which does
+#: not think unless asked. Newer litellm adds ``thinking_always_on``, but only on
+#: Fable and Mythos; Opus 5 and Sonnet 5 can be switched off, so it is false for
+#: them. Exact ids, so a model released after 2026-09-18 is not assumed either
+#: way — it runs on the no-effort default until it is added here.
+_EFFORT_WHEN_UNSET = {
+    "claude": {
+        "claude-opus-5": "high",
+        "claude-sonnet-5": "high",
+        "claude-fable-5": "high",
+        "claude-fable-5-1": "high",
+        "claude-mythos-5": "high",
+        "claude-mythos-5-1": "high",
+        "claude-mythos-preview": "high",
+    },
+}
+
 #: Upper bound for a ``--no-timeout`` calibration run. The point of that run is an
 #: uncensored measurement, so the ceiling goes as high as the model allows — but
 #: not to Mistral's advertised 262,144, which is its whole context window: the
@@ -66,16 +100,30 @@ def _load():
 _CONFIG = _load()
 
 
+def effort_when_unset(provider, model):
+    """The effort ``model`` reasons at when its config sets none, or None.
+
+    Matched on the bare id, so a route pinned in user.yaml
+    (``anthropic/claude-opus-5``) counts as the model it routes to.
+    """
+    if not model:
+        return None
+    return _EFFORT_WHEN_UNSET.get(provider, {}).get(str(model).rsplit("/", 1)[-1])
+
+
 def effort_of(provider, cfg):
-    """The reasoning level ``provider`` will be sent, or None for a plain pass.
+    """The reasoning level ``provider`` will run at, or None for a plain pass.
 
     ``"none"`` is a real value mistral-medium-3-5 accepts, and it means no
-    reasoning — so it is treated exactly like an absent key.
+    reasoning — so it is treated exactly like an absent key. An absent key is
+    not always a plain pass, though: a model that thinks by default runs at its
+    default (``_EFFORT_WHEN_UNSET``). That holds for a claude ``"none"`` too,
+    since litellm drops it before sending, leaving a request with no effort.
     """
     key = _EFFORT_KEY.get(provider)
     effort = (cfg or {}).get(key) if key else None
     if not effort or str(effort).lower() == "none":
-        return None
+        return effort_when_unset(provider, (cfg or {}).get("model"))
     return str(effort).lower()
 
 
@@ -104,7 +152,7 @@ def compute_max_tokens(provider, cfg, domain, char_count, config=None):
     """The output ceiling for one reasoning pass, or None when none applies.
 
     None means "leave the request alone": a provider that sends no ceiling, or a
-    pass with no reasoning effort, where the client's own default already fits.
+    pass that does not reason, where the client's own default already fits.
     """
     if provider not in CAPPED_PROVIDERS:
         return None

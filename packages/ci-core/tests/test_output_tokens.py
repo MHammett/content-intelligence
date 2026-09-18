@@ -147,12 +147,14 @@ class TestWhoGetsACeiling:
 
     def test_each_provider_reads_the_key_its_request_is_built_from(self):
         """client._provider_params reads `effort` for claude and
-        `reasoning_effort` for mistral; the wrong key sends no reasoning, so it
-        must not buy a reasoning-sized ceiling either."""
+        `reasoning_effort` for mistral; the wrong key sends no reasoning, so on a
+        model that thinks only when asked it must not buy a reasoning-sized
+        ceiling either. (claude-opus-5 thinks anyway — see
+        TestAnUnsetEffortIsTheModelsDefault.)"""
         assert (
             ot.compute_max_tokens(
                 "claude",
-                {"model": "claude-opus-5", "reasoning_effort": "high"},
+                {"model": "claude-opus-4-8", "reasoning_effort": "high"},
                 "fact_check",
                 27113,
             )
@@ -167,6 +169,107 @@ class TestWhoGetsACeiling:
             )
             is None
         )
+
+
+class TestAnUnsetEffortIsTheModelsDefault:
+    """claude-opus-5 and claude-sonnet-5 think when the request names no effort.
+
+    Anthropic lists thinking as "On" for both when `thinking` is omitted, and an
+    omitted effort as identical to `high`; litellm sends neither for a config
+    with no effort (captured on the wire in test_llm_client.py). So a bare
+    `claude: model: claude-opus-5` — configs/user.yaml's own base entry, and the
+    shipped user.example.yaml's — runs exactly as `effort: high` does, and was
+    sent 8000 tokens for its thinking and its answer together.
+    """
+
+    THINK_BY_DEFAULT = ["claude-opus-5", "claude-sonnet-5"]
+    # Anthropic's table: thinking "Off" unless the request asks for it.
+    THINK_WHEN_ASKED = [
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5-20251001",
+    ]
+
+    @pytest.mark.parametrize("model", THINK_BY_DEFAULT)
+    def test_sized_exactly_as_effort_high(self, model):
+        for chars in (2182, 27113, 135514):
+            for domain in ("fact_check", "red_team"):
+                unset = ot.compute_max_tokens("claude", {"model": model}, domain, chars)
+                high = ot.compute_max_tokens(
+                    "claude", {"model": model, "effort": "high"}, domain, chars
+                )
+                assert unset == high, (model, chars, domain)
+
+    @pytest.mark.parametrize("model", THINK_WHEN_ASKED)
+    def test_a_model_that_thinks_only_when_asked_keeps_the_client_default(self, model):
+        assert ot.effort_of("claude", {"model": model}) is None
+        assert (
+            ot.compute_max_tokens("claude", {"model": model}, "fact_check", 27113)
+            is None
+        )
+
+    def test_an_explicit_effort_still_wins(self):
+        low = {"model": "claude-opus-5", "effort": "low"}
+        assert ot.effort_of("claude", low) == "low"
+        assert ot.compute_max_tokens(
+            "claude", low, "fact_check", 27113
+        ) < ot.compute_max_tokens("claude", OPUS_HIGH, "fact_check", 27113)
+
+    def test_the_wrong_key_is_ignored_here_as_it_is_in_the_request(self):
+        """Nothing reaches the provider from `reasoning_effort` on claude, so
+        claude-opus-5 runs at its default whatever the stray key says."""
+        stray = {"model": "claude-opus-5", "reasoning_effort": "low"}
+        assert ot.effort_of("claude", stray) == "high"
+
+    def test_a_claude_none_is_unset(self):
+        """litellm drops a claude reasoning_effort of "none" before sending, so
+        the model runs at its default — also captured in test_llm_client.py."""
+        assert ot.effort_of("claude", {"model": "claude-opus-5", "effort": "none"}) == (
+            "high"
+        )
+
+    def test_mistral_none_still_means_no_reasoning(self):
+        """mistral's "none" is sent and honoured; the list must not reach it."""
+        cfg = {"model": "mistral-medium-3-5", "reasoning_effort": "none"}
+        assert ot.effort_of("mistral", cfg) is None
+        assert ot.effort_when_unset("mistral", "claude-opus-5") is None
+
+    def test_a_pinned_route_is_the_model_it_routes_to(self):
+        assert ot.effort_when_unset("claude", "anthropic/claude-opus-5") == "high"
+        assert ot.effort_when_unset("claude", None) is None
+
+    def test_the_wall_clock_formula_uses_high_too(self, monkeypatch):
+        """The effort multiplier on its own. Time-to-fill the ceiling is taken
+        out, because at high it outweighs the formula and would hide it."""
+        monkeypatch.setattr(ot, "seconds_to_fill", lambda *a, **k: None)
+        unset = tm.compute_budget(27113, "claude", {"model": "claude-opus-5"}, CEILING)
+        assert unset == tm.compute_timeout(27113, "claude-opus-5", "high", CEILING)
+        assert unset > tm.compute_timeout(27113, "claude-opus-5", None, CEILING)
+
+    @pytest.mark.parametrize("model", THINK_BY_DEFAULT)
+    def test_the_whole_budget_matches_effort_high(self, model):
+        for chars in (2182, 27113, 135514):
+            assert tm.compute_budget(
+                chars, "claude", {"model": model}, CEILING
+            ) == tm.compute_budget(
+                chars, "claude", {"model": model, "effort": "high"}, CEILING
+            ), (model, chars)
+
+    def test_litellms_model_map_cannot_tell_the_two_kinds_apart(self):
+        """Why this is a list and not a map lookup: claude-opus-5 thinks by
+        default and claude-opus-4-8 does not, yet the bundled map gives them the
+        same thinking flags. If this fails, litellm has learned the difference,
+        and _EFFORT_WHEN_UNSET can be keyed off its map instead."""
+        from ci_core.llm import client
+
+        cost_map = client._litellm().model_cost
+
+        def _thinking_flags(model):
+            return {k: v for k, v in cost_map[model].items() if "thinking" in k}
+
+        assert _thinking_flags("claude-opus-5") == _thinking_flags("claude-opus-4-8")
 
 
 class TestTheModelsOwnLimit:

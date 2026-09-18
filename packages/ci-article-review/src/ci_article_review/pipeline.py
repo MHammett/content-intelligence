@@ -3291,8 +3291,17 @@ def run_draft_pipeline(
             if isinstance(model_configs.get(model_name), dict)
             else {}
         )
+        # What the pass ran at, not what the config spelled out: a claude model
+        # that thinks with no effort set ran at high, and this field sits beside
+        # the ceiling and budget sized for that. Read off the model that
+        # answered, since a fallback need not think the way the primary does.
         effort = (
-            (mcfg or {}).get("reasoning_effort") or (mcfg or {}).get("effort") or "none"
+            (mcfg or {}).get("reasoning_effort")
+            or (mcfg or {}).get("effort")
+            or output_tokens.effort_when_unset(
+                model_name, result.get("model") or (mcfg or {}).get("model")
+            )
+            or "none"
         )
         budget = (mcfg or {}).get("timeout_seconds")
         elapsed = result.get("elapsed_seconds")
