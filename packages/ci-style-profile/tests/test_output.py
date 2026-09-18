@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 
 _CANONICAL_PROFILE = {
@@ -248,29 +248,13 @@ class TestMarkdownFormatter:
 class TestProfileVersioning:
     def test_snapshot_saved_to_profiles_dir(self):
         """Snapshot written to profiles/<name>/<ISO8601>.yaml."""
-        from ci_style_profile.output import save_versioned_snapshot
+        from ci_style_profile import output
 
-        with tempfile.TemporaryDirectory():
-            with patch("ci_style_profile.output.Path"):
-                # We'll test via actual filesystem since patching Path is complex
-                pass
+        snap = output.save_versioned_snapshot(
+            "content: test\n", publication="test_pub", output_yaml=None
+        )
 
-        # Just test it doesn't raise (actual path is in the package dir)
-        profiles_dir = Path(__file__).parent.parent / "profiles"
-        profiles_dir.mkdir(exist_ok=True)
-
-        with patch(
-            "ci_style_profile.output.Path.__truediv__",
-            return_value=Path(tempfile.mkdtemp()),
-        ):
-            pass  # Skip complex path patch
-
-        # Direct test
-        with tempfile.TemporaryDirectory():
-            with patch("ci_style_profile.output.Path", lambda *a: Path(*a)):
-                # Just verify the function signature works
-                snap = save_versioned_snapshot(
-                    "content: test\n", publication="test_pub", output_yaml=None
-                )
-                assert snap.exists()
-                snap.unlink()
+        # _PROFILES_DIR is this test's scratch directory: see tests/conftest.py.
+        assert snap.parent == output._PROFILES_DIR / "test_pub"
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d-\d\d-\d\dZ\.yaml", snap.name)
+        assert snap.read_text(encoding="utf-8") == "content: test\n"

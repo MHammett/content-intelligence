@@ -334,12 +334,18 @@ def write_atomic(path: str | Path, content: str, encoding: str = "utf-8") -> Non
     log.info("Wrote profile to %s", output_path)
 
 
+#: Every profile's snapshot history. It sits beside this module, so inside the
+#: installed package (gitignored in a checkout). A module constant so the test
+#: suite can redirect it: see ``isolate_package_state`` in tests/conftest.py.
+_PROFILES_DIR = Path(__file__).parent / "profiles"
+
+
 def save_versioned_snapshot(
     content: str, publication: str | None, output_yaml: str | None
 ) -> Path:
     """Save a timestamped copy of the profile."""
     ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
-    profiles_dir = Path(__file__).parent / "profiles"
+    profiles_dir = _PROFILES_DIR
 
     if publication:
         snap_dir = profiles_dir / publication
