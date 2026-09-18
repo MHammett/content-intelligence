@@ -974,7 +974,7 @@ The tables below show exactly what settings each preset applies to each provider
 | gpt-5.4 | $0.040 | +$0.01–$0.06 (effort low→xhigh) |
 | gpt-5.5 | $0.080 | +$0.03–$0.10 |
 | grok-4.3 / grok-4.20-reasoning | $0.010 | same price |
-| mistral-large | $0.030 | +$0.01–$0.04 |
+| mistral-large | $0.005 | — |
 | claude-haiku-4-5 | $0.014 | +$0.02+ (extended thinking) |
 | claude-sonnet-5 | $0.028 | Thinks by default, at `high` — [measured per-call cost](PROVIDERS.md#anthropic-claude-optional) |
 | claude-opus-5 | $0.070 | Thinks by default, at `high` — [measured per-call cost](PROVIDERS.md#anthropic-claude-optional) |
