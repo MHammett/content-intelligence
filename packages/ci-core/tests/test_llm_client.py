@@ -2324,13 +2324,14 @@ class TestClaudeOutputCeiling:
     def test_a_model_that_thinks_with_no_effort_gets_the_reasoning_fallback(
         self, model
     ):
-        """Nothing is sent and the model thinks anyway, at high (see
+        """No effort is sent and the model thinks anyway, at high (see
         TestClaudeRequestOnTheWire) — so it gets what `effort: high` gets, not
         8000 to split between that thinking and the answer."""
         seen = self._seen(model=model)
         assert seen["max_tokens"] == 16000
         assert "reasoning_effort" not in seen
-        assert "thinking" not in seen
+        # Only the display; see TestClaudeThinkingIsAudible.
+        assert seen["thinking"] == {"type": "adaptive", "display": "summarized"}
 
     def test_the_model_may_arrive_as_an_argument_rather_than_config(self):
         seen = {}
@@ -2410,11 +2411,13 @@ class TestClaudeRequestOnTheWire:
 
     Every other test in this file stops at the kwargs handed to litellm, which
     is the seam this file is for. These go one layer lower because the question
-    is litellm's: does a claude config with no effort reach Anthropic with no
-    `thinking` at all? In litellm 1.96.2 it does — and on that request
-    claude-opus-5 and claude-sonnet-5 think, at effort high, by Anthropic's
-    per-model table. That is why their ceiling is sized for thinking; see
-    output_tokens._EFFORT_WHEN_UNSET.
+    is litellm's: what does it make of the claude parameters we hand it? Left
+    to itself, litellm 1.96.2 sends a no-effort claude config with no `thinking`
+    at all — and on that request claude-opus-5 and claude-sonnet-5 think, at
+    effort high, by Anthropic's per-model table. That is why their ceiling is
+    sized for thinking; see output_tokens._EFFORT_WHEN_UNSET. They are now sent
+    `thinking` for its display alone, and with an effort that `thinking` meets
+    litellm's own mapping of it, in an order only litellm decides.
 
     ``httpx.Client.send`` is replaced, so litellm's own request transformation
     runs in full and nothing leaves the machine.
@@ -2442,28 +2445,60 @@ class TestClaudeRequestOnTheWire:
         (body,) = wire
         return body
 
+    SUMMARIZED = {"type": "adaptive", "display": "summarized"}
+
     @pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5"])
-    def test_no_effort_sends_no_thinking_under_a_ceiling_sized_for_it(
+    def test_no_effort_sends_only_the_display_under_a_ceiling_sized_for_it(
         self, wire, model
     ):
         body = self._body(wire, model=model)
         assert body["model"] == model
-        assert "thinking" not in body
+        assert body["thinking"] == self.SUMMARIZED
         assert "output_config" not in body
         assert body["max_tokens"] == 16000
 
     def test_effort_high_is_the_same_request_with_the_default_spelled_out(self, wire):
+        """litellm maps the effort to thinking {"type": "adaptive"} and assigns
+        it outright; the display survives only because our `thinking` is mapped
+        after it. The effort must survive too."""
         body = self._body(wire, model="claude-opus-5", effort="high")
-        assert body["thinking"] == {"type": "adaptive"}
+        assert body["thinking"] == self.SUMMARIZED
         assert body["output_config"] == {"effort": "high"}
         assert body["max_tokens"] == 16000
 
     def test_a_claude_none_is_dropped_before_it_is_sent(self, wire):
         """So on claude-opus-5 it is unset, not off, and output_tokens.effort_of
-        sizes it as high on the strength of this."""
+        sizes it as high on the strength of this. The `thinking` that remains
+        is the display, which does not turn thinking on for a model that thinks
+        only when asked."""
         body = self._body(wire, model="claude-opus-5", effort="none")
+        assert body["thinking"] == self.SUMMARIZED
+        assert "output_config" not in body
+        wire.clear()
+        body = self._body(wire, model="claude-opus-4-8", effort="none")
         assert "thinking" not in body
         assert "output_config" not in body
+
+    def test_a_model_without_adaptive_thinking_gets_what_its_effort_maps_to(self, wire):
+        """Exactly what `reasoning_effort` alone puts on the wire. An explicit
+        adaptive `thinking` would be rewritten by litellm into its own budget
+        (1024 -> 2048 at low), and ci-style-profile's economy tier runs
+        claude-haiku-4-5 at effort low."""
+        ours = self._body(wire, model="claude-haiku-4-5-20251001", effort="low")
+        wire.clear()
+        list(
+            client.litellm.completion(
+                model="anthropic/claude-haiku-4-5-20251001",
+                messages=[{"role": "user", "content": "user"}],
+                reasoning_effort="low",
+                max_tokens=16000,
+                stream=True,
+                api_key="key",
+            )
+        )
+        (alone,) = wire
+        assert ours["thinking"] == alone["thinking"]
+        assert ours["thinking"]["type"] == "enabled"
 
     @pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-haiku-4-5-20251001"])
     def test_a_model_that_thinks_only_when_asked_keeps_8000(self, wire, model):
@@ -2474,7 +2509,142 @@ class TestClaudeRequestOnTheWire:
     def test_the_pipelines_computed_ceiling_is_what_is_sent(self, wire):
         body = self._body(wire, model="claude-opus-5", max_tokens=40500)
         assert body["max_tokens"] == 40500
-        assert "thinking" not in body
+        assert "output_config" not in body
+
+
+def _thinking_chunk(summary):
+    """What litellm yields for a summarized thinking_delta: the summary rides in
+    reasoning_content, and content is empty rather than absent."""
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="", reasoning_content=summary),
+                finish_reason=None,
+            )
+        ],
+        usage=None,
+        citations=None,
+        search_results=None,
+        vertex_ai_grounding_metadata=None,
+    )
+
+
+class TestClaudeThinkingIsAudible:
+    """A claude request that thinks adaptively asks for its thinking summarized.
+
+    Opus 5, Sonnet 5 and Opus 4.7/4.8 default to thinking display "omitted": a
+    thinking block streams one empty thinking_delta, then nothing until its
+    signature. litellm drops the empty delta, so the entire thinking phase
+    reached _iter_with_gap as a single silence — a lone claude-opus-5 fact_check
+    with no fan-out stalled at >120.02s and >120.01s on 2026-09-18.
+
+    What reaches the wire is pinned in TestClaudeRequestOnTheWire; these cover
+    which requests ask, and what the stream does with the answer.
+    """
+
+    SUMMARIZED = {"type": "adaptive", "display": "summarized"}
+
+    def _seen(self, model, **provider_config):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call("claude", model=model, provider_config=provider_config)
+        return seen
+
+    def test_an_adaptive_model_asks_for_summaries_and_keeps_its_effort(self):
+        for model in ("claude-opus-5", "claude-sonnet-5", "claude-opus-4-8"):
+            seen = self._seen(model, effort="high")
+            assert seen["thinking"] == self.SUMMARIZED, model
+            assert seen["reasoning_effort"] == "high", model
+
+    def test_a_model_without_adaptive_thinking_is_left_to_its_effort(self):
+        """ci-style-profile's economy tier runs claude-haiku-4-5 at effort low.
+        An explicit adaptive request would be rewritten by litellm into its own
+        medium budget, overriding the one the effort chose."""
+        seen = self._seen("claude-haiku-4-5-20251001", effort="low")
+        assert "thinking" not in seen
+        assert seen["reasoning_effort"] == "low"
+
+    def test_a_fallback_is_judged_on_its_own_model(self):
+        """Parameters are built per attempt. The chain ends on claude-haiku-4-5,
+        which must not inherit the requested model's thinking request."""
+        sent = []
+
+        def _capacity_until_haiku(**kwargs):
+            sent.append(kwargs)
+            if "haiku" not in kwargs["model"]:
+                raise _http_error(503, "model overloaded")
+            return _completion_stream()
+
+        with patch.object(
+            client.litellm, "completion", side_effect=_capacity_until_haiku
+        ):
+            result = _call(
+                "claude", model="claude-opus-5", provider_config={"effort": "high"}
+            )
+
+        assert result["failed"] is False
+        assert [kw["model"] for kw in sent] == [
+            "anthropic/claude-opus-5",
+            "anthropic/claude-sonnet-4-6",
+            "anthropic/claude-haiku-4-5-20251001",
+        ]
+        assert sent[0]["thinking"] == self.SUMMARIZED
+        assert sent[1]["thinking"] == self.SUMMARIZED
+        assert "thinking" not in sent[2]
+
+    @pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5"])
+    def test_a_model_that_thinks_unasked_is_asked_only_for_the_display(self, model):
+        """No effort, and the model thinks anyway, at high (see
+        output_tokens._EFFORT_WHEN_UNSET): explicit adaptive thinking is the
+        same thinking, so the display is all this adds."""
+        for provider_config in ({}, {"effort": "none"}):
+            seen = self._seen(model, **provider_config)
+            assert seen["thinking"] == self.SUMMARIZED, provider_config
+
+    @pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-sonnet-4-6"])
+    def test_a_model_that_thinks_only_when_asked_is_not_asked(self, model):
+        """The model map's supports_adaptive_thinking is true for these too, and
+        they do not think without an effort. `thinking` would switch it on —
+        and under the 8000 no-effort ceiling, which has no room for it."""
+        for provider_config in ({}, {"effort": "none"}):
+            seen = self._seen(model, **provider_config)
+            assert "thinking" not in seen, provider_config
+
+    def test_summaries_keep_the_first_byte_phase_alive_without_ending_it(self):
+        """0.6s of thinking against a 0.3s first-byte allowance. Omitted, that is
+        one silence and a stall; summarized, it is six short ones and no stall.
+        The summaries are not the answer, so they must not reach `raw`, and they
+        must not end the first-byte phase either: that would switch to the gap
+        budget before the answer has begun."""
+        cfg = {"effort": "high", "stream_read_timeout": 0.3}
+
+        def _thinks_aloud():
+            for i in range(6):
+                time.sleep(0.1)
+                yield _thinking_chunk(f"Checking claim {i}. ")
+            yield from _completion_stream()
+
+        with patch.object(client.litellm, "completion", return_value=_thinks_aloud()):
+            result = _call("claude", model="claude-opus-5", provider_config=cfg)
+
+        assert result["failed"] is False, result.get("error")
+        assert result["raw"] == '{"flags": []}'
+        (record,) = result["stream_timing"]
+        assert record["first_byte_s"] < 0.3
+        assert record["first_output_s"] >= 0.6
+
+        silent = _slow_stream(_completion_stream(), first_delay=0.6)
+        with patch.object(client.litellm, "completion", return_value=silent):
+            result = _call("claude", model="claude-opus-5", provider_config=cfg)
+
+        assert result["failed"] is True
+        (record,) = result["stream_timing"]
+        assert record["cut_short_by"] == "StreamStalled"
 
 
 class TestLitellmIsImportedLazily:

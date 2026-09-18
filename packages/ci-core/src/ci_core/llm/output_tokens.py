@@ -47,8 +47,9 @@ _EFFORT_KEY = {"claude": "effort", "mistral": "reasoning_effort"}
 #: model this repo has run as "Off"; and "setting effort to "high" produces
 #: exactly the same behavior as omitting the effort parameter entirely"
 #: (platform.claude.com, build-with-claude/thinking-troubleshooting and
-#: build-with-claude/effort, read 2026-09-18). With no effort, litellm sends
-#: neither ``thinking`` nor ``output_config`` (captured on the wire in
+#: build-with-claude/effort, read 2026-09-18). With no effort, no
+#: ``output_config`` is sent, and ``thinking`` only asks for the thinking's
+#: display (client._provider_params; both captured on the wire in
 #: tests/test_llm_client.py), so these run exactly as ``effort: high`` does and
 #: need the same ceiling. claude-opus-5 at high has spent over 15,000 tokens
 #: reasoning on one pass (configs/output_tokens.yaml, a censored floor) — before
