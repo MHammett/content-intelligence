@@ -462,3 +462,103 @@ class TestTheTwoAuthorLabelsAreDistinct:
             "Body.\n"
         )
         assert parse_draft_submission(text)["author"] == "Mike Hammett"
+
+
+class TestABlankLabelIsBlank:
+    """A header label left blank means "not provided", not "the next line".
+
+    The value pattern allowed any whitespace after the label, newlines
+    included, so a blank label took the whole next line as its value.
+    Reproduced 2026-09-17: a blank ``Author:`` above ``History key: a-piece``
+    parsed as the author "History key: a-piece", which citation verification
+    was then told is who "I" refers to.
+    """
+
+    #: Every header label the draft and metadata parsers read, in template
+    #: order, with the key it lands on and a value to fill it with.
+    #: ``Pipeline run:`` is left out: its value is only used when it is all
+    #: digits, so a next line taken in its place never got through.
+    _HEADER = {
+        "Article:": ("title", "A Piece"),
+        "Publication:": ("publication", "mikehammett"),
+        "Author:": ("author", "Jane Guest"),
+        "History key:": ("history_key", "a-piece"),
+        "Drafted with:": ("drafted_with", "claude"),
+    }
+
+    def _handoff(self, blank):
+        lines = [
+            f"{label} " if label == blank else f"{label} {value}"
+            for label, (_, value) in self._HEADER.items()
+        ]
+        return (
+            "DRAFT SUBMISSION HANDOFF\n"
+            + "\n".join(lines)
+            + "\n\nPRIMARY CLAIM\nA claim.\n\nDRAFT\nBody.\n"
+        )
+
+    def test_a_blank_author_does_not_take_the_next_line(self):
+        got = parse_draft_submission(
+            "Article: A Piece\n"
+            "Author:\n"
+            "History key: a-piece\n"
+            "\n"
+            "PRIMARY CLAIM\nA claim.\n\n"
+            "DRAFT\nBody.\n"
+        )
+        assert got["author"] == ""
+        assert got["history_key"] == "a-piece"
+
+    def test_a_blank_history_key_does_not_take_the_next_line(self):
+        """The key names the run's pipeline_history directory. In template
+        order the next line is ``Drafted with:``, so every article left blank
+        here was filed under one shared "drafted-with-claude" directory. Blank
+        now reads as absent, which ``_history_key`` resolves to the title."""
+        got = parse_draft_submission(
+            "Article: A Piece\n"
+            "History key:\n"
+            "Drafted with: claude\n"
+            "\n"
+            "PRIMARY CLAIM\nA claim.\n\n"
+            "DRAFT\nBody.\n"
+        )
+        assert got["history_key"] == ""
+        assert got["drafted_with"] == "claude"
+
+    @pytest.mark.parametrize("parse", [parse_draft_submission, parse_metadata_only])
+    @pytest.mark.parametrize("blank", list(_HEADER))
+    def test_no_header_label_takes_the_next_line(self, parse, blank):
+        """Blanked with a trailing space, as deleting a value leaves it. The
+        last label is followed by an empty line and then PRIMARY CLAIM, which
+        the old pattern crossed as well."""
+        got = parse(self._handoff(blank))
+        for label, (key, value) in self._HEADER.items():
+            assert got[key] == ("" if label == blank else value), label
+
+    def test_a_blank_publication_title_does_not_take_the_next_line(self):
+        """The publish path sends this to WordPress as the post title."""
+        got = parse_publication_handoff(
+            "PUBLICATION HANDOFF\n"
+            "Article:\n"
+            "Publication: mikehammett\n"
+            "\n"
+            "FINAL DRAFT\nBody.\n"
+        )
+        assert got["title"] == ""
+        assert got["publication"] == "mikehammett"
+
+    def test_a_blank_label_does_not_borrow_a_later_line_with_that_label(self):
+        """The first occurrence is the field. Skipping a blank one would read
+        the next line that starts with the same label, wherever it is — here a
+        source's byline in SOURCES ALREADY CITED."""
+        got = parse_draft_submission(
+            "Article: A Piece\n"
+            "Author:\n"
+            "\n"
+            "PRIMARY CLAIM\nA claim.\n\n"
+            "SOURCES ALREADY CITED\n"
+            "Title: 2025 Broadband Map\n"
+            "Author: FCC staff\n\n"
+            "DRAFT\nBody.\n"
+        )
+        assert got["author"] == ""
