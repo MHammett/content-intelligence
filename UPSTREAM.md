@@ -467,3 +467,94 @@ The test note is the reusable part. A test asserting the call succeeds passes
 against the broken version, which is presumably how this survived; the PR's
 tests assert on the params bound for the provider, and 5 of 8 fail without the
 fix.
+
+---
+
+## 7. pytest-socket — fixture teardown runs after the guard is lifted
+
+**Status:** filed as
+[miketheman/pytest-socket#537](https://github.com/miketheman/pytest-socket/issues/537),
+2026-09-18, offering the PR. Worked around here by the `pytest_runtest_teardown`
+in `pytest_plugins/socket_guard.py`, which is written to be deleted when this
+ships.
+**Repo:** miketheman/pytest-socket (tested against 0.8.1, the latest release;
+`main` has not touched the hook since, checked 2026-09-18)
+
+A test run under `--disable-socket` or `--allow-hosts` is guarded from its
+fixtures' setup through its call, and then not at all while its fixtures are
+torn down. pytest-socket lifts its restrictions in its own teardown hook:
+
+```python
+def pytest_runtest_teardown() -> None:
+    _remove_restrictions()
+```
+
+pytest runs the fixture finalizers from `_pytest.runner.pytest_runtest_teardown`
+(`item.session._setupstate.teardown_exact(nextitem)`). Both are plain hook
+implementations, pluggy calls those newest-registered first, and pytest-socket —
+loaded from its entry point or with `-p` — always registers after pytest's
+built-in runner. So the lift always runs first, and every finalizer runs with
+the network open. Their tracker has nothing on it (issues and PRs searched
+2026-09-18 for teardown, finalizer, "fixture teardown", "yield fixture",
+trylast, runtest_teardown). The nearest is PR #90, which moved the
+`socket_enabled`/`socket_disabled` restores out of those fixtures and into this
+hook.
+
+**Reproduction** (`pytest --disable-socket --allow-hosts=127.0.0.1`):
+
+```python
+import socket
+
+import pytest
+
+
+def dial():
+    try:
+        with socket.socket() as sock:
+            sock.connect(("0.0.0.0", 0))  # refused by the OS at once: nothing leaves the machine
+    except (RuntimeError, OSError) as exc:
+        return type(exc).__name__
+
+
+@pytest.fixture
+def fixture():
+    print("setup:", dial())  # SocketConnectBlockedError
+    yield
+    print("teardown:", dial())  # OSError: connect() really ran
+
+
+def test_it(fixture):
+    print("call:", dial())  # SocketConnectBlockedError
+```
+
+Measured 2026-09-18 on pytest 8.4.2 and 9.1.1, pluggy 1.6.0: function-, class-,
+module- and session-scoped yield fixtures, `request.addfinalizer` callbacks and
+xunit `teardown_module` all reach a real `connect()` at teardown, while setup
+and call are blocked. Loading it with `-p pytest_socket` and autoloading off
+changes nothing.
+
+**Proposed change:** `@pytest.hookimpl(trylast=True)` on
+`pytest_runtest_teardown`, so the restrictions come off after the runner has
+run the finalizers. Verified on a copy of 0.8.1 with only that line added: every
+teardown above is then blocked, and pluggy calls the runner before
+pytest-socket. Since nothing lifts the restrictions in between, teardown runs
+under exactly the ones `pytest_runtest_setup` chose for that test — markers and
+the `socket_enabled`/`socket_disabled` fixtures included. The test that goes
+with it has to dial from a fixture's teardown: every test of the call phase
+passes today.
+
+**A second, smaller gap the one-liner leaves.** After a *teardown* error under
+`-x` or `--maxfail`, pytest decides to stop only once that teardown has run with
+`nextitem` set, so the fixtures the next test would have shared are torn down
+later, by `_pytest.runner.pytest_sessionfinish` (`teardown_exact(None)`) —
+outside any test, and so outside the guard. A setup or call failure does not
+leave it: pytest then tears everything down in that test's own teardown
+(pytest-dev/pytest#11706). A `pytest_sessionfinish` wrapper that applies the
+global restrictions around it closes this; `socket_guard.py` has one. The issue
+raises it as a separate case rather than bundling it with the fix above.
+
+**Why it matters here:** a green run under `--disable-socket` was being read as
+"this suite does not touch the network", and teardown is exactly where cleanup
+code — closing a client, flushing an upload — makes its calls. The local
+workaround is held to `packages/ci-article-review/tests/test_socket_guard.py`,
+whose teardown tests all fail without it.
