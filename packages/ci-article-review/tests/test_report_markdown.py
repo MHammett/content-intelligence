@@ -1294,6 +1294,10 @@ class TestSeoSuggestions:
         assert "reporting tied to a pending vote" in md
         assert "Differs from the configured default" in md
         assert "BlogPosting" in md
+        # Where to act on it. It said the push would set the default; the
+        # push sets no schema at all.
+        assert "Schema tab" in md
+        assert "push would set" not in md
 
     def test_unrecognized_schema_type_is_flagged(self):
         md = self._render(

@@ -23,8 +23,9 @@ from .adapters.citation.disposition import DISPOSITIONS, disposition
 # pulls nothing in behind it.
 from .worklist import build_worklist, render_worklist
 
-#: Order the SEO METADATA fields render in, matching publication.md's block.
-#: Duplicated from ``analysis.seo_suggest.FIELD_ORDER`` rather than imported so
+#: Order the suggested SEO fields render in: publication.md's SEO METADATA
+#: order, then schema type, which that block no longer carries. Duplicated
+#: from ``analysis.seo_suggest.FIELD_ORDER`` rather than imported so
 #: this module stays a dependency-free renderer over a plain dict — importing
 #: the suggestion module would pull the provider adapters in behind it. A test
 #: asserts the two stay in step.
@@ -2849,15 +2850,15 @@ def _render_seo_field(field):
 
     if field.get("recognized") is False:
         lines.append(
-            "_Not one of the types this publication's template lists — confirm "
-            "Rank Math accepts it before using._"
+            "_Not one of Rank Math's article types — confirm Rank Math accepts "
+            "it before setting it in the post's Schema tab._"
         )
         lines.append("")
     elif field.get("differs_from_default"):
         lines.append(
             f"_Differs from the configured default "
-            f"(`{field['configured_default']}`), which is what the push would "
-            f"set if this field is left blank._"
+            f"(`{field['configured_default']}`). The push does not set schema "
+            f"— to use this type, set it in the post's Rank Math Schema tab._"
         )
         lines.append("")
 

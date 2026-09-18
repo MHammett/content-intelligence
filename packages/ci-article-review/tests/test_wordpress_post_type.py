@@ -126,7 +126,7 @@ class TestPayload:
         payload = _build_post_payload(
             {
                 "title": "About",
-                "seo": {"focus_keyword": "mike hammett", "schema_type": "AboutPage"},
+                "seo": {"focus_keyword": "mike hammett"},
             },
             WP_CONFIG,
             RANK_MATH,
