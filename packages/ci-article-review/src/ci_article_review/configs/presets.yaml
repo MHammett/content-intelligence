@@ -107,6 +107,19 @@
 # pass re-ran 7 of them and got all 7 back. That is the same mechanism one tier
 # further along, not a new one.
 #
+# CLAUDE ALSO HAD A CAUSE THAT IS NOT FAN-OUT (measured 2026-09-18). One
+# claude-opus-5 fact_check run entirely alone (--only-model claude
+# --only-domain fact_check --offline, 28,746-char gps-rollover draft) stalled
+# first-byte at >120.02s and >120.01s, then took 113.49s on the recovery pass.
+# opus-5's thinking display defaults to "omitted", which puts nothing on the
+# wire while it thinks, so each thinking phase was one silence however few
+# calls were running. client.py now asks for display "summarized" wherever a
+# claude request thinks adaptively (see _provider_params). The same isolated
+# pass then ran as a single stream: first output at 252.15s, yet
+# first_byte=7.01s, max_gap=0.45s.
+# Fan-out may still lengthen claude's silences; that is unmeasured, and no
+# value in this file changed.
+#
 # CONSEQUENCE FOR CALIBRATION: measuring ONE call at a time (--only-model /
 # --only-domain / --no-timeout) is the correct method for the WALL-CLOCK cells
 # in timeouts.yaml, and cannot measure these two knobs at all. By the 2026-08-16

@@ -646,6 +646,28 @@ def _qualified(provider, model):
     return f"{prefix}{model}"
 
 
+def _thinks_adaptively(effort, model):
+    """Whether a claude request with ``effort`` thinks adaptively on ``model``.
+
+    It can happen two ways, and each has its own authority:
+
+    * An effort is set. litellm turns adaptive thinking on for every model whose
+      map entry has ``supports_adaptive_thinking``, and that flag is read here,
+      so the answer is litellm's own. A model it cannot map reads as False.
+    * No effort, or ``"none"``, which litellm drops before sending. Only a model
+      that thinks by default thinks then, and the map cannot say which: its
+      flag is as true of claude-opus-4-8, which thinks only when asked. That
+      list is ``output_tokens._EFFORT_WHEN_UNSET``.
+    """
+    if effort and str(effort).lower() != "none":
+        try:
+            info = _litellm().get_model_info(_qualified("claude", model))
+        except Exception:  # litellm raises a bare Exception for an unmapped model
+            return False
+        return info.get("supports_adaptive_thinking") is True
+    return output_tokens.effort_when_unset("claude", model) is not None
+
+
 def _provider_params(provider, cfg, response_schema=None, model=None):
     """Per-provider request parameters drawn from the model config.
 
@@ -672,6 +694,7 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
     elif provider == "claude":
         budget = cfg.get("thinking_budget")
         effort = cfg.get("effort")
+        target = _resolve_model(provider, model, cfg)
         if budget is not None:
             params["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
             # Room for the answer on top of the thinking allowance, which is
@@ -684,10 +707,8 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
             # the review pipeline sizes it per pass instead — see
             # ci_core/llm/output_tokens.py for why 16000 truncated fact_check.
             default_max_tokens = 16000
-        elif output_tokens.effort_when_unset(
-            provider, _resolve_model(provider, model, cfg)
-        ):
-            # Nothing is sent, and the model thinks anyway: claude-opus-5 and
+        elif output_tokens.effort_when_unset(provider, target):
+            # No effort is sent, and the model thinks anyway: claude-opus-5 and
             # claude-sonnet-5 run adaptive thinking at effort high when the
             # request names neither, exactly as `effort: high` does (see
             # output_tokens._EFFORT_WHEN_UNSET). That thinking spends from this
@@ -706,6 +727,32 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
             # and claude-haiku-4-5's real max_output_tokens is 64000, so this
             # is still 8x below the provider's ceiling rather than near it.
             default_max_tokens = 8000
+        if budget is None and _thinks_adaptively(effort, target):
+            # Ask for that thinking back as a summary, so it is audible on the
+            # wire — the same reason openai's Responses call sends
+            # summary="auto". Opus 5, Sonnet 5 and Opus 4.7/4.8 default to
+            # display "omitted": thinking streams one empty thinking_delta, then
+            # nothing until the block's signature, and litellm drops the empty
+            # delta, so the whole thinking phase is one silence. Measured
+            # 2026-09-18 on a single isolated claude-opus-5 fact_check, no
+            # fan-out: >120.02s and >120.01s (StreamStalled), then 113.49s on
+            # the recovery pass. The summaries arrive as reasoning_content
+            # chunks, each restarting _iter_with_gap's clock: with them the same
+            # pass ran as one stream, first output at 252.15s but no silence
+            # over 7.01s. Billing is unchanged; the full thinking is charged
+            # whatever the display.
+            #
+            # Nothing else changes. With an effort, litellm maps it to thinking
+            # {"type": "adaptive"} with no display (BerriAI/litellm#25965) plus
+            # output_config.effort, then applies this `thinking`, replacing
+            # only its own. Without one, these models already think adaptively
+            # at high. Sent only where the request thinks adaptively anyway:
+            # anywhere else it changes how the model thinks — litellm rewrites
+            # it into its own budget for claude-haiku-4-5 (4096 -> 2048 at
+            # high), and it would switch thinking on for a no-effort
+            # claude-opus-4-8 under the 8000 ceiling. Pinned by
+            # TestClaudeThinkingIsAudible and TestClaudeRequestOnTheWire.
+            params["thinking"] = {"type": "adaptive", "display": "summarized"}
         params["max_tokens"] = int(cfg.get("max_tokens", default_max_tokens))
         # No temperature — see _SENDS_TEMPERATURE.
 
@@ -835,7 +882,10 @@ def _completion_is_progress(chunk):
     """A chat-completions chunk carrying real output.
 
     Providers open with keep-alive or role-only chunks whose delta has no
-    content; those are framing, not progress.
+    content; those are framing, not progress. Neither are claude's thinking
+    summaries, which carry ``reasoning_content`` and empty ``content``: like
+    mistral's thinking chunks they end a silence, keeping the first-byte phase
+    alive under its own allowance, without ending that phase.
     """
     for choice in getattr(chunk, "choices", None) or []:
         delta = getattr(choice, "delta", None)
