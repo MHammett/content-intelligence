@@ -1,8 +1,11 @@
 """Shared fixtures for the ci-article-review suite."""
 
 import hashlib
+import ssl
 
 import pytest
+import requests
+import urllib3
 
 import spn_client.client as _spn_client_engine
 
@@ -107,3 +110,37 @@ def block_tls_impersonation(monkeypatch):
     """
     monkeypatch.setattr(resolver, "impersonating_get", lambda url, timeout=30: None)
     monkeypatch.setattr(links, "impersonating_get", lambda url, timeout=30: None)
+
+
+@pytest.fixture
+def certificate_failure():
+    """Build what ``requests`` raises when a server's certificate fails verification.
+
+    The shape is the real one, as a loopback handshake produces it (see
+    ``TestRealHandshakes`` in ``test_wayback.py``): ``requests``' ``SSLError``
+    wraps urllib3's ``MaxRetryError``, whose ``reason`` wraps the
+    ``ssl.SSLCertVerificationError``. The outer exception is also a
+    ``requests.exceptions.ConnectionError``, which is how a certificate failure
+    came to be reported as an unreachable origin. ``verify_message`` is set the
+    way ``ssl`` and truststore set it; it is the part a report quotes.
+
+    Nothing here opens a socket — constructing a connection pool does not
+    connect.
+    """
+
+    def make(reason="unable to get local issuer certificate", host="www.ntia.gov"):
+        err = ssl.SSLCertVerificationError(
+            1,
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            f"{reason} (_ssl.c:1032)",
+        )
+        err.verify_message = reason
+        return requests.exceptions.SSLError(
+            urllib3.exceptions.MaxRetryError(
+                urllib3.HTTPSConnectionPool(host, 443),
+                "/page",
+                reason=urllib3.exceptions.SSLError(err),
+            )
+        )
+
+    return make

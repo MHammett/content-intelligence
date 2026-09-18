@@ -2,9 +2,16 @@
 that stays local (fallback-status scoping, human-readable summaries), on top
 of the shared archive.org engine now tested in the spn-client package."""
 
+import datetime
+import ipaddress
 import logging
+import ssl
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
 import requests
+import urllib3
 from unittest.mock import MagicMock
 
 from ci_article_review.adapters.citation import wayback
@@ -64,8 +71,273 @@ class TestFallbackScoping:
         assert wayback.fallback_reason_for_exception(ValueError("nope")) is None
 
     def test_every_reason_has_a_label(self):
-        reasons = set(wayback._FALLBACK_STATUSES.values()) | {"timeout", "unreachable"}
+        reasons = set(wayback._FALLBACK_STATUSES.values()) | {
+            "timeout",
+            "tls_untrusted",
+            "unreachable",
+        }
         assert reasons <= set(wayback.FALLBACK_REASON_LABELS)
+
+
+def _wrapped_like_urllib3(ssl_error):
+    """``ssl_error`` inside the chain requests really raises (see conftest)."""
+    return requests.exceptions.SSLError(
+        urllib3.exceptions.MaxRetryError(
+            urllib3.HTTPSConnectionPool("www.example.org", 443),
+            "/page",
+            reason=urllib3.exceptions.SSLError(ssl_error),
+        )
+    )
+
+
+class TestCertificateFailures:
+    """A certificate that fails verification is ``tls_untrusted``, not
+    ``unreachable``.
+
+    ``requests.exceptions.SSLError`` subclasses ``ConnectionError``, so every
+    www.ntia.gov link in the 2026-09-17 smoke test was filed as an unreachable
+    origin — the reason a hostname that does not resolve gets, and one the
+    expansion pass reads as a sign the URL was invented.
+    """
+
+    def test_the_certificate_failure_is_its_own_reason(self):
+        exc = requests.exceptions.SSLError(
+            ssl.SSLCertVerificationError(
+                1,
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "unable to get local issuer certificate (_ssl.c:1010)",
+            )
+        )
+        assert isinstance(exc, requests.exceptions.ConnectionError), (
+            "the premise: requests files SSLError under ConnectionError"
+        )
+        assert wayback.fallback_reason_for_exception(exc) == "tls_untrusted"
+
+    def test_it_is_found_inside_the_chain_requests_really_raises(
+        self, certificate_failure
+    ):
+        assert (
+            wayback.fallback_reason_for_exception(certificate_failure())
+            == "tls_untrusted"
+        )
+
+    def test_it_is_matched_on_type_not_on_openssls_wording(self):
+        """truststore raises the same type with the platform's message, which
+        says nothing about "certificate verify failed"."""
+        err = ssl.SSLCertVerificationError(
+            "A certificate chain processed, but terminated in a root "
+            "certificate which is not trusted by the trust provider."
+        )
+        err.verify_message = err.args[0]
+        err.verify_code = 0x800B0109
+        exc = _wrapped_like_urllib3(err)
+        assert "verify failed" not in str(exc)
+        assert wayback.fallback_reason_for_exception(exc) == "tls_untrusted"
+
+    @pytest.mark.parametrize(
+        "ssl_error",
+        [
+            ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number"),
+            ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+        ],
+        ids=["protocol-mismatch", "handshake-reset"],
+    )
+    def test_a_tls_failure_that_is_not_about_the_certificate_stays_unreachable(
+        self, ssl_error
+    ):
+        """The connection failed; nobody declined to trust it. Sweeping every
+        SSLError into tls_untrusted would relabel these as certificate
+        problems, which is the same mistake in the other direction."""
+        exc = _wrapped_like_urllib3(ssl_error)
+        assert wayback.fallback_reason_for_exception(exc) == "unreachable"
+        assert wayback.certificate_error(exc) is None
+
+    def test_a_timeout_is_still_a_timeout(self):
+        assert (
+            wayback.fallback_reason_for_exception(requests.exceptions.ReadTimeout())
+            == "timeout"
+        )
+
+    def test_an_error_raised_while_handling_one_is_not_one(self, certificate_failure):
+        """``__context__`` records what was being handled, not what caused the
+        exception, so it is not followed."""
+        try:
+            try:
+                raise certificate_failure()
+            except requests.exceptions.SSLError:
+                raise requests.exceptions.ConnectionError("getaddrinfo failed")
+        except requests.exceptions.ConnectionError as later:
+            assert later.__context__ is not None
+            assert wayback.fallback_reason_for_exception(later) == "unreachable"
+
+    def test_an_explicit_cause_is_followed(self):
+        err = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        try:
+            try:
+                raise err
+            except ssl.SSLError as inner:
+                raise requests.exceptions.ConnectionError("wrapped") from inner
+        except requests.exceptions.ConnectionError as outer:
+            assert wayback.certificate_error(outer) is err
+
+    def test_a_cyclic_chain_does_not_hang(self):
+        a = requests.exceptions.ConnectionError("a")
+        b = requests.exceptions.ConnectionError(a)
+        a.args = (b,)
+        assert wayback.certificate_error(a) is None
+
+    def test_it_has_a_label_that_does_not_say_unreachable(self):
+        label = wayback.FALLBACK_REASON_LABELS["tls_untrusted"]
+        assert "certificate" in label
+        assert "unreachable" not in label
+
+
+class TestCertificateFailureSummary:
+    def test_it_keeps_the_verifiers_reason_and_drops_the_wrapper(
+        self, certificate_failure
+    ):
+        exc = certificate_failure("certificate has expired")
+        assert "HTTPSConnectionPool" in str(exc), "the raw form this replaces"
+
+        summary = wayback.certificate_failure_summary(exc)
+        assert (
+            summary == "TLS certificate could not be verified: certificate has expired"
+        )
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            requests.exceptions.ReadTimeout("read timed out"),
+            requests.exceptions.ConnectionError("getaddrinfo failed"),
+            _wrapped_like_urllib3(ssl.SSLError(1, "[SSL] wrong version number")),
+        ],
+    )
+    def test_anything_else_gets_none(self, exc):
+        assert wayback.certificate_failure_summary(exc) is None
+
+    def test_archive_orgs_own_certificate_is_not_called_unreachable(
+        self, certificate_failure
+    ):
+        """The same misfiling on the archive side: a snapshot read that failed
+        verification read "the connection was refused, dropped, or the host
+        did not resolve" — none of which happened."""
+        summary = wayback.transport_failure_summary(
+            certificate_failure(host="web.archive.org"), "for the snapshot"
+        )
+        assert summary == (
+            "archive.org's TLS certificate could not be verified for the "
+            "snapshot (unable to get local issuer certificate)"
+        )
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *_args):
+        pass
+
+
+class _QuietServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # A client that rejects the handshake resets the connection. That is
+        # the test passing, not an error.
+        pass
+
+
+def _serve(server):
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+@pytest.fixture(scope="module")
+def untrusted_https_url(tmp_path_factory):
+    """A loopback HTTPS server with a self-signed certificate no client trusts."""
+    x509 = pytest.importorskip("cryptography.x509")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    out = tmp_path_factory.mktemp("untrusted_tls")
+    cert_path, key_path = out / "cert.pem", out / "key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    server = _QuietServer(("127.0.0.1", 0), _Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert_path), str(key_path))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    _serve(server)
+    yield f"https://127.0.0.1:{server.server_address[1]}/"
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture(scope="module")
+def plaintext_port_as_https_url():
+    """``https://`` to a server that only speaks plain HTTP."""
+    server = _serve(_QuietServer(("127.0.0.1", 0), _Handler))
+    yield f"https://127.0.0.1:{server.server_address[1]}/"
+    server.shutdown()
+    server.server_close()
+
+
+class TestRealHandshakes:
+    """The chain ``certificate_error`` walks, as a real handshake builds it.
+
+    The tests above construct the exception by hand, which only proves the code
+    reads the shape its author believed in. Here ``ssl``, urllib3 and requests
+    build it. Loopback only; and plain ``requests`` verifies with certifi, so
+    the Windows chain engine — which goes online for an unknown root — is never
+    consulted.
+    """
+
+    def test_an_untrusted_certificate_is_tls_untrusted(self, untrusted_https_url):
+        with pytest.raises(requests.exceptions.SSLError) as caught:
+            requests.get(untrusted_https_url, timeout=5)
+
+        assert wayback.fallback_reason_for_exception(caught.value) == "tls_untrusted"
+        summary = wayback.certificate_failure_summary(caught.value)
+        assert summary.startswith("TLS certificate could not be verified: ")
+        assert "HTTPSConnectionPool" not in summary
+
+    def test_a_tls_failure_unrelated_to_certificates_stays_unreachable(
+        self, plaintext_port_as_https_url
+    ):
+        with pytest.raises(requests.exceptions.ConnectionError) as caught:
+            requests.get(plaintext_port_as_https_url, timeout=5)
+
+        assert wayback.fallback_reason_for_exception(caught.value) == "unreachable"
+        assert wayback.certificate_failure_summary(caught.value) is None
 
 
 class TestFormatSummary:

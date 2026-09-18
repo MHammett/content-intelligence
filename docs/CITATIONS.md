@@ -277,7 +277,10 @@ It fires on:
 | 403 Forbidden | `blocked` |
 | 429 Too Many Requests | `rate_limited` |
 | Connect/read timeout | `timeout` |
-| DNS or connection failure, or a certificate that fails verification (see "Certificate verification") | `unreachable` |
+| DNS or connection failure | `unreachable` |
+| A TLS certificate that fails verification (see "Certificate verification") | `tls_untrusted` |
+
+`tls_untrusted` is split out of `unreachable` although `requests` raises its `SSLError` as a kind of `ConnectionError`. The two say different things about a link: `unreachable` is also what a hostname that does not resolve gets, and the expansion pass counts that as a sign the URL was invented, while a certificate failure means a server answered and the handshake stopped before any page was asked for. Every `www.ntia.gov` link in the 2026-09-17 smoke test was misfiled this way, its error the raw `HTTPSConnectionPool(...)` string; the error is now the verifier's own reason, e.g. `TLS certificate could not be verified: unable to get local issuer certificate`. Only certificate *verification* qualifies — detected by type anywhere in the exception chain, because truststore's messages are the platform's wording, not OpenSSL's. A TLS protocol mismatch or a reset handshake is a connection that failed, and stays `unreachable`. The archive fallback still applies, for the same reason it does to a timeout: it answers what the page said, from archive.org's copy, fetched over a connection we do verify. It is not a claim that the origin's certificate is sound — archive.org's crawler does not necessarily check one — and the reason stays on the entry.
 
 It deliberately does **not** fire on 404/410 — the resource is genuinely gone, and surfacing that is the point; an archive copy would mask a problem you need to fix by re-sourcing the claim. It also does not fire on 5xx, which is the origin's own failure rather than a refusal aimed at us: a transient 5xx will be fine by the time a reader clicks, and a persistent one means the source needs replacing. Neither is helped by quietly substituting an archived copy.
 
@@ -289,7 +292,7 @@ The same rules govern draft link validation (`analysis/links.py`), so a link rec
 
 A 403 gets one more attempt before the archive: the same request with a browser TLS fingerprint, via `ci_core.http.impersonating_get`. **For a public document, retrieval method does not affect citation validity** — the reader opening the link gets the same page — so a source that refuses scripts but serves browsers is a verifiable citation, not an unverifiable one. On the 2026-09-05 Honda run this was eight claims whose sources the *link checker* could already read, because it has escalated since 2026-08-12 and citation verification did not.
 
-**Scope.** Only a 403. A 401 says an account is required, which is the access-controlled case this policy puts out of scope; a 429 is a rate limit, and changing fingerprint to slip one is abuse rather than verification; a timeout or DNS failure never reached the origin, and no handshake fixes that. No attempt is made at a CAPTCHA, a JS challenge or a subscription gate, and none would work — the measurement in `ci_core/http.py` records three academic publishers returning a challenge page to impersonation too.
+**Scope.** Only a 403. A 401 says an account is required, which is the access-controlled case this policy puts out of scope; a 429 is a rate limit, and changing fingerprint to slip one is abuse rather than verification; a timeout or DNS failure never reached the origin, and no handshake fixes that. Nor does one fix a certificate that failed verification (`tls_untrusted`): both tiers verify against the same roots, so a chain one rejects the other rejects too. No attempt is made at a CAPTCHA, a JS challenge or a subscription gate, and none would work — the measurement in `ci_core/http.py` records three academic publishers returning a challenge page to impersonation too.
 
 **Live before archive**, deliberately, because the two are not competing options:
 
@@ -351,7 +354,9 @@ NTIA runs the BEAD program, a primary source for this publication's broadband co
 
 **Not fixed on Linux.** The OS store there is Mozilla-derived too, so NTIA fails on both tiers exactly as before, and `NATIVE_CA` is documented for Windows only. The portable fix would be AIA chasing: NTIA's Cloudflare intermediate names a caIssuers URL serving a cross-sign of its SSL.com transit CA to *SSL.com TLS ECC Root CA 2022*, which certifi does ship. Verified, not built — this pipeline runs on Windows.
 
-**A certificate that still fails** is recorded as `origin_failure: unreachable`, because requests files `SSLError` under `ConnectionError`, so the archive fallback gets its turn as for any origin that could not be read. It is never escalated: both tiers now trust the same roots, so a chain one rejects the other would reject too.
+*Measured 2026-09-18: NTIA's own chain has since changed.* `www.ntia.gov` now sends its transit CA issued by *SSL.com TLS ECC Root CA 2022*, plus that root's cross-sign to *AAA Certificate Services*, so certifi alone verifies it — the same OpenSSL check on any platform, Linux included. The Linux gap above is still real for any host whose chain needs a root certifi lacks; NTIA is just no longer one of them.
+
+**A certificate that still fails** is recorded as `origin_failure: tls_untrusted` — its own reason, not `unreachable`, although requests files `SSLError` under `ConnectionError`; see the fallback table under "Wayback Machine behavior" for why the distinction matters. The archive fallback gets its turn as for any origin that could not be read. It is never escalated: both tiers now trust the same roots, so a chain one rejects the other would reject too.
 
 ### archive.org credentials (optional)
 

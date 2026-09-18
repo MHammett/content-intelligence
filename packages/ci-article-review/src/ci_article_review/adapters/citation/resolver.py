@@ -354,7 +354,10 @@ def _impersonation_fallback_content(url, timeout):
     access-controlled case policy puts out of scope; a 429 is a rate limit, and
     changing fingerprint to slip one is abuse rather than verification; a
     timeout or DNS failure is not a refusal and a different handshake cannot fix
-    it. Those keep going straight to the archive as before.
+    it. Nor can it fix a certificate that failed verification
+    (``tls_untrusted``): both tiers verify against the same roots, so a chain
+    one rejects the other rejects too. Those keep going straight to the archive
+    as before.
 
     Returns ``(final_url, content, kind)``, or None when the block held, when
     ``curl_cffi`` is absent, or when what came back is not actually readable.
@@ -391,11 +394,12 @@ def _wayback_fallback_content(url, timeout):
     archive.org serves its own cached copy, so a site blocking our fetch — or
     a host we never reached at all — doesn't block the archived one. Which
     failures qualify is decided by ``wayback.fallback_reason_for_exception``:
-    blocks (401/403/429) and unreachable origins (timeouts, DNS/connection
-    errors) do; a 404 (genuinely gone) and a 5xx (the origin's own problem)
-    deliberately do not. A single attempt, no retry loop. The snapshot body goes
-    through the same extraction as a direct fetch — a Wayback page is HTML (with
-    archive.org's own banner chrome on top), so it needs it even more.
+    blocks (401/403/429), unreachable origins (timeouts, DNS/connection errors)
+    and certificates that fail verification do; a 404 (genuinely gone) and a
+    5xx (the origin's own problem) deliberately do not. A single attempt, no
+    retry loop. The snapshot body goes through the same extraction as a direct
+    fetch — a Wayback page is HTML (with archive.org's own banner chrome on
+    top), so it needs it even more.
 
     Returns ``(content, wayback_result)``, where ``content`` is the snapshot's
     ``(url, text, kind)`` on success and None when there is no snapshot or the
@@ -630,8 +634,9 @@ def _resolve_known_url(
     """Resolve a claim whose source URL is already known (e.g. supplied by the
     fact-check model itself), bypassing the narrow adapter matching entirely.
 
-    A fetch the origin refused (401/403/429) or that never reached it at all
-    (timeout, DNS/connection error) — but not a 404 or 5xx, see
+    A fetch the origin refused (401/403/429), that never reached it at all
+    (timeout, DNS/connection error), or that stopped at a certificate which
+    failed verification — but not a 404 or 5xx, see
     ``_wayback_fallback_content``'s scoping — triggers a fallback so a claim
     isn't reported unresolved just because the origin site blocks automated
     fetches or happened to be unreachable during this run. There are two
@@ -780,11 +785,21 @@ def _resolve_known_url(
                 log.warning(
                     f"Known source URL fetch failed for claim '{claim[:50]}': {e}"
                 )
+                # A certificate failure is described, not dumped: its raw form
+                # is an HTTPSConnectionPool(...) wrapper around the one reason
+                # an author can act on. The log line above keeps it whole.
+                cert = wayback.certificate_failure_summary(e)
                 failed = {
                     "claim": claim,
                     "url": known_url,
                     "resolved": False,
-                    "note": f"Known source URL could not be fetched: {e}",
+                    "note": (
+                        # A full sentence: the multi-source pass appends
+                        # " Also checked N other source(s)..." to the note.
+                        f"Known source URL could not be fetched ({cert})."
+                        if cert
+                        else f"Known source URL could not be fetched: {e}"
+                    ),
                 }
                 if wb is not None:
                     # The fallback was tried and did not produce readable

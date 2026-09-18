@@ -17,6 +17,7 @@ from ci_core.http import (
 from ci_core.http import is_public_host as _core_is_public_host
 
 from ..adapters.citation.wayback import (
+    certificate_failure_summary,
     check as wayback_check,
     fallback_reason_for_exception,
     fallback_reason_for_status,
@@ -222,12 +223,21 @@ def _check_http(url, timeout=_HEAD_TIMEOUT):
 def _finalize_error_result(url, exc, timeout):
     """Build the result for a fetch that never produced a response.
 
-    A timeout or a DNS/connection failure means we couldn't reach the origin —
-    which says nothing about whether the page exists — so these get the same
-    archive fallback a 403 does. The error stays on the result either way: a
-    recovered link is reported as read-from-archive, never as a clean fetch.
+    A timeout, a DNS/connection failure or a certificate that failed
+    verification means we couldn't read the origin — which says nothing about
+    whether the page exists — so these get the same archive fallback a 403
+    does. The error stays on the result either way: a recovered link is
+    reported as read-from-archive, never as a clean fetch.
+
+    A certificate failure's error is the verifier's reason rather than the raw
+    exception, whose ``HTTPSConnectionPool(...)`` wrapper is all an author
+    would otherwise see. It is never escalated to ``impersonating_get``, which
+    only a 403 reaches: both tiers verify against the same roots.
     """
-    error = "timeout" if isinstance(exc, requests.exceptions.Timeout) else str(exc)
+    if isinstance(exc, requests.exceptions.Timeout):
+        error = "timeout"
+    else:
+        error = certificate_failure_summary(exc) or str(exc)
     result = {"status_code": None, "ok": False, "error": error}
     reason = fallback_reason_for_exception(exc)
     if reason:
@@ -279,8 +289,10 @@ def validate_links(
       origin_failure str  — why the origin didn't serve us the page, whether or
                             not the archive fallback then succeeded: "blocked"
                             (403), "auth_required" (401), "rate_limited" (429),
-                            "timeout", or "unreachable" (DNS/connection error).
-                            Absent for a 404/410/5xx, which get no fallback.
+                            "timeout", "tls_untrusted" (its certificate failed
+                            verification), or "unreachable" (DNS/connection
+                            error). Absent for a 404/410/5xx, which get no
+                            fallback.
       wayback_snapshot_url str — the snapshot fetched, set only when verified_via
                             is "wayback_fallback"
       wayback       dict  — result from Wayback availability check (if check_wayback)

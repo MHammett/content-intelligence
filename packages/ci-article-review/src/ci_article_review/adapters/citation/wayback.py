@@ -10,6 +10,7 @@ archive copy, and how to summarize a wayback result for a human reader.
 """
 
 import logging
+import ssl
 
 import requests
 
@@ -61,6 +62,8 @@ __all__ = [
     "capture_capacity",
     "capture_options",
     "categorize_job_error",
+    "certificate_error",
+    "certificate_failure_summary",
     "check",
     "check_job_status",
     "fallback_reason_for_exception",
@@ -190,6 +193,7 @@ FALLBACK_REASON_LABELS = {
     "blocked": "403 blocked",
     "rate_limited": "429 rate limited",
     "timeout": "origin timed out",
+    "tls_untrusted": "origin's TLS certificate could not be verified",
     "unreachable": "origin unreachable",
 }
 
@@ -206,11 +210,31 @@ def fallback_reason_for_status(status):
 def fallback_reason_for_exception(exc):
     """Reason label if a fetch exception warrants an archive fallback, else None.
 
-    Covers the "we never reached the origin" failures — connect/read timeouts
-    and connection errors (which is where ``requests`` puts DNS resolution
-    failures). These say nothing about whether the resource exists, only that
-    we couldn't ask, so an archived copy is a legitimate substitute in exactly
-    the way it is for a 403.
+    Covers the "we never read the origin" failures — connect/read timeouts,
+    connection errors (which is where ``requests`` puts DNS resolution
+    failures), and a certificate that failed verification. These say nothing
+    about whether the resource exists, only that we couldn't ask, so an archived
+    copy is a legitimate substitute in exactly the way it is for a 403.
+
+    A certificate failure is ``"tls_untrusted"``, not ``"unreachable"``, even
+    though ``requests`` files ``SSLError`` under ``ConnectionError``. The two
+    say different things about the link. "Unreachable" is also what a hostname
+    that does not resolve gets, which the expansion pass reads as a sign the URL
+    was invented; a certificate failure means a server answered, and the
+    handshake stopped before any page was asked for. Every www.ntia.gov link in
+    the 2026-09-17 smoke test was filed as "unreachable" this way. See
+    ``certificate_error`` for why only certificate failures qualify, and not
+    every TLS error.
+
+    The archive fallback still applies to it. That is not because archive.org
+    vouches for the origin's certificate — its crawler does not necessarily
+    check one (Heritrix's default trust level accepts self-signed and expired
+    certificates) — but because the fallback only ever answers what the page
+    said, from a copy fetched over archive.org's own connection, which we do
+    verify. ``archive_provenance`` says the content came from the archive, and
+    the reason stays on the result, so the certificate failure is not hidden.
+    It is never escalated to the TLS-impersonation tier: both tiers verify
+    against the same roots, so a chain one rejects the other rejects too.
 
     An ``HTTPError`` is dispatched to ``fallback_reason_for_status`` so callers
     with one bare ``except`` don't have to special-case it.
@@ -222,9 +246,77 @@ def fallback_reason_for_exception(exc):
     # and "timed out" is the more specific description of it.
     if isinstance(exc, requests.exceptions.Timeout):
         return "timeout"
+    # Before ConnectionError, which is where requests files SSLError.
+    if certificate_error(exc) is not None:
+        return "tls_untrusted"
     if isinstance(exc, requests.exceptions.ConnectionError):
         return "unreachable"
     return None
+
+
+def certificate_error(exc):
+    """The certificate-verification failure behind ``exc``, or None.
+
+    ``requests`` never raises ``ssl.SSLCertVerificationError`` itself. What a
+    caller catches is ``requests.exceptions.SSLError`` wrapping urllib3's
+    ``MaxRetryError``, whose ``reason`` is urllib3's ``SSLError``, whose first
+    argument is the ``ssl`` error. So this follows the chain — ``args``,
+    ``reason`` and ``__cause__`` — instead of testing the outer type, which
+    cannot answer the question anyway: every TLS failure arrives as the same
+    ``requests.exceptions.SSLError``, and most kinds are not about the
+    certificate. A protocol mismatch, or a server that resets the handshake, is
+    a connection that failed, not one that was refused trust, so those stay
+    ``"unreachable"``. ``__context__`` is deliberately not followed: it records
+    what was being handled when an exception was raised, not what caused it.
+
+    Matched on type, never on message text. OpenSSL's message says "certificate
+    verify failed", but truststore — the OS trust-store verifier — raises the
+    same type with the *platform's* wording (on Windows, "A certificate chain
+    processed, but terminated in a root certificate which is not trusted by the
+    trust provider."), which a substring match would miss.
+    """
+    pending = [exc]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return current
+        pending.extend(arg for arg in current.args if isinstance(arg, BaseException))
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            pending.append(reason)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+    return None
+
+
+def _certificate_reason(err):
+    """The verifier's own reason, e.g. "unable to get local issuer certificate".
+
+    ``verify_message`` is set by OpenSSL's path in ``ssl`` and by truststore;
+    a hand-built error has only its message.
+    """
+    return getattr(err, "verify_message", None) or str(err)
+
+
+def certificate_failure_summary(exc):
+    """A reader-facing phrase for a certificate failure, or None for anything else.
+
+    Stands in for the raw exception, which is what reports carried before:
+    ``HTTPSConnectionPool(host='www.ntia.gov', port=443): Max retries exceeded
+    with url: ... (Caused by SSLError(SSLCertVerificationError(1, '[SSL:
+    CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local
+    issuer certificate (_ssl.c:1032)')))``, on every www.ntia.gov link on
+    2026-09-17. The one part of that an author can act on is the verifier's
+    reason, and that is kept.
+    """
+    err = certificate_error(exc)
+    if err is None:
+        return None
+    return f"TLS certificate could not be verified: {_certificate_reason(err)}"
 
 
 def transport_failure_summary(exc, what):
@@ -256,6 +348,15 @@ def transport_failure_summary(exc, what):
         return f"the address {what} resolved to a non-public host and was not fetched"
     if isinstance(exc, requests.exceptions.Timeout):
         return f"archive.org did not answer {what} within the timeout"
+    # Before ConnectionError, which is where requests files SSLError. A
+    # connection that was made and then not trusted is none of "refused,
+    # dropped, or did not resolve".
+    cert = certificate_error(exc)
+    if cert is not None:
+        return (
+            f"archive.org's TLS certificate could not be verified {what} "
+            f"({_certificate_reason(cert)})"
+        )
     if isinstance(exc, requests.exceptions.ConnectionError):
         return (
             f"could not reach archive.org {what} — the connection was refused, "
