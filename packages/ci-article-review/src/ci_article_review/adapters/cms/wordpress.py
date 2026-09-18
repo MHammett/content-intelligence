@@ -131,8 +131,45 @@ def _lookup_term_ids(api_base, headers, taxonomy, items):
     return resolved, unresolved
 
 
+#: WordPress core content types this adapter can create, mapped to their REST
+#: route. Both are "posts" in WordPress's internal vocabulary, but they are
+#: different endpoints with different fields: only ``post`` carries categories
+#: and tags. Anything outside this map is rejected rather than passed through —
+#: a typo ("pages", "Post ") would otherwise POST the article to a URL that
+#: does not exist, and the failure would surface as a bare 404 from the REST
+#: API rather than as the handoff error it actually is.
+POST_TYPE_ROUTES = {"post": "posts", "page": "pages"}
+
+#: Fields the ``page`` type does not accept. WordPress pages are not in the
+#: category/tag taxonomies at all, so sending these is not merely redundant —
+#: the REST API rejects unregistered fields on a route that does not declare
+#: them.
+_TAXONOMY_FIELDS = ("categories", "tags")
+
+
+def resolve_post_type(raw):
+    """Return the normalised post type for a handoff's ``Post type:`` value.
+
+    Empty or missing means ``post``: every publication handoff written before
+    this field existed is an article, and must keep publishing as one.
+    """
+    value = (raw or "").strip().lower() or "post"
+    if value not in POST_TYPE_ROUTES:
+        raise ValueError(
+            f"Unknown post type {value!r} in the publication handoff. "
+            f"Supported: {', '.join(sorted(POST_TYPE_ROUTES))}."
+        )
+    return value
+
+
 def _build_post_payload(
-    pub_params, wp_config, rank_math_config, content, category_ids, tag_ids
+    pub_params,
+    wp_config,
+    rank_math_config,
+    content,
+    category_ids,
+    tag_ids,
+    post_type="post",
 ):
     payload = {
         "title": pub_params.get("title", ""),
@@ -141,6 +178,13 @@ def _build_post_payload(
         "categories": category_ids,
         "tags": tag_ids,
     }
+
+    # A page has no taxonomy. Build the common payload first and strip, rather
+    # than branching the whole dict, so a field added for posts later cannot be
+    # silently missing from pages.
+    if post_type == "page":
+        for field in _TAXONOMY_FIELDS:
+            payload.pop(field, None)
 
     author = pub_params.get("author")
     if author:
@@ -186,8 +230,20 @@ def push(
     Resolves category and tag slugs to integer IDs via the WP REST API before
     creating the post.
 
+    ``pub_params["post_type"]`` selects the REST route: ``post`` (default) or
+    ``page``. A page carries no categories or tags, so for that type the term
+    lookups are skipped entirely and any terms named in the handoff are
+    reported back on the result rather than dropped — naming a category on a
+    page is an authoring mistake, and a silent drop is how it stays one.
+
     Returns dict with keys: success (bool), post_id, post_url, error (if failed).
     """
+    try:
+        post_type = resolve_post_type(pub_params.get("post_type"))
+    except ValueError as e:
+        log.error(str(e))
+        return {"success": False, "error": str(e)}
+    route = POST_TYPE_ROUTES[post_type]
     site_url = wp_config["site_url"].rstrip("/")
     _require_https(site_url, wp_config)
     endpoint = wp_config.get("rest_api_endpoint", "/wp-json/wp/v2")
@@ -199,19 +255,30 @@ def push(
     headers["Content-Type"] = "application/json"
     auth_headers = _auth_header(username, app_password)  # without Content-Type for GETs
 
-    # Resolve slugs → IDs before building the post payload
-    category_ids, unresolved_categories = _lookup_term_ids(
-        api_base,
-        auth_headers,
-        "categories",
-        pub_params.get("wordpress_category"),
-    )
-    tag_ids, unresolved_tags = _lookup_term_ids(
-        api_base,
-        auth_headers,
-        "tags",
-        pub_params.get("tags", []),
-    )
+    # Resolve slugs → IDs before building the post payload. Pages are not in
+    # either taxonomy, so the two GETs are skipped rather than issued and
+    # discarded.
+    requested_terms = []
+    if post_type == "page":
+        category_ids, unresolved_categories = [], []
+        tag_ids, unresolved_tags = [], []
+        raw_category = pub_params.get("wordpress_category")
+        if raw_category:
+            requested_terms.append(str(raw_category))
+        requested_terms.extend(str(t) for t in pub_params.get("tags", []) or [])
+    else:
+        category_ids, unresolved_categories = _lookup_term_ids(
+            api_base,
+            auth_headers,
+            "categories",
+            pub_params.get("wordpress_category"),
+        )
+        tag_ids, unresolved_tags = _lookup_term_ids(
+            api_base,
+            auth_headers,
+            "tags",
+            pub_params.get("tags", []),
+        )
 
     # Fail closed before an irreversible publish. Going live into no category,
     # with none of its tags, is a real editorial failure, and the checklist item
@@ -238,6 +305,7 @@ def push(
         content,
         category_ids=category_ids,
         tag_ids=tag_ids,
+        post_type=post_type,
     )
 
     if publish_live:
@@ -245,17 +313,27 @@ def push(
 
     try:
         resp = requests.post(
-            f"{api_base}/posts", headers=headers, json=payload, timeout=60
+            f"{api_base}/{route}", headers=headers, json=payload, timeout=60
         )
         resp.raise_for_status()
         data = resp.json()
         post_id = data.get("id")
         post_url = data.get("link")
         log.info(
-            f"WordPress push successful: post_id={post_id} url={post_url} "
-            f"categories={category_ids} tags={tag_ids}"
+            f"WordPress push successful: type={post_type} post_id={post_id} "
+            f"url={post_url} categories={category_ids} tags={tag_ids}"
         )
-        result = {"success": True, "post_id": post_id, "post_url": post_url}
+        result = {
+            "success": True,
+            "post_id": post_id,
+            "post_url": post_url,
+            "post_type": post_type,
+        }
+        if requested_terms:
+            # Not an error: the push succeeded and the page is correct. It is
+            # reported so the author learns the terms they wrote were never
+            # applied, instead of assuming a page can be categorised.
+            result["ignored_terms"] = sorted(set(requested_terms))
         if unresolved:
             # Surfaced on the result, not just in a log line, so the caller can
             # print it next to the success message instead of it scrolling past.
