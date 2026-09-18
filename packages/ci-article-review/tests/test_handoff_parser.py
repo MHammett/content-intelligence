@@ -366,6 +366,56 @@ class TestSeoMetadataBlock:
         )["seo"]
         assert seo == {}
 
+    #: The five fields as publication.md writes them, unfilled. The SEO title's
+    #: placeholder wraps onto further lines there, so its "]" is not on the
+    #: label's line.
+    _UNFILLED = (
+        "Focus keyword: [keyword or phrase | or: derive from primary claim]\n"
+        "SEO title: [the search-facing title, 20-60 chars | or: use OG title.\n"
+        "Separate from the post title.]\n"
+        "Meta description: [under 155 characters | or: derive from opening paragraph]\n"
+        "OG title: [or: use article title]\n"
+        "OG description: [or: use meta description]"
+    )
+
+    def test_bracketed_placeholders_are_dropped(self):
+        """The template writes every placeholder in brackets, and only the
+        bare "derive"/"use" forms were dropped. Reproduced 2026-09-18: the
+        unfilled template sent all five to Rank Math verbatim."""
+        assert self._parse(self._UNFILLED)["seo"] == {}
+
+    def test_filled_fields_survive_next_to_placeholders(self):
+        result = self._parse("Focus keyword: fiber\nOG title: [or: use article title]")
+        assert result["seo"] == {"focus_keyword": "fiber"}
+
+    @pytest.mark.parametrize(
+        "title", ["[Case Study] How We Cut Fiber Costs", "[2026] Fiber Costs [Guide]"]
+    )
+    def test_a_value_that_only_begins_with_a_bracketed_tag_is_kept(self, title):
+        """A leading bracketed tag is real title practice, not a placeholder.
+        Only a value that is one bracketed span, or never closes its bracket,
+        reads as one."""
+        assert self._parse(f"SEO title: {title}")["seo"] == {"seo_title": title}
+
+    def test_a_value_typed_inside_the_brackets_is_dropped_and_logged(self, caplog):
+        """It cannot be told from a placeholder, so it is dropped like one.
+        The log names it, so the author can see the value was theirs."""
+        with caplog.at_level("INFO", logger="ci_article_review.handoff_parser"):
+            seo = self._parse("Focus keyword: [fiber buildout]")["seo"]
+        assert seo == {}
+        assert any(
+            "Focus keyword" in r.getMessage() and "[fiber buildout]" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("blank", ["SEO title:", "SEO title: "])
+    def test_a_blank_field_does_not_borrow_a_later_line_with_that_label(self, blank):
+        """The first line with the label is the field, as for header fields.
+        The old pattern read the later line only when the blank one had no
+        trailing space, so an invisible character decided the <title>."""
+        seo = self._parse(f"{blank}\nOG title: A title\nSEO title: Stray")["seo"]
+        assert seo == {"og_title": "A title"}
+
     def test_schema_type_is_not_an_seo_field(self):
         """Nothing sets schema from a handoff, so it never reaches ``seo``."""
         result = self._parse("Focus keyword: fiber\nSchema type: AboutPage")

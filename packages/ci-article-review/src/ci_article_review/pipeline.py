@@ -4836,8 +4836,10 @@ def _suggest_seo_for_publish(pub_handoff, pub_config, api_keys):
     Draft time is where the suggestion pass earns its keep — it's free to
     regenerate each round and it feeds the revision loop. This is the safety
     net for a handoff that reached Template C with SEO METADATA still on its
-    "derive from primary claim" placeholders (``_parse_seo_block`` drops those,
-    so they arrive here as absent rather than as literal text).
+    placeholders: bracketed, as the template writes them ("[keyword or phrase
+    | or: derive from primary claim]"), or bare ("derive from primary claim").
+    ``_parse_seo_block`` drops both, so they arrive here as absent rather than
+    as literal text.
 
     Triggered by the two SEO METADATA fields the push has no fallback for —
     focus keyword and meta description. OG title and OG description resolve

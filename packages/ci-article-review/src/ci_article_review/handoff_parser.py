@@ -367,19 +367,54 @@ def _parse_seo_block(text):
         "OG description": "og_description",
     }
     for label, key in field_map.items():
-        # [ \t]*, not \s*: \s crosses the newline, so a label left blank to
-        # mean "use the default" took the whole next line as its value — a
-        # blank "SEO title:" put "Meta description: ..." in the <title> tag.
-        match = re.search(rf"^{re.escape(label)}:[ \t]*(.+)$", text, re.MULTILINE)
-        if match:
-            value = match.group(1).strip()
-            if (
-                value
-                and not value.startswith("derive")
-                and not value.startswith("use ")
-            ):
-                seo[key] = value
+        # Read exactly as a header field is. A blank label is blank, not the
+        # next line: a blank "SEO title:" once put "Meta description: ..." in
+        # the <title> tag. And the first line with the label is the field,
+        # whether or not a blank one was left with a trailing space; under
+        # (.+) that invisible space decided whether a later line was read.
+        value = _extract_field(text, f"{label}:")
+        if _is_bracketed_placeholder(value):
+            log.info(
+                "SEO METADATA %s is not set: its value is bracketed, so it reads "
+                "as the template's placeholder. Remove the brackets if it is "
+                "real: %s",
+                label,
+                value,
+            )
+        # The template's own alternatives, written out without their brackets
+        # ("derive from primary claim", "use article title"), also mean "leave
+        # this to the default".
+        elif value and not value.startswith("derive") and not value.startswith("use "):
+            seo[key] = value
     return seo
+
+
+def _is_bracketed_placeholder(value):
+    """True when an SEO METADATA value is still one of the template's ``[...]``.
+
+    Every SEO placeholder in publication.md is bracketed, and a field left on
+    one went to Rank Math verbatim while the publish reported success: the
+    unfilled template's focus keyword was "[keyword or phrase | or: derive
+    from primary claim]".
+
+    The rule is structural. The value opens with "[", and either closes it
+    only as its last character or never closes it. The unclosed case is the
+    SEO title's placeholder, which wraps onto two more lines: only a label's
+    own line is read, so its "]" is never seen.
+
+    "Starts with [" alone would be simpler, and would be safe for three of the
+    five fields: a focus keyword, meta description or OG description has no
+    reason to open with a bracket. A title can. A leading tag such as "[Case
+    Study] How We Cut Costs" is a common click-through device, and some sites
+    put shortcodes such as "[year]" in SEO titles. So a value that only begins
+    with a bracketed span is kept. What the rule cannot tell from a placeholder
+    is a value typed inside the brackets, "[fiber buildout]". That is dropped
+    too, and the caller logs it by name so the author can see which it was.
+    """
+    if not value.startswith("["):
+        return False
+    close = value.find("]")
+    return close in (-1, len(value) - 1)
 
 
 #: The SEO METADATA line the template used to offer for structured data. It is
