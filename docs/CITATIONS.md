@@ -277,7 +277,7 @@ It fires on:
 | 403 Forbidden | `blocked` |
 | 429 Too Many Requests | `rate_limited` |
 | Connect/read timeout | `timeout` |
-| DNS or connection failure | `unreachable` |
+| DNS or connection failure, or a certificate that fails verification (see "Certificate verification") | `unreachable` |
 
 It deliberately does **not** fire on 404/410 — the resource is genuinely gone, and surfacing that is the point; an archive copy would mask a problem you need to fix by re-sourcing the claim. It also does not fire on 5xx, which is the origin's own failure rather than a refusal aimed at us: a transient 5xx will be fine by the time a reader clicks, and a persistent one means the source needs replacing. Neither is helped by quietly substituting an archived copy.
 
@@ -331,6 +331,27 @@ The working boundary is 0.16.1, which bumped curl-impersonate to 2.1.1. The extr
 - **header absent** — the origin refuses browsers too. That is a genuine subscription or JS gate, and no fingerprint will move it; the three academic publishers in the `ci_core/http.py` measurement are this case. Not worth chasing.
 
 **Success is not deterministic.** Six concurrent requests to one Cloudflare-fronted host in a single run had four succeed and two challenged. A claim resolved this way in one run may be reported refused in the next — see the rerun-nondeterminism caveat that already applies to this pipeline. It is also why the version comparison above is one sequential fetch per version: concurrent fetches to a single Cloudflare host cannot tell a version difference apart from luck.
+
+### Certificate verification
+
+Every source fetch — `safe_get`, link validation, and the escalation tier above — verifies TLS against the **operating system's trust store**, not certifi's copy of Mozilla's. Verification is never switched off: a fetch that can be intercepted proves nothing about what a source says.
+
+Why, measured 2026-09-17 on Windows: three hosts the OS verified failed under certifi with `unable to get local issuer certificate`, for two different reasons.
+
+| Host | What the server sends | Why certifi fails | What Windows does |
+|---|---|---|---|
+| `www.ntia.gov`, `www.ntia.doc.gov` | a complete chain ending at *AAA Certificate Services* (Comodo) | certifi 2026.6.17 no longer ships that root | still trusts it |
+| `techinfo.honda.com` | the wrong intermediate | a static bundle cannot fetch the right one | fetches it from the leaf's AIA URL |
+
+NTIA runs the BEAD program, a primary source for this publication's broadband coverage, and every citation to it failed. Nothing is missing from NTIA's handshake — the two stores disagree about the root. "Incomplete chain" is the obvious reading of that error, and it was wrong here.
+
+**Plain fetches** use [truststore](https://truststore.readthedocs.io/) as an explicit `truststore.SSLContext` inside `ci_core.http` (`os_trust_get`, `os_trust_head`), not `truststore.inject_into_ssl()`. truststore's docs reserve injection for applications, and it is process-global: it would also change TLS under litellm's provider calls, which were never affected. Wired into `ci_core.http`, it covers every console script and every direct caller of `pipeline.main`, with nothing to remember at an entry point. It only widens trust — certifi is still loaded, and truststore falls back to it when the platform verifier rejects a chain.
+
+**The escalation tier is a separate TLS stack.** curl_cffi verifies with BoringSSL inside libcurl, so truststore never reaches it: with the plain fetch fixed, `impersonating_get` still failed on NTIA with curl error 60. On Windows it now passes `CURLSSLOPT_NATIVE_CA | CURLSSLOPT_NO_PARTIALCHAIN`. The first has curl import the Windows root *and intermediate* stores next to its bundle; the second is required alongside it, because curl otherwise accepts any certificate in its store as a trust anchor. Measured: NTIA went from error 60 to HTTP 200 (91,944 bytes); a bundle holding only an intermediate verified a site under curl's default and was refused with `NO_PARTIALCHAIN`. A certificate failure in this tier is logged as a warning instead of becoming a silent `None`.
+
+**Not fixed on Linux.** The OS store there is Mozilla-derived too, so NTIA fails on both tiers exactly as before, and `NATIVE_CA` is documented for Windows only. The portable fix would be AIA chasing: NTIA's Cloudflare intermediate names a caIssuers URL serving a cross-sign of its SSL.com transit CA to *SSL.com TLS ECC Root CA 2022*, which certifi does ship. Verified, not built — this pipeline runs on Windows.
+
+**A certificate that still fails** is recorded as `origin_failure: unreachable`, because requests files `SSLError` under `ConnectionError`, so the archive fallback gets its turn as for any origin that could not be read. It is never escalated: both tiers now trust the same roots, so a chain one rejects the other would reject too.
 
 ### archive.org credentials (optional)
 

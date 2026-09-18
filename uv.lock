@@ -20,6 +20,7 @@ members = [
 dev = [
     { name = "ci-core", extras = ["persistence"], editable = "packages/ci-core" },
     { name = "ci-core", extras = ["unblock"], editable = "packages/ci-core" },
+    { name = "cryptography", specifier = ">=42.0" },
     { name = "httpx2", specifier = ">=2.4.0" },
     { name = "mypy", specifier = ">=1.9" },
     { name = "pre-commit", specifier = ">=3.0" },
@@ -617,6 +618,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "trafilatura" },
+    { name = "truststore" },
 ]
 
 [package.optional-dependencies]
@@ -650,6 +652,7 @@ requires-dist = [
     { name = "starlette", marker = "extra == 'persistence'", specifier = ">=1.3.1" },
     { name = "structlog", marker = "extra == 'persistence'", specifier = ">=26.1.0" },
     { name = "trafilatura", specifier = ">=1.6" },
+    { name = "truststore", specifier = ">=0.10.4" },
 ]
 provides-extras = ["unblock", "persistence", "vertex"]
 

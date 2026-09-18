@@ -10,6 +10,8 @@ from ci_core.http import (
     DEFAULT_HEADERS,
     impersonating_get,
     impersonation_available,
+    os_trust_get,
+    os_trust_head,
     safe_get,
 )
 from ci_core.http import is_public_host as _core_is_public_host
@@ -159,7 +161,10 @@ def _check_http(url, timeout=_HEAD_TIMEOUT):
             "error": "skipped: non-public host (SSRF guard)",
         }
     try:
-        resp = requests.head(
+        # The OS trust store, not certifi: see ci_core.http. On certifi alone
+        # every link to www.ntia.gov failed with a certificate error, and was
+        # reported as unreachable.
+        resp = os_trust_head(
             url,
             allow_redirects=True,
             timeout=timeout,
@@ -176,7 +181,7 @@ def _check_http(url, timeout=_HEAD_TIMEOUT):
         # been reporting as 403. That second case is why this matters most —
         # a dead link was being excused as "403 blocked, likely still valid".
         if resp.status_code in (403, 405):
-            with requests.get(
+            with os_trust_get(
                 url,
                 allow_redirects=True,
                 timeout=timeout,
