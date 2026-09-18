@@ -106,24 +106,23 @@ The pipeline resolves string slugs to integer IDs via the WordPress REST API. If
 
 ## Claude
 
-**Claude `fact_check` always fails at ~15s with Malformed JSON**  
-The `fact_check` prompt explicitly requires live web search ("verify against live sources using your search capability"). Claude has no live web search capability and returns a refusal or explanation instead of JSON. Fix: add a `prompts:` filter to the Claude config that excludes `fact_check`:
+**Claude's `fact_check` pass is not marked `[grounded]`**  
+Claude searches only where its `web_search` setting covers the domain. The `maximum` preset sets `web_search: [fact_check]`, and nothing else turns it on, so a hand-built config that runs Claude on `fact_check` without it checks claims against training recall. Add it to the model entry — like `prompts:`, it survives `cost_preset`:
 
 ```yaml
 models:
   claude:
-    model: claude-opus-4-8
-    prompts: [voice_style, completeness, argument_integrity, red_team]
-    # fact_check excluded: Claude has no live web search
+    model: claude-opus-5
+    web_search: [fact_check]
 ```
 
-The `prompts:` key survives `cost_preset` overrides — you only need to set this once.
+If Claude does not run `fact_check` at all under the `maximum` preset, look for a `prompts:` list that leaves it out. These docs used to recommend one, from before Claude could search, and it still wins over the preset. If the call fails with a 400 saying web search is not enabled, an admin has turned web search off for your organization in the Claude Console. What search costs is in [PROVIDERS.md](PROVIDERS.md#anthropic-claude-optional).
 
-**`thinking_budget` on Sonnet 4.6 or Opus 4.8 causes 400 errors**  
-These models use adaptive thinking, not extended thinking. Use `effort: low/medium/high` instead of `thinking_budget`. See [CONFIGURATION.md](CONFIGURATION.md#claude--adaptive-vs-extended-thinking).
+**`thinking_budget` causes 400 errors on Opus 5, Sonnet 5, Opus 4.7/4.8 or Fable**  
+`thinking_budget` asks for extended thinking, which Anthropic's Claude 4.7-and-later models reject: `"thinking.type.enabled" is not supported for this model`. Use `effort: low/medium/high` instead. Opus 4.6 and Sonnet 4.6 still accept `thinking_budget`, deprecated. Haiku 4.5 is the model it is for — extended thinking is its only mode. See [CONFIGURATION.md](CONFIGURATION.md#claude--adaptive-vs-extended-thinking).
 
 **Claude times out on long articles**  
-Timeouts are sized automatically (see [the sliding-scale model](CONFIGURATION.md#timeouts-are-automatic-sliding-scale)) — Claude gets a budget from draft size × model × effort like every other provider, so you don't normally set one. If Opus 4.8 at high effort still times out on a very long article, raise `variance_margin` in ci-core's `timeouts.yaml` or add a `claude` entry to `model_multipliers` there. As a last resort, set `timeout_seconds` explicitly on the Claude model in `user.yaml` to override the formula.
+Timeouts are sized automatically (see [the sliding-scale model](CONFIGURATION.md#wall-clock-backstop-is-automatic-sliding-scale)) — Claude gets a budget from draft size × model × effort like every other provider, so you don't normally set one. If Opus 5 at high effort (which is also what no `effort` means) still times out on a very long article, raise `variance_margin` in ci-core's `timeouts.yaml` or add a `claude` entry to `model_multipliers` there. As a last resort, set `timeout_seconds` explicitly on the Claude model in `user.yaml` to override the formula.
 
 ---
 
@@ -137,7 +136,7 @@ Your API key or username is wrong. Log in to languagetool.org and check your acc
 ## Pipeline behavior
 
 **A model pass timed out**  
-Timeouts are sized automatically by the sliding-scale model in ci-core's `timeouts.yaml` — you don't hand-set them per model. Each call's budget is `base × size_mult × model_mult × effort_mult × variance_margin`, clamped to `pipeline.task_timeout_seconds − 15`. See [CONFIGURATION.md](CONFIGURATION.md#timeouts-are-automatic-sliding-scale).
+Timeouts are sized automatically by the sliding-scale model in ci-core's `timeouts.yaml` — you don't hand-set them per model. Each call's budget is `base × size_mult × model_mult × effort_mult × variance_margin`, clamped to `pipeline.task_timeout_seconds − 15`. See [CONFIGURATION.md](CONFIGURATION.md#wall-clock-backstop-is-automatic-sliding-scale).
 
 If a pass still times out, in order of preference:
 
