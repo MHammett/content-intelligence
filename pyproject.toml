@@ -95,3 +95,12 @@ markers = [
 python_version = "3.10"
 strict = false
 ignore_missing_imports = true
+# What a bare `uv run mypy` checks; mypy ignores it when given any targets.
+# Mirrors MYPY_TARGETS in the Makefile and CI's matrix: src/ only, because the
+# test directories share module names and mypy aborts on the duplicate before
+# checking anything (see the Makefile comment above MYPY_TARGETS).
+files = [
+    "packages/ci-core/src",
+    "packages/ci-article-review/src",
+    "packages/ci-style-profile/src",
+]

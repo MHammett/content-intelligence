@@ -11,8 +11,9 @@ setup:
 # test directories are not packages (see conftest.py) and share file names
 # across packages, so `mypy packages/` aborts on a duplicate module — today
 # "test_import", in ci-core and ci-style-profile — having checked nothing at
-# all: a silent no-op, not a warning. CI (.github/workflows/ci.yml) and the
-# pre-commit hook scope it to src/ for the same reason; keep all three in
+# all: a silent no-op, not a warning. CI (.github/workflows/ci.yml), the
+# pre-commit hook and `files` in pyproject.toml's [tool.mypy] (what a bare
+# `uv run mypy` checks) scope it to src/ for the same reason; keep all four in
 # agreement.
 #
 # One invocation rather than one per package: make stops at the first failing
