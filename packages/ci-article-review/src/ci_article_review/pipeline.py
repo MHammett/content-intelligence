@@ -2625,6 +2625,10 @@ def run_draft_pipeline(
     and merges the new attempts back over everything that already succeeded.
     Unlike ``replay_results`` this still spends money and still writes a new,
     distinct ``run_N`` — it fills gaps, it does not replay a whole run for free.
+    It bills only the calls it makes: the results it carries over are marked
+    ``replayed`` in the call log, as a replay's are, so ``incurred_usd`` is
+    what the retry cost, and the report names the capture in
+    ``retry_failed_from``.
     """
     t_start = time.monotonic()
 
@@ -3172,6 +3176,9 @@ def run_draft_pipeline(
     ]
 
     raw_results: dict[str, dict] = {}
+    # What --retry-failed loaded, kept so the call log below can tell the
+    # results it passed through from the calls this run made.
+    prior_results: dict[str, dict] = {}
 
     if replay_results:
         # Replay: hand back a previously captured ensemble instead of paying for
@@ -3185,7 +3192,7 @@ def run_draft_pipeline(
         # Manual gap-fill: make model calls only for the (model, domain) pairs
         # a prior capture marked failed, then merge onto everything that
         # already succeeded. Unlike replay this does cost money — just not for
-        # the calls that already worked.
+        # the calls that already worked, which the call log marks as history.
         prior_results = ensemble_capture.load(retry_failed_results)
         names_to_retry = [name for name, r in prior_results.items() if r.get("failed")]
         log.info(
@@ -3357,11 +3364,18 @@ def run_draft_pipeline(
         # numbers the socket budgets bound. See ci_core.llm.client._StreamTiming.
         if result.get("stream_timing"):
             log_entry["stream_timing"] = result["stream_timing"]
-        if replay_results:
+        if replay_results or prior_results.get(f"{model_name}:{domain}") is result:
             # These token counts came out of a capture file — they are the
-            # captured run's spend, not this one's. Marked so the cost summary
-            # can separate history from what this run actually bought; without
-            # it a replay reported the capture's total as its own.
+            # captured run's spend, not this one's. A replay re-reports its
+            # whole capture; --retry-failed re-reports each result it passed
+            # through untouched, which is still the very object it loaded.
+            # Anything this run re-attempted, recovered or substituted is a new
+            # one. Marked so the cost summary can separate history from what
+            # this run actually bought. Without it a replay reported the
+            # capture's total as its own, and a --retry-failed run billed every
+            # call that had already worked, with any attempts those calls had
+            # discarded (2026-09-18, in the end-to-end suite's stubs: $0.0315
+            # incurred for one $0.0045 retry).
             log_entry["replayed"] = True
         if (not status_ok or truncated) and result.get("raw"):
             log_entry["raw_excerpt"] = _raw_excerpt(result["raw"])
@@ -3859,6 +3873,11 @@ def run_draft_pipeline(
     # tool summing history would count one run's spend as many.
     if replay_results:
         report["replayed_from"] = str(replay_results)
+    # Likewise a --retry-failed run, for the part of its ensemble it carried
+    # over. Unlike a replay it is saved in the article's own history, so this
+    # is how a reader tells its ``replayed`` entries from a replay's.
+    elif retry_failed_results:
+        report["retry_failed_from"] = str(retry_failed_results)
 
     # Saved under the ``history_root`` chosen before consolidation, above. A
     # replay is a code test, not a review of the article. Writing it into the
@@ -4554,13 +4573,25 @@ def _print_draft_summary(
             if cost["pricing_known"]
             else " (estimated — unknown model in pricing table)"
         )
-        print(f"\nEstimated cost: ${cost['total_usd']:.4f}{known_flag}")
-        if cost.get("by_pass"):
-            for entry in cost["by_pass"]:
-                if entry["total_usd"] > 0:
-                    print(
-                        f"  {entry['pass']:30s}  ${entry['total_usd']:.4f}  {entry['model']}"
-                    )
+        # A --retry-failed run carries the calls that already worked over from
+        # its capture, and their cost is in the total as history. Lead with
+        # what this run bought and list only that; the carried calls were paid
+        # for by the capture's own run. Any other run carries nothing, and
+        # prints exactly as it always has.
+        carried = [e for e in cost.get("by_pass") or () if e.get("replayed")]
+        spent = cost["incurred_usd"] if carried else cost["total_usd"]
+        print(f"\nEstimated cost: ${spent:.4f}{known_flag}")
+        for entry in cost.get("by_pass") or ():
+            if entry["total_usd"] > 0 and not entry.get("replayed"):
+                print(
+                    f"  {entry['pass']:30s}  ${entry['total_usd']:.4f}  {entry['model']}"
+                )
+        if carried:
+            print(
+                f"  ({len(carried)} call(s) carried over from the capture were "
+                f"not re-run — the capture's own run paid "
+                f"${cost['replayed_usd']:.4f} for them)"
+            )
 
     # Contradiction summary
     contradictions = report.get("contradictions", [])
