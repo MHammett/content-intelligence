@@ -359,7 +359,8 @@ def _validate_publication_keys(config, publication_name):
 #   - Sets thoroughness (unless the user also set thoroughness explicitly).
 #   - Overrides model name and reasoning flags for each configured provider.
 #   - Preserves user's infrastructure settings: provider, project, location,
-#     credentials_file, endpoint, deployment, api_version, prompts, web_search.
+#     credentials_file, endpoint, deployment, api_version, prompts, web_search,
+#     and the two user-tuned limits, timeout_seconds and max_tokens.
 #   - Skips providers the user has not configured (no API key / no models entry).
 #   - Respects enabled: false set by the user.
 #
@@ -377,6 +378,12 @@ _INFRA_KEYS = frozenset(
         "credentials_file",
         "prompts",
         "timeout_seconds",  # user-tuned HTTP timeout; preserved so long articles don't time out
+        # The output-token ceiling, for the same reason as timeout_seconds: a
+        # user-tuned limit, not a property of the tier. It was missing, so the
+        # advice in client.py's own comments — raise cfg["max_tokens"] if a
+        # domain truncates — silently did nothing under any cost_preset, which
+        # is every real configuration. Only `preset_overrides` could reach it.
+        "max_tokens",
         # Which domains may run a live web search. Same category as `prompts`:
         # the user decides what a model is allowed to do, the preset decides how
         # expensive a variant it runs. Without this the preset rebuilt the model

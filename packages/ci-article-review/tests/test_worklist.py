@@ -98,6 +98,46 @@ def _rendered(report, **kwargs):
     return "\n".join(render_worklist(build_worklist(report, **kwargs)))
 
 
+class TestAnIncompleteFactCheckIsDeclared:
+    """The list claims to cover what the run could not settle. A fact-check cut
+    off at its output ceiling never reached some claims, and nothing in the
+    list itself would show it."""
+
+    _TRUNCATED = {
+        "pass": "mistral:fact_check",
+        "model": "mistral-medium-3-5",
+        "domain": "fact_check",
+        "missing_buckets": ["contradicted", "unverifiable"],
+        "last_bucket": "outdated",
+    }
+
+    def test_the_list_opens_by_saying_so(self):
+        report = _report([_refused("c")])
+        report["truncated_result_details"] = [self._TRUNCATED]
+        text = _rendered(report)
+        assert "Built from an incomplete fact-check: mistral-medium-3-5" in text
+        assert "contradicted, unverifiable never arrived" in text
+        assert text.index("incomplete fact-check") < text.index("action(s) below")
+
+    def test_even_nothing_outstanding_is_qualified(self):
+        """'Nothing outstanding' is exactly what a cut-off fact-check earns."""
+        report = _report()
+        report["truncated_result_details"] = [self._TRUNCATED]
+        text = _rendered(report)
+        assert "Built from an incomplete fact-check" in text
+        assert "Nothing outstanding" in text
+
+    def test_a_truncation_in_another_domain_does_not_touch_it(self):
+        report = _report([_refused("c")])
+        report["truncated_result_details"] = [
+            {**self._TRUNCATED, "pass": "mistral:red_team", "domain": "red_team"}
+        ]
+        assert "incomplete fact-check" not in _rendered(report)
+
+    def test_a_clean_run_says_nothing(self):
+        assert "incomplete fact-check" not in _rendered(_report([_refused("c")]))
+
+
 class TestActionsAreCollapsedByTarget:
     """Six claims behind one refused URL are one errand, not six.
 

@@ -13,11 +13,15 @@ backstop"; both are sized the same way (total generation time still bounds it).
 
     effective = clamp( base × size_mult × model_mult × effort_mult, floor, ceiling )
 
+and, for a model sent an output-token ceiling, at least the time a healthy call
+needs to reach that ceiling (``compute_budget``; see ci_core/llm/output_tokens.py).
+
 Config is loaded from configs/timeouts.yaml at import time; the hardcoded
 _FALLBACK is used only when the YAML is missing or unreadable.
 """
 
 import logging
+import math
 from pathlib import Path
 
 import yaml as _yaml  # noqa: F401
@@ -123,6 +127,35 @@ def compute_timeout(char_count, model_id, effort, task_ceiling_seconds, config=N
     return int(min(max(raw, floor), ceiling))
 
 
+def compute_budget(char_count, provider, cfg, task_ceiling_seconds, config=None):
+    """``compute_timeout``, raised if need be to let the model reach its ceiling.
+
+    A model sent an output-token ceiling (see ``output_tokens``) needs enough
+    wall-clock to generate it. The formula above sizes for TYPICAL output and
+    this for the LONGEST allowed: whichever is larger wins, still clamped to the
+    task ceiling. Without it, raising the token ceiling converts truncations —
+    which keep every complete finding — into timeouts, which keep none.
+
+    Measured case: claude:fact_check on a 27,113-char draft ran 391.39s of a
+    446s budget and was still cut off at the old 16,000 ceiling. A ceiling with
+    room to finish needed a budget with room to reach it.
+    """
+    effort = cfg.get("reasoning_effort") or cfg.get("effort")
+    budget = compute_timeout(
+        char_count, cfg.get("model", ""), effort, task_ceiling_seconds, config=config
+    )
+    # Imported here, not at the top: output_tokens sizes its ceiling off this
+    # module's size table, so it imports this module first.
+    from ci_core.llm import output_tokens
+
+    need = output_tokens.seconds_to_fill(provider, cfg, char_count)
+    if need:
+        cfg_ = config or _CONFIG
+        ceiling = max(int(cfg_["floor_seconds"]), int(task_ceiling_seconds) - 15)
+        budget = min(max(budget, math.ceil(need)), ceiling)
+    return budget
+
+
 def compute_all(char_count, model_configs, task_ceiling_seconds, config=None):
     """Compute effective timeouts for every enabled model.
 
@@ -138,13 +171,8 @@ def compute_all(char_count, model_configs, task_ceiling_seconds, config=None):
         if explicit is not None:
             out[provider] = int(explicit)
             continue
-        effort = cfg.get("reasoning_effort") or cfg.get("effort")
-        out[provider] = compute_timeout(
-            char_count,
-            cfg.get("model", ""),
-            effort,
-            task_ceiling_seconds,
-            config=config,
+        out[provider] = compute_budget(
+            char_count, provider, cfg, task_ceiling_seconds, config=config
         )
     return out
 
@@ -165,9 +193,9 @@ def flag_stale_overrides(
     caller logs its findings so an operator sees them.
 
     Returns ``[(provider, override_seconds, formula_seconds), ...]`` for every
-    enabled model whose override sits below ``ratio`` of the unclamped formula
-    value. Silent about models with no override — that is the normal,
-    recommended state.
+    enabled model whose override sits below ``ratio`` of the value the model
+    would otherwise get from ``compute_budget``. Silent about models with no
+    override — that is the normal, recommended state.
     """
     out = []
     for provider, cfg in (model_configs or {}).items():
@@ -176,13 +204,8 @@ def flag_stale_overrides(
         explicit = cfg.get("timeout_seconds")
         if explicit is None:
             continue
-        effort = cfg.get("reasoning_effort") or cfg.get("effort")
-        formula = compute_timeout(
-            char_count,
-            cfg.get("model", ""),
-            effort,
-            task_ceiling_seconds,
-            config=config,
+        formula = compute_budget(
+            char_count, provider, cfg, task_ceiling_seconds, config=config
         )
         if explicit < ratio * formula:
             out.append((provider, int(explicit), formula))

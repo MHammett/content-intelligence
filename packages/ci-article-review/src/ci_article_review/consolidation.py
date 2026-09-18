@@ -64,6 +64,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import schemas
 from .passage_match import group_passages, normalise, same_passage
 from ci_core.llm import watermarking
 
@@ -1579,6 +1580,48 @@ def result_is_empty(result):
     return True
 
 
+def _truncation_extent(domain, data, raw=None):
+    """Which of ``domain``'s output buckets a truncated response never delivered.
+
+    Returns ``{"missing_buckets": [...], "last_bucket": ..., "cut_in": ...}``.
+    The model writes the buckets in schema order, and salvage keeps only
+    complete elements, so everything after the last bucket that arrived was
+    lost — including one the model had started but not finished an entry of.
+
+    ``cut_in`` is the bucket the response was inside when it stopped, read off
+    the raw text: the last bucket key it opened. That settles what the parsed
+    data cannot. On honda-navigation run 3, mistral:fact_check's data ended at
+    a complete (empty) ``outdated``; the raw shows it had opened
+    ``contradicted`` and was partway through its first entry, which salvage
+    then dropped. None when there is no raw text to read.
+
+    A bucket absent from *before* the last one that arrived was skipped by the
+    model rather than cut off, and is not reported. A custom domain declares no
+    schema, so there is nothing to compare against and the fields come back
+    empty.
+    """
+    schema = schemas.BY_DOMAIN.get(domain)
+    if not schema:
+        return {"missing_buckets": [], "last_bucket": None, "cut_in": None}
+    order = list(schema["properties"])
+    present = data if isinstance(data, dict) else {}
+    arrived = [k for k in order if k in present]
+    last = arrived[-1] if arrived else None
+    missing = order[order.index(last) + 1 :] if last else order
+    opened = (
+        {
+            key: max((m.start() for m in re.finditer(rf'"{key}"\s*:', raw)), default=-1)
+            for key in order
+        }
+        if isinstance(raw, str)
+        else {}
+    )
+    cut_in = (
+        max(opened, key=opened.get) if any(v >= 0 for v in opened.values()) else None
+    )
+    return {"missing_buckets": missing, "last_bucket": last, "cut_in": cut_in}
+
+
 def _collect_low_confidence(results):
     out = []
     for (model_name, domain), r in results.items():
@@ -1917,6 +1960,25 @@ def build_report(
         for (model, domain), r in results.items()
         if r.get("truncated")
     ]
+    # …and what each one lost. The bare pass name was the whole record, and a
+    # truncated fact-check reads exactly like a finished one: it has findings,
+    # they are well-formed, and nothing about them says the model stopped
+    # before `contradicted`. Measured 2026-09-18, honda-navigation run 3:
+    # mistral:fact_check never delivered contradicted, unverifiable,
+    # primary_source_needed, out_of_scope or additional_observations.
+    truncated_result_details = [
+        {
+            "pass": f"{model}:{domain}",
+            "model": r.get("model") or model,
+            "domain": domain,
+            "section": _DOMAIN_SECTIONS.get(domain),
+            "completion_tokens": (r.get("tokens") or {}).get("completion"),
+            "max_tokens": r.get("max_tokens"),
+            **_truncation_extent(domain, r.get("data"), r.get("raw")),
+        }
+        for (model, domain), r in results.items()
+        if r.get("truncated")
+    ]
 
     # Calls that returned a well-formed response containing nothing at all.
     # A third outcome beside "failed" and "truncated", and until now the only
@@ -2001,6 +2063,7 @@ def build_report(
         "model_failure_details": model_failure_details,
         "domains_not_run": domains_not_run_details,
         "truncated_results": truncated_results,
+        "truncated_result_details": truncated_result_details,
         "empty_results": empty_results,
         "empty_result_details": empty_result_details,
         "ensemble": {

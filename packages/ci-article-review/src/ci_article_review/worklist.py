@@ -828,6 +828,14 @@ def build_worklist(report, limit=DEFAULT_LIMIT):
         "grounding_redirects": sum(
             1 for c in citations if _is_grounding_redirect(c.get("url"))
         ),
+        # Fact-check passes cut off before they finished. This list is built
+        # from what they did deliver, so a claim one of them never reached is
+        # absent here in a way nothing else on the page reveals.
+        "truncated_fact_check": [
+            d
+            for d in _dicts(report.get("truncated_result_details"))
+            if d.get("domain") == "fact_check"
+        ],
     }
 
 
@@ -879,9 +887,31 @@ def _render_item(number, item):
     return lines
 
 
+def _truncation_caveat(truncated):
+    """One line saying the fact-check this list rests on was cut off, or []."""
+    if not truncated:
+        return []
+    models = ", ".join(d.get("model") or d.get("pass", "") for d in truncated)
+    # Schema order, which is the order the model writes them in.
+    never = list(
+        dict.fromkeys(b for d in truncated for b in d.get("missing_buckets") or [])
+    )
+    lost = f" — {', '.join(never)} never arrived" if never else ""
+    return [
+        f"_Built from an incomplete fact-check: {models} hit the output-token "
+        f"ceiling before finishing{lost}. A claim only a truncated pass would "
+        "have flagged is missing from this list, not settled. See *Truncated "
+        "model passes* in the report._",
+        "",
+    ]
+
+
 def render_worklist(worklist):
     """Render ``build_worklist``'s output as markdown lines."""
     lines = [HEADING, ""]
+    # First, and above the empty case too: "nothing outstanding" is exactly the
+    # sentence a cut-off fact-check would otherwise earn.
+    lines.extend(_truncation_caveat(worklist.get("truncated_fact_check")))
     items = worklist["items"]
     if not items:
         lines.append(

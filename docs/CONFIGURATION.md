@@ -255,6 +255,20 @@ Under streaming the adapter passes `timeout=(connect, read_gap)` to the HTTP req
 
 `timeout_seconds` is an **infrastructure key** — it survives `cost_preset` overrides. If you set it in `models:` for a provider, the preset will not clear it.
 
+#### Output-token ceiling is automatic too
+
+Claude and Mistral are the two providers whose requests carry an output-token ceiling (`max_tokens`); the other four run to the model's own limit. On a reasoning pass (`effort` / `reasoning_effort` set) the pipeline sizes that ceiling per call, from [`ci-core`'s `output_tokens.yaml`](../packages/ci-core/src/ci_core/configs/output_tokens.yaml):
+
+```
+max_tokens = reasoning_tokens[effort] + answer_tokens[domain] × size_mult
+```
+
+`size_mult` is the wall-clock formula's own size table, so the two scale together. The ceiling counts **thinking**: every truncated pass on record ran out while reasoning, including on drafts under 5,000 characters, which is why reasoning is a flat term and only the answer scales with the draft. A capped model's wall-clock backstop is raised, if it has to be, to the time a healthy call needs to reach its ceiling — otherwise a longer ceiling just turns truncations into timeouts.
+
+A truncated pass is reported as **PARTIAL**: the complete findings it wrote are kept, and the report names which of its output buckets never arrived — in the header, and above the section it feeds.
+
+To set a ceiling yourself, put `max_tokens` on the model. Like `timeout_seconds`, it is an infrastructure key that survives `cost_preset`. `--no-timeout` lifts the ceiling to the model's own limit as well as the backstop, so a calibration run measures a call's real length instead of the ceiling.
+
 ---
 
 ### Reasoning controls
