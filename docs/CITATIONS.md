@@ -354,7 +354,9 @@ NTIA runs the BEAD program, a primary source for this publication's broadband co
 
 **Not fixed on Linux.** The OS store there is Mozilla-derived too, so NTIA fails on both tiers exactly as before, and `NATIVE_CA` is documented for Windows only. The portable fix would be AIA chasing: NTIA's Cloudflare intermediate names a caIssuers URL serving a cross-sign of its SSL.com transit CA to *SSL.com TLS ECC Root CA 2022*, which certifi does ship. Verified, not built — this pipeline runs on Windows.
 
-**A certificate that still fails** is recorded as `origin_failure: unreachable`, because requests files `SSLError` under `ConnectionError`, so the archive fallback gets its turn as for any origin that could not be read. It is never escalated: both tiers now trust the same roots, so a chain one rejects the other would reject too.
+*Measured 2026-09-18: NTIA's own chain has since changed.* `www.ntia.gov` now sends its transit CA issued by *SSL.com TLS ECC Root CA 2022*, plus that root's cross-sign to *AAA Certificate Services*, so certifi alone verifies it — the same OpenSSL check on any platform, Linux included. The Linux gap above is still real for any host whose chain needs a root certifi lacks; NTIA is just no longer one of them.
+
+**A certificate that still fails** is recorded as `origin_failure: tls_untrusted` — its own reason, not `unreachable`, although requests files `SSLError` under `ConnectionError`; see the fallback table under "Wayback Machine behavior" for why the distinction matters. The archive fallback gets its turn as for any origin that could not be read. It is never escalated: both tiers now trust the same roots, so a chain one rejects the other would reject too.
 
 ### archive.org credentials (optional)
 
