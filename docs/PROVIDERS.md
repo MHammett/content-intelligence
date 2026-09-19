@@ -265,38 +265,47 @@ Grok reasoning is **model-selection based** — use `grok-4.20-0309-reasoning` f
 
 ## Anthropic (Claude) (optional)
 
-**Where:** https://console.anthropic.com
+**Where:** https://platform.claude.com, the Claude Console (`console.anthropic.com` redirects there)
 
 **Steps:**
-1. Create an account at https://console.anthropic.com
-2. Go to **API Keys** in the left sidebar
-3. Click **Create Key**, give it a name, copy it immediately — shown once only
-4. Add a payment method under **Billing** and load a minimum of $5
+1. Sign in, or create an account, at https://platform.claude.com
+2. Go to **Settings → API keys**: https://platform.claude.com/settings/keys
+3. Click **Create key**, give it a name, copy it immediately — shown once only
+4. Buy credits under **Settings → Billing**: https://platform.claude.com/settings/billing
 
 **What you need:**
 - API key: the key you created
 
-**Current models (June 2026):**
+**Current models (September 2026):**
 
-| Model | Input | Output | Context | Thinking |
-|---|---|---|---|---|
-| `claude-opus-4-8` | $5/MTok | $25/MTok | 1M | Adaptive (always on; control via `effort`) |
-| `claude-fable-5` | $10/MTok | $50/MTok | 1M | Adaptive always-on, not configurable |
-| `claude-sonnet-4-6` | $3/MTok | $15/MTok | 1M | Adaptive (always on; control via `effort`) |
-| `claude-haiku-4-5-20251001` | $1/MTok | $5/MTok | 200K | Extended (`thinking_budget`) opt-in only |
+| Model | Input | Output | Context | Presets | With no `effort` set |
+|---|---|---|---|---|---|
+| `claude-opus-5` | $5/MTok | $25/MTok | 1M | `maximum` (`effort: high`) | Thinks, at `high` |
+| `claude-sonnet-5` | $2/MTok | $10/MTok | 1M | `balanced` (`effort: medium`), `thorough` (`effort: high`) | Thinks, at `high` |
+| `claude-haiku-4-5-20251001` | $1/MTok | $5/MTok | 200K | `wide` | Does not think |
 
-**Thinking modes — important distinction:**
+`economy` runs no Claude model. The prices are Anthropic's list rates, the same ones [`pricing.yaml`](../packages/ci-core/src/ci_core/configs/pricing.yaml) bills with; Sonnet 5's $2/$10 launched as introductory pricing and is now its standard price. `claude-fable-5-1` ($10/$50, thinking cannot be turned off) is in no preset — the note on it in [`presets.yaml`](../packages/ci-article-review/src/ci_article_review/configs/presets.yaml) records why it was ruled out without a live test.
 
-- **Adaptive thinking** (Opus 4.8, Fable 5, Sonnet 4.6): reasoning is always on and model-controlled. Add `effort: low/medium/high` to control depth. Do NOT set `thinking_budget` on these models — extended thinking is deprecated for them.
-- **Extended thinking** (Haiku 4.5): opt-in via `thinking_budget: N`. Only Haiku 4.5 uses this mode.
+**Thinking:** Opus 5 and Sonnet 5 think by default, at effort `high`, so an unset `effort` runs exactly as `effort: high` does; set `low` or `medium` to spend less. Older models such as Opus 4.8 and Sonnet 4.6 do not think by default, and the pipeline turns thinking on for them whenever `effort` is set. Haiku 4.5 has only extended thinking, which `thinking_budget: N` turns on. Opus 4.7 and every later model — Opus 5, Sonnet 5 and Fable included — reject `thinking_budget` with a 400. The per-model table is in [CONFIGURATION.md](CONFIGURATION.md#claude--adaptive-vs-extended-thinking); Anthropic's own is on its [thinking troubleshooting](https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting) page.
 
-**Important for `fact_check`:** Claude has no live web search capability. The `fact_check` prompt requires it and Claude will always fail or produce non-JSON output. Add `prompts: [voice_style, completeness, argument_integrity, red_team]` to your Claude config to exclude `fact_check`. This setting survives `cost_preset` overrides. See [CONFIGURATION.md](CONFIGURATION.md#restricting-which-prompts-a-model-runs).
+**Live web search:** Claude searches wherever its `web_search` setting covers the domain. It is the same key as [OpenAI web search](CONFIGURATION.md#openai-web-search), and like `prompts:` it survives `cost_preset`. The `maximum` preset sets `web_search: [fact_check]` for Claude; no other preset turns it on. To add it yourself:
 
-For argument integrity depth, `claude-opus-4-8` with `effort: high` is the recommended choice. For cost efficiency, `claude-sonnet-4-6` with `effort: medium` gives strong reasoning at lower per-call cost.
+```yaml
+models:
+  claude:
+    model: claude-opus-5
+    web_search: [fact_check]   # only fact_check searches
+```
 
-**Expected cost:** ~$0.01–$0.10 per call depending on model and thinking mode.
+Anthropic bills [$10 per 1,000 searches](https://platform.claude.com/docs/en/about-claude/pricing) on top of tokens, and the pipeline lets one call make up to five. The search results count as input tokens, which the report's cost figure includes; the per-search fee it does not. If an admin has turned web search off for your organization in the Claude Console, every request that asks for it fails with a 400 saying web search is not enabled.
 
-**What it adds:** A second argument integrity pass. Claude's training lineage is independent from the rest of the stack and it tends to catch logical gaps the other models miss. At `standard` thoroughness, both Mistral and Claude argument results are merged into Section 4.
+Claude runs `fact_check` only at `maximum` thoroughness, unless a `prompts:` list adds it. Without `web_search` there, it checks claims against training recall, like any model that does not search — add `web_search: [fact_check]`, or leave the domain out with [`prompts:`](CONFIGURATION.md#restricting-which-prompts-a-model-runs). An old `prompts:` list that drops `fact_check` from Claude (this page used to recommend one) keeps it off that domain under the `maximum` preset too, so the preset's search never runs.
+
+**Choosing a model:** start from the presets. `thorough` ran Opus 5 until 2026-09-08, when a measured comparison moved it to Sonnet 5 — the note above `maximum:` in `presets.yaml` has the numbers. Opus 5 is still `maximum`'s model.
+
+**Expected cost:** measured per call on drafts of 2,000–135,000 characters, August–September 2026: Haiku 4.5 $0.005–$0.06; Sonnet 5 at `effort: medium` $0.03–$0.06 (one draft so far); Opus 5 at `high` $0.08–$0.56 per review pass, and $0.36–$2.15 for `fact_check` with search, because the search results bill as input. The per-search fee comes on top of those grounded figures.
+
+**What it adds:** A second argument integrity pass. Claude's training lineage is independent from the rest of the stack and it tends to catch logical gaps the other models miss. At `standard` thoroughness, both Mistral and Claude argument results are merged into Section 4. At `thorough` — the `wide`, `balanced` and `thorough` presets — it also runs voice/style and red team, and at `maximum` it runs every domain.
 
 ---
 

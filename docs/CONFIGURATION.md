@@ -139,7 +139,7 @@ models:
   mistral: mistral-large-latest
   perplexity: sonar-reasoning-pro
   grok: grok-4.3              # grok-4.6 for CoT, via reasoning_effort
-  claude: claude-opus-4-8     # claude-sonnet-4-6 for lower cost with extended thinking
+  claude: claude-sonnet-5     # claude-opus-5 for more depth, claude-haiku-4-5-20251001 for least cost
 ```
 
 **Extended form:** dict with `model`, optional `provider`, and provider-specific fields.
@@ -180,15 +180,7 @@ Valid domain names: `fact_check`, `voice_style`, `completeness`, `argument_integ
 
 The `prompts:` list is an **infrastructure key** — it survives `cost_preset` overrides. If you set `prompts:` in `models:` for a provider, the preset will not clear it even when it overrides the model ID and reasoning flags.
 
-Common use: excluding `fact_check` from Claude (which has no live web search and will always fail it):
-
-```yaml
-models:
-  claude:
-    model: claude-opus-4-8
-    prompts: [voice_style, completeness, argument_integrity, red_team]
-    # fact_check excluded: Claude has no live web search capability
-```
+Claude used to be the standard example here, kept off `fact_check` because it could not search. It can now: it searches wherever `web_search` covers the domain — the key works as in [OpenAI web search](#openai-web-search) — and the `maximum` preset sets `web_search: [fact_check]` for it. A `prompts:` list that still drops `fact_check` from Claude keeps it off that domain under every preset, so the `maximum` preset's search never runs.
 
 #### The three timeout layers (streaming)
 
@@ -247,8 +239,8 @@ models:
     timeout_seconds: 240        # total-time headroom for reasoning on long articles
 
   claude:
-    model: claude-opus-4-8
-    timeout_seconds: 240
+    model: claude-opus-5
+    timeout_seconds: 900        # only if the computed budget keeps cutting it off
 ```
 
 Under streaming the adapter passes `timeout=(connect, read_gap)` to the HTTP request, where `read_gap` is the **inter-token** allowance (constant, from `stream_read_timeout` or the adapter default) — **not** `timeout_seconds`. The big `timeout_seconds` value is enforced separately as the pipeline's per-task thread wall-clock backstop. Set `pipeline.task_timeout_seconds` high enough to accommodate your slowest model's genuine total generation time (streaming detects stalls quickly but does not shorten a legitimately long generation).
@@ -302,15 +294,14 @@ models:
 
 Leaving `effort` unset is not "no reasoning" on Opus 5 or Sonnet 5: Anthropic's API thinks by default on those models, at its default effort of `high`, so the run is the same as `effort: high`, and the pipeline sizes its output ceiling and wall-clock budget the same way. Set `effort: low` or `medium` to spend less. (Per-model defaults: Anthropic's [thinking troubleshooting](https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting) page.)
 
-**Do not** set `thinking_budget` on Opus 5, Sonnet 5, Opus 4.8, Fable 5, or Sonnet 4.6 — they use adaptive thinking and the parameter is ignored (or causes an error). Use `effort:` instead. Only Haiku 4.5 uses extended thinking with `thinking_budget`.
+**Do not** set `thinking_budget` on Opus 5, Sonnet 5, Opus 4.8, or Fable 5. It asks for extended thinking, which Claude 4.7 and later models reject with a 400 (`"thinking.type.enabled" is not supported for this model`); Sonnet 4.6 still accepts it, but Anthropic has deprecated it there. Use `effort:` instead. Haiku 4.5 is the model `thinking_budget` is for: extended thinking is its only mode.
 
 ```yaml
-# Opus 4.8 or Sonnet 4.6 — adaptive thinking, control effort level
+# Opus 5 or Sonnet 5 — adaptive thinking, control effort level
 models:
   claude:
-    model: claude-opus-4-8
-    effort: high            # "low" | "medium" | "high"
-    timeout_seconds: 240
+    model: claude-sonnet-5
+    effort: medium          # "low" | "medium" | "high" — unset runs at "high"
 
 # Haiku 4.5 — extended thinking with token budget
 models:
@@ -895,9 +886,9 @@ Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article
 |---|---|---|---|---|
 | `economy` | standard | gpt-5.4-mini, gemini-2.5-flash, mistral-small | none | $0.04–$0.10 |
 | `standard` | standard | gpt-5.4, gemini-2.5-flash, mistral-large, grok-4.3, claude-haiku | none | $0.10–$0.40 |
-| `balanced` | thorough | o4-mini, gemini-2.5-flash, mistral-medium-3-5, grok-4.3+reasoning, claude-sonnet-4-6+adaptive | light | $0.50–$1.50 |
-| `thorough` | thorough | o4-mini, gemini-2.5-flash, mistral-medium-3-5+reasoning, grok-4.3+reasoning, claude-opus-4-8 | deep | $1.00–$2.50 |
-| `maximum` | maximum | o3, gemini-2.5-pro, mistral-medium-3-5+reasoning, grok-4.3+reasoning, claude-opus-4-8 | max | $2.50–$5.00 |
+| `balanced` | thorough | o4-mini, gemini-2.5-flash, mistral-medium-3-5, grok-4.3+reasoning, claude-sonnet-5 (effort medium) | light | $0.50–$1.50 |
+| `thorough` | thorough | o4-mini, gemini-2.5-flash, mistral-medium-3-5+reasoning, grok-4.3+reasoning, claude-sonnet-5 (effort high) | deep | $1.00–$2.50 |
+| `maximum` | maximum | o3, gemini-2.5-pro, mistral-medium-3-5+reasoning, grok-4.3+reasoning, claude-opus-5 (effort high, searches on fact_check) | max | $2.50–$5.00 |
 
 **Guidance:**
 - Single-digit cents per article is genuinely cheap for a publishing workflow. `balanced` is the recommended default — it gives thorough search-grounded fact-check plus light reasoning on all argument passes for about $1/article.
@@ -941,7 +932,7 @@ The tables below show exactly what settings each preset applies to each provider
 | mistral | `mistral-medium-3-5` | — | — | Reasoning model; `low`/`medium` not accepted — preset omits effort flag |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding |
 | grok | `grok-4.6` | `reasoning_effort` | `"low"` | Light CoT. Unset would mean `high` |
-| claude | `claude-sonnet-4-6` | `effort` | `"medium"` | Adaptive thinking (always on on Sonnet 4.6); effort controls depth |
+| claude | `claude-sonnet-5` | `effort` | `"medium"` | Adaptive thinking, on by default; `medium` spends less than the `high` default |
 
 #### thorough preset — thorough thoroughness, ~$1.00–$2.50/article
 
@@ -952,7 +943,7 @@ The tables below show exactly what settings each preset applies to each provider
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted on this model |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding |
 | grok | `grok-4.6` | `reasoning_effort` | `"high"` | Full CoT depth |
-| claude | `claude-opus-4-8` | `effort` | `"high"` | Adaptive thinking (always on); effort=high pushes harder |
+| claude | `claude-sonnet-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Was `claude-opus-5` until 2026-09-08 — see the note above `maximum:` in `presets.yaml` |
 
 #### maximum preset — maximum thoroughness, ~$2.50–$5.00/article
 
@@ -963,13 +954,13 @@ The tables below show exactly what settings each preset applies to each provider
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding |
 | grok | `grok-4.6` | `reasoning_effort` | `"high"` | Full CoT depth. `xhigh` exists, unmeasured |
-| claude | `claude-opus-4-8` | `effort` | `"high"` | Adaptive thinking, max effort |
+| claude | `claude-opus-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Also sets `web_search: [fact_check]`, so it searches on that domain only |
 
 **Notes on the preset tables:**
 - "_(user model)_" means the preset does not override that provider's model name — your `models:` entry is used as-is. The preset may still add reasoning flags.
 - Gemini's `thinking_budget` is only set at `maximum` (requires `gemini-2.5-pro`) — for other presets the model uses its dynamic default. Set `thinking_budget: 0` in your Gemini model config to disable thinking for any preset.
 - `mistral-medium-3-5` is the reasoning-capable Mistral model (replaces the deprecated `magistral-medium-latest`). It only accepts `reasoning_effort: "high"` or `"none"` — not `"low"` or `"medium"`. The `-latest` suffix variant (`mistral-medium-3-5-latest`) does not exist and returns a 400 error.
-- Claude's adaptive thinking is always on for Sonnet 4.6, Opus 4.8, and Fable 5. The `effort:` parameter controls reasoning depth; `thinking_budget:` is not used on these models.
+- Claude Opus 5 and Sonnet 5 think by default, at effort `high`; the `effort:` parameter sets the depth, and both reject `thinking_budget:`. Other Claude models differ — see [Claude — adaptive vs extended thinking](#claude--adaptive-vs-extended-thinking).
 - Provider infrastructure settings (Vertex AI, Azure, credentials) are always preserved regardless of preset.
 - If you haven't configured a provider (no API key), the preset silently skips it.
 
@@ -985,8 +976,8 @@ The tables below show exactly what settings each preset applies to each provider
 | grok-4.3 / grok-4.20-reasoning | $0.010 | same price |
 | mistral-large | $0.030 | +$0.01–$0.04 |
 | claude-haiku-4-5 | $0.014 | +$0.02+ (extended thinking) |
-| claude-sonnet-4-6 | $0.042 | +$0.05+ (extended thinking) |
-| claude-opus-4-8 | $0.070 | adaptive, always included |
+| claude-sonnet-5 | $0.028 | Thinks by default, at `high` — [measured per-call cost](PROVIDERS.md#anthropic-claude-optional) |
+| claude-opus-5 | $0.070 | Thinks by default, at `high` — [measured per-call cost](PROVIDERS.md#anthropic-claude-optional) |
 | perplexity sonar-pro | $0.042 | — |
 | perplexity sonar-reasoning-pro | $0.10–$0.20 | CoT trace, high variance |
 
@@ -1090,9 +1081,8 @@ pipeline:
     openai:
       reasoning_effort: high     # balanced uses "low"; bump to "high"
     claude:
-      model: claude-opus-4-8     # balanced uses sonnet; use opus instead
-      effort: high
-      thinking_budget: null      # null out sonnet's extended thinking budget
+      model: claude-opus-5       # balanced uses sonnet-5; use opus-5 instead
+      effort: high               # balanced sets medium
     grok:
       enabled: false             # skip Grok for this run
 ```
