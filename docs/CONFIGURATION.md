@@ -8,7 +8,7 @@ Configuration lives in several files:
 
 Three more are provider/model reference data rather than review settings, so they live in `ci-core` next to the shared LLM layer that reads them (`packages/ci-core/src/ci_core/configs/`):
 
-- `pricing.yaml` — per-million-token pricing for cost estimation; update when providers change prices
+- `pricing.yaml` — per-million-token prices, plus the per-search fees grounded calls pay on top of tokens (`search_fees`), for cost estimation; update when providers change prices
 - `model_registry.yaml` — model deprecation tracking; edit to add superseded entries and bump the date
 - `timeouts.yaml` — sliding-scale timeout model (size × model × effort multipliers)
 

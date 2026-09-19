@@ -1222,6 +1222,71 @@ class TestSearchFeesReachTheReport:
         assert summary["total_search_usd"] == 0.035
         assert summary["incurred_usd"] == 0.0
         assert summary["replayed_usd"] == summary["total_usd"]
+        # Every gemini result said how often it searched, so nothing is unknown.
+        assert summary["unmeasured_search_calls"] == 0
+
+    #: Priced models, so the basis can say "at least": with any model unknown
+    #: to pricing.yaml it says "estimated" instead, which outranks it.
+    _PRICED = {
+        "gemini": "gemini-2.5-pro",
+        "openai": "gpt-5.4",
+        "mistral": "mistral-small-latest",
+    }
+
+    def _old_capture(self, tmp_path, **gemini_result):
+        """A capture from before calls recorded their searches: the plain stub
+        run's own, whose results carry no ``searches`` key."""
+        with _stubbed_run(tmp_path / "original", offline=True):
+            pass
+        written = next((tmp_path / "original" / "history").rglob("*_results.json"))
+        raw = ensemble_capture.load(written)
+        assert not any("searches" in r for r in raw.values())
+        for name, result in raw.items():
+            result["model"] = self._PRICED[name.split(":")[0]]
+            if name.startswith("gemini:"):
+                result.update(gemini_result)
+        path = tmp_path / "old_capture_results.json"
+        ensemble_capture.save(path, raw, article_title="T", run_number=1)
+        return str(path)
+
+    def _replay(self, tmp_path, capture, caplog):
+        with caplog.at_level("INFO", logger="pipeline"):
+            with _stubbed_run(
+                tmp_path / "replay", offline=True, replay_results=capture
+            ) as report:
+                pass
+        return report
+
+    def test_an_old_ungrounded_gemini_capture_is_not_called_exact(
+        self, tmp_path, caplog
+    ):
+        """googleSearch rides on every gemini call, and litellm drops gemini's
+        grounding metadata on some streams, so every gemini result on record
+        since 2026-08-18 reads ungrounded. Keyed on "grounded", a gemini-only
+        history would still have been called exact."""
+        capture = self._old_capture(tmp_path, grounding_available=False)
+        report = self._replay(tmp_path, capture, caplog)
+
+        gemini = [e for e in report["api_call_log"] if e["pass"].startswith("gemini:")]
+        assert gemini and all(e["searches"] is None for e in gemini)
+        summary = report["cost_summary"]
+        assert summary["pricing_known"] is True
+        assert summary["unmeasured_search_calls"] == len(gemini)
+        assert (
+            f"(at least — {len(gemini)} attempt(s) that could search did not "
+            "report how many searches they ran)"
+        ) in caplog.text
+        assert "(exact)" not in caplog.text
+
+    def test_an_old_capture_marks_only_calls_that_could_have_searched(
+        self, tmp_path, caplog
+    ):
+        report = self._replay(tmp_path, self._old_capture(tmp_path), caplog)
+
+        for entry in report["api_call_log"]:
+            could = entry["pass"].startswith("gemini:")
+            # openai and mistral here neither searched nor could have.
+            assert ("searches" in entry) == could, entry["pass"]
 
 
 class TestATruncatedPassIsReportedAsIncomplete:

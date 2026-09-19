@@ -552,6 +552,41 @@ class TestRecoverFailedCalls:
         assert "searches" not in recovered["discarded_attempts"]
 
 
+class TestCaptureCouldHaveSearched:
+    """Which calls in a capture from before PR #230 may have paid search fees.
+
+    Those captures record no count, so a replay prices none. Whether that
+    makes its total a floor is decided per provider, not by
+    ``grounding_available``: litellm drops gemini's grounding metadata on some
+    streams, so every gemini result on record since 2026-08-18 reads ungrounded.
+    """
+
+    _ANSWERED = {"tokens": {"prompt": 900, "completion": 300}}
+
+    @pytest.mark.parametrize("provider", ["gemini", "perplexity"])
+    def test_a_provider_that_always_could_search(self, provider):
+        result = dict(self._ANSWERED, grounding_available=False)
+        assert pipeline._capture_could_have_searched(provider, result) is True
+
+    @pytest.mark.parametrize("provider", ["claude", "openai"])
+    def test_a_configured_search_counts_only_where_it_shows(self, provider):
+        grounded = dict(self._ANSWERED, grounding_available=True)
+        plain = dict(self._ANSWERED, grounding_available=False)
+        assert pipeline._capture_could_have_searched(provider, grounded) is True
+        assert pipeline._capture_could_have_searched(provider, plain) is False
+
+    def test_a_provider_that_cannot_search(self):
+        assert pipeline._capture_could_have_searched("mistral", self._ANSWERED) is False
+
+    def test_a_call_that_never_answered_billed_nothing(self):
+        dead = {"failed": True, "tokens": {"prompt": 0, "completion": 0}}
+        assert pipeline._capture_could_have_searched("gemini", dead) is False
+
+    def test_an_unparseable_answer_was_still_billed(self):
+        malformed = dict(self._ANSWERED, failed=True)
+        assert pipeline._capture_could_have_searched("perplexity", malformed) is True
+
+
 class TestFailureReason:
     """``_failure_reason`` — which exception a failed result's text names.
 

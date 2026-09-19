@@ -2223,6 +2223,29 @@ def _failure_reason(error_text):
     return "unknown"
 
 
+def _capture_could_have_searched(model_name, result):
+    """Whether a captured result with no ``searches`` may have paid search fees.
+
+    Captures written before calls recorded their searches (PR #230,
+    2026-09-19) carry no count at all. Which of their calls could have searched
+    is known by provider, not from the ``grounding_available`` they did record:
+    googleSearch rides on every gemini call, and litellm drops gemini's grounding
+    metadata on some streams (BerriAI/litellm#41492), so every gemini result
+    since 2026-08-18 reads ungrounded whether it searched or not. Every sonar
+    request pays a fee. claude's and openai's search is a per-domain setting,
+    so only a result that shows it grounded proves one ran. A call that never
+    answered billed nothing, searches included.
+    """
+    if not isinstance(result, dict):
+        return False
+    tokens = result.get("tokens") or {}
+    if result.get("failed") and not (tokens.get("prompt") or tokens.get("completion")):
+        return False
+    if model_name in ("gemini", "perplexity"):
+        return True
+    return bool(result.get("grounding_available"))
+
+
 def _keep_earlier_billing(failed, fresh):
     """Carry what a failed dispatch was billed for into the result replacing it.
 
@@ -3412,6 +3435,13 @@ def run_draft_pipeline(
             # discarded (2026-09-18, in the end-to-end suite's stubs: $0.0315
             # incurred for one $0.0045 retry).
             log_entry["replayed"] = True
+            if "searches" not in log_entry and _capture_could_have_searched(
+                model_name, result
+            ):
+                # Captured before calls recorded their searches (PR #230). It
+                # may have searched, and nothing says how often, so the replay
+                # calls its total "at least" rather than "exact".
+                log_entry["searches"] = None
         if (not status_ok or truncated) and result.get("raw"):
             log_entry["raw_excerpt"] = _raw_excerpt(result["raw"])
         if not status_ok and result.get("error_body"):
