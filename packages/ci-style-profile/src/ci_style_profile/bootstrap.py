@@ -37,6 +37,7 @@ import yaml as _yaml
 from dotenv import find_dotenv, load_dotenv
 
 from ci_core.concurrency import run_all_bounded
+from ci_core.config_helpers import PackagedConfigError, load_packaged_yaml
 from ci_core.console import force_utf8_stdio
 from ci_core.env_provenance import (
     effective_env as _effective_env,
@@ -103,60 +104,31 @@ def _load_sources_yaml() -> dict:
     return resolve_env_recursive(data, env=_EFFECTIVE_ENV)
 
 
-def _load_presets() -> dict:
-    """Load style-profile presets from configs/presets.yaml."""
-    presets_path = Path(__file__).parent / "configs" / "presets.yaml"
-    if presets_path.exists():
-        try:
-            with open(presets_path, encoding="utf-8") as f:
-                return _yaml.safe_load(f) or {}
-        except Exception as e:
-            log.warning("Could not load presets.yaml: %s; using defaults", e)
-    return _HARDCODED_PRESETS
+def _load_presets(config_dir: Path | None = None) -> dict:
+    """Load the style-profile presets from the packaged configs/presets.yaml.
 
+    The file lives inside the package, so it ships in the wheel. 59e81c9 moved
+    this module into src/ and left the file at the package root, where this did
+    not look.
 
-_HARDCODED_PRESETS = {
-    "economy": {
-        "style_mode": "canonical",
-        "max_input_chars": 40000,
-        "max_styles": 0,
-        "per_style_min_words": 1000,
-        "synthesis_models": ["claude"],
-        "detection_models": [],
-    },
-    "standard": {
-        "style_mode": "detect",
-        "max_input_chars": 80000,
-        "max_styles": 3,
-        "per_style_min_words": 1500,
-        "synthesis_models": ["claude", "openai"],
-        "detection_models": ["claude"],
-    },
-    "balanced": {
-        "style_mode": "detect",
-        "max_input_chars": 120000,
-        "max_styles": 5,
-        "per_style_min_words": 2000,
-        "synthesis_models": [],
-        "detection_models": [],
-    },
-    "thorough": {
-        "style_mode": "detect",
-        "max_input_chars": 160000,
-        "max_styles": 7,
-        "per_style_min_words": 2000,
-        "synthesis_models": [],
-        "detection_models": [],
-    },
-    "maximum": {
-        "style_mode": "detect",
-        "max_input_chars": 200000,
-        "max_styles": 10,
-        "per_style_min_words": 2000,
-        "synthesis_models": [],
-        "detection_models": "*",
-    },
-}
+    Raises PackagedConfigError if the file is missing or malformed. There is no
+    hardcoded fallback: the one this replaced had no ``models`` block, so while
+    the file went unfound nothing errored and every --preset ran user.yaml's
+    models as written. A packaged file that is absent is a broken install, and
+    that is what load_packaged_yaml says for every other packaged config.
+    """
+    config_dir = config_dir or Path(__file__).parent / "configs"
+    yaml_path = config_dir / "presets.yaml"
+    presets = load_packaged_yaml(yaml_path)
+    for name, body in presets.items():
+        if not isinstance(body, dict):
+            raise PackagedConfigError(f"{yaml_path}: preset {name!r} must be a mapping")
+        models = body.get("models")
+        if models is not None and not isinstance(models, dict):
+            raise PackagedConfigError(
+                f"{yaml_path}: preset {name!r}: 'models' must be a mapping"
+            )
+    return presets
 
 
 def _apply_preset(
@@ -193,6 +165,39 @@ def _apply_preset(
         effective["max_styles"] = cli_args.max_styles
 
     return effective
+
+
+def _apply_preset_models(models: dict, preset_models: dict) -> dict:
+    """Lay a preset's per-provider model settings over user.yaml's ``models``.
+
+    Key by key: what the preset names replaces the user's value, and every other
+    key the user set stays theirs (project, stream_read_timeout, web_search, and
+    an ``effort`` the preset leaves unset). ``provider`` is never replaced. A
+    provider the user has not configured is not added, and one the preset does
+    not name is left as written. Returns a new dict.
+
+    This is not ci-article-review's rule, which rebuilds the entry from the
+    preset and copies back a fixed list of keys (``_INFRA_KEYS``). The
+    effort-none warning in main() is written against this one: an ``effort:
+    none`` survives a preset that sets no effort. A fixed list drops whatever is
+    not on it, and ``stream_read_timeout``, which a real user.yaml sets on
+    gemini, is not. And this package cannot import ci-article-review's list.
+    """
+    merged_models = dict(models)
+    for name, preset_cfg in preset_models.items():
+        existing = merged_models.get(name)
+        if existing is None or not isinstance(preset_cfg, dict):
+            continue
+        if isinstance(existing, str):
+            existing = {"model": existing}
+        elif not isinstance(existing, dict):
+            continue
+        merged = dict(existing)
+        for key, value in preset_cfg.items():
+            if key != "provider":  # infrastructure: the user's, not the tier's
+                merged[key] = value
+        merged_models[name] = merged
+    return merged_models
 
 
 def _load_user_config_lenient() -> dict:
@@ -523,19 +528,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Apply preset model overrides to user_config
     preset_models = presets.get(args.preset, {}).get("models", {})
-    if preset_models and user_config.get("models"):
-        for model_name, preset_model_cfg in preset_models.items():
-            if model_name in user_config["models"] and isinstance(
-                preset_model_cfg, dict
-            ):
-                existing = user_config["models"][model_name]
-                if isinstance(existing, str):
-                    existing = {"model": existing}
-                merged = {**existing}
-                for k, v in preset_model_cfg.items():
-                    if k not in ("provider",):  # preserve infra keys from user.yaml
-                        merged[k] = v
-                user_config["models"][model_name] = merged
+    if preset_models and isinstance(user_config.get("models"), dict):
+        user_config["models"] = _apply_preset_models(
+            user_config["models"], preset_models
+        )
 
     # After the merge above, so it judges the config that runs. The merge keeps
     # any key a preset leaves unset, so an `effort: none` from user.yaml
