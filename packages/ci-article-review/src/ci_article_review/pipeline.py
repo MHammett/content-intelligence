@@ -5003,6 +5003,51 @@ def run_publish_pipeline(
         )
         sys.exit(1)
 
+    # A page ignores category and tags entirely — wp.push skips the term
+    # lookup for one, and the template tells the author to leave both fields
+    # on their placeholder for exactly that reason ("A page ignores the
+    # category and tag fields below."). So the check below only applies to
+    # the post type that actually uses them.
+    placeholder_fields = pub_handoff.get("placeholder_publication_fields") or set()
+    post_type_value = (
+        (pub_handoff["publication_parameters"].get("post_type") or "").strip().lower()
+    )
+    if post_type_value != "page":
+        unfilled = [
+            label
+            for label, key in (
+                ("WordPress category:", "wordpress_category"),
+                ("Tags:", "tags"),
+            )
+            if key in placeholder_fields
+        ]
+        if unfilled:
+            # Refused rather than published uncategorised without a word.
+            # Post type and WordPress author fall back safely when left on
+            # their placeholder — default to post, default to the
+            # authenticated WordPress user — so their placeholder reads as
+            # blank like any other unset field (see _extract_field). Category
+            # and tags have no such fallback: an absent one is never checked,
+            # so WordPress silently files the post under "Uncategorized",
+            # live or not. Collapsing a placeholder to blank here would trade
+            # today's (accidental) protection — the placeholder text fails a
+            # live WordPress term lookup and refuses the publish — for a
+            # silent uncategorised one, which is worse than doing nothing.
+            # Checked before the SEO suggestion call is paid for, and before
+            # the checklist asks for a yes that would come to nothing.
+            log.error(
+                "The publication handoff has not filled in: %s — each still "
+                "reads as the template's bracketed placeholder. An absent "
+                "category or tags list is never checked, so a live publish "
+                "would go out uncategorised without a word, unlike a "
+                "genuinely blank line, which is left alone. Fill in a real "
+                "value, delete the line entirely if this really has none, "
+                "or set 'Post type: page' if this is a standing page, which "
+                "ignores both fields. Set it and re-run.",
+                ", ".join(unfilled),
+            )
+            sys.exit(1)
+
     from .adapters.cms import wordpress as wp
 
     if seo_suggestions is not False:
@@ -5012,15 +5057,21 @@ def run_publish_pipeline(
     if not confirmed:
         sys.exit(0)
 
+    # A placeholder can only still be here for a page (the check above refused
+    # it for every other post type), where it is not read at all — but it
+    # would otherwise reach wp.push as literal bracket text and print in its
+    # "a page has no categories or tags" note as if it had been named for
+    # real. Normalized to blank the same as a field with no fallback, now
+    # that the "was this a placeholder" question has already been answered.
+    def _param_or_blank(key):
+        value = pub_handoff["publication_parameters"].get(key)
+        return "" if key in placeholder_fields else value
+
     pub_params = {
         "title": pub_handoff.get("title", ""),
-        "wordpress_category": pub_handoff["publication_parameters"].get(
-            "wordpress_category"
-        ),
+        "wordpress_category": _param_or_blank("wordpress_category"),
         "tags": [
-            t.strip()
-            for t in pub_handoff["publication_parameters"].get("tags", "").split(",")
-            if t.strip()
+            t.strip() for t in (_param_or_blank("tags") or "").split(",") if t.strip()
         ],
         # "WordPress author:" is the current spelling; "Author:" is the
         # original and still parsed, because existing publication handoffs

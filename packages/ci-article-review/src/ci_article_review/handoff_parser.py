@@ -321,10 +321,19 @@ def parse_publication_handoff(text):
     pub_params_raw = section("PUBLICATION PARAMETERS")
     seo_raw = section("SEO METADATA")
 
+    publication_parameters, placeholder_publication_fields = _parse_key_value_block(
+        pub_params_raw
+    )
+
     return {
         "title": title,
         "publication": publication,
-        "publication_parameters": _parse_key_value_block(pub_params_raw),
+        "publication_parameters": publication_parameters,
+        # Which of publication_parameters' raw fields (wordpress_category,
+        # tags) are still on the template's bracketed placeholder, so
+        # run_publish_pipeline can refuse rather than publish uncategorised.
+        # See _RAW_PUBLICATION_PARAMETER_FIELDS.
+        "placeholder_publication_fields": placeholder_publication_fields,
         "seo": _parse_seo_block(seo_raw),
         "ignored_schema_type": _ignored_schema_type(seo_raw),
         "embeds": section("EMBEDS AND SPECIAL ELEMENTS"),
@@ -333,7 +342,14 @@ def parse_publication_handoff(text):
     }
 
 
-def _extract_field(text, label):
+def _extract_raw_field(text, label):
+    """The single-line, first-occurrence value of a label — placeholder or not.
+
+    Split out of ``_extract_field`` so a caller that must tell a bracketed
+    placeholder apart from a genuinely blank line can reuse the same anchored
+    extraction without going through the collapse-to-blank step below. See
+    ``_parse_key_value_block``'s ``wordpress_category`` and ``tags``.
+    """
     # [ \t]*, not \s*: \s crosses the newline, so a label left blank took the
     # whole next line as its value — a blank "Author:" above "History key:
     # a-piece" became the author "History key: a-piece", and citation
@@ -344,7 +360,20 @@ def _extract_field(text, label):
     # starts with the same label: an "Author:" in SOURCES ALREADY CITED, or in
     # the draft itself. The first occurrence is the field, and blank reads as
     # "", the same as absent.
-    #
+    match = re.search(rf"^{re.escape(label)}[ \t]*(.*)$", text, re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def _log_unset_placeholder(label, value):
+    log.info(
+        "Handoff field %r is not set: its value is bracketed, so it reads as "
+        "the template's placeholder. Remove the brackets if it is real: %s",
+        label,
+        value,
+    )
+
+
+def _extract_field(text, label):
     # A value still on its template placeholder reads as "" too. The templates'
     # placeholders for these labels are bracketed, and a label left on one was
     # read as real: the unfilled draft template's History key named the
@@ -353,26 +382,79 @@ def _extract_field(text, label):
     # publication.md's "Article: [title]" became the WordPress post title. The
     # first occurrence is still the field when it is a placeholder, so this
     # never falls through to a later line with the same label either.
-    match = re.search(rf"^{re.escape(label)}[ \t]*(.*)$", text, re.MULTILINE)
-    value = match.group(1).strip() if match else ""
+    value = _extract_raw_field(text, label)
     if _is_bracketed_placeholder(value):
-        log.info(
-            "Handoff field %r is not set: its value is bracketed, so it reads as "
-            "the template's placeholder. Remove the brackets if it is real: %s",
-            label,
-            value,
-        )
+        _log_unset_placeholder(label, value)
         return ""
     return value
 
 
+#: The label for each PUBLICATION PARAMETERS field pipeline.py reads.
+#: "WordPress author:" is the current spelling; "Author:" is the original and
+#: still parsed, because existing publication handoffs use it — see
+#: TestTheTwoAuthorLabelsAreDistinct. "Status:" is not read by anything; the
+#: line exists to remind whoever fills in the template that ``--publish-live``
+#: is the actual switch, not this field.
+_PUBLICATION_PARAMETER_LABELS = {
+    "status": "Status:",
+    "post_type": "Post type:",
+    "wordpress_category": "WordPress category:",
+    "tags": "Tags:",
+    "wordpress_author": "WordPress author:",
+    "author": "Author:",
+}
+
+#: Fields read raw rather than through _extract_field's placeholder collapse.
+#:
+#: Every other PUBLICATION PARAMETERS field has a safe fallback for "unset":
+#: Post type defaults to post, and WordPress author (with the legacy Author)
+#: falls back to the authenticated WordPress user. Collapsing an unfilled
+#: placeholder to the same "" a blank line produces is exactly right for
+#: those. Category and tags do not have one — an absent category is never
+#: checked, so a post with none silently files under WordPress's own
+#: "Uncategorized", live or not. Collapsing their placeholder to "" would
+#: trade today's (accidental) protection — the placeholder text fails a live
+#: WordPress term lookup and refuses the publish — for a silent uncategorised
+#: one instead. run_publish_pipeline checks these two for a placeholder
+#: itself, via parse_publication_handoff's "placeholder_publication_fields",
+#: and refuses before anything is sent.
+_RAW_PUBLICATION_PARAMETER_FIELDS = ("wordpress_category", "tags")
+
+
 def _parse_key_value_block(text):
-    result = {}
-    for line in text.splitlines():
-        if ":" in line:
-            key, _, value = line.partition(":")
-            result[key.strip().lower().replace(" ", "_")] = value.strip()
-    return result
+    """Parse the PUBLICATION PARAMETERS fields pipeline.py reads.
+
+    This used to split every "key: value" line in the section into a dict
+    entry — fine while every field fit on one line, until a placeholder
+    wrapped onto more: "Post type: [post (default) | page -- use page for
+    standing pages such as" is one line, but its continuation, "About or
+    Contact: no date, no category, not in the blog feed. A page", has its own
+    colon too, so it became its own key ("about_or_contact") that nothing
+    reads — harmless clutter today only because no real field happens to
+    collide with a continuation line's text, not a rule anything enforces.
+
+    Each field is looked up by its own label instead, anchored to the start
+    of a line the same way a header field or an SEO METADATA field is, so a
+    continuation line is never mistaken for a field of its own, and the first
+    occurrence wins.
+
+    Returns ``(params, placeholder_fields)``: the parsed dict (every key in
+    ``_PUBLICATION_PARAMETER_LABELS``, always present, "" when absent or
+    blank), and the subset of ``_RAW_PUBLICATION_PARAMETER_FIELDS`` whose
+    value is still a bracketed placeholder.
+    """
+    params = {}
+    placeholder_fields = set()
+    for key, label in _PUBLICATION_PARAMETER_LABELS.items():
+        if key in _RAW_PUBLICATION_PARAMETER_FIELDS:
+            raw = _extract_raw_field(text, label)
+            if _is_bracketed_placeholder(raw):
+                _log_unset_placeholder(label, raw)
+                placeholder_fields.add(key)
+            params[key] = raw
+        else:
+            params[key] = _extract_field(text, label)
+    return params, placeholder_fields
 
 
 def _parse_seo_block(text):
