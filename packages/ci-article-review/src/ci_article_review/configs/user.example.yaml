@@ -62,8 +62,9 @@ api_keys:
 #   Gemini:      gemini-2.5-pro ($1.25/$10), gemini-2.5-flash ($0.30/$2.50), gemini-2.5-flash-lite ($0.10/$0.40)
 #              Note: Gemini 3 Flash and 3.1 Pro are preview-only on Vertex AI as of Aug 2026 —
 #              not used here yet. 2.5-family retirement date is 2026-10-16.
-#   Mistral:     mistral-large-latest (~$3/$9), mistral-small-latest (~$0.10/$0.30)
-#              mistral-medium-3-5 (reasoning_effort "high" or "none" only)
+#   Mistral:     mistral-large-latest ($0.50/$1.50), mistral-small-latest ($0.15/$0.60)
+#              mistral-medium-3-5 ($1.50/$7.50; reasoning_effort "high" or "none" only)
+#              A -latest alias moves to each new GA model, and its price moves with it.
 #              Note: reasoning_effort is NOT supported on most Mistral models (API rejects it) —
 #              mistral-medium-3-5 is the one exception, and litellm needs an explicit
 #              allowed_openai_params escape hatch to send it (see ci_core/llm/client.py).
