@@ -1,6 +1,7 @@
 """Shared fixtures for the ci-article-review suite."""
 
 import contextlib
+import functools
 import hashlib
 import ssl
 from pathlib import Path
@@ -11,7 +12,13 @@ import urllib3
 
 import spn_client.client as _spn_client_engine
 
-from ci_article_review import live_model_check, pipeline
+from ci_article_review import (
+    history,
+    history_analytics,
+    live_model_check,
+    pipeline,
+    reproducibility,
+)
 from ci_article_review.adapters.citation import resolver, wayback
 from ci_article_review.analysis import links
 
@@ -21,19 +28,79 @@ from ci_article_review.analysis import links
 #: before any fixture replaces ``HISTORY_ROOT`` or a test changes directory.
 _CWD_HISTORY = Path(pipeline.HISTORY_ROOT).resolve()
 
+#: Every name a history reader is bound to, as ``(module, name)``.
+#: ``reproducibility`` imports ``_existing_run_dir`` by value, so patching
+#: ``history``'s alone would leave its lookups unwatched.
+#: ``test_cwd_history_guard.py`` fails if a third module does the same.
+_HISTORY_READERS = (
+    (history, "_existing_run_dir"),
+    (reproducibility, "_existing_run_dir"),
+    (history_analytics, "iter_reports"),
+)
+
+
+def _in_cwd_history(root):
+    """Whether ``root`` is the working directory's ``pipeline_history/``, or inside it.
+
+    Inside counts: a ``--replay`` run reads ``pipeline_history/_replay/``.
+    """
+    try:
+        return Path(root).resolve().is_relative_to(_CWD_HISTORY)
+    except (OSError, ValueError):
+        return False
+
+
+def _watch(reader, reads):
+    """``reader``, noting each call whose first argument is in the cwd's history."""
+
+    @functools.wraps(reader)
+    def watched(history_root, *args, **kwargs):
+        if _in_cwd_history(history_root):
+            reads.append(f"{reader.__name__}({str(history_root)!r})")
+        return reader(history_root, *args, **kwargs)
+
+    return watched
+
 
 @pytest.fixture(autouse=True)
-def cwd_history_untouched():
-    """Fail any test that creates ``pipeline_history/`` in the working directory.
+def cwd_history_reads(monkeypatch):
+    """The lookups this test makes in the working directory's ``pipeline_history/``.
 
-    This checks only whether the directory exists. Where it already does, as
-    in a checkout that has run a review, a live run in that checkout can write
-    to it while the suite runs, so its contents cannot be blamed on a test. CI
-    starts without one, so there this fails every test that creates it.
+    ``cwd_history_untouched`` fails the test if there are any. Every history
+    reader takes the directory to search as its first argument, so a lookup in
+    the working directory is a call whose argument resolves there.
+
+    That is not visible from outside. The readers ``stat`` the directory first
+    and stop if it is missing, which it is in CI, so nothing is opened, listed
+    or created for a file-system hook to see, and the directory's existence
+    proves nothing either. Measured 2026-09-19: nine tests looked in it, and a
+    PEP 578 audit hook on open, listdir and scandir reported none of them.
+    """
+    reads = []
+    for module, name in _HISTORY_READERS:
+        monkeypatch.setattr(module, name, _watch(getattr(module, name), reads))
+    return reads
+
+
+@pytest.fixture(autouse=True)
+def cwd_history_untouched(cwd_history_reads):
+    """Fail any test that creates or reads ``pipeline_history/`` in the working directory.
+
+    Creating: this checks only whether the directory exists. Where it already
+    does, as in a checkout that has run a review, a live run in that checkout
+    can write to it while the suite runs, so its contents cannot be blamed on a
+    test. CI starts without one, so there this fails every test that creates it.
 
     If the test left the directory empty, it is removed again. The tests that
     follow are then still checked, rather than passing because it is already
     there.
+
+    Reading: ``run_draft_pipeline`` asks history for the article's earlier runs
+    early on, so where the directory has that article's slug, a test that calls
+    it takes a different path from the one CI does. A prior run there renumbers
+    this one, becomes its delta baseline and is measured against for
+    reproducibility. Nothing fails when that happens, which is why this check
+    exists.
     """
     existed = _CWD_HISTORY.exists()
     yield
@@ -41,10 +108,21 @@ def cwd_history_untouched():
     if created:
         with contextlib.suppress(OSError):
             _CWD_HISTORY.rmdir()
-    assert not created, (
-        f"test created {_CWD_HISTORY}; pipeline.main() does that unless the "
-        "test uses the tmp_history_root fixture"
-    )
+    problems = []
+    if created:
+        problems.append(
+            f"created {_CWD_HISTORY}; pipeline.main() does that unless the "
+            "test uses the tmp_history_root fixture"
+        )
+    if cwd_history_reads:
+        problems.append(
+            f"looked for history in {_CWD_HISTORY}: "
+            f"{', '.join(sorted(set(cwd_history_reads)))}. "
+            "run_draft_pipeline does that unless the test uses the "
+            "tmp_history_root fixture; any other reader needs a root under "
+            "tmp_path"
+        )
+    assert not problems, "test " + "; and ".join(problems)
 
 
 @pytest.fixture
@@ -60,6 +138,11 @@ def tmp_history_root(tmp_path, monkeypatch):
     That includes the tests that expect ``main()`` to stop at argument
     parsing. Whether an invocation reaches the ``mkdir`` depends on the order
     of ``main()``, which is not what those tests are about.
+
+    And for every test that calls ``run_draft_pipeline`` itself, which looks in
+    ``HISTORY_ROOT`` for the article's earlier runs, and saves its report there
+    unless ``save_run`` is stubbed. Nine of them looked, measured from a
+    checkout that had none of their slugs.
     """
     root = tmp_path / "pipeline_history"
     monkeypatch.setattr(pipeline, "HISTORY_ROOT", str(root))

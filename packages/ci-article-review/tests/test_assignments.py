@@ -403,6 +403,7 @@ _HANDOFF = {
 }
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestSkipsReachTheRunOutput:
     """The reasons are only useful if the run actually prints them."""
 
@@ -706,6 +707,7 @@ class TestCustomDomainConfigForms:
         assert skips == []
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestCustomSkipsReachTheRunOutput:
     """Same wiring check as the built-in domains, for the custom ones."""
 
