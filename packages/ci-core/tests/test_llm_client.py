@@ -3086,6 +3086,18 @@ class TestSearchCountsReachTheResult:
         ):
             assert _call("perplexity")["searches"] == 1
 
+    def test_deep_research_bills_its_queries_and_they_are_unknown(self):
+        """No request fee: sonar-deep-research bills each search query, and
+        usage.num_search_queries does not survive litellm's stream. Counted as
+        one request, it was priced at a query's fee regardless of how many ran."""
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream()
+        ):
+            result = _call(
+                "perplexity", provider_config={"model": "sonar-deep-research"}
+            )
+        assert result["searches"] is None
+
     def test_a_provider_that_cannot_search_has_no_count(self):
         with patch.object(
             client.litellm, "completion", return_value=_completion_stream()

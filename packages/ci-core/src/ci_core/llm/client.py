@@ -1284,7 +1284,7 @@ def _search_enabled(provider, cfg, params):
     return "web_search_options" in params
 
 
-def _read_searches(provider, assembled):
+def _read_searches(provider, assembled, model=""):
     """Billable searches this response reports, or None if it does not say.
 
     The count sits beside ``tokens`` in the result and is priced by
@@ -1308,7 +1308,10 @@ def _read_searches(provider, assembled):
       153), and none of the 37 since the move to litellm on 2026-08-18.
     * perplexity: 1. The fee is per request, and this response is one.
       Perplexity also prices it in ``usage.cost.request_cost``, but litellm does
-      not carry that through a stream.
+      not carry that through a stream. sonar-deep-research is the exception:
+      it has no request fee and bills each search query instead, and its count
+      (``usage.num_search_queries``) does not survive the stream either, so it
+      is unknown.
     * grok: unknown. xAI reports ``num_sources_used`` and litellm maps it only
       on a response that was not streamed. Grok's search is off in every preset
       until the litellm fix in UPSTREAM.md lands.
@@ -1320,7 +1323,7 @@ def _read_searches(provider, assembled):
     text, and those counts are unknown, like its tokens.
     """
     if provider == "perplexity":
-        return 1
+        return None if "sonar-deep-research" in str(model) else 1
     if provider == "gemini":
         queries = assembled.get("web_search_queries")
         details = _usage_as_dict(assembled.get("usage")).get("prompt_tokens_details")
@@ -1684,7 +1687,7 @@ def _attempt(
         if searchable:
             # Read per stream, so an attempt a retry throws away carries its
             # own count into the discarded record with its usage.
-            assembled["searches"] = _read_searches(provider, assembled)
+            assembled["searches"] = _read_searches(provider, assembled, model)
         return assembled
 
     def _request(timing):
