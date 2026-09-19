@@ -314,6 +314,7 @@ class TestNoSeoSuggestionsFlag:
         assert mock_run.call_args.kwargs["seo_suggestions"] is None
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestSeoSuggestionPassReachedFromDraftRun:
     """The pass has to actually be invoked by run_draft_pipeline, with the
     material the pipeline already has, and the CLI override has to reach it."""

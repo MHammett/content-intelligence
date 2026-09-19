@@ -22,6 +22,8 @@ citation markers instead; see ``test_draft_citations``.
 
 from unittest.mock import patch
 
+import pytest
+
 import ci_article_review.pipeline as pipeline
 from ci_article_review.adapters.citation import resolver
 
@@ -124,6 +126,7 @@ class TestCollectCitationClaims:
         assert pipeline._collect_citation_claims(fact_check, "") == []
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestPassThreeIsNotGatedOnAdapters:
     """Finding 3 — the regression that silently disabled verification."""
 
