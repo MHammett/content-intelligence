@@ -343,6 +343,89 @@ class TestRetiredPresets:
         )
         assert args.cost_preset == "standard"
 
+
+class TestEffortNoneIsWarnedAtConfigLoad:
+    """`effort: none` does not stop claude-opus-5 thinking, and config load says so.
+
+    litellm drops the value, so the model thinks at its default, high, and is
+    billed for it. It is judged on the merged config because that is the one
+    that runs: a cost_preset replaces an effort written under models:, but one in
+    preset_overrides survives the preset. The wording and the rule are ci_core's
+    (output_tokens.effort_none_warnings); these pin where it is raised.
+    """
+
+    @staticmethod
+    def _merge(caplog, user):
+        import logging
+
+        from ci_article_review.config_loader import merge_configs
+
+        with caplog.at_level(logging.WARNING):
+            return merge_configs(user, {})
+
+    def test_an_effort_none_under_models_warns(self, caplog):
+        claude = {"model": "claude-opus-5", "effort": "none"}
+        self._merge(caplog, {"models": {"claude": claude}})
+        assert "claude model claude-opus-5 is set to effort: none" in caplog.text
+        assert "effort: low or medium" in caplog.text
+
+    def test_one_in_preset_overrides_survives_the_preset_and_warns(self, caplog):
+        """The way to write it under a preset, so the likeliest way to meet it."""
+        override = {"model": "claude-opus-5", "effort": "none"}
+        user = {
+            "pipeline": {
+                "cost_preset": "maximum",
+                "preset_overrides": {"claude": override},
+            },
+            "models": {"claude": {}},
+        }
+        merged = self._merge(caplog, user)
+        assert merged["models"]["claude"]["effort"] == "none"
+        assert "claude model claude-opus-5 is set to effort: none" in caplog.text
+
+    def test_one_under_models_is_replaced_by_a_preset_and_is_quiet(self, caplog):
+        """The preset owns the effort, so the none never runs and is not warned."""
+        user = {
+            "pipeline": {"cost_preset": "maximum"},
+            "models": {"claude": {"model": "claude-opus-5", "effort": "none"}},
+        }
+        merged = self._merge(caplog, user)
+        assert merged["models"]["claude"].get("effort") != "none"
+        assert "effort: none" not in caplog.text
+
+    def test_yaml_off_read_from_user_yaml_warns(self, tmp_path, caplog):
+        """The whole path an operator's file takes, where `off` loads as False."""
+        from ci_article_review.config_loader import load_user_config
+
+        (tmp_path / "user.yaml").write_text(
+            "api_keys:\n"
+            "  openai: {api_key: k}\n"
+            "  gemini: {api_key: k}\n"
+            "  mistral: {api_key: k}\n"
+            "models:\n"
+            "  claude:\n"
+            "    model: claude-sonnet-5\n"
+            "    effort: off\n",
+            encoding="utf-8",
+        )
+        user = load_user_config(tmp_path)
+        assert user["models"]["claude"]["effort"] is False
+        self._merge(caplog, user)
+        assert "claude model claude-sonnet-5 is set to effort: false" in caplog.text
+
+    @pytest.mark.parametrize(
+        "claude",
+        [
+            {"model": "claude-opus-5", "effort": "low"},
+            {"model": "claude-opus-5"},
+            {"model": "claude-opus-4-8", "effort": "none"},
+        ],
+        ids=["a-real-effort", "unset", "a-model-that-thinks-only-when-asked"],
+    )
+    def test_a_config_that_runs_as_written_is_quiet(self, caplog, claude):
+        self._merge(caplog, {"models": {"claude": claude}})
+        assert "claude model" not in caplog.text
+
     def test_the_cli_help_advertises_only_live_tiers(self):
         from ci_article_review.pipeline import build_parser
 

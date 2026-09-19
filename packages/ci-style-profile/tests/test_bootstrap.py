@@ -103,6 +103,77 @@ class TestDryRun:
             assert not output_path.exists()
 
 
+class TestEffortNoneIsWarned:
+    """`effort: none` in user.yaml does not stop claude-sonnet-5 thinking.
+
+    main() merges the preset over user.yaml's model config key by key, keeping
+    what the preset leaves unset, so a claude `effort: none` rides into any
+    preset whose claude sets no effort. litellm drops the none and the model
+    thinks at high. The warning is raised before collection, and --dry-run
+    makes no calls. The presets are this test's own, so the merge is exercised
+    whatever the shipped presets.yaml holds or whether it is found.
+    """
+
+    PRESETS = {
+        "balanced": {"models": {"claude": {"model": "claude-sonnet-5"}}},
+        "maximum": {"models": {"claude": {"model": "claude-opus-5", "effort": "high"}}},
+    }
+
+    def _run(self, caplog, preset, claude):
+        import logging
+
+        user_config = {"models": {"claude": dict(claude)}}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                caplog.at_level(logging.WARNING),
+                # main() replaces the root handlers, caplog's among them.
+                patch("ci_style_profile.logging_config.configure_logging"),
+                patch("ci_style_profile.bootstrap._load_sources_yaml", return_value={}),
+                patch(
+                    "ci_style_profile.bootstrap._load_presets",
+                    return_value=self.PRESETS,
+                ),
+                patch(
+                    "ci_style_profile.bootstrap._load_user_config_lenient",
+                    return_value=user_config,
+                ),
+                patch(
+                    "ci_style_profile.collectors.REGISTRY",
+                    _make_mock_registry("wordpress"),
+                ),
+                patch(
+                    "ci_style_profile.bootstrap._collect_source",
+                    return_value=_MOCK_DOCS,
+                ),
+            ):
+                rc = _run_bootstrap(
+                    "--output-yaml",
+                    str(Path(tmpdir) / "out.yaml"),
+                    "--sources",
+                    "wordpress",
+                    "--style",
+                    "canonical",
+                    "--preset",
+                    preset,
+                    "--dry-run",
+                )
+        assert rc == 0
+        return caplog.text
+
+    def test_a_none_that_rides_into_the_presets_model_is_warned(self, caplog):
+        text = self._run(
+            caplog, "balanced", {"model": "claude-haiku-4-5-20251001", "effort": "none"}
+        )
+        assert "claude model claude-sonnet-5 is set to effort: none" in text
+        assert "effort: low or medium" in text
+
+    def test_a_preset_that_sets_the_effort_replaces_it_and_is_quiet(self, caplog):
+        text = self._run(
+            caplog, "maximum", {"model": "claude-sonnet-5", "effort": "none"}
+        )
+        assert "effort: none" not in text
+
+
 class TestContinueOnError:
     def test_continue_on_error_skips_failed_source(self):
         """--continue-on-error: one collector raises CollectorError; run completes."""

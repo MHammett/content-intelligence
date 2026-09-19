@@ -1302,9 +1302,11 @@ class TestTheCallLogRecordsTheEffortThatRan:
     claude-opus-5 with no effort set thinks at high and is sized as high (see
     ci_core/llm/output_tokens.py). Logged as `effort=none`, a high-effort call's
     length and speed would be filed under none, in the record calibration is
-    mined from.
+    mined from. `effort: none` is the same request, since litellm drops it, so
+    it is logged the same way.
     """
 
+    @pytest.mark.parametrize("effort", [None, "none"], ids=["unset", "none"])
     @pytest.mark.parametrize(
         "configured,answered,expected",
         [
@@ -1316,10 +1318,14 @@ class TestTheCallLogRecordsTheEffortThatRan:
             ("claude-opus-5", "claude-sonnet-4-6", "none"),
         ],
     )
-    def test_claude_with_no_effort_set(self, tmp_path, configured, answered, expected):
+    def test_claude_with_no_effort_sent(
+        self, tmp_path, effort, configured, answered, expected
+    ):
         config = copy.deepcopy(_CONFIG)
         config["api_keys"]["claude"] = {"api_key": "k"}
         config["models"]["claude"] = {"model": configured}
+        if effort is not None:
+            config["models"]["claude"]["effort"] = effort
 
         def _answered_by(model_name, domain, *a, **kw):
             result = _fake_run_domain(model_name, domain, *a, **kw)

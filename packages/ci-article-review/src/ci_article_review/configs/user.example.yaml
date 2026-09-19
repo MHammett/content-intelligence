@@ -118,8 +118,13 @@ models:
 # Claude — thinking mode depends on model generation:
 #
 #   Adaptive thinking (claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-fable-5):
-#     Always on — no thinking_budget needed.  Control depth via effort parameter.
+#     No thinking_budget needed.  Control depth via effort parameter.
 #     Sonnet 5 uses the adaptive path; extended thinking is deprecated for it.
+#     claude-opus-5, claude-sonnet-5 and claude-fable-5 think even with no effort
+#     set, at "high"; claude-opus-4-8 thinks only when an effort is set.
+#     There is no effort "none": it does NOT turn thinking off.  litellm drops it,
+#     so those three still think at "high", and config load warns.  To spend
+#     less on thinking, use effort: low or medium.
 #
 #   Extended thinking (claude-haiku-4-5-20251001 and earlier):
 #     Opt-in via thinking_budget.  Beta header is added automatically.

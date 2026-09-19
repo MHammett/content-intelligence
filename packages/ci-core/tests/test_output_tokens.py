@@ -8,6 +8,7 @@ formula to that evidence.
 """
 
 import pytest
+import yaml
 
 import ci_core.llm.output_tokens as ot
 import ci_core.llm.timeout_model as tm
@@ -270,6 +271,117 @@ class TestAnUnsetEffortIsTheModelsDefault:
             return {k: v for k, v in cost_map[model].items() if "thinking" in k}
 
         assert _thinking_flags("claude-opus-5") == _thinking_flags("claude-opus-4-8")
+
+
+class TestEffortNoneThatStillThinksIsWarned:
+    """`effort: none` on claude-opus-5 is unset, not off, so it is said out loud.
+
+    Whoever writes it wants no thinking, usually to save money. litellm drops the
+    value, and the model thinks at its default, high, and bills for it. Nothing
+    fails, so nothing else would say so. What reaches the wire for each spelling
+    is pinned in test_llm_client.py; these cover who is warned, and with what.
+    """
+
+    THINK_BY_DEFAULT = sorted(ot._EFFORT_WHEN_UNSET["claude"])
+    THINK_WHEN_ASKED = TestAnUnsetEffortIsTheModelsDefault.THINK_WHEN_ASKED
+
+    @staticmethod
+    def _warned(model=None, **cfg):
+        if model is not None:
+            cfg["model"] = model
+        return ot.effort_none_warnings({"claude": cfg})
+
+    @pytest.mark.parametrize("model", THINK_BY_DEFAULT)
+    def test_names_the_model_what_it_runs_at_and_what_to_set(self, model):
+        (warning,) = self._warned(model, effort="none")
+        default = ot.effort_when_unset("claude", model)
+        assert f"claude model {model} is set to effort: none" in warning
+        assert f"thinks at its default, {default}" in warning
+        assert "effort: low or medium" in warning
+
+    @pytest.mark.parametrize("model", THINK_WHEN_ASKED)
+    def test_a_model_that_thinks_only_when_asked_is_not_warned(self, model):
+        """litellm drops the none here too, and these models then do not think,
+        which is what was asked for."""
+        assert self._warned(model, effort="none") == []
+
+    @pytest.mark.parametrize("written", ["off", "no", "false", "False"])
+    def test_yaml_false_is_warned_the_same_way(self, written):
+        """YAML reads all four as false. A false effort is not sent at all, so
+        the request is the same as a none that litellm dropped."""
+        cfg = yaml.safe_load(f"model: claude-opus-5\neffort: {written}")
+        assert cfg["effort"] is False
+        (warning,) = ot.effort_none_warnings({"claude": cfg})
+        assert "effort: false (YAML reads off and no as false too)" in warning
+        assert "thinks at its default, high" in warning
+
+    @pytest.mark.parametrize("written", ["None", "NONE", " none "])
+    def test_another_spelling_is_warned_that_every_call_fails(self, written):
+        """litellm matches "none" exactly and rejects anything else before
+        sending. Promising a high-effort run here would be wrong: no request
+        is made at all."""
+        (warning,) = self._warned("claude-opus-5", effort=written)
+        assert f"effort: {written!r}" in warning
+        assert "every claude call will fail" in warning
+        assert "is billed" not in warning
+        assert "effort: low or medium" in warning
+
+    def test_unset_is_not_warned(self):
+        """Unset is the API default, documented and sized for (see the class
+        above). It is what an empty config means, not a request for less."""
+        assert self._warned("claude-opus-5") == []
+        assert self._warned("claude-opus-5", effort=None) == []  # YAML null
+
+    @pytest.mark.parametrize("effort", ["", "low", "medium", "high", "xhigh", "max"])
+    def test_other_efforts_are_not_warned(self, effort):
+        assert self._warned("claude-opus-5", effort=effort) == []
+
+    def test_a_disabled_claude_is_not_warned(self):
+        assert self._warned("claude-opus-5", effort="none", enabled=False) == []
+
+    def test_a_thinking_budget_decides_instead_and_is_not_warned(self):
+        """The client sends the budget and never reads the effort, so "thinks
+        at its default" would be false. (On these models the budget is its own
+        failure: Anthropic rejects budget_tokens on Opus 5 and Sonnet 5.)"""
+        from ci_core.llm import client
+
+        cfg = {"effort": "none", "thinking_budget": 4096}
+        assert self._warned("claude-opus-5", **cfg) == []
+        params = client._provider_params("claude", {"model": "claude-opus-5", **cfg})
+        assert params["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+        assert "reasoning_effort" not in params
+
+    def test_only_claude_is_judged(self):
+        """mistral's and openai's none are real levels, sent and honoured."""
+        configs = {
+            "mistral": {"model": "mistral-medium-3-5", "reasoning_effort": "none"},
+            "openai": {"model": "gpt-5.6-terra", "reasoning_effort": "none"},
+        }
+        assert ot.effort_none_warnings(configs) == []
+
+    def test_a_pinned_route_is_the_model_it_routes_to(self):
+        (warning,) = self._warned("anthropic/claude-opus-5", effort="none")
+        assert "anthropic/claude-opus-5" in warning
+
+    def test_no_model_is_judged_on_the_model_the_client_calls(self, monkeypatch):
+        from ci_core.llm import client
+
+        default = client._PROVIDERS["claude"]["default_model"]
+        expected = 1 if ot.effort_when_unset("claude", default) else 0
+        assert len(self._warned(effort="none")) == expected
+        monkeypatch.setitem(
+            client._PROVIDERS["claude"], "default_model", "claude-opus-5"
+        )
+        (warning,) = self._warned(effort="none")
+        assert "claude-opus-5" in warning
+
+    @pytest.mark.parametrize(
+        "configs", [None, {}, [], "claude", {"claude": "claude-opus-5"}]
+    )
+    def test_a_config_it_cannot_read_is_not_an_error(self, configs):
+        """ci-style-profile hands over user.yaml's models as written, where the
+        string form and a missing section are both legal."""
+        assert ot.effort_none_warnings(configs) == []
 
 
 class TestTheModelsOwnLimit:
