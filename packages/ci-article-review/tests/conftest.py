@@ -1,7 +1,9 @@
 """Shared fixtures for the ci-article-review suite."""
 
+import contextlib
 import hashlib
 import ssl
+from pathlib import Path
 
 import pytest
 import requests
@@ -9,9 +11,59 @@ import urllib3
 
 import spn_client.client as _spn_client_engine
 
-from ci_article_review import live_model_check
+from ci_article_review import live_model_check, pipeline
 from ci_article_review.adapters.citation import resolver, wayback
 from ci_article_review.analysis import links
+
+#: The ``pipeline_history/`` a real run would write to. ``HISTORY_ROOT`` is
+#: relative to the working directory, which for this suite is wherever pytest
+#: was started: the repo root, for ``make test`` and for CI. Resolved at import,
+#: before any fixture replaces ``HISTORY_ROOT`` or a test changes directory.
+_CWD_HISTORY = Path(pipeline.HISTORY_ROOT).resolve()
+
+
+@pytest.fixture(autouse=True)
+def cwd_history_untouched():
+    """Fail any test that creates ``pipeline_history/`` in the working directory.
+
+    This checks only whether the directory exists. Where it already does, as
+    in a checkout that has run a review, a live run in that checkout can write
+    to it while the suite runs, so its contents cannot be blamed on a test. CI
+    starts without one, so there this fails every test that creates it.
+
+    If the test left the directory empty, it is removed again. The tests that
+    follow are then still checked, rather than passing because it is already
+    there.
+    """
+    existed = _CWD_HISTORY.exists()
+    yield
+    created = not existed and _CWD_HISTORY.exists()
+    if created:
+        with contextlib.suppress(OSError):
+            _CWD_HISTORY.rmdir()
+    assert not created, (
+        f"test created {_CWD_HISTORY}; pipeline.main() does that unless the "
+        "test uses the tmp_history_root fixture"
+    )
+
+
+@pytest.fixture
+def tmp_history_root(tmp_path, monkeypatch):
+    """Point ``pipeline.HISTORY_ROOT`` into ``tmp_path``.
+
+    For every test that calls ``main()``, which creates ``HISTORY_ROOT`` before
+    it opens its log file there. Those tests patch ``logging.FileHandler``,
+    which stops the file but not the ``mkdir``, so each one that got that far
+    left an empty ``pipeline_history/`` in the working directory: eight of
+    them, measured from a checkout that had none.
+
+    That includes the tests that expect ``main()`` to stop at argument
+    parsing. Whether an invocation reaches the ``mkdir`` depends on the order
+    of ``main()``, which is not what those tests are about.
+    """
+    root = tmp_path / "pipeline_history"
+    monkeypatch.setattr(pipeline, "HISTORY_ROOT", str(root))
+    return root
 
 
 @pytest.fixture(scope="session")

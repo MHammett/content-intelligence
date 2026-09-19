@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestRawDraftArgparse:
     def test_raw_draft_mutually_exclusive_with_draft(self):
         import ci_article_review.pipeline as pipeline
@@ -58,6 +59,7 @@ class TestRawDraftArgparse:
                 pipeline.main()
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestRetryFailedArgparse:
     def test_retry_failed_mutually_exclusive_with_replay(self):
         import ci_article_review.pipeline as pipeline
@@ -94,6 +96,7 @@ class TestRetryFailedArgparse:
                 pipeline.main()
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestRetryFailedFlowsIntoReview:
     """--retry-failed must reach run_draft_pipeline alongside normal draft-loading."""
 
@@ -137,6 +140,7 @@ class TestRetryFailedFlowsIntoReview:
         assert mock_run.call_args.kwargs["retry_failed_results"] is None
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestRawDraftModeFlowsIntoReview:
     """--raw-draft alone must build a raw-text handoff and reach run_draft_pipeline."""
 
@@ -197,6 +201,7 @@ class TestRawDraftModeFlowsIntoReview:
         assert handoff["title"] == "my-cool-draft"
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestRawDraftWithMetadataFlowsIntoReview:
     """--raw-draft + --metadata must combine both files into one handoff."""
 
@@ -275,6 +280,7 @@ class TestBuildUserPromptForwardsMetadataFields:
         assert "KNOWN GAPS" not in prompt
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestNoSeoSuggestionsFlag:
     """--no-seo-suggestions must reach run_draft_pipeline; its absence must not."""
 
@@ -893,6 +899,7 @@ class TestTheHardExitStaysOutOfMain:
     def test_cli_does(self):
         assert "exit_without_waiting_for_foreign_threads" in self._source("cli")
 
+    @pytest.mark.usefixtures("tmp_history_root")
     def test_main_returns_rather_than_ending_the_process(self, monkeypatch):
         """A bad invocation must raise SystemExit for a caller to handle, not
         take the interpreter with it."""
