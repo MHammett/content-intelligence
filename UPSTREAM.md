@@ -558,3 +558,61 @@ raises it as a separate case rather than bundling it with the fix above.
 code — closing a client, flushing an upload — makes its calls. The local
 workaround is held to `packages/ci-article-review/tests/test_socket_guard.py`,
 whose teardown tests all fail without it.
+
+---
+
+## 8. pytest-socket — name lookups go unguarded under an allow-list
+
+**Status:** `ready`. This is a capability pytest-socket never claimed for this
+mode, so by the rule above it belongs on the existing thread rather than in a
+new issue: [miketheman/pytest-socket#43](https://github.com/miketheman/pytest-socket/issues/43)
+asked for lookups to be blocked, and asked how that should interact with
+`socket_allow_hosts()`. PR #482 closed it for `--disable-socket` alone. #43 is
+closed, so this goes either as a comment there or as a feature request that
+links it. Worked around here by the lookup guard in
+`pytest_plugins/socket_guard.py`, which is written to be deleted when this
+ships.
+**Repo:** miketheman/pytest-socket (tested against 0.8.1, the latest release;
+`main` unchanged here as of 2026-09-18)
+
+Since 0.8.0, `--disable-socket` guards `socket.getaddrinfo` and
+`socket.gethostbyname` as well as `socket.socket`. Under `--allow-hosts` both
+stay open: `socket_allow_hosts()` patches `socket.socket.connect` and nothing
+else, so every name a test looks up goes to the real resolver. An allow-list is
+how a suite keeps loopback usable (this one's database and logging tests bind
+local sockets), so a suite like that runs in exactly the mode where lookups go
+unguarded. Their tracker has nothing else on it: issues and PRs were searched
+2026-09-18 for getaddrinfo, DNS, gethostbyname, resolve and allow_hosts. #412,
+about allow-listed hostnames resolving to new addresses at runtime, is the
+opposite problem, and was closed as stale.
+
+**Reproduction** (`pytest --disable-socket --allow-hosts=127.0.0.1`):
+
+```python
+import socket
+
+
+def test_it():
+    socket.getaddrinfo("example.com", 443)  # not blocked: the real resolver answers
+```
+
+With `--disable-socket` alone, the same test fails with `SocketBlockedError: A
+test tried to use socket.getaddrinfo.`
+
+**Measured 2026-09-18** on this repo's suite (3,145 tests, run with
+`--allow-hosts=127.0.0.1,::1`) with a plugin that records every lookup and the
+test that made it: 23 tests asked the real resolver about a name. With every
+such lookup made to fail, three of them failed. One had already failed a real
+run, when a network blip left example.com unresolved. None of the 23 looks a
+name up itself: each reached the resolver through an SSRF check that resolves
+a URL's host before fetching it.
+
+**Proposed change:** in `socket_allow_hosts()`, alongside the `connect` patch,
+guard `getaddrinfo` and `gethostbyname` so they pass through only lookups that
+need no nameserver (an address literal, `None` or `""`, `localhost`) and the
+hostnames on the allow-list, and raise `SocketBlockedError` naming the host
+for any other. `_remove_restrictions()` then restores them with the identity
+check #482 added. `socket_guard.py` does exactly this from outside, by wrapping
+`socket_allow_hosts` and `_remove_restrictions`. Its tests in
+`packages/ci-article-review/tests/test_socket_guard.py` cover the exemptions,
+and the guard's lifecycle across markers, fixtures, collection and teardown.

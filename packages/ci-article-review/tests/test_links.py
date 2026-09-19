@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from ci_article_review.analysis import links
@@ -45,7 +46,15 @@ class TestSsrfGuard:
             assert links._is_public_host(url) is False, url
 
     def test_allows_public_host(self):
-        assert links._is_public_host("https://www.fhwa.dot.gov/") is True
+        # What a public name resolves to is DNS's answer, so the answer is
+        # stubbed: one fixed global address. Unstubbed, this asked real DNS on
+        # every run, and passed when the lookup failed too, because this
+        # wrapper fails open on an unresolvable host.
+        with patch(
+            "ci_core.http.socket.getaddrinfo",
+            return_value=[(0, 0, 0, "", ("93.184.216.34", 0))],
+        ):
+            assert links._is_public_host("https://www.fhwa.dot.gov/") is True
 
     def test_no_hostname_rejected(self):
         assert links._is_public_host("not-a-url") is False
@@ -109,6 +118,22 @@ class TestWaybackFallbackOnUnreadableOrigin:
     """A link the origin refused (401/403/429) or that we never reached
     (timeout, DNS/connection error) should fall back to a Wayback snapshot;
     404/410/5xx should not."""
+
+    @pytest.fixture(autouse=True)
+    def _example_com_is_public(self):
+        """Answer the SSRF guard without asking DNS.
+
+        ``_check_http`` consults the guard before anything else, and the guard
+        answers with a real lookup of the host: every test here asked real DNS
+        about example.com on every run. None depended on the answer, since the
+        guard fails open on a failed lookup, but each one still waited for it.
+        The guard itself is ``TestSsrfGuard``'s subject; this class is about
+        what happens after it.
+        """
+        with patch(
+            "ci_article_review.analysis.links._is_public_host", return_value=True
+        ):
+            yield
 
     def _head_response(self, status_code):
         resp = MagicMock()

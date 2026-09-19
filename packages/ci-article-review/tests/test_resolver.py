@@ -9,7 +9,7 @@ import requests
 import spn_client.client as _spn_client_engine
 
 from ci_core import extract
-from ci_core.http import UnsafeURLError
+from ci_core.http import HOST_PUBLIC, HOST_UNRESOLVABLE, UnsafeURLError
 
 from ci_article_review.adapters.citation import resolver, wayback
 
@@ -987,6 +987,12 @@ class TestKnownUrlWaybackFallback:
         the public-host guard, so an unstubbed run asks archive.org's Save Page Now
         API to really capture the page — measured at 21s of live network in a
         unit test, on every run of the suite.
+
+        The guard is stubbed too, because ``classify_host`` answers it by looking
+        example.com up in real DNS. ``test_stale_snapshot_stays_flagged_stale``
+        passed only while that lookup worked: during a network blip on
+        2026-09-18 it came back unresolvable, the citation was never a
+        submission target, and the test failed ``assert 0 == 1`` on ``submit``.
         """
         snap_resp = _page_response()
         with (
@@ -998,6 +1004,10 @@ class TestKnownUrlWaybackFallback:
                 "ci_article_review.adapters.citation.resolver.wayback.check",
                 return_value=wayback_result,
             ) as mock_wb,
+            patch(
+                "ci_article_review.adapters.citation.resolver.classify_host",
+                return_value=HOST_PUBLIC,
+            ),
             patch(
                 "ci_article_review.adapters.citation.resolver.wayback.submit",
                 return_value={"submitted": True, "job_id": None},
@@ -1224,10 +1234,11 @@ class TestKnownUrlImpersonationEscalation:
     ):
         """One known_url claim whose honest fetch fails with ``status``.
 
-        ``wayback.submit`` is stubbed for the reason ``_resolve_with_fetch_failure``
-        above documents: a resolved citation with no snapshot is a re-capture
-        target, and example.com passes ``is_public_host``, so an unstubbed run
-        asks archive.org to really capture the page.
+        ``wayback.submit`` and the public-host guard are stubbed for the reasons
+        ``_resolve_with_fetch_failure`` above documents: a resolved citation
+        with no snapshot is a re-capture target, so an unstubbed run asks
+        archive.org to really capture the page, after asking real DNS whether
+        example.com is public.
         """
         wayback_result = (
             {"archived": False} if wayback_result is None else wayback_result
@@ -1248,6 +1259,10 @@ class TestKnownUrlImpersonationEscalation:
                 "ci_article_review.adapters.citation.resolver.wayback.check",
                 return_value=wayback_result,
             ) as mock_wb,
+            patch(
+                "ci_article_review.adapters.citation.resolver.classify_host",
+                return_value=HOST_PUBLIC,
+            ),
             patch(
                 "ci_article_review.adapters.citation.resolver.wayback.submit",
                 return_value={"submitted": True, "job_id": None},
@@ -2367,11 +2382,19 @@ class TestStaleSnapshotsAreResubmitted:
             "wayback": wayback,
         }
 
+    # The tests that expect a submission stub the public-host check: it looks
+    # example.org up in real DNS, and when that lookup fails the pass skips the
+    # URL, which reads here as "not submitted". The private-host test keeps
+    # the real check, which settles an address literal without a lookup.
+
     def test_a_stale_snapshot_is_submitted(self):
         entries = [self._entry(archived=True, snapshot_stale=True)]
-        with patch.object(
-            resolver.wayback, "submit", return_value={"submitted": True}
-        ) as mock_submit:
+        with (
+            patch.object(resolver, "classify_host", return_value=HOST_PUBLIC),
+            patch.object(
+                resolver.wayback, "submit", return_value={"submitted": True}
+            ) as mock_submit,
+        ):
             resolver._submit_missing_archives(entries, {})
         mock_submit.assert_called_once()
 
@@ -2383,9 +2406,12 @@ class TestStaleSnapshotsAreResubmitted:
 
     def test_an_absent_snapshot_is_still_submitted(self):
         entries = [self._entry(archived=False)]
-        with patch.object(
-            resolver.wayback, "submit", return_value={"submitted": True}
-        ) as mock_submit:
+        with (
+            patch.object(resolver, "classify_host", return_value=HOST_PUBLIC),
+            patch.object(
+                resolver.wayback, "submit", return_value={"submitted": True}
+            ) as mock_submit,
+        ):
             resolver._submit_missing_archives(entries, {})
         mock_submit.assert_called_once()
 
@@ -2887,6 +2913,15 @@ class TestResolvedUrlIsRecorded:
             patch(
                 "ci_article_review.adapters.citation.resolver.wayback.check",
                 return_value={"archived": False},
+            ),
+            # With no snapshot, the citation is a re-capture target, and the
+            # archiving pass looks its host up first. redirector.example is
+            # under a reserved TLD with no real answer: the real lookup came
+            # back unresolvable and nothing was submitted. This gives the same
+            # answer without asking DNS.
+            patch(
+                "ci_article_review.adapters.citation.resolver.classify_host",
+                return_value=HOST_UNRESOLVABLE,
             ),
             patch(
                 "ci_article_review.adapters.citation.resolver._verify_relevance",

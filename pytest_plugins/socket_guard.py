@@ -1,4 +1,4 @@
-"""Extend pytest-socket's network guard to collection and fixture teardown.
+"""Extend pytest-socket's network guard to collection, fixture teardown and DNS.
 
 pytest-socket applies its restrictions in ``pytest_runtest_setup`` and lifts
 them in ``pytest_runtest_teardown``, so they cover a test's setup and call, and
@@ -61,6 +61,43 @@ leaves set up when it stops early — on a teardown error under ``-x`` or
 ``pytest_sessionfinish``, with no test running, so the global restrictions
 apply there, as they do during collection.
 
+Name lookups fall outside pytest-socket's guard in every window. Under an
+allow-list — how every inifile here runs it, so that loopback stays usable — it
+patches ``connect()`` and nothing else, and ``getaddrinfo`` asks the real
+resolver.
+It blocks lookups only under ``--disable-socket`` with no allow-list (0.8.0,
+PR #482, which settled miketheman/pytest-socket#43 for that mode alone). That
+failed a run on 2026-09-18: a resolver test reached
+``ci_core.http.classify_host``, which looked example.com up for real, and a
+network blip left the name unresolved. Measured that day, 23 tests asked the
+real resolver about a name, and three of them depended on the answer.
+
+So wherever pytest-socket installs an allow-list, this plugin restricts the
+forward lookups — ``getaddrinfo``, ``gethostbyname``, ``gethostbyname_ex`` —
+to names that need no nameserver: address literals, which parse locally; the
+wildcard, ``None`` or ``""``; ``localhost``, which RFC 6761 reserves to
+loopback; and the names on the allow-list itself. Any other name raises
+pytest-socket's ``SocketBlockedError``, as it does under ``--disable-socket``.
+That is a RuntimeError, not an OSError, so code written to survive a failed
+lookup does not absorb it; ``classify_host``, which catches everything,
+reads it as "unresolvable" on every run rather than on an unlucky one. And
+pytest-socket's errors warn when raised, so the warnings summary names the
+host even when the error itself is caught.
+
+The restriction goes on inside ``pytest_socket.socket_allow_hosts`` and comes
+off inside ``pytest_socket._remove_restrictions``, both wrapped at import, so
+it follows the allow-list exactly: every marker and fixture, collection, the
+held teardown and ``pytest_sessionfinish``, with no copy of pytest-socket's
+rules. That relies on pytest-socket calling both through its module globals,
+as 0.8.1 does; the lookup tests fail if it stops. pytest-socket's tracker has
+nothing on lookups under an allow-list (checked 2026-09-18): UPSTREAM.md entry
+8 has the change to propose, and this goes when it ships.
+
+Reverse lookups — ``gethostbyaddr``, ``getnameinfo``, ``getfqdn`` — are left
+open, as ``--disable-socket`` leaves them. The address is the query there, so
+the literal exemption would not hold, and the suite makes one only when
+``http.server`` names the loopback address it has bound.
+
 Subprocesses are not covered, deliberately. A guard installed here lives in
 this interpreter, and a child starts a fresh one. Reaching into it takes a
 startup hook — a ``.pth`` file in the environment or a ``sitecustomize`` on
@@ -80,8 +117,12 @@ Revisit this if a test starts running network-capable code in a child — the
 
 from __future__ import annotations
 
+import functools
+import ipaddress
+import socket
 from argparse import Namespace
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from typing import Any
 
 import pytest
 import pytest_socket
@@ -93,10 +134,11 @@ def _apply(config: pytest.Config, options: Namespace) -> None:
     """Restrict sockets the way pytest-socket does for a test with no markers.
 
     Mirrors the global branch of ``pytest_socket.pytest_runtest_setup``: an
-    allow-list restricts ``connect()`` and nothing else, ``--disable-socket``
-    without one blocks sockets and name resolution outright, and
-    ``--force-enable-socket`` overrides both. The options are pytest-socket's,
-    so with pytest-socket disabled they are absent and this does nothing.
+    allow-list restricts ``connect()`` (and, through the wrapper below, name
+    lookups), ``--disable-socket`` without one blocks sockets and name
+    resolution outright, and ``--force-enable-socket`` overrides both. The
+    options are pytest-socket's, so with pytest-socket disabled they are absent
+    and this does nothing.
     """
     if config.stash.get(_APPLIED, False) or getattr(
         options, "force_enable_socket", False
@@ -120,6 +162,105 @@ def _lift(config: pytest.Config) -> None:
         # and keeps doing so if pytest-socket starts patching more.
         pytest_socket._remove_restrictions()
         config.stash[_APPLIED] = False
+
+
+#: The forward lookups an allow-list leaves open, as they are before anything
+#: restricts them. Each is put back only while this plugin's guard is the one in
+#: place, the way pytest-socket restores its own.
+_LOOKUPS = {
+    name: getattr(socket, name)
+    for name in ("getaddrinfo", "gethostbyname", "gethostbyname_ex")
+}
+
+#: The names on the allow-list in force, which a test may still look up.
+_allowed_names: frozenset[str] = frozenset()
+
+
+def _is_address(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _asks_no_nameserver(host: object) -> bool:
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    if not isinstance(host, str):
+        # None is the wildcard. Any other type is the lookup's own to reject.
+        return True
+    if host == "" or _is_address(host):
+        return True
+    return host.lower() == "localhost" or host.lower() in _allowed_names
+
+
+def _guarded(name: str, lookup: Callable[..., Any]) -> Callable[..., Any]:
+    def guarded(host: object, *args: Any, **kwargs: Any) -> Any:
+        if _asks_no_nameserver(host):
+            return lookup(host, *args, **kwargs)
+        allowed = ", ".join(["address literals", "localhost", *sorted(_allowed_names)])
+        raise pytest_socket.SocketBlockedError(
+            f'A test tried to use socket.{name}() with host "{host}" '
+            f"(allowed: {allowed})."
+        )
+
+    return guarded
+
+
+_GUARDS = {name: _guarded(name, lookup) for name, lookup in _LOOKUPS.items()}
+
+
+def _restrict_lookups(allowed: list[str]) -> None:
+    global _allowed_names
+    # As pytest-socket reads the list: stripped, with networks and addresses
+    # set apart from names.
+    _allowed_names = frozenset(
+        host.strip().lower()
+        for host in allowed
+        if "/" not in host and not _is_address(host.strip())
+    )
+    for name, guard in _GUARDS.items():
+        # Over the real lookup only. pytest-socket's outright block, from
+        # disable_socket, is stricter than this; a test's own stub asks no
+        # nameserver either.
+        if getattr(socket, name) is _LOOKUPS[name]:
+            setattr(socket, name, guard)
+
+
+def _lift_lookups() -> None:
+    for name, guard in _GUARDS.items():
+        if getattr(socket, name) is guard:
+            setattr(socket, name, _LOOKUPS[name])
+
+
+_true_socket_allow_hosts = pytest_socket.socket_allow_hosts
+_true_remove_restrictions = pytest_socket._remove_restrictions
+
+
+@functools.wraps(_true_socket_allow_hosts)
+def _socket_allow_hosts(
+    allowed: str | list[str] | None = None, *args: Any, **kwargs: Any
+) -> None:
+    _true_socket_allow_hosts(allowed, *args, **kwargs)
+    # The same test pytest-socket makes before it patches connect().
+    if isinstance(allowed, str):
+        allowed = allowed.split(",")
+    if isinstance(allowed, list):
+        _restrict_lookups(allowed)
+
+
+@functools.wraps(_true_remove_restrictions)
+def _remove_restrictions() -> None:
+    _true_remove_restrictions()
+    _lift_lookups()
+
+
+# At import, before any hook runs: the first caller of either is this
+# plugin's own pytest_load_initial_conftests. pytest-socket reaches both
+# through its module globals, so its setup and teardown hooks call these too.
+pytest_socket.socket_allow_hosts = _socket_allow_hosts
+pytest_socket._remove_restrictions = _remove_restrictions
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
