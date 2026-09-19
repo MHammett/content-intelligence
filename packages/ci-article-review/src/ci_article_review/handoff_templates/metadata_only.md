@@ -1,11 +1,19 @@
 DRAFT SUBMISSION HANDOFF
 Generated: YYYY-MM-DD
-Pipeline run: [increment by 1 each time you re-run this article]
-Article: [Your article title — this is the history key, so keep it identical across re-runs of the same piece]
+Pipeline run: 1
+Article: [Your article title]
 Publication: [your publication config name, i.e. the NAME in configs/NAME.yaml]
 Author: [optional — who "I" refers to in the draft. Only needed when it is not
          the publication's usual byline; citation verification uses it to check
          first-person claims against a source page.]
+History key: [Optional but recommended. A short stable name for this piece, used
+as its history directory. Without it the title is the key, so revising the title
+starts a fresh history and the run loses its delta baseline. Set it once and
+never change it, however much the headline moves.]
+Drafted with: [Optional. The model you drafted this with — claude, openai, gemini,
+mistral, grok or perplexity. That model is then dropped from the voice review,
+because a model asked to flag AI phrasing in its own output is being asked to
+notice its own habits. Delete this line if you wrote the piece yourself.]
 
 PRIMARY CLAIM
 [One or two sentences: the single thing this article argues. Not the topic —
