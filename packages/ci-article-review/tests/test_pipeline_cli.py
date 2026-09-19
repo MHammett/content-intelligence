@@ -718,6 +718,149 @@ class TestPublishRefusesAnUntitledPost:
         assert steps["post"].call_args_list[0].kwargs["json"]["title"] == "About"
 
 
+class TestPublishRefusesUnfilledCategoryOrTags:
+    """An unfilled category or tags line is refused, not published uncategorised.
+
+    ``publication_parameters`` is read by ``_parse_key_value_block``, not
+    ``_extract_field``, so the placeholder handling
+    ``TestPublishRefusesAnUntitledPost`` above exercises for ``Article:``
+    never reached this section. Post type and WordPress author read as
+    blank on a placeholder,
+    the same as any other unset field — each has a safe fallback (default to
+    post, default to the authenticated WordPress user). Category and tags do
+    not: an absent category is never checked, so WordPress silently files
+    the post under "Uncategorized" whether or not the push is live. A
+    placeholder there used to reach ``wordpress.push`` as literal bracket
+    text, which happened to fail a live WordPress term lookup and refuse the
+    publish — but only for ``--publish-live``, only after the paid SEO
+    suggestion call and the checklist, and only by accident of the garbled
+    text never matching a real slug.
+    """
+
+    _HANDOFF = (
+        "PUBLICATION HANDOFF\n"
+        "Article: About\n"
+        "Publication: testpub\n\n"
+        "PUBLICATION PARAMETERS\n"
+        "Status: draft\n"
+        "{params}"
+        "\n"
+        "SEO METADATA\n"
+        "Focus keyword: mike hammett\n\n"
+        "FINAL DRAFT\n"
+        "# About\n\nBody.\n"
+    )
+
+    def _publish(self, tmp_path, params_block, publish_live=False):
+        """Exit code (None if it ran to the end), and every outward step."""
+        from ci_article_review.pipeline import run_publish_pipeline
+
+        path = tmp_path / "about-publication.md"
+        path.write_text(self._HANDOFF.format(params=params_block), encoding="utf-8")
+        config = {
+            "publication": {
+                "wordpress": {
+                    "site_url": "https://example.com",
+                    "username": "editor",
+                    "application_password": "pass word here",
+                },
+                "rank_math": {"auto_set_og_tags": True},
+            },
+            "api_keys": {},
+        }
+        wp_module = "ci_article_review.adapters.cms.wordpress"
+        with (
+            patch("ci_article_review.pipeline.load_user_config", return_value={}),
+            patch(
+                "ci_article_review.pipeline.load_publication_config", return_value={}
+            ),
+            patch("ci_article_review.pipeline.merge_configs", return_value=config),
+            patch("ci_article_review.pipeline._suggest_seo_for_publish") as suggest,
+            patch(
+                f"{wp_module}.print_checklist_and_confirm", return_value=True
+            ) as confirm,
+            patch(f"{wp_module}.requests.post") as post,
+            patch(f"{wp_module}.requests.get") as get,
+        ):
+            try:
+                run_publish_pipeline(str(path), "testpub", publish_live=publish_live)
+            except SystemExit as e:
+                code = e.code
+            else:
+                code = None
+        return code, {"suggest": suggest, "confirm": confirm, "post": post, "get": get}
+
+    def test_an_unfilled_category_is_refused_before_anything_is_sent(
+        self, tmp_path, caplog
+    ):
+        """Refused before the SEO suggestion call is paid for, and before the
+        checklist asks for a yes that would come to nothing."""
+        with caplog.at_level("ERROR"):
+            code, steps = self._publish(
+                tmp_path, "WordPress category: [category slug]\n"
+            )
+        assert code == 1
+        assert [name for name, mock in steps.items() if mock.called] == []
+        assert "WordPress category:" in caplog.text
+        assert "uncategorised" in caplog.text
+
+    def test_an_unfilled_tags_is_refused_before_anything_is_sent(
+        self, tmp_path, caplog
+    ):
+        with caplog.at_level("ERROR"):
+            code, steps = self._publish(tmp_path, "Tags: [comma-separated slugs]\n")
+        assert code == 1
+        assert [name for name, mock in steps.items() if mock.called] == []
+        assert "Tags:" in caplog.text
+
+    def test_both_unfilled_are_named_together(self, tmp_path, caplog):
+        with caplog.at_level("ERROR"):
+            self._publish(
+                tmp_path,
+                "WordPress category: [category slug]\nTags: [comma-separated slugs]\n",
+            )
+        assert "WordPress category:, Tags:" in caplog.text
+
+    def test_a_genuinely_blank_category_still_publishes(self, tmp_path):
+        """The existing, unchanged behaviour this refusal must not touch: a
+        blank category was never refused, and still is not."""
+        code, steps = self._publish(tmp_path, "WordPress category:\n")
+        assert code is None
+        assert steps["post"].called
+
+    def test_an_absent_category_still_publishes(self, tmp_path):
+        code, steps = self._publish(tmp_path, "")
+        assert code is None
+        assert steps["post"].called
+
+    def test_a_page_is_exempt(self, tmp_path, capsys):
+        """The template's own instruction: "A page ignores the category and
+        tag fields below." Refusing here would penalize following it. The
+        placeholder text is also kept out of wordpress.push, so it does not
+        show up in the "these were named and not applied" note as if it were
+        a real value someone typed."""
+        code, steps = self._publish(
+            tmp_path,
+            "Post type: page\nWordPress category: [category slug]\n"
+            "Tags: [comma-separated slugs]\n",
+        )
+        assert code is None
+        assert steps["post"].called
+        assert "category slug" not in capsys.readouterr().out
+
+    def test_live_is_refused_the_same_way(self, tmp_path, caplog):
+        """Not gated on --publish-live: the SEO call and checklist this
+        saves are wasted on a draft push just as much as a live one."""
+        with caplog.at_level("ERROR"):
+            code, steps = self._publish(
+                tmp_path,
+                "WordPress category: [category slug]\n",
+                publish_live=True,
+            )
+        assert code == 1
+        assert not steps["post"].called
+
+
 class TestSeoSuggestionConsoleOutput:
     """The suggestion has to reach the terminal, next to the SEO issues it answers."""
 
