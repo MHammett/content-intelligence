@@ -186,10 +186,14 @@
     "incurred_usd": 0.0315,
     "pricing_known": false,
     "replayed_usd": 0.0,
+    "search_units": 0,
     "total_input_usd": 0.0175,
     "total_output_usd": 0.014,
+    "total_search_usd": 0.0,
     "total_usd": 0.0315,
-    "uncosted_calls": 0
+    "uncosted_calls": 0,
+    "unmeasured_search_calls": 0,
+    "unpriced_searches": 0
   },
   "delta": null,
   "domains_not_run": [],

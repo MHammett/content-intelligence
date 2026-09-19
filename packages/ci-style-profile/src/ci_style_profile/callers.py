@@ -105,14 +105,17 @@ def call_one(
         )
 
     # Append to global cost log
-    _api_call_log.append(
-        {
-            "pass": pass_name,
-            "model": result.get("model", model_cfg.get("model", model_name)),
-            "tokens": result.get("tokens", {}),
-            "failed": result.get("failed", False),
-        }
-    )
+    entry = {
+        "pass": pass_name,
+        "model": result.get("model", model_cfg.get("model", model_name)),
+        "tokens": result.get("tokens", {}),
+        "failed": result.get("failed", False),
+    }
+    # gemini grounds every call and perplexity bills every request, so a
+    # profile run pays search fees too; cost_calculate prices them from this.
+    if "searches" in result:
+        entry["searches"] = result["searches"]
+    _api_call_log.append(entry)
     return result
 
 
@@ -265,10 +268,18 @@ def log_cost_summary() -> None:
         return
     summary = cost_calculate(log_entries)
     log.info(
-        "API spend: $%.4f total ($%.4f input + $%.4f output) across %d calls%s",
+        "API spend: $%.4f total ($%.4f input + $%.4f output + $%.4f search) "
+        "across %d calls%s",
         summary["total_usd"],
         summary["total_input_usd"],
         summary["total_output_usd"],
+        summary["total_search_usd"],
         len(log_entries),
         "" if summary["pricing_known"] else " [pricing estimate — some models unknown]",
     )
+    if summary["unmeasured_search_calls"]:
+        log.info(
+            "  plus the fees of %d attempt(s) that could search but did not "
+            "report how many searches they ran",
+            summary["unmeasured_search_calls"],
+        )

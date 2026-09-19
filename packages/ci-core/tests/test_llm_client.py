@@ -2368,8 +2368,11 @@ class TestClaudeOutputCeiling:
         ]
 
 
-def _anthropic_sse(text):
-    """A complete Anthropic Messages stream, as it arrives on the wire."""
+def _anthropic_sse(text, final_usage=None):
+    """A complete Anthropic Messages stream, as it arrives on the wire.
+
+    ``final_usage`` replaces the closing message_delta's usage.
+    """
     events = [
         {
             "type": "message_start",
@@ -2398,7 +2401,7 @@ def _anthropic_sse(text):
         {
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": 5},
+            "usage": final_usage or {"output_tokens": 5},
         },
         {"type": "message_stop"},
     ]
@@ -2933,3 +2936,426 @@ class TestLitellmIsImportedLazily:
         assert all(m is seen[0] for m in seen), "Threads got different modules"
         assert seen[0].suppress_debug_info is True
         assert seen[0].telemetry is False
+
+
+# ---------------------------------------------------------------------------
+# Search counts — what a grounded call is billed on top of its tokens
+# ---------------------------------------------------------------------------
+
+
+def _with_searches(n):
+    """Usage carrying Anthropic's count, as litellm's ServerToolUse does."""
+    usage = _usage()
+    usage.server_tool_use = SimpleNamespace(web_search_requests=n)
+    return usage
+
+
+def _search_item(item_id, action="search"):
+    """An OpenAI web_search_call output item, in the dict shape."""
+    return {
+        "type": "web_search_call",
+        "id": item_id,
+        "status": "completed",
+        "action": {"type": action},
+    }
+
+
+class TestSearchCountsReachTheResult:
+    """The result carried tokens and nothing else, so every grounded pass was
+    under-reported by its search fee: $0.05 on the 2026-09-18 claude:fact_check
+    alone. The count now sits beside ``tokens``.
+
+    It is present only on a call that could search, and None where the
+    response did not say how many searches ran. It is never a guess.
+    cost.calculate prices it against pricing.yaml's search_fees.
+    """
+
+    def _claude(self, usage, text='{"flags": []}', **cfg):
+        stream = _completion_stream(text=text, usage=usage)
+        with patch.object(client.litellm, "completion", return_value=stream):
+            return _call("claude", provider_config={"model": "claude-opus-5", **cfg})
+
+    def test_claude_reports_anthropics_own_count(self):
+        assert self._claude(_with_searches(5), web_search=True)["searches"] == 5
+
+    def test_claude_reports_a_search_it_did_not_run_as_zero(self):
+        assert self._claude(_with_searches(0), web_search=True)["searches"] == 0
+
+    def test_a_claude_count_the_response_lacks_is_unknown_not_zero(self):
+        assert self._claude(_usage(), web_search=True)["searches"] is None
+
+    def test_claude_without_web_search_has_no_count_at_all(self):
+        assert "searches" not in self._claude(_with_searches(0))
+
+    def test_a_malformed_answer_still_reports_what_it_searched(self):
+        """Complete, unparseable and billed, searches included."""
+        result = self._claude(_with_searches(3), text="not json", web_search=True)
+        assert result["failed"] is True
+        assert result["searches"] == 3
+
+    def test_a_retried_attempt_keeps_its_own_count(self):
+        """The discarded attempt's searches were billed like its tokens."""
+        streams = [
+            _completion_stream(text="not json", usage=_with_searches(4)),
+            _completion_stream(usage=_with_searches(2)),
+        ]
+        with patch.object(client.litellm, "completion", side_effect=streams):
+            result = _call(
+                "claude",
+                retry=True,
+                provider_config={"model": "claude-opus-5", "web_search": True},
+            )
+        assert result["searches"] == 2
+        assert result["discarded_attempts"]["searches"] == [4]
+
+    def _gemini(self, *metadata_per_chunk):
+        chunks = _completion_stream()
+        for meta in metadata_per_chunk:
+            chunks.append(_chunk(vertex_ai_grounding_metadata=[meta]))
+        with patch.object(client.litellm, "completion", return_value=chunks):
+            return _call("gemini")
+
+    def test_gemini_counts_distinct_queries_across_every_chunk(self):
+        """Google bills Gemini 3 per query and ignores empty ones. A query
+        named on an earlier chunk only still ran."""
+        result = self._gemini(
+            {"webSearchQueries": ["gps week rollover", ""]},
+            {"webSearchQueries": ["gps week rollover", "honda clock stuck at 0:00"]},
+        )
+        assert result["searches"] == 2
+
+    @staticmethod
+    def _litellm_counted(n):
+        """Usage carrying litellm's own count of the raw candidates' queries."""
+        usage = _usage()
+        usage.prompt_tokens_details = SimpleNamespace(
+            cached_tokens=None, web_search_requests=n
+        )
+        return usage
+
+    def test_litellms_count_stands_in_when_the_metadata_was_dropped(self):
+        """litellm 1.96.2 drops a chunk's grounding metadata when the chunk has
+        no text and no groundingSupports (BerriAI/litellm#41492); the count it
+        took from the raw candidates is all that survives."""
+        stream = _completion_stream(usage=self._litellm_counted(2))
+        with patch.object(client.litellm, "completion", return_value=stream):
+            assert _call("gemini")["searches"] == 2
+
+    def test_the_metadatas_own_queries_win_where_they_arrive(self):
+        """Google ignores duplicate queries when it bills; litellm's count
+        includes them."""
+        chunks = _completion_stream(usage=self._litellm_counted(3))
+        chunks.append(
+            _chunk(vertex_ai_grounding_metadata=[{"webSearchQueries": ["a", "a", "b"]}])
+        )
+        with patch.object(client.litellm, "completion", return_value=chunks):
+            assert _call("gemini")["searches"] == 2
+
+    def test_gemini_with_no_grounding_metadata_ran_no_search(self):
+        """googleSearch is attached to every gemini call; the model still
+        decides whether to use it, and Google bills only if it did."""
+        assert self._gemini()["searches"] == 0
+
+    def test_an_empty_gemini_response_is_not_a_report_of_no_searches(self):
+        """Live, 2026-09-19: gemini:fact_check came back empty four times
+        running, with no text, no usage and no grounding metadata. Its tokens
+        were unknown, and so is whether it searched."""
+        empty = [_chunk(finish_reason="stop")]
+        with patch.object(client.litellm, "completion", return_value=empty):
+            result = _call("gemini")
+        assert result["failed"] is True
+        assert result["searches"] is None
+
+    def test_zeroed_usage_is_no_more_a_report_than_none(self):
+        """The live run recorded 0+0 tokens, which is either no usage or a
+        usage of zeros; the two must read the same."""
+        empty = [
+            _chunk(finish_reason="stop"),
+            _chunk(usage=_usage(prompt=0, completion=0)),
+        ]
+        with patch.object(client.litellm, "completion", return_value=empty):
+            assert _call("gemini")["searches"] is None
+
+    def test_gemini_metadata_naming_no_queries_is_unknown(self):
+        meta = {"groundingChunks": [{"web": {"uri": "https://x.test", "title": "x"}}]}
+        assert self._gemini(meta)["searches"] is None
+
+    def test_perplexity_bills_the_request_itself(self):
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream()
+        ):
+            assert _call("perplexity")["searches"] == 1
+
+    def test_a_provider_that_cannot_search_has_no_count(self):
+        with patch.object(
+            client.litellm, "completion", return_value=_completion_stream()
+        ):
+            assert "searches" not in _call("mistral")
+
+    def test_a_call_that_never_answered_has_no_count(self):
+        """Nothing came back, so there is nothing to bill: the same rule as
+        its zero tokens."""
+        with patch.object(
+            client.litellm, "completion", side_effect=_http_error(400, "bad")
+        ):
+            result = _call("perplexity")
+        assert result["failed"] is True
+        assert "searches" not in result
+
+    def _openai(self, events, web_search=True):
+        with patch.object(client.litellm, "responses", return_value=events):
+            return _call(
+                "openai",
+                provider_config={"model": "gpt-5.6-sol", "web_search": web_search},
+            )
+
+    def test_openai_counts_search_actions_only(self):
+        """OpenAI's web search guide: "Search actions incur a tool call cost".
+        It says nothing of billing open_page or find_in_page."""
+        events = _responses_stream()
+        events[-1].response.output = [
+            _search_item("ws_1"),
+            _search_item("ws_2", "open_page"),
+            _search_item("ws_3"),
+            _search_item("ws_4", "find_in_page"),
+        ]
+        assert self._openai(events)["searches"] == 2
+
+    def test_openai_reads_typed_items_as_well_as_dicts(self):
+        events = _responses_stream()
+        events[-1].response.output = [
+            SimpleNamespace(
+                type="web_search_call", id="ws_1", action=SimpleNamespace(type="search")
+            )
+        ]
+        assert self._openai(events)["searches"] == 1
+
+    def test_openai_items_seen_only_as_they_finish_are_counted(self):
+        events = _responses_stream()
+        events.insert(
+            1,
+            SimpleNamespace(
+                type="response.output_item.done", item=_search_item("ws_1")
+            ),
+        )
+        assert self._openai(events)["searches"] == 1
+
+    def test_an_openai_search_with_no_item_to_count_is_unknown(self):
+        events = _responses_stream()
+        events.insert(
+            1,
+            SimpleNamespace(type="response.web_search_call.completed", item_id="ws_1"),
+        )
+        assert self._openai(events)["searches"] is None
+
+    def test_openai_search_offered_and_not_used_costs_nothing(self):
+        assert self._openai(_responses_stream())["searches"] == 0
+
+    def test_an_openai_stream_with_no_final_response_is_unknown(self):
+        """No response.completed, so no usage and no item list: the absence
+        of search items proves nothing."""
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta='{"flags": []}')
+        ]
+        assert self._openai(events)["searches"] is None
+
+    def test_openai_without_web_search_has_no_count(self):
+        assert "searches" not in self._openai(_responses_stream(), web_search=False)
+
+
+# What claude-opus-5 streamed as its final usage on the 2026-09-18 isolated
+# fact_check, verbatim (main checkout, pipeline_history/_experiments/
+# claude-web-search-20260209/runA_web_search_20250305/record.jsonl).
+_CAPTURED_CLAUDE_USAGE = {
+    "input_tokens": 139051,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 19998,
+    "output_tokens_details": {"thinking_tokens": 9281},
+    "server_tool_use": {"web_search_requests": 5, "web_fetch_requests": 0},
+}
+
+
+def _gemini_sse(queries, texts=('{"flags": ', "[]}")):
+    """A grounded Gemini stream: text first, then groundingMetadata on the last
+    chunk, as the grounding guide's example response carries it. ``texts`` is
+    each chunk's text."""
+    first_text, final_text = texts
+    chunks = [
+        {
+            "candidates": [
+                {"content": {"parts": [{"text": first_text}], "role": "model"}}
+            ],
+            "usageMetadata": {"promptTokenCount": 900, "candidatesTokenCount": 2},
+        },
+        {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": final_text}], "role": "model"},
+                    "finishReason": "STOP",
+                    "groundingMetadata": {
+                        "webSearchQueries": list(queries),
+                        "groundingChunks": [
+                            {
+                                "web": {
+                                    "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ1",
+                                    "title": "gps.gov",
+                                }
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 900,
+                "candidatesTokenCount": 40,
+                "totalTokenCount": 940,
+            },
+        },
+    ]
+    return "".join(f"data: {json.dumps(c)}\r\n\r\n" for c in chunks).encode()
+
+
+def _openai_responses_sse(actions):
+    """A Responses API stream with one web_search_call per action, each
+    announced as it finishes and listed again on the completed response."""
+    items = [
+        {
+            "type": "web_search_call",
+            "id": f"ws_{i}",
+            "status": "completed",
+            "action": {"type": action},
+        }
+        for i, action in enumerate(actions)
+    ]
+    message = {
+        "type": "message",
+        "id": "msg_1",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {"type": "output_text", "text": '{"flags": []}', "annotations": []}
+        ],
+    }
+    base = {
+        "id": "resp_1",
+        "object": "response",
+        "created_at": 1,
+        "model": "gpt-5.6-sol",
+        "status": "in_progress",
+        "output": [],
+        "tools": [{"type": "web_search_preview"}],
+    }
+    events = [{"type": "response.created", "response": base}]
+    for i, item in enumerate(items):
+        events.append(
+            {
+                "type": "response.web_search_call.completed",
+                "item_id": item["id"],
+                "output_index": i,
+            }
+        )
+        events.append(
+            {"type": "response.output_item.done", "item": item, "output_index": i}
+        )
+    events.append(
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": len(items),
+            "content_index": 0,
+            "delta": '{"flags": []}',
+        }
+    )
+    done = dict(
+        base,
+        status="completed",
+        output=items + [message],
+        usage={
+            "input_tokens": 5000,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 300,
+            "output_tokens_details": {"reasoning_tokens": 100},
+            "total_tokens": 5300,
+        },
+    )
+    events.append({"type": "response.completed", "response": done})
+    for n, event in enumerate(events):
+        event["sequence_number"] = n
+    return "".join(
+        f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events
+    ).encode()
+
+
+class TestSearchCountsOnTheWire:
+    """The same counts, read through litellm's own stream parsing.
+
+    The class above stops at the objects litellm hands back, which is exactly
+    where a litellm upgrade could drop a field while every mock still passed.
+    These go a layer lower, as TestClaudeRequestOnTheWire does:
+    ``httpx.Client.send`` is replaced, litellm parses each provider's SSE in
+    full, and nothing leaves the machine. The Anthropic usage is the real one;
+    the Gemini and OpenAI streams are built from each provider's documented
+    response shape, since no capture of either records its raw stream.
+    """
+
+    @pytest.fixture
+    def wire(self, monkeypatch):
+        reply = {"sse": b""}
+
+        def _send(http_client, request, *args, **kwargs):
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                content=reply["sse"],
+            )
+
+        monkeypatch.setattr(httpx.Client, "send", _send)
+        return reply
+
+    def test_claudes_count_survives_the_stream(self, wire):
+        """litellm keeps web_search_requests on its ServerToolUse. It drops
+        web_fetch_requests, which bills nothing."""
+        wire["sse"] = _anthropic_sse('{"flags": []}', _CAPTURED_CLAUDE_USAGE)
+        result = _call(
+            "claude",
+            provider_config={
+                "model": "claude-opus-5",
+                "effort": "high",
+                "web_search": True,
+            },
+        )
+        assert result["failed"] is False, result
+        assert result["tokens"] == {"prompt": 139051, "completion": 19998}
+        assert result["searches"] == 5
+
+    def test_geminis_queries_survive_the_stream(self, wire):
+        wire["sse"] = _gemini_sse(["gps week rollover 2019", "honda clock 0:00", ""])
+        result = _call("gemini", provider_config={"model": "gemini-2.5-pro"})
+        assert result["failed"] is False, result
+        assert result["grounding_available"] is True
+        assert result["searches"] == 2
+
+    def test_geminis_count_survives_litellm_dropping_the_metadata(self, wire):
+        """The final chunk carries no text and no groundingSupports, so litellm
+        drops its grounding metadata: the call reads as ungrounded. The search
+        still ran and billed, and litellm's usage still counts it."""
+        wire["sse"] = _gemini_sse(["q one", "q two"], texts=('{"flags": []}', ""))
+        result = _call("gemini", provider_config={"model": "gemini-2.5-pro"})
+        assert result["failed"] is False, result
+        # The drop itself, so this test notices if a litellm upgrade fixes it.
+        assert result["grounding_available"] is False, (
+            "litellm now keeps Gemini's grounding metadata on this shape, so "
+            "BerriAI/litellm#41492 may be fixed and gemini's sources may reach "
+            "Section 9 again. The count below is right either way; update this."
+        )
+        assert result["searches"] == 2
+
+    def test_openais_search_calls_survive_the_stream(self, wire):
+        wire["sse"] = _openai_responses_sse(["search", "open_page", "search"])
+        result = _call(
+            "openai", provider_config={"model": "gpt-5.6-sol", "web_search": True}
+        )
+        assert result["failed"] is False, result
+        assert result["searches"] == 2
