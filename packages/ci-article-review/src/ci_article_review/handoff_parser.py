@@ -344,8 +344,26 @@ def _extract_field(text, label):
     # starts with the same label: an "Author:" in SOURCES ALREADY CITED, or in
     # the draft itself. The first occurrence is the field, and blank reads as
     # "", the same as absent.
+    #
+    # A value still on its template placeholder reads as "" too. The templates'
+    # placeholders for these labels are bracketed, and a label left on one was
+    # read as real: the unfilled draft template's History key named the
+    # pipeline_history directory, so every handoff that left it shared one;
+    # its Author was what citation verification was told "I" is; and
+    # publication.md's "Article: [title]" became the WordPress post title. The
+    # first occurrence is still the field when it is a placeholder, so this
+    # never falls through to a later line with the same label either.
     match = re.search(rf"^{re.escape(label)}[ \t]*(.*)$", text, re.MULTILINE)
-    return match.group(1).strip() if match else ""
+    value = match.group(1).strip() if match else ""
+    if _is_bracketed_placeholder(value):
+        log.info(
+            "Handoff field %r is not set: its value is bracketed, so it reads as "
+            "the template's placeholder. Remove the brackets if it is real: %s",
+            label,
+            value,
+        )
+        return ""
+    return value
 
 
 def _parse_key_value_block(text):
@@ -371,45 +389,39 @@ def _parse_seo_block(text):
         # next line: a blank "SEO title:" once put "Meta description: ..." in
         # the <title> tag. And the first line with the label is the field,
         # whether or not a blank one was left with a trailing space; under
-        # (.+) that invisible space decided whether a later line was read.
+        # (.+) that invisible space decided whether a later line was read. A
+        # bracketed placeholder comes back blank as well; _extract_field logs it.
         value = _extract_field(text, f"{label}:")
-        if _is_bracketed_placeholder(value):
-            log.info(
-                "SEO METADATA %s is not set: its value is bracketed, so it reads "
-                "as the template's placeholder. Remove the brackets if it is "
-                "real: %s",
-                label,
-                value,
-            )
         # The template's own alternatives, written out without their brackets
         # ("derive from primary claim", "use article title"), also mean "leave
         # this to the default".
-        elif value and not value.startswith("derive") and not value.startswith("use "):
+        if value and not value.startswith("derive") and not value.startswith("use "):
             seo[key] = value
     return seo
 
 
 def _is_bracketed_placeholder(value):
-    """True when an SEO METADATA value is still one of the template's ``[...]``.
+    """True when a label's value is still one of the template's ``[...]``.
 
-    Every SEO placeholder in publication.md is bracketed, and a field left on
-    one went to Rank Math verbatim while the publish reported success: the
-    unfilled template's focus keyword was "[keyword or phrase | or: derive
-    from primary claim]".
+    Every header and SEO METADATA placeholder in the templates is bracketed,
+    and a field left on one was read as real. The unfilled publication
+    template's focus keyword went to Rank Math as "[keyword or phrase | or:
+    derive from primary claim]" while the publish reported success.
 
     The rule is structural. The value opens with "[", and either closes it
-    only as its last character or never closes it. The unclosed case is the
-    SEO title's placeholder, which wraps onto two more lines: only a label's
+    only as its last character or never closes it. The unclosed case is a
+    placeholder that wraps onto further lines, as the SEO title's does and the
+    draft template's Author, History key and Drafted with do. Only a label's
     own line is read, so its "]" is never seen.
 
-    "Starts with [" alone would be simpler, and would be safe for three of the
-    five fields: a focus keyword, meta description or OG description has no
-    reason to open with a bracket. A title can. A leading tag such as "[Case
-    Study] How We Cut Costs" is a common click-through device, and some sites
-    put shortcodes such as "[year]" in SEO titles. So a value that only begins
-    with a bracketed span is kept. What the rule cannot tell from a placeholder
-    is a value typed inside the brackets, "[fiber buildout]". That is dropped
-    too, and the caller logs it by name so the author can see which it was.
+    "Starts with [" alone would be simpler, and would be safe for most labels:
+    a focus keyword, an author or a history key has no reason to open with a
+    bracket. A title can. A leading tag such as "[Case Study] How We Cut
+    Costs" is a common click-through device, and some sites put shortcodes
+    such as "[year]" in SEO titles. So a value that only begins with a
+    bracketed span is kept. What the rule cannot tell from a placeholder is a
+    value typed inside the brackets, "[fiber buildout]". That is dropped too,
+    and ``_extract_field`` logs it by label so the author can see which it was.
     """
     if not value.startswith("["):
         return False

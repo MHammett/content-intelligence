@@ -5,8 +5,11 @@ build_handoff_from_raw_draft_and_metadata, added alongside the --raw-draft /
 --metadata CLI flags (commit 803440c) but previously untested.
 """
 
+from pathlib import Path
+
 import pytest
 
+from ci_article_review import handoff_parser
 from ci_article_review.handoff_parser import (
     build_handoff_from_raw_draft_and_metadata,
     build_handoff_from_raw_text,
@@ -612,3 +615,133 @@ class TestABlankLabelIsBlank:
             "DRAFT\nBody.\n"
         )
         assert got["author"] == ""
+
+
+#: The templates as they ship. A copy of one with a line not filled in is how a
+#: placeholder reaches the parser.
+_TEMPLATES = Path(handoff_parser.__file__).parent / "handoff_templates"
+
+
+class TestAnUnfilledLabelIsBlank:
+    """A header label left on its bracketed template placeholder is not set.
+
+    ``_extract_field`` returned the value verbatim, so a label nobody filled in
+    was read as a real one. Reproduced 2026-09-18 by parsing the shipped
+    templates unfilled: the History key placeholder named the run's
+    pipeline_history directory, so every handoff that left it shared one, and
+    the Author placeholder was what citation verification was told "I" refers
+    to. It now reads as absent, like a blank label, so each field's own
+    fallback applies: the title for the history key, the publication's
+    ``author_name`` for the author, ``pipeline.drafting_model`` for the drafter.
+    """
+
+    _HEADER = TestABlankLabelIsBlank._HEADER
+
+    def _handoff(self, unfilled, placeholder):
+        lines = [
+            f"{label} {placeholder}" if label == unfilled else f"{label} {value}"
+            for label, (_, value) in self._HEADER.items()
+        ]
+        return (
+            "DRAFT SUBMISSION HANDOFF\n"
+            + "\n".join(lines)
+            + "\n\nPRIMARY CLAIM\nA claim.\n\nDRAFT\nBody.\n"
+        )
+
+    @pytest.mark.parametrize(
+        "placeholder",
+        [
+            "[Your article title]",
+            # Wrapped, as three of the draft template's are. Only the label's
+            # own line is read, so its "]" is never seen.
+            "[Optional. The model you drafted this with — claude, openai,\n"
+            "gemini, mistral, grok or perplexity.]",
+        ],
+        ids=["closed", "wrapped"],
+    )
+    @pytest.mark.parametrize("parse", [parse_draft_submission, parse_metadata_only])
+    @pytest.mark.parametrize("unfilled", list(_HEADER))
+    def test_no_header_label_reads_its_placeholder(self, unfilled, parse, placeholder):
+        got = parse(self._handoff(unfilled, placeholder))
+        for label, (key, value) in self._HEADER.items():
+            assert got[key] == ("" if label == unfilled else value), label
+
+    @pytest.mark.parametrize(
+        "parse, template",
+        [
+            (parse_draft_submission, "draft_submission.template.md"),
+            (parse_metadata_only, "metadata_only.md"),
+        ],
+    )
+    def test_an_unfilled_template_sets_no_header_field(self, parse, template):
+        """The reproduction, on the templates as they ship."""
+        got = parse((_TEMPLATES / template).read_text(encoding="utf-8"))
+        keys = [key for key, _ in self._HEADER.values()]
+        assert {key: got[key] for key in keys} == dict.fromkeys(keys, "")
+
+    def test_an_unfilled_publication_template_has_no_title(self):
+        """publication.md's "Article: [title]" became the WordPress post
+        title, and Rank Math's title whenever the SEO and OG titles were
+        unset. The publish path now refuses a handoff with no title."""
+        got = parse_publication_handoff(
+            (_TEMPLATES / "publication.md").read_text(encoding="utf-8")
+        )
+        assert got["title"] == ""
+        assert got["publication"] == ""
+
+    def test_an_unfilled_draft_title_is_warned_about_as_missing(self, caplog):
+        with caplog.at_level("WARNING"):
+            got = parse_draft_submission(
+                self._handoff("Article:", "[Your article title]")
+            )
+        assert got["title"] == ""
+        assert any("missing 'Article:'" in r.getMessage() for r in caplog.records)
+
+    def test_an_unfilled_metadata_title_falls_back_to_the_draft_heading(self):
+        """--raw-draft --metadata takes the title from the draft's heading
+        when the metadata names none, and a placeholder now names none."""
+        handoff = build_handoff_from_raw_draft_and_metadata(
+            "# Draft-Derived Title\n\nBody text.",
+            (_TEMPLATES / "metadata_only.md").read_text(encoding="utf-8"),
+            source_name="fallback",
+        )
+        assert handoff["title"] == "Draft-Derived Title"
+
+    def test_a_title_that_only_begins_with_a_bracketed_tag_is_kept(self):
+        """The rule the SEO title already follows: a leading tag is real
+        title practice, not a placeholder."""
+        title = "[Case Study] How We Cut Fiber Costs"
+        got = parse_draft_submission(
+            f"Article: {title}\n\nPRIMARY CLAIM\nA claim.\n\nDRAFT\nBody.\n"
+        )
+        assert got["title"] == title
+
+    def test_a_placeholder_does_not_borrow_a_later_line_with_that_label(self):
+        """The first occurrence is the field, as for a blank label. A
+        placeholder there is not a reason to read the next "Author:" in the
+        document — here a source's byline in SOURCES ALREADY CITED."""
+        got = parse_draft_submission(
+            "Article: A Piece\n"
+            'Author: [optional — who "I" refers to in the draft. Only needed '
+            "when it is not\n"
+            "         the publication's usual byline.]\n"
+            "\n"
+            "PRIMARY CLAIM\nA claim.\n\n"
+            "SOURCES ALREADY CITED\n"
+            "Title: 2025 Broadband Map\n"
+            "Author: FCC staff\n\n"
+            "DRAFT\nBody.\n"
+        )
+        assert got["author"] == ""
+
+    def test_the_log_names_the_label_and_what_it_held(self, caplog):
+        """A value typed inside the brackets cannot be told from a
+        placeholder, so it is dropped like one. The log says which label and
+        what it held, so the author can see the value was theirs."""
+        with caplog.at_level("INFO", logger="ci_article_review.handoff_parser"):
+            got = parse_draft_submission(self._handoff("Author:", "[Jane Guest]"))
+        assert got["author"] == ""
+        assert any(
+            "'Author:'" in r.getMessage() and "[Jane Guest]" in r.getMessage()
+            for r in caplog.records
+        )

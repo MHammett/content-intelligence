@@ -622,6 +622,96 @@ class TestPublishReportsAnUnappliedSchemaType:
         assert "schema" not in out.lower()
 
 
+class TestPublishRefusesAnUntitledPost:
+    """No title, no post: the handoff is refused before anything is sent.
+
+    A blank ``Article:`` created an untitled WordPress post without a word, and
+    one left on publication.md's ``[title]`` published that as the title. The
+    push also drops the draft's leading "# " heading, because the theme renders
+    the title itself, so an untitled post carried no title anywhere.
+    """
+
+    _HANDOFF = (
+        "PUBLICATION HANDOFF\n"
+        "{article}"
+        "Publication: testpub\n\n"
+        "PUBLICATION PARAMETERS\n"
+        "Status: draft\n"
+        "Post type: page\n\n"
+        "SEO METADATA\n"
+        "Focus keyword: mike hammett\n\n"
+        "FINAL DRAFT\n"
+        "# About\n\nBody.\n"
+    )
+
+    def _publish(self, tmp_path, article_line):
+        """Exit code (None if it ran to the end), and every outward step."""
+        from ci_article_review.pipeline import run_publish_pipeline
+
+        path = tmp_path / "about-publication.md"
+        path.write_text(self._HANDOFF.format(article=article_line), encoding="utf-8")
+        config = {
+            "publication": {
+                "wordpress": {
+                    "site_url": "https://example.com",
+                    "username": "editor",
+                    "application_password": "pass word here",
+                },
+                "rank_math": {"auto_set_og_tags": True},
+            },
+            "api_keys": {},
+        }
+        wp_module = "ci_article_review.adapters.cms.wordpress"
+        with (
+            patch("ci_article_review.pipeline.load_user_config", return_value={}),
+            patch(
+                "ci_article_review.pipeline.load_publication_config", return_value={}
+            ),
+            patch("ci_article_review.pipeline.merge_configs", return_value=config),
+            patch("ci_article_review.pipeline._suggest_seo_for_publish") as suggest,
+            patch(
+                f"{wp_module}.print_checklist_and_confirm", return_value=True
+            ) as confirm,
+            patch(f"{wp_module}.requests.post") as post,
+            patch(f"{wp_module}.requests.get") as get,
+        ):
+            try:
+                run_publish_pipeline(str(path), "testpub")
+            except SystemExit as e:
+                code = e.code
+            else:
+                code = None
+        return code, {"suggest": suggest, "confirm": confirm, "post": post, "get": get}
+
+    @pytest.mark.parametrize(
+        "article_line",
+        ["Article: [title]\n", "Article:\n", ""],
+        ids=["placeholder", "blank", "absent"],
+    )
+    def test_nothing_is_sent_without_a_title(self, tmp_path, caplog, article_line):
+        """Refused before the SEO suggestion call is paid for, and before the
+        checklist asks for a yes that would come to nothing."""
+        with caplog.at_level("ERROR"):
+            code, steps = self._publish(tmp_path, article_line)
+        assert code == 1
+        assert [name for name, mock in steps.items() if mock.called] == []
+        assert "has no title" in caplog.text
+
+    def test_the_refusal_offers_the_draft_heading(self, tmp_path, caplog):
+        """The heading the push would have dropped is the likely title, so
+        the refusal gives it as the line to paste."""
+        with caplog.at_level("ERROR"):
+            self._publish(tmp_path, "Article: [title]\n")
+        assert "the line is: Article: About" in caplog.text
+
+    def test_a_titled_handoff_still_publishes(self, tmp_path):
+        """The control: the same handoff with its title goes out, so the
+        refusal above is the title check and not the harness."""
+        code, steps = self._publish(tmp_path, "Article: About\n")
+        assert code is None
+        assert steps["post"].call_args_list[0].kwargs["json"]["title"] == "About"
+
+
 class TestSeoSuggestionConsoleOutput:
     """The suggestion has to reach the terminal, next to the SEO issues it answers."""
 
