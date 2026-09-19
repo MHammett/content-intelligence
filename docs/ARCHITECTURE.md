@@ -363,10 +363,10 @@ CI_REGENERATE_GOLDEN=1 uv run pytest packages/ci-article-review/tests/test_pipel
 ```
 
 **`test_docs_current.py`** fails when documentation drifts from the code — CLI
-flags missing from the README, adapter counts, dead doc links, the module-vs-
-console-script invocation form, and the same checks over strings the code
-*prints*, since a wrong command in `ci-setup`'s output reaches users just as
-directly as one in the README.
+flags missing from the README, adapter counts, dead doc links (including a
+`#anchor` whose heading was renamed), the module-vs-console-script invocation
+form, and the same checks over strings the code *prints*, since a wrong command
+in `ci-setup`'s output reaches users just as directly as one in the README.
 
 **`test_concurrency_doctrine.py`** fails when any shipped module uses a
 `concurrent.futures` executor. `concurrent.futures.thread` registers

@@ -36,6 +36,15 @@ dev = [
     # google-auth; declared so a ci-core test does not depend on a sibling
     # package's dependency tree.
     "cryptography>=42.0",
+    # Parses the repo's markdown for test_docs_current.py's anchor check, which
+    # has to know what is a heading and what only looks like one. docs/
+    # CONFIGURATION.md nests ```yaml fences inside list items, and a line scan
+    # reads their `# comment` lines as headings; a CommonMark parser does not.
+    # Its heading ids match GitHub's own rendering of every doc in this repo.
+    # The slug rule itself is not a dependency: the one Python port of
+    # github-slugger is dormant (a single release day, 2022-12-12), and the rule
+    # is a short function, tested in that file against GitHub's own output.
+    "markdown-it-py>=4.2,<5",
 ]
 
 [tool.uv.sources]
