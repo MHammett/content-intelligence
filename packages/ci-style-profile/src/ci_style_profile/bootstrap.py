@@ -212,6 +212,48 @@ def _load_user_config_lenient() -> dict:
         return {}
 
 
+def _log_model_currency(models: dict) -> None:
+    """Log what ci_core's model registry says about the models this run uses.
+
+    check_model_currency returns a dict, not a list of warnings: the superseded
+    models, the optional upgrades, and the registry's own date, age and
+    staleness. Wording follows ci-review's, in pipeline.run_draft_pipeline.
+    """
+    from ci_core.llm.model_registry import check_model_currency
+
+    currency = check_model_currency(models)
+    for w in currency["warnings"]:
+        log.warning(
+            "Model currency: %s is using %r, which has been superseded by %r. "
+            "%sUpdate user.yaml to use the newer model.",
+            w["provider"],
+            w["model"],
+            w["replacement"],
+            w["note"] + ". " if w["note"] else "",
+        )
+    for n in currency["notices"]:
+        log.info(
+            "Model upgrade available (optional): %s is using %r — %s",
+            n["provider"],
+            n["model"],
+            n["note"] or "newer: " + n["newer"],
+        )
+    if currency["registry_warning"]:
+        log.warning(
+            "Model registry is %d days old (last updated %s). "
+            "Provider APIs change frequently — re-check available models and pricing.",
+            currency["registry_age_days"],
+            currency["registry_date"],
+        )
+    elif currency["registry_stale"]:
+        log.info(
+            "Model registry last updated %s (%d days ago). "
+            "Consider re-checking for newer models.",
+            currency["registry_date"],
+            currency["registry_age_days"],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Staging helpers
 # ---------------------------------------------------------------------------
@@ -548,14 +590,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Check model currency
     try:
-        from ci_core.llm.model_registry import check_model_currency
-
-        warnings = check_model_currency(user_config.get("models", {}))
-        for w in (warnings or {}).values():
-            if w:
-                log.warning("Model currency: %s", w)
+        _log_model_currency(user_config.get("models", {}))
     except Exception:
-        pass
+        # Advisory: a registry that cannot be read must not stop a run.
+        log.debug("Model currency check skipped", exc_info=True)
 
     # 4. Build collector registry
     from .collectors import REGISTRY
