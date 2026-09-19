@@ -131,6 +131,12 @@ models:
 #     Opt-in via thinking_budget.  Beta header is added automatically.
 #     Do NOT use thinking_budget on Opus 4.8+/5 or Sonnet 4.6+/5 — use effort instead.
 #
+#   Spell it the way claude reads it.  The key is `effort` (openai, mistral, grok
+#   and perplexity take `reasoning_effort`); the other spelling is ignored, so
+#   `reasoning_effort` under claude leaves it thinking at its default.  And write
+#   the level in lowercase: litellm rejects "High", and every claude call fails.
+#   Config load warns of both.
+#
 #  claude:
 #    model: claude-opus-5
 #    effort: high               # "low" | "medium" | "high" — adaptive thinking depth

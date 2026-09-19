@@ -116,6 +116,29 @@ class TestWhatTheProbeSends:
         seen = self._capture({"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"})
         assert seen["provider_config"]["reasoning_effort"] == "xhigh"
 
+    @pytest.mark.parametrize(
+        "provider,cfg,shown",
+        [
+            ("openai", {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}, "xhigh"),
+            # claude's key is `effort`: reading `reasoning_effort` printed
+            # effort=none for a probe that asked for, and got, high.
+            ("claude", {"model": "claude-opus-5", "effort": "high"}, "high"),
+            # Dropped by the client, so it is not what the probe ran at.
+            ("claude", {"model": "claude-opus-5", "reasoning_effort": "low"}, "none"),
+            ("openai", {"model": "gpt-5.6-sol", "effort": "high"}, "none"),
+            ("gemini", {"model": "gemini-2.5-pro", "reasoning_effort": "high"}, "none"),
+        ],
+    )
+    def test_the_effort_it_reports_is_the_one_the_request_carries(
+        self, capsys, provider, cfg, shown
+    ):
+        def _fake_call(provider, system, prompt, api_key, **kwargs):
+            return {"failed": False, "data": {"ok": True}, "model": "m", "tokens": {}}
+
+        with patch.object(probe.client, "call", side_effect=_fake_call):
+            probe.probe_provider(provider, cfg, "sk-test")
+        assert f"effort={shown} " in capsys.readouterr().out
+
     def test_live_search_is_disabled(self):
         """The pipeline resolves web_search to a bool per domain; the raw config
         holds a list, which is truthy. Passing it through made every openai

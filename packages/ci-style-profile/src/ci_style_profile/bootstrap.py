@@ -540,10 +540,11 @@ def main(argv: list[str] | None = None) -> int:
     # After the merge above, so it judges the config that runs. The merge keeps
     # any key a preset leaves unset, so an `effort: none` from user.yaml
     # survives it, and it does not stop claude-opus-5 or claude-sonnet-5
-    # thinking. Same check, same wording as ci-review's.
-    from ci_core.llm.output_tokens import effort_none_warnings
+    # thinking. A `reasoning_effort` left under claude survives it too, beside
+    # the preset's `effort`. Same checks, same wording as ci-review's.
+    from ci_core.llm.output_tokens import effort_warnings
 
-    for warning in effort_none_warnings(user_config.get("models")):
+    for warning in effort_warnings(user_config.get("models")):
         log.warning(warning)
 
     # Check model currency

@@ -680,9 +680,9 @@ def merge_configs(user_config, pub_config):
     models = _normalize_model_configs(models_raw)
 
     # Judged here, after the preset and its overrides, because that is the
-    # config that runs: a cost_preset replaces an `effort: none` written under
-    # models:, and one in preset_overrides survives it.
-    for warning in output_tokens.effort_none_warnings(models):
+    # config that runs: a cost_preset replaces an effort written under models:,
+    # and one in preset_overrides survives it.
+    for warning in output_tokens.effort_warnings(models):
         log.warning(warning)
 
     return {

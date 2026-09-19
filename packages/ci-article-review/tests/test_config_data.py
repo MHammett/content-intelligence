@@ -438,6 +438,98 @@ class TestEffortNoneIsWarnedAtConfigLoad:
             raise AssertionError("no --cost-preset argument found")
 
 
+class TestAnEffortThatDoesNotDoWhatItSaysIsWarnedAtConfigLoad:
+    """The other two ways to write an effort that runs as something else.
+
+    `reasoning_effort` under claude (or `effort` under anyone else) is dropped by
+    the client, so the model runs as though none were set. `High` under claude is
+    rejected by litellm, so every claude call fails. Both are judged on the
+    merged config, as `effort: none` is: a cost_preset replaces what was written
+    under models: (it keeps only infrastructure keys), and preset_overrides is
+    layered on top and survives it. The rules and wording are ci_core's
+    (output_tokens.effort_key_warnings, .effort_spelling_warnings); these pin
+    where they are raised.
+    """
+
+    _merge = staticmethod(TestEffortNoneIsWarnedAtConfigLoad._merge)
+
+    def test_a_reasoning_effort_under_claude_warns(self, caplog):
+        claude = {"model": "claude-opus-5", "reasoning_effort": "low"}
+        self._merge(caplog, {"models": {"claude": claude}})
+        assert "claude model claude-opus-5 sets reasoning_effort: 'low'" in caplog.text
+        assert "thinks at its default, high, and is billed for it" in caplog.text
+        assert "Rename it to effort." in caplog.text
+
+    def test_an_effort_under_openai_warns(self, caplog):
+        openai = {"model": "gpt-5.6-terra", "effort": "high"}
+        self._merge(caplog, {"models": {"openai": openai}})
+        assert "openai model gpt-5.6-terra sets effort: 'high'" in caplog.text
+        assert "Rename it to reasoning_effort." in caplog.text
+
+    def test_one_in_preset_overrides_survives_the_preset_and_warns(self, caplog):
+        """The way to write it under a preset, and the likeliest way to meet it:
+        the docs example one line above claude's puts reasoning_effort on
+        openai. The preset's own `effort` is beside it, so both are named."""
+        user = {
+            "pipeline": {
+                "cost_preset": "maximum",
+                "preset_overrides": {"claude": {"reasoning_effort": "low"}},
+            },
+            "models": {"claude": {}},
+        }
+        merged = self._merge(caplog, user)
+        assert merged["models"]["claude"]["effort"] == "high"
+        assert merged["models"]["claude"]["reasoning_effort"] == "low"
+        assert "sets both effort: 'high' and reasoning_effort: 'low'" in caplog.text
+
+    def test_one_under_models_is_replaced_by_a_preset_and_is_quiet(self, caplog):
+        """The preset owns the model config, and a stray key does not survive
+        it, so the one that runs has nothing to warn of."""
+        user = {
+            "pipeline": {"cost_preset": "maximum"},
+            "models": {"claude": {"model": "claude-opus-5", "reasoning_effort": "low"}},
+        }
+        merged = self._merge(caplog, user)
+        assert "reasoning_effort" not in merged["models"]["claude"]
+        assert "reasoning_effort" not in caplog.text
+
+    @pytest.mark.parametrize("effort", ["High", "Medium", "HIGH", " high"])
+    def test_a_misspelled_claude_effort_warns_that_every_call_fails(
+        self, caplog, effort
+    ):
+        claude = {"model": "claude-opus-5", "effort": effort}
+        self._merge(caplog, {"models": {"claude": claude}})
+        assert f"claude model claude-opus-5 is set to effort: {effort!r}" in caplog.text
+        assert "every claude call will fail" in caplog.text
+
+    def test_a_misspelled_effort_in_preset_overrides_warns(self, caplog):
+        user = {
+            "pipeline": {
+                "cost_preset": "maximum",
+                "preset_overrides": {"claude": {"effort": "High"}},
+            },
+            "models": {"claude": {}},
+        }
+        self._merge(caplog, user)
+        assert "is set to effort: 'High'" in caplog.text
+
+    def test_a_none_is_said_once_not_twice(self, caplog):
+        """effort_none_warnings owns the none spellings on a model that thinks by
+        default, and says what they cost."""
+        claude = {"model": "claude-opus-5", "effort": "None"}
+        self._merge(caplog, {"models": {"claude": claude}})
+        assert caplog.text.count("every claude call will fail") == 1
+
+    def test_a_config_that_runs_as_written_is_quiet(self, caplog):
+        models = {
+            "claude": {"model": "claude-opus-5", "effort": "low"},
+            "openai": {"model": "gpt-5.6-terra", "reasoning_effort": "low"},
+            "gemini": {"model": "gemini-2.5-pro", "thinking_budget": 8192},
+        }
+        self._merge(caplog, {"models": models})
+        assert "effort" not in caplog.text
+
+
 class TestAuthorNameIsADeclaredPublicationKey:
     """`author_name` was read by the pipeline before anything declared it.
 
