@@ -3312,9 +3312,17 @@ def run_draft_pipeline(
         # that thinks with no effort set ran at high, and this field sits beside
         # the ceiling and budget sized for that. Read off the model that
         # answered, since a fallback need not think the way the primary does.
+        configured = mcfg.get("reasoning_effort") or mcfg.get("effort")
+        if (
+            model_name == "claude"
+            and isinstance(configured, str)
+            and configured.lower() == "none"
+        ):
+            # Not sent: litellm drops a claude "none", so the pass ran with no
+            # effort, exactly as unset (output_tokens.effort_none_warnings).
+            configured = None
         effort = (
-            (mcfg or {}).get("reasoning_effort")
-            or (mcfg or {}).get("effort")
+            configured
             or output_tokens.effort_when_unset(
                 model_name, result.get("model") or (mcfg or {}).get("model")
             )

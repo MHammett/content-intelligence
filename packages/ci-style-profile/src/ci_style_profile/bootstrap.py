@@ -537,6 +537,15 @@ def main(argv: list[str] | None = None) -> int:
                         merged[k] = v
                 user_config["models"][model_name] = merged
 
+    # After the merge above, so it judges the config that runs. The merge keeps
+    # any key a preset leaves unset, so an `effort: none` from user.yaml
+    # survives it, and it does not stop claude-opus-5 or claude-sonnet-5
+    # thinking. Same check, same wording as ci-review's.
+    from ci_core.llm.output_tokens import effort_none_warnings
+
+    for warning in effort_none_warnings(user_config.get("models")):
+        log.warning(warning)
+
     # Check model currency
     try:
         from ci_core.llm.model_registry import check_model_currency

@@ -30,6 +30,7 @@ import httpx
 import pytest
 
 from ci_core.llm import client
+from ci_core.llm import output_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -2467,10 +2468,11 @@ class TestClaudeRequestOnTheWire:
         assert body["max_tokens"] == 16000
 
     def test_a_claude_none_is_dropped_before_it_is_sent(self, wire):
-        """So on claude-opus-5 it is unset, not off, and output_tokens.effort_of
-        sizes it as high on the strength of this. The `thinking` that remains
-        is the display, which does not turn thinking on for a model that thinks
-        only when asked."""
+        """So on claude-opus-5 it is unset, not off: output_tokens.effort_of
+        sizes it as high on the strength of this, and effort_none_warnings
+        says so at config load. The `thinking` that remains is the display,
+        which does not turn thinking on for a model that thinks only when
+        asked."""
         body = self._body(wire, model="claude-opus-5", effort="none")
         assert body["thinking"] == self.SUMMARIZED
         assert "output_config" not in body
@@ -2478,6 +2480,51 @@ class TestClaudeRequestOnTheWire:
         body = self._body(wire, model="claude-opus-4-8", effort="none")
         assert "thinking" not in body
         assert "output_config" not in body
+
+    @pytest.mark.parametrize("model", ["claude-opus-5", "claude-sonnet-5"])
+    def test_a_false_effort_is_the_same_request_as_none(self, wire, model):
+        """YAML reads `effort: off`, `no` and `false` as False, and no effort is
+        sent for it, so it thinks at the default just as a dropped none does."""
+        body = self._body(wire, model=model, effort=False)
+        assert body["thinking"] == self.SUMMARIZED
+        assert "output_config" not in body
+
+    def test_any_other_spelling_of_none_fails_before_it_is_sent(self, wire):
+        """litellm matches "none" exactly, so `None` is an unmapped effort and
+        is rejected client-side. effort_none_warnings tells a `None` that every
+        call fails, rather than that it thinks at high, because of this."""
+        config = {"model": "claude-opus-5", "effort": "None"}
+        result = _call("claude", provider_config=config)
+        assert result["failed"] is True
+        assert "reasoning_effort" in result["error"]
+        assert wire == []
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-haiku-4-5-20251001",
+        ],
+    )
+    @pytest.mark.parametrize("effort", ["none", False])
+    def test_the_warning_fires_exactly_where_the_request_thinks_anyway(
+        self, wire, model, effort
+    ):
+        """Asked for no thinking, sent adaptive thinking with no effort in it:
+        the request an operator pays high-effort thinking for. The config-load
+        warning is keyed off a list, not this request, so hold the two
+        together."""
+        body = self._body(wire, model=model, effort=effort)
+        thinks_anyway = (
+            body.get("thinking", {}).get("type") == "adaptive"
+            and "output_config" not in body
+        )
+        warned = output_tokens.effort_none_warnings(
+            {"claude": {"model": model, "effort": effort}}
+        )
+        assert bool(warned) == thinks_anyway
 
     def test_a_model_without_adaptive_thinking_gets_what_its_effort_maps_to(self, wire):
         """Exactly what `reasoning_effort` alone puts on the wire. An explicit

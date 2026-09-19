@@ -17,6 +17,7 @@ from ci_core.env_provenance import (
     shadowed_mismatches as _shadowed_mismatches,
     snapshot as _snapshot_dotenv,
 )
+from ci_core.llm import output_tokens
 from ci_core.redact import mask_secret
 
 log = logging.getLogger("config_loader")
@@ -676,6 +677,13 @@ def merge_configs(user_config, pub_config):
     # Apply selective preset_overrides on top — lets users adjust individual
     # fields of a preset without specifying the full config.
     models_raw = _apply_preset_overrides(pipeline, models_raw)
+    models = _normalize_model_configs(models_raw)
+
+    # Judged here, after the preset and its overrides, because that is the
+    # config that runs: a cost_preset replaces an `effort: none` written under
+    # models:, and one in preset_overrides survives it.
+    for warning in output_tokens.effort_none_warnings(models):
+        log.warning(warning)
 
     return {
         "api_keys": _merge_api_keys(
@@ -691,7 +699,7 @@ def merge_configs(user_config, pub_config):
             },
         ),
         "ensemble": user_config.get("ensemble", {}),
-        "models": _normalize_model_configs(models_raw),
+        "models": models,
         "publication": pub_config,
     }
 

@@ -128,6 +128,77 @@ def effort_of(provider, cfg):
     return str(effort).lower()
 
 
+def effort_none_warnings(model_configs):
+    """A warning for each claude config that asks for no thinking and won't get it.
+
+    Whoever writes ``effort: none`` means "do not think", usually to save money,
+    and on claude-opus-5 that is not what runs. Anthropic has no effort level
+    called none. litellm drops it before sending, so the request carries no
+    effort, and a model in ``_EFFORT_WHEN_UNSET`` thinks at its default, high,
+    and is billed for it. Nothing fails and nothing truncates (``effort_of``
+    sizes it as high), so nothing else says so. YAML reads
+    ``effort: off``, ``no`` and ``false`` as false, and a false effort is not
+    sent either, with the same result. Both are captured on the wire in
+    tests/test_llm_client.py.
+
+    It warns and changes nothing. The other way out is sending ``thinking:
+    {"type": "disabled"}``, and for Opus 5 Anthropic documents two failure modes
+    of disabled thinking: a tool call written into the visible text, and
+    internal tags leaking into the answer. Anthropic recommends a lower effort
+    instead, so that is what the warning suggests. Whether to disable thinking
+    anyway is the operator's call, not this module's.
+
+    Matched case-insensitively, but litellm matches exactly. It rejects
+    ``None``, ``NONE`` or a padded ``" none "`` before sending, so every call
+    fails. That is loud already, but only once calls are being made, and the
+    warning for it says so rather than promising a high-effort run.
+    """
+    if not isinstance(model_configs, dict):
+        return []
+    cfg = model_configs.get("claude")
+    if not isinstance(cfg, dict) or cfg.get("enabled", True) is False:
+        return []
+    if cfg.get("thinking_budget") is not None:
+        # client._provider_params sends the budget and never reads the effort.
+        return []
+    effort = cfg.get(_EFFORT_KEY["claude"])
+    if effort is not False and not (
+        isinstance(effort, str) and effort.strip().lower() == "none"
+    ):
+        return []
+    from ci_core.llm import client  # lazy, as in model_output_limit
+
+    # The model the request goes to: a config with no `model` calls the client's
+    # default, which is what decides whether it thinks.
+    model = client._resolve_model("claude", None, cfg)
+    default = effort_when_unset("claude", model)
+    if default is None:
+        return []
+    if effort is False:
+        said = (
+            "effort: false (YAML reads off and no as false too), which does not "
+            "turn its thinking off: a false effort is not sent"
+        )
+    elif effort == "none":
+        said = (
+            "effort: none, which does not turn its thinking off: Anthropic has "
+            'no "none" effort, and litellm drops it before sending'
+        )
+    else:
+        return [
+            f"claude model {model} is set to effort: {effort!r}, which litellm "
+            f'rejects before sending (it accepts only lowercase "none"), so '
+            f'every claude call will fail. Lowercase "none" would not turn '
+            f"thinking off either: with no effort, {model} thinks at its default, "
+            f"{default}. Set effort: low or medium to spend less on thinking."
+        ]
+    return [
+        f"claude model {model} is set to {said}. With no effort, {model} thinks "
+        f"at its default, {default}, and is billed for it. Set effort: low or "
+        f"medium to spend less on thinking."
+    ]
+
+
 @functools.lru_cache(maxsize=None)
 def model_output_limit(provider, model):
     """The model's own maximum output, from litellm's model map, or None.
