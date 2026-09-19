@@ -191,6 +191,7 @@ class TestBuildHandoffFromUrl:
         )
 
 
+@pytest.mark.usefixtures("tmp_history_root")
 class TestUrlModeFlowsIntoReview:
     """The synthesized handoff must reach run_draft_pipeline via the CLI dispatch."""
 

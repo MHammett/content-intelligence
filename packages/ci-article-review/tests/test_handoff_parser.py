@@ -305,7 +305,7 @@ Article: Test Article
 Publication: mikehammett
 
 PUBLICATION PARAMETERS
-category: news
+WordPress category: news
 
 SEO METADATA
 Focus keyword: fiber
@@ -496,10 +496,18 @@ class TestTheTwoAuthorLabelsAreDistinct:
         return parse_publication_handoff(text)["publication_parameters"]
 
     def test_the_current_spelling_parses(self):
-        assert self._params("WordPress author: mikeh") == {"wordpress_author": "mikeh"}
+        # publication_parameters now always carries every known key (blank
+        # when absent) rather than only the lines the text happened to have —
+        # see _parse_key_value_block — so this checks the two labels directly
+        # rather than the whole dict.
+        params = self._params("WordPress author: mikeh")
+        assert params["wordpress_author"] == "mikeh"
+        assert params["author"] == ""
 
     def test_the_legacy_spelling_still_parses(self):
-        assert self._params("Author: mikeh") == {"author": "mikeh"}
+        params = self._params("Author: mikeh")
+        assert params["author"] == "mikeh"
+        assert params["wordpress_author"] == ""
 
     def test_the_draft_template_author_is_a_different_field(self):
         """Template A's Author: lands on the handoff, not in publish params."""
@@ -745,3 +753,144 @@ class TestAnUnfilledLabelIsBlank:
             "'Author:'" in r.getMessage() and "[Jane Guest]" in r.getMessage()
             for r in caplog.records
         )
+
+
+class TestPublicationParametersPlaceholder:
+    """PUBLICATION PARAMETERS placeholders, left unfilled.
+
+    ``_parse_key_value_block`` reads this section, not ``_extract_field``, so
+    the header-field and SEO METADATA placeholder fix (this file's own
+    ``TestAnUnfilledLabelIsBlank``, and ``TestSeoMetadataBlock`` before it)
+    never reached it. Reproduced 2026-09-18 by parsing publication.md
+    unfilled: "Post type:" read as its own wrapped placeholder text and
+    failed WordPress's post type check ("Unknown post type '[post (default)
+    | page -- ...'") — but only after the checklist and the paid SEO
+    suggestion call; "WordPress category:" and "Tags:" read the same way and
+    would have been looked up as slugs; and a wrapped placeholder's
+    continuation line ("About or Contact: no date, no category...") became
+    its own junk key, ``about_or_contact``.
+
+    Post type and WordPress author now read as blank on a placeholder, same
+    as any other unset field — each has a safe fallback (post, or the
+    authenticated WordPress user). Category and tags do not get the same
+    treatment: they are read raw, and ``placeholder_publication_fields``
+    names which of them are still on the template's placeholder, so
+    ``run_publish_pipeline`` can refuse instead of silently publishing
+    uncategorised (see ``TestPublishRefusesUnfilledCategoryOrTags`` in
+    test_pipeline_cli.py).
+    """
+
+    _KNOWN_KEYS = {
+        "status",
+        "post_type",
+        "wordpress_category",
+        "tags",
+        "wordpress_author",
+        "author",
+    }
+
+    def _handoff(self, *lines):
+        text = (
+            "PUBLICATION HANDOFF\n"
+            "Article: T\n"
+            "\n"
+            "PUBLICATION PARAMETERS\n" + "\n".join(lines) + "\n"
+            "\n"
+            "FINAL DRAFT\n"
+            "Body text.\n"
+        )
+        return parse_publication_handoff(text)
+
+    def test_an_unfilled_post_type_reads_as_blank(self):
+        """The template's own wording says what "unset" means here: "[post
+        (default) | page -- ...]". Blank is exactly what makes
+        wp.resolve_post_type's existing "absent means post" apply."""
+        handoff = self._handoff(
+            "Post type: [post (default) | page -- use page for standing pages such as",
+            "About or Contact: no date, no category, not in the blog feed. A page",
+            "ignores the category and tag fields below.]",
+        )
+        assert handoff["publication_parameters"]["post_type"] == ""
+        assert "post_type" not in handoff["placeholder_publication_fields"]
+
+    def test_an_unfilled_post_type_is_logged(self, caplog):
+        with caplog.at_level("INFO", logger="ci_article_review.handoff_parser"):
+            self._handoff("Post type: [post (default) | page -- use page for x")
+        assert any("'Post type:'" in r.getMessage() for r in caplog.records)
+
+    def test_a_wrapped_placeholders_continuation_line_is_not_its_own_key(self):
+        """The old per-line splitter turned "About or Contact: ..." into its
+        own "about_or_contact" key. Looking up known labels by their own
+        anchored line, instead of splitting every colon-bearing line, means a
+        continuation line is never extracted as a field at all."""
+        handoff = self._handoff(
+            "Post type: [post (default) | page -- use page for standing pages such as",
+            "About or Contact: no date, no category, not in the blog feed. A page",
+            "ignores the category and tag fields below.]",
+        )
+        assert set(handoff["publication_parameters"]) == self._KNOWN_KEYS
+
+    def test_an_unfilled_wordpress_author_reads_as_blank(self):
+        handoff = self._handoff(
+            "WordPress author: [WordPress *login username*, if a "
+            "multi-author site. Not a"
+        )
+        assert handoff["publication_parameters"]["wordpress_author"] == ""
+        assert "wordpress_author" not in handoff["placeholder_publication_fields"]
+
+    def test_an_unfilled_legacy_author_reads_as_blank(self):
+        handoff = self._handoff("Author: [a guest byline]")
+        assert handoff["publication_parameters"]["author"] == ""
+        assert "author" not in handoff["placeholder_publication_fields"]
+
+    def test_an_unfilled_category_is_flagged_not_blanked(self):
+        """Category and tags are read raw, not collapsed to "" like every
+        other field. An absent category is never checked, so collapsing the
+        placeholder the same way would let a live publish go out
+        uncategorised without a word — the one thing this has to avoid."""
+        handoff = self._handoff("WordPress category: [category slug]")
+        assert (
+            handoff["publication_parameters"]["wordpress_category"] == "[category slug]"
+        )
+        assert handoff["placeholder_publication_fields"] == {"wordpress_category"}
+
+    def test_an_unfilled_tags_is_flagged_not_blanked(self):
+        handoff = self._handoff("Tags: [comma-separated slugs]")
+        assert handoff["publication_parameters"]["tags"] == "[comma-separated slugs]"
+        assert handoff["placeholder_publication_fields"] == {"tags"}
+
+    def test_an_unfilled_category_is_logged(self, caplog):
+        with caplog.at_level("INFO", logger="ci_article_review.handoff_parser"):
+            self._handoff("WordPress category: [category slug]")
+        assert any(
+            "'WordPress category:'" in r.getMessage()
+            and "[category slug]" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_a_genuinely_blank_category_is_not_flagged(self):
+        """The distinction the raw path exists for: a blank line is left
+        alone exactly as it always has been. Only a placeholder is flagged."""
+        handoff = self._handoff("WordPress category:")
+        assert handoff["publication_parameters"]["wordpress_category"] == ""
+        assert handoff["placeholder_publication_fields"] == set()
+
+    def test_an_absent_category_is_not_flagged(self):
+        handoff = self._handoff("Tags: fiber, broadband")
+        assert handoff["publication_parameters"]["wordpress_category"] == ""
+        assert handoff["placeholder_publication_fields"] == set()
+
+    def test_an_unfilled_publication_template_reproduces(self):
+        """The reproduction, on the template as it ships."""
+        handoff = parse_publication_handoff(
+            (_TEMPLATES / "publication.md").read_text(encoding="utf-8")
+        )
+        params = handoff["publication_parameters"]
+        assert params["post_type"] == ""
+        assert params["wordpress_author"] == ""
+        assert params["author"] == ""
+        assert handoff["placeholder_publication_fields"] == {
+            "wordpress_category",
+            "tags",
+        }
+        assert set(params) == self._KNOWN_KEYS
