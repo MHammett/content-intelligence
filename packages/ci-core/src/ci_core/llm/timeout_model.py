@@ -146,10 +146,12 @@ def compute_budget(char_count, provider, cfg, task_ceiling_seconds, config=None)
 
     # An unset effort is sized at the level the model runs at, as its output
     # ceiling is: claude-opus-5 with no effort thinks at high, not at "default".
-    effort = (
-        cfg.get("reasoning_effort")
-        or cfg.get("effort")
-        or output_tokens.effort_when_unset(provider, cfg.get("model"))
+    # Read from the key the provider's request reads, and only that one: the
+    # client drops the other spelling, so a value under it sizes a budget for an
+    # effort the pass never ran at.
+    key = output_tokens.effort_key(provider)
+    effort = (cfg.get(key) if key else None) or output_tokens.effort_when_unset(
+        provider, cfg.get("model")
     )
     budget = compute_timeout(
         char_count, cfg.get("model", ""), effort, task_ceiling_seconds, config=config

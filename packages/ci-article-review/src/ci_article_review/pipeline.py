@@ -3312,7 +3312,11 @@ def run_draft_pipeline(
         # that thinks with no effort set ran at high, and this field sits beside
         # the ceiling and budget sized for that. Read off the model that
         # answered, since a fallback need not think the way the primary does.
-        configured = mcfg.get("reasoning_effort") or mcfg.get("effort")
+        # Only the key the provider's request reads (claude's `effort`, the
+        # others' `reasoning_effort`): the client drops the other spelling, so a
+        # value under it never ran and must not be filed as though it had.
+        effort_key = output_tokens.effort_key(model_name)
+        configured = mcfg.get(effort_key) if effort_key else None
         if (
             model_name == "claude"
             and isinstance(configured, str)

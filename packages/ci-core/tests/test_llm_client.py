@@ -2558,6 +2558,159 @@ class TestClaudeRequestOnTheWire:
         assert body["max_tokens"] == 40500
         assert "output_config" not in body
 
+    # One of each kind: adaptive and thinking by default, adaptive and thinking
+    # only when asked, and budget thinking, which litellm rejects in different
+    # words (below).
+    MODELS = [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5-20251001",
+    ]
+
+    @pytest.mark.parametrize("model", MODELS)
+    def test_reasoning_effort_is_not_read_for_claude(self, wire, model):
+        """claude's key is `effort`. The openai-family spelling is dropped, so
+        the request is the one a config with no effort sends, and claude-opus-5
+        goes on thinking at its default, high. effort_key_warnings says so at
+        config load, from output_tokens._EFFORT_KEY; this is the request it is
+        held to."""
+        stray = self._body(wire, model=model, reasoning_effort="low")
+        wire.clear()
+        unset = self._body(wire, model=model)
+        assert stray == unset
+
+    @pytest.mark.parametrize("model", MODELS)
+    @pytest.mark.parametrize("effort", ["High", "HIGH", " high", "None", " none "])
+    def test_a_misspelled_effort_fails_before_it_is_sent(self, wire, model, effort):
+        """litellm matches the levels exactly, in lowercase. Nothing is built, so
+        nothing is billed, and every attempt in the fallback chain fails alike.
+        An adaptive model is refused in one sentence and haiku, which maps the
+        level to a thinking budget, in another; both quote the value."""
+        result = _call("claude", provider_config={"model": model, "effort": effort})
+        assert result["failed"] is True
+        assert repr(effort) in result["error"]
+        assert wire == []
+
+    @pytest.mark.parametrize("model", MODELS)
+    @pytest.mark.parametrize("effort", ["high", "low"])
+    def test_the_same_levels_in_lowercase_are_sent(self, wire, model, effort):
+        """The control for the test above: what is rejected is the spelling."""
+        body = self._body(wire, model=model, effort=effort)
+        assert body["model"] == model
+
+    @pytest.mark.parametrize("model", MODELS)
+    @pytest.mark.parametrize(
+        "effort", ["high", "none", "High", "HIGH", " high", "None", " none "]
+    )
+    def test_config_load_says_every_call_fails_exactly_when_litellm_rejects(
+        self, wire, model, effort
+    ):
+        """The warning is keyed off the spelling, not this request, so hold the
+        two together: it promises failure for a value litellm refuses, and only
+        for one. (`none` is quiet here and warned elsewhere, for what it costs.)"""
+        result = _call("claude", provider_config={"model": model, "effort": effort})
+        rejected = result["failed"] is True and wire == []
+        promised = [
+            w
+            for w in output_tokens.effort_warnings(
+                {"claude": {"model": model, "effort": effort}}
+            )
+            if "every claude call will fail" in w
+        ]
+        assert len(promised) == (1 if rejected else 0)
+
+
+class TestEffortKeyIsTheOneEachProviderReads:
+    """output_tokens._EFFORT_KEY, against what the client sends.
+
+    Config load, the call log, the timeout budget and the probe all trust that
+    table for which key a provider reads, and none of them can check it against
+    a request. So this does: for every provider, the key the table names puts an
+    effort into the request and the other spelling puts nothing in. gemini is
+    the case with no key, which reads neither.
+    """
+
+    def _seen(self, provider, **provider_config):
+        seen = {}
+        surface = "responses" if provider == "openai" else "completion"
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            if provider == "openai":
+                return _responses_stream()
+            return _completion_stream()
+
+        with patch.object(client.litellm, surface, side_effect=_capture):
+            _call(provider, provider_config=provider_config)
+        return seen
+
+    @pytest.mark.parametrize("provider", sorted(client._PROVIDERS))
+    def test_the_table_agrees_with_the_request(self, provider):
+        right = output_tokens.effort_key(provider)
+        for spelling in ("effort", "reasoning_effort"):
+            seen = self._seen(provider, **{spelling: "high"})
+            # openai's Responses call nests the effort under `reasoning`.
+            carried = (
+                "reasoning" in seen
+                if provider == "openai"
+                else ("reasoning_effort" in seen)
+            )
+            assert carried == (spelling == right), (provider, spelling)
+
+
+class TestOtherProvidersAreSentAnEffortAsWritten:
+    """Why only claude's effort is judged for its spelling.
+
+    litellm 1.96.2 rejects `High` for claude before sending (above). For the
+    other four it does not look: the value reaches the request exactly as
+    written, so whether the provider's server accepts `High` is the server's to
+    say. That is not measured here, as it would take a live call, and
+    output_tokens.effort_spelling_warnings does not speak for them. If litellm
+    starts to normalise or reject, this fails and the question is open again.
+
+    grok-4.3 rather than the shipped grok-4.6: litellm allows grok a
+    reasoning_effort from its model map, and the map bundled in the wheel (the
+    one the tests run against) predates 4.6, so it refuses the parameter at any
+    value there.
+    """
+
+    @pytest.fixture
+    def wire(self, monkeypatch):
+        bodies = []
+
+        def _send(http_client, request, *args, **kwargs):
+            bodies.append(json.loads(request.content))
+            # A 400 that says nothing of reasoning, so the client does not go
+            # on to retry without it. Only the first body is read.
+            return httpx.Response(
+                400,
+                request=request,
+                json={"error": {"message": "captured", "type": "invalid_request"}},
+            )
+
+        monkeypatch.setattr(httpx.Client, "send", _send)
+        return bodies
+
+    @pytest.mark.parametrize(
+        "provider,model,carried",
+        [
+            ("openai", "gpt-5.6-terra", lambda body: body["reasoning"]["effort"]),
+            ("mistral", "mistral-medium-3-5", lambda b: b["reasoning_effort"]),
+            ("grok", "grok-4.3", lambda body: body["reasoning_effort"]),
+            ("perplexity", "sonar-reasoning-pro", lambda b: b["reasoning_effort"]),
+        ],
+        ids=["openai", "mistral", "grok", "perplexity"],
+    )
+    @pytest.mark.parametrize("effort", ["High", "None"])
+    def test_the_value_reaches_the_request_as_written(
+        self, wire, provider, model, carried, effort
+    ):
+        _call(provider, provider_config={"model": model, "reasoning_effort": effort})
+        assert wire, "litellm refused the request before it was sent"
+        assert carried(wire[0]) == effort
+
 
 def _thinking_chunk(summary):
     """What litellm yields for a summarized thinking_delta: the summary rides in

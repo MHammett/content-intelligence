@@ -1355,6 +1355,91 @@ class TestTheCallLogRecordsTheEffortThatRan:
         assert others and {e["effort"] for e in others} == {"none"}
 
 
+class TestTheCallLogReadsOnlyTheKeyTheProviderReads:
+    """claude's key is `effort` and openai's is `reasoning_effort`.
+
+    The client drops the other spelling, so a value under it never ran. The log
+    read `reasoning_effort` first for every provider, and so recorded a stray
+    `reasoning_effort: low` for a claude pass that ran at high, beside the budget
+    and ceiling sized for high: the record retuning configs/timeouts.yaml is
+    mined from, wrong in its one column that says what the pass was.
+    """
+
+    def _efforts(self, tmp_path, provider, cfg):
+        config = copy.deepcopy(_CONFIG)
+        config["api_keys"]["claude"] = {"api_key": "k"}
+        config["models"][provider] = cfg
+        # The model that answered is the one asked for, so an unset effort is
+        # judged on it, as it is in a run with no fallback.
+        answered = cfg["model"]
+
+        def _answered_by(model_name, domain, *a, **kw):
+            result = _fake_run_domain(model_name, domain, *a, **kw)
+            if model_name == provider:
+                result["model"] = answered
+            return result
+
+        with _stubbed_run(
+            tmp_path,
+            extra_patches=[
+                patch("ci_article_review.pipeline.merge_configs", return_value=config),
+                patch(
+                    "ci_article_review.pipeline._run_domain", side_effect=_answered_by
+                ),
+            ],
+            offline=True,
+        ) as report:
+            pass
+        passes = [
+            e for e in report["api_call_log"] if e["pass"].startswith(f"{provider}:")
+        ]
+        assert passes, f"{provider} reviewed nothing, so this proves nothing"
+        return {e["effort"] for e in passes}
+
+    @pytest.mark.parametrize(
+        "cfg,expected",
+        [
+            ({"model": "claude-opus-5", "effort": "medium"}, "medium"),
+            # The stray key alone: nothing was sent, so it ran at its default.
+            ({"model": "claude-opus-5", "reasoning_effort": "low"}, "high"),
+            # Beside the right one, it is not the one that ran.
+            (
+                {
+                    "model": "claude-opus-5",
+                    "effort": "medium",
+                    "reasoning_effort": "low",
+                },
+                "medium",
+            ),
+            # A model that thinks only when asked, and was not asked.
+            ({"model": "claude-opus-4-8", "reasoning_effort": "high"}, "none"),
+        ],
+        ids=["right-key", "stray-only", "stray-beside-right", "not-asked"],
+    )
+    def test_claude_logs_its_effort_key(self, tmp_path, cfg, expected):
+        assert self._efforts(tmp_path, "claude", cfg) == {expected}
+
+    @pytest.mark.parametrize(
+        "cfg,expected",
+        [
+            ({"model": "gpt-5.4", "reasoning_effort": "high"}, "high"),
+            # claude's spelling under openai: nothing was sent.
+            ({"model": "gpt-5.4", "effort": "high"}, "none"),
+            (
+                {"model": "gpt-5.4", "reasoning_effort": "low", "effort": "high"},
+                "low",
+            ),
+        ],
+        ids=["right-key", "stray-only", "stray-beside-right"],
+    )
+    def test_the_other_providers_log_theirs(self, tmp_path, cfg, expected):
+        assert self._efforts(tmp_path, "openai", cfg) == {expected}
+
+    def test_gemini_reads_neither_spelling(self, tmp_path):
+        cfg = {"model": "gemini-2.5-flash", "reasoning_effort": "high", "effort": "low"}
+        assert self._efforts(tmp_path, "gemini", cfg) == {"none"}
+
+
 class TestADomainWithNoReviewerReachesTheReport:
     """The drafter exclusion can empty a domain; the run must not hide it.
 

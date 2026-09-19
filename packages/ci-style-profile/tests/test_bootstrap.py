@@ -174,6 +174,53 @@ class TestEffortNoneIsWarned:
         assert "effort: none" not in text
 
 
+class TestAnEffortThatDoesNotDoWhatItSaysIsWarned:
+    """`reasoning_effort` under claude, and `High` where litellm wants `high`.
+
+    The merge above is key by key, so what the preset leaves unset rides in from
+    user.yaml, and a key the preset does set sits beside the stray one. Both
+    checks are ci_core's (output_tokens.effort_warnings), the same ones
+    ci-review's config load runs.
+    """
+
+    PRESETS = TestEffortNoneIsWarned.PRESETS
+    _run = TestEffortNoneIsWarned._run
+
+    def test_a_reasoning_effort_left_beside_the_presets_effort_is_named(self, caplog):
+        text = self._run(
+            caplog,
+            "maximum",
+            {"model": "claude-sonnet-5", "reasoning_effort": "low"},
+        )
+        assert "sets both effort: 'high' and reasoning_effort: 'low'" in text
+
+    def test_a_reasoning_effort_the_preset_does_not_replace_is_warned(self, caplog):
+        text = self._run(
+            caplog,
+            "balanced",
+            {"model": "claude-haiku-4-5-20251001", "reasoning_effort": "low"},
+        )
+        assert "claude model claude-sonnet-5 sets reasoning_effort: 'low'" in text
+        assert "Rename it to effort." in text
+
+    def test_a_misspelled_effort_that_rides_into_the_presets_model_is_warned(
+        self, caplog
+    ):
+        text = self._run(
+            caplog,
+            "balanced",
+            {"model": "claude-haiku-4-5-20251001", "effort": "High"},
+        )
+        assert "claude model claude-sonnet-5 is set to effort: 'High'" in text
+        assert "every claude call will fail" in text
+
+    def test_a_config_that_runs_as_written_is_quiet(self, caplog):
+        text = self._run(
+            caplog, "maximum", {"model": "claude-sonnet-5", "effort": "medium"}
+        )
+        assert "effort" not in text
+
+
 class TestContinueOnError:
     def test_continue_on_error_skips_failed_source(self):
         """--continue-on-error: one collector raises CollectorError; run completes."""
