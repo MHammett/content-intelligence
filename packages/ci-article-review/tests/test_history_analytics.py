@@ -1,5 +1,6 @@
 """Unit tests for history_analytics — cross-run aggregation over pipeline_history/."""
 
+import copy
 import json
 from collections import Counter
 from pathlib import Path
@@ -36,6 +37,7 @@ def _report(
     fk_grade=None,
     seo_issue_count=None,
     broken_links=None,
+    links_skipped=None,
 ):
     report = {
         "generated": generated,
@@ -58,6 +60,10 @@ def _report(
         pre_analysis["links"] = [
             {"ok": i >= broken_links} for i in range(max(broken_links, 1))
         ]
+    if links_skipped is not None:
+        # What the pipeline writes when link validation did not run.
+        pre_analysis["links"] = None
+        pre_analysis["links_skipped_reason"] = links_skipped
     if pre_analysis:
         report["pre_analysis"] = pre_analysis
     return report
@@ -382,6 +388,102 @@ class TestQualityTrend:
             )
         result = ha.global_quality_trend(entries, recent_window=3)
         assert result["fk_grade"]["trend"] == "improved"
+
+
+class TestARunThatNeverCheckedItsLinks:
+    """--offline and link_validation: false leave a run's links unchecked.
+
+    Such a run has no broken-link count. It was written as ``[]`` and counted
+    as zero: one --offline run after short-example-smoke-test's four checked
+    runs (1, 3, 2 and 2 links not ok) turned that article's links from
+    "worsened" to "improved" and moved the global baseline (2026-09-18).
+    """
+
+    _CHECKED = (1, 3, 2, 2)
+
+    def _entries(self, *reports, slug=None):
+        return [
+            {
+                "slug": slug or f"article-{i}",
+                "path": None,
+                "report": report,
+                "timestamp": i,
+            }
+            for i, report in enumerate(reports)
+        ]
+
+    def _checked(self, broken, fk_grade=10.0):
+        return _report(
+            "2026-09-18T00:00:00+00:00", fk_grade=fk_grade, broken_links=broken
+        )
+
+    def _unchecked(self, reason="offline", fk_grade=10.0):
+        return _report(
+            "2026-09-18T00:00:00+00:00", fk_grade=fk_grade, links_skipped=reason
+        )
+
+    def test_it_has_no_broken_link_count(self):
+        metrics = ha._quality_metrics(self._unchecked())
+        assert metrics["broken_link_count"] is None
+        assert metrics["fk_grade"] == 10.0
+
+    def test_an_empty_list_still_reads_as_none_broken(self):
+        """A checked draft with no links, or a report from before the marker
+        existed, where the two cannot be told apart — read as it always was."""
+        report = {"pre_analysis": {"links": []}}
+        assert ha._quality_metrics(report)["broken_link_count"] == 0
+
+    def test_a_checked_run_counts_the_links_that_were_not_ok(self):
+        report = {"pre_analysis": {"links": [{"ok": True}, {"ok": False}, {}]}}
+        assert ha._quality_metrics(report)["broken_link_count"] == 2
+
+    def test_it_does_not_turn_the_article_trend(self):
+        checked = [self._checked(n) for n in self._CHECKED]
+        before = ha.per_article_quality_trend(self._entries(*checked, slug="a"))
+        after = ha.per_article_quality_trend(
+            self._entries(*checked, self._unchecked(fk_grade=9.0), slug="a")
+        )
+        assert before["a"]["broken_links_trend"] == "worsened"
+        assert after["a"]["broken_links_trend"] == "worsened"
+        assert after["a"]["first"]["broken_link_count"] == 1
+        assert after["a"]["last"]["broken_link_count"] == 2
+        # It did measure readability, and counts for that.
+        assert after["a"]["last"]["fk_grade"] == 9.0
+        assert after["a"]["fk_grade_trend"] == "improved"
+
+    def test_it_does_not_hide_the_trend_as_the_first_run(self):
+        runs = [self._unchecked("disabled"), self._checked(1), self._checked(3)]
+        result = ha.per_article_quality_trend(self._entries(*runs, slug="a"))["a"]
+        assert result["broken_links_trend"] == "worsened"
+        assert result["first"]["broken_link_count"] == 1
+
+    def test_one_checked_run_is_compared_with_itself(self):
+        """As a single-run article is — not "unknown" because of the others."""
+        runs = [self._unchecked(), self._checked(2), self._unchecked()]
+        result = ha.per_article_quality_trend(self._entries(*runs, slug="a"))["a"]
+        assert result["broken_links_trend"] == "unchanged"
+        assert result["first"]["broken_link_count"] == 2
+        assert result["last"]["broken_link_count"] == 2
+
+    def test_an_article_that_never_checked_is_unknown(self):
+        runs = [self._unchecked(), self._unchecked("disabled")]
+        result = ha.per_article_quality_trend(self._entries(*runs, slug="a"))["a"]
+        assert result["broken_links_trend"] == "unknown"
+        assert result["fk_grade_trend"] == "unchanged"
+
+    def test_it_does_not_move_the_global_averages(self):
+        """Not even by taking a slot in the recent window: that would push a
+        measured run into the baseline and move both averages."""
+        checked = [self._checked(n) for n in (4, 4, 4, 1, 1)]
+        before = ha.global_quality_trend(self._entries(*checked), recent_window=2)
+        after = ha.global_quality_trend(
+            self._entries(*checked, self._unchecked(fk_grade=9.0)), recent_window=2
+        )
+        assert after["broken_link_count"] == before["broken_link_count"]
+        assert after["broken_link_count"]["recent_average"] == 1.0
+        assert after["broken_link_count"]["baseline_average"] == 4.0
+        # Readability is windowed over its own measurements, which include it.
+        assert after["fk_grade"]["recent_average"] == 9.5
 
 
 class TestBuildHistoryReport:
@@ -1113,3 +1215,60 @@ class TestARetryFailedRunThePipelineWrote:
         )
         for name in carried:
             assert contribution[name]["consensus_hits"] == capture_hits[name], name
+
+
+class TestAnUncheckedRunThePipelineWrote:
+    """The same, over reports the pipeline itself wrote: two runs that checked
+    the draft's links, then an --offline run that did not, all in one history
+    directory the way a real article's runs are."""
+
+    def _run(self, tmp_path, broken=None):
+        """A stubbed run; ``broken`` of its three links not ok, or offline."""
+        from .test_pipeline_end_to_end import _CONFIG, _stubbed_run
+
+        config = copy.deepcopy(_CONFIG)
+        config["pipeline"]["link_validation"] = True
+        patches = [
+            patch("ci_article_review.pipeline.merge_configs", return_value=config)
+        ]
+        if broken is None:
+            kwargs = {"offline": True}
+        else:
+            found = [
+                {
+                    "url": f"https://example.org/{i}",
+                    "ok": i >= broken,
+                    "status_code": 404 if i < broken else 200,
+                }
+                for i in range(3)
+            ]
+            patches.append(
+                patch(
+                    "ci_article_review.analysis.links.validate_links",
+                    return_value=found,
+                )
+            )
+            kwargs = {}
+        with _stubbed_run(tmp_path, extra_patches=patches, **kwargs) as report:
+            return report
+
+    def test_it_changes_no_link_figure(self, tmp_path):
+        history = tmp_path / "history"
+        self._run(tmp_path, broken=1)
+        self._run(tmp_path, broken=2)
+        # A window of one, so the offline run would have taken the only
+        # recent slot had it counted.
+        before = ha.build_history_report(history, recent_window=1)
+        offline = self._run(tmp_path)
+        assert offline["pre_analysis"]["links"] is None
+
+        after = ha.build_history_report(history, recent_window=1)
+        assert after["total_reports"] == 3
+        (article,) = after["per_article_quality_trend"].values()
+        assert article["runs"] == 3
+        assert article["broken_links_trend"] == "worsened"
+        assert article["first"]["broken_link_count"] == 1
+        assert article["last"]["broken_link_count"] == 2
+        links = after["global_quality_trend"]["broken_link_count"]
+        assert links == before["global_quality_trend"]["broken_link_count"]
+        assert links["trend"] == "worsened"

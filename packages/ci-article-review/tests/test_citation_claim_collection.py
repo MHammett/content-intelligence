@@ -592,3 +592,12 @@ class TestImpersonationDegradation:
         with patch.object(pipeline, "impersonation_available", return_value=False):
             pipeline._record_impersonation_degradation(report, {})
         assert "degradations" not in report
+
+    def test_links_that_were_never_checked_are_not_an_error(self):
+        """--offline and link_validation: false write None, not a list."""
+        report = {}
+        with patch.object(pipeline, "impersonation_available", return_value=False):
+            pipeline._record_impersonation_degradation(
+                report, {"links": None, "links_skipped_reason": "offline"}
+            )
+        assert "degradations" not in report

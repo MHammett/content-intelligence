@@ -916,3 +916,58 @@ class TestReviewContextReachesTheModels:
         from ci_article_review.pipeline import _build_user_prompt
 
         assert "PIPELINE OBSERVATIONS" not in _build_user_prompt("BODY", {"title": "T"})
+
+    def test_links_that_were_never_checked_add_nothing(self):
+        """None is not a list of dead links, and not an error either."""
+        pre = {**self._PRE, "links": None, "links_skipped_reason": "offline"}
+        ctx = self._ctx(pre=pre)
+        assert "Link check" not in ctx
+        assert "Flesch-Kincaid grade 6.4" in ctx
+
+
+class TestTheSummarySaysWhenLinksWereNotChecked:
+    """A run that skipped link validation printed nothing about links, which is
+    also what a draft with no links prints."""
+
+    _REPORT = {
+        "article_title": "A Title",
+        "run_number": 1,
+        "generated": "2026-09-18T00:00:00+00:00",
+        "section_1_consensus": [],
+        "section_2_fact_check": {},
+        "section_3_voice": [],
+        "section_4_argument": [],
+        "section_5_completeness": [],
+        "section_6_red_team": {},
+        "section_7_low_confidence": [],
+        "lt_corrections_applied": [],
+    }
+
+    def _out(self, pre, capsys):
+        from ci_article_review.pipeline import _print_draft_summary
+
+        _print_draft_summary({**self._REPORT, "pre_analysis": pre}, {})
+        return capsys.readouterr().out
+
+    def test_offline(self, capsys):
+        out = self._out({"links": None, "links_skipped_reason": "offline"}, capsys)
+        assert "Links: not checked (--offline)" in out
+
+    def test_switched_off_in_config(self, capsys):
+        out = self._out({"links": None, "links_skipped_reason": "disabled"}, capsys)
+        assert (
+            "Links: not checked (link_validation is set to false in the pipeline "
+            "config)" in out
+        )
+
+    def test_a_checked_draft_with_no_links_is_not_called_unchecked(self, capsys):
+        assert "Links:" not in self._out({"links": []}, capsys)
+
+    def test_checked_links_still_print_as_before(self, capsys):
+        links = [
+            {"url": "https://ok.example/", "ok": True, "status_code": 200},
+            {"url": "https://gone.example/", "ok": False, "status_code": 404},
+        ]
+        out = self._out({"links": links}, capsys)
+        assert "Links: 2 found, 1 broken/error" in out
+        assert "not checked" not in out
