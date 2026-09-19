@@ -23,17 +23,19 @@ Skip optional sections for services you don't plan to use. The pipeline detects 
 **What you need:**
 - API key: the key you just created
 
-**Current models (June 2026):**
+**Current models (September 2026):**
 
-| Model | Input | Output | Context | Notes |
-|---|---|---|---|---|
-| `gpt-5.5` | $5.00/MTok | $30/MTok | 1M tokens | Highest capability, reasoning defaults to medium |
-| `gpt-5.4` | $2.50/MTok | $15/MTok | 1M tokens | Best value flagship; **recommended default** |
-| `gpt-5.4-mini` | $0.75/MTok | $4.50/MTok | 400K tokens | Economy option |
+| Model | Input | Output | Context | Presets | Notes |
+|---|---|---|---|---|---|
+| `gpt-5.6-sol` | $4.00/MTok | $20/MTok | 1.05M tokens | `maximum` (`reasoning_effort: xhigh`) | Highest capability. The rate is promotional: OpenAI's pricing page says it is available "at least through November 21, 2026" |
+| `gpt-5.6-terra` | $2.00/MTok | $12/MTok | 1.05M tokens | `balanced` (`low`), `thorough` (`high`) | Best value; **recommended default** |
+| `gpt-5.6-luna` | $0.20/MTok | $1.20/MTok | 1.05M tokens | `economy`, `wide` (no effort set) | Economy option |
 
-Reasoning is controlled via `reasoning_effort: none | low | medium | high | xhigh` in the model config. Default is `medium` on gpt-5.5; omit for model defaults.
+The gpt-5.6 family replaced gpt-5.5, gpt-5.4 and gpt-5.4-mini in the presets on 2026-08-18, at matching price tiers. Those three still work, and `pricing.yaml` still prices them ($5/$30, $2.50/$15 and $0.75/$4.50 per MTok, matching OpenAI's pricing page), for configs that name them.
 
-**Expected cost:** ~$0.04–$0.10 per call at default settings.
+Reasoning is controlled via `reasoning_effort: none | low | medium | high | xhigh` in the model config. All three gpt-5.6 models default to `medium`, and the pipeline sends nothing when the setting is omitted, so an unset effort runs at `medium`, not `none`.
+
+**Expected cost:** measured per review call, tokens only, from saved runs and re-priced at the current rates: `gpt-5.6-luna` $0.004–$0.006, median $0.005 (12 calls, all on a 9,456-character draft); `gpt-5.6-terra` at `high` $0.064–$0.066 (3 calls, one 18,167-character draft); `gpt-5.6-sol` at `xhigh` $0.08–$1.30, median $0.33 (23 calls, drafts of 2,182–27,113 characters). Speed follows the same order: about 25s for luna, about 370s for sol at `xhigh`. Live web search, when you turn it on, is billed on top: OpenAI's pricing page lists $10 per 1,000 calls plus the search-content tokens at model rates.
 
 **What it does:** Voice/style review (detects AI-generated phrasing, hedging language, banned words) and completeness analysis (finds gaps a technically literate critic would notice). Optional web-search upgrade — see [CONFIGURATION.md](CONFIGURATION.md#openai-web-search).
 
@@ -56,19 +58,25 @@ Gemini runs the fact-check pass with live Google Search grounding. There are two
 **What you need:**
 - API key: the key you just generated
 
-**Billing:** No credit card required. At one article per month you will stay within the free tier for Gemini Flash.
+**Billing:** No credit card is required for the free tier. It covers the Flash models (2.5 Flash, 2.5 Flash-Lite and the 3.x Flash models) but not `gemini-2.5-pro`, which `thorough` and `maximum` run. Google's [pricing page](https://ai.google.dev/gemini-api/docs/pricing) also marks free-tier content as used to improve its products and paid-tier content as not. What this pipeline sends is unpublished drafts, so if that matters to you, use a billing-enabled key or Vertex AI.
 
 **Limitation:** AI Studio draws from a shared capacity pool. At peak hours you may get 503 errors. If that happens consistently, use Vertex AI instead.
 
-**Current models (June 2026):**
+**Current models (September 2026):**
 
 | Model | Input | Output | Notes |
 |---|---|---|---|
-| `gemini-3.5-flash` | $1.50/MTok | $9.00/MTok | Latest generation, stable |
-| `gemini-2.5-flash` | $0.30/MTok | $2.50/MTok | Best price-performance; **recommended default** |
-| `gemini-2.5-pro` | $1.25/MTok | $10/MTok | More thorough, higher cost |
+| `gemini-2.5-flash` | $0.30/MTok | $2.50/MTok | Best price-performance; **recommended default**; what `economy`, `wide` and `balanced` run |
+| `gemini-2.5-pro` | $1.25/MTok ($2.50 over 200K-token prompts) | $10/MTok ($15 over 200K) | What `thorough` and `maximum` run; no free tier; thinking cannot be turned off |
+| `gemini-3.5-flash` | $1.50/MTok | $9.00/MTok | GA; Google's named replacement for 2.5 Pro on Vertex AI; in no preset |
 
-All Gemini models support `thinking_budget` for controlling reasoning token allocation. Set `0` to disable thinking (faster/cheaper). Gemini 2.5 Flash already thinks dynamically by default; a budget applies a ceiling.
+Google's newer Flash models, 3.6, 3.7 and 3.8, are also GA on the Gemini API, at promotional prices that run through 2026-12-31 (see the pricing page). No preset runs them, and `pricing.yaml` has no row for them yet, so the pipeline's cost report would price them at its fallback rate.
+
+**Retirement.** Google Cloud's [Model versions and lifecycle](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions) page lists `gemini-2.5-pro`, `gemini-2.5-flash` and `gemini-2.5-flash-lite` for retirement on Vertex AI on **2026-10-20**, and names Gemini 3.5 Flash, 3.5 Flash-Lite or 3.1 Flash-Lite as replacements. Google says listed retirement dates may be extended but will not move earlier. The Gemini API's [deprecations](https://ai.google.dev/gemini-api/docs/deprecations) page listed no shutdown date for them on 2026-09-19. Every shipped preset still runs a 2.5 model, and `presets.yaml` has not been changed; Vertex AI (Option B below) is where the date applies. Vertex AI's pricing page lists Gemini 3.5 Flash under "Global", so check that your location serves a model before you switch to it.
+
+`thinking_budget` controls reasoning token allocation on the 2.5 models, and it is the only Gemini thinking setting this pipeline sends: 2.5 Flash takes 1–24,576 tokens, 2.5 Flash-Lite 512–24,576, 2.5 Pro 128–32,768, and unset each thinks dynamically, up to 8,192. `0` turns thinking off on 2.5 Flash and Flash-Lite. **Thinking cannot be turned off on 2.5 Pro.** Gemini 3.x models use a different parameter, `thinking_level`, which the pipeline does not send. Details and Google's source are in [CONFIGURATION.md](CONFIGURATION.md#gemini--thinking_budget).
+
+**Expected cost:** measured per review call, tokens only, from saved runs and re-priced at the current rates: `gemini-2.5-flash` $0.007–$0.033, median $0.023 (14 calls, drafts of 9,456–73,786 characters); `gemini-2.5-pro` $0.02–$0.15, median $0.05 (177 calls, 2,182–135,514 characters). Across a whole run, Gemini's share was $0.02–$0.07 at `wide` (four runs, a 9,456-character draft), $0.17 at `thorough` (one run, 18,167 characters) and $0.22–$0.49 at `maximum` (four runs, 3,999–27,113 characters). Search grounding is separate: every Gemini call here is grounded, and Google's pricing page lists a daily allowance of grounded prompts at no charge (1,500 for the 2.5 Flash models combined, 10,000 for 2.5 Pro on Vertex AI) before per-1,000 charges apply. A run makes up to five Gemini calls, one per domain, before any retries.
 
 **Config:**
 ```yaml
@@ -146,7 +154,9 @@ models:
     location: us-central1
 ```
 
-**Billing:** Same per-token price as AI Studio paid tier. Under $0.10/month at one article per month.
+**Billing:** The same per-token list prices as the AI Studio paid tier for 2.5 Pro, 2.5 Flash and 3.5 Flash (Vertex AI's pricing page lists them alike). What a run costs is under **Expected cost** in the Gemini section above: a few cents at `wide`, and tens of cents at `maximum`.
+
+**Retirement:** the 2.5 models are listed for retirement on Vertex AI on 2026-10-20; see **Retirement** above.
 
 ---
 
@@ -163,13 +173,15 @@ models:
 **What you need:**
 - API key: the key you created
 
-**Current models (June 2026):**
+**Current models (September 2026):**
 
-| Model | Notes |
-|---|---|
-| `mistral-large-latest` | Flagship non-reasoning model; **recommended default** |
-| `mistral-medium-3-5` | Reasoning model; replaces deprecated `magistral-medium-latest` |
-| `mistral-small-latest` | Economy option; reduced depth |
+| Model | Input | Output | Notes |
+|---|---|---|---|
+| `mistral-large-latest` | $0.50/MTok | $1.50/MTok | Mistral Large 3; flagship non-reasoning model; **recommended default**; in no preset |
+| `mistral-medium-3-5` | $1.50/MTok | $7.50/MTok | Mistral Medium 3.5, 256K context; reasoning model, replaces deprecated `magistral-medium-latest`; what `balanced`, `thorough` and `maximum` run |
+| `mistral-small-latest` | $0.15/MTok | $0.60/MTok | Mistral Small 4; economy option, reduced depth; what `economy` and `wide` run, and the model behind citation verification and both SEO passes |
+
+Prices are from Mistral's [pricing page](https://mistral.ai/pricing/api/), checked 2026-09-19, and `pricing.yaml` carries the same rates. A `-latest` alias moves to each new GA model, and its price moves with it, so re-check the two `-latest` rows whenever Mistral ships a new Small or Large.
 
 **Reasoning constraints (important):** `mistral-medium-3-5` is the only Mistral model that supports `reasoning_effort`. It only accepts `"high"` or `"none"` — `"low"` and `"medium"` return a 400 error. Standard models (`mistral-large-latest`, `mistral-small-latest`) reject `reasoning_effort` entirely. The `-latest` suffix variant (`mistral-medium-3-5-latest`) does not exist and returns a 400 error.
 
@@ -186,7 +198,7 @@ models:
     timeout_seconds: 240
 ```
 
-**Expected cost:** ~$0.03–$0.10 per call for standard; higher for reasoning on long articles.
+**Expected cost:** measured per review call, tokens only, from saved runs and re-priced at the current rates: `mistral-small-latest` $0.001–$0.005, median $0.002 (28 calls, drafts of 3,999–73,786 characters); `mistral-medium-3-5` at `high` $0.03–$0.33, median $0.12 (132 calls, 2,182–135,514 characters), where the reasoning trace dominates the bill (a median of about 10,700 completion tokens per call).
 
 **What it does:** Argument integrity review (logical gaps, unstated assumptions, conclusions that outrun their evidence) and red team analysis (most attackable claim, audience alienation risk, credibility risk). European company, architecture independent from Google and OpenAI — independent analytical perspective matters.
 
@@ -194,7 +206,9 @@ models:
 
 ## Perplexity AI (optional — recommended)
 
-Perplexity's sonar models run every response through live web search by default. Adding a Perplexity key gives you a second independent search-grounded fact-checker alongside Gemini. Both carry a 1.5× weight in consensus scoring.
+Perplexity's sonar models run every response through live web search by default. Adding a Perplexity key gives you a second independent search-grounded fact-checker alongside Gemini. Both get the `grounding_bonus` (1.5×) on `fact_check` when the call actually consulted live sources; see [Ensemble weighting](CONFIGURATION.md#ensemble-weighting).
+
+> **Sonar is being retired.** Perplexity's documentation says Sonar "will be supported until September 27, 2026", and recommends moving existing Sonar Chat Completions usage to its [Agent API](https://docs.perplexity.ai/docs/agent-api/migrate-from-sonar/overview). Its [forum announcement](https://community.perplexity.ai/t/sonar-is-moving-to-the-agent-api/5802) of 2026-08-13 says the Sonar endpoints retire on that date. This pipeline calls Sonar through litellm's `perplexity/` chat-completions route, and every cost preset runs a Sonar model, so plan for those calls to fail after the date unless the adapter moves to the Agent API. Setting `enabled: false` on `perplexity` (see [Disabling a model](CONFIGURATION.md#disabling-a-model)) runs the pipeline without it. `presets.yaml` has not been changed.
 
 **Where:** https://www.perplexity.ai/settings/api
 
@@ -207,18 +221,20 @@ Perplexity's sonar models run every response through live web search by default.
 **What you need:**
 - API key: the key you generated
 
-**Current models (June 2026):**
+**Current models (September 2026):**
 
-| Model | Notes |
-|---|---|
-| `sonar-reasoning-pro` | CoT reasoning + web search; **recommended default** |
-| `sonar-pro` | Web search, no CoT trace; good for standard tier |
-| `sonar` | Lightweight; economy option |
-| `sonar-deep-research` | Extended research; highest cost and latency |
+| Model | Input | Output | Request fee, per 1,000 (low / medium / high search context) | Notes |
+|---|---|---|---|---|
+| `sonar-reasoning-pro` | $2/MTok | $8/MTok | $6 / $10 / $14 | CoT reasoning + web search; **recommended default**; what `balanced`, `thorough` and `maximum` run |
+| `sonar-pro` | $3/MTok | $15/MTok | $6 / $10 / $14 | Web search, no CoT trace; good for standard tier; in no preset |
+| `sonar` | $1/MTok | $1/MTok | $5 / $8 / $12 | Lightweight; economy option; what `economy` and `wide` run |
+| `sonar-deep-research` | $2/MTok | $8/MTok | none | Extended research; highest cost and latency. Also bills citation tokens ($2/MTok), reasoning tokens ($3/MTok) and $5 per 1,000 searches |
+
+Prices are from Perplexity's [pricing page](https://docs.perplexity.ai/docs/getting-started/pricing), checked 2026-09-19. The request fee is charged per request on top of the tokens. For `sonar` it is about as large as the tokens themselves: $0.005–$0.012 a request against roughly $0.009 of tokens a call in saved runs.
 
 Perplexity's reasoning is model-selection based — use `sonar-reasoning-pro` for CoT, `sonar-pro` for standard search grounding. There is no separate reasoning parameter.
 
-**Expected cost:** ~$0.04–$0.20 per call depending on model (sonar-reasoning-pro has higher variance due to reasoning trace overhead).
+**Expected cost:** measured per review call, tokens only, from saved runs: `sonar-reasoning-pro` $0.006–$0.13, median $0.063 (160 calls, drafts of 2,182–135,514 characters; the reasoning trace makes the token count vary widely); `sonar` $0.008–$0.010 (4 calls, a 9,456-character draft), priced at Perplexity's $1/$1 rate. The request fee above comes on top of both.
 
 **What it adds:** At `standard` thoroughness, Perplexity only runs if you explicitly add it to a model's `prompts:` list. At `thorough` thoroughness, it runs fact_check automatically alongside Gemini. Two independently grounded models flagging the same claim is very strong signal.
 
@@ -246,18 +262,23 @@ models:
 **What you need:**
 - API key: the key you generated
 
-**Current models (June 2026):**
+**Current models (September 2026):**
 
 | Model | Input | Output | Notes |
 |---|---|---|---|
-| `grok-4.3` | $1.25/MTok | $2.50/MTok | General purpose; **recommended default** |
+| `grok-4.6` | $2.00/MTok | $6.00/MTok | 500K context; takes `reasoning_effort`; what `balanced`, `thorough` and `maximum` run |
+| `grok-4.3` | $1.25/MTok | $2.50/MTok | 1M context; general purpose; what `wide` runs; **recommended default** for a plain config |
 | `grok-4.20-0309-reasoning` | $1.25/MTok | $2.50/MTok | Reasoning variant; same price as standard |
 | `grok-4.20-0309-non-reasoning` | $1.25/MTok | $2.50/MTok | Explicit non-reasoning variant |
-| `grok-build-0.1` | $1.00/MTok | $2.00/MTok | Economy fallback |
+| `grok-build-0.1` | $1.00/MTok | $2.00/MTok | 256K context; economy fallback |
 
-Grok reasoning is **model-selection based** — use `grok-4.20-0309-reasoning` for CoT. Unlike OpenAI/Mistral/Claude, there is no reasoning parameter; you switch models. Since the reasoning model costs the same as the standard model, there is no reason not to use it at `balanced` and above.
+Prices are xAI's for prompts under 200K tokens ([models page](https://docs.x.ai/docs/models), checked 2026-09-19). A request whose prompt reaches 200K tokens is billed at double these rates for all its tokens; no prompt this pipeline sends comes near that (the largest in the two 2026-09-09 `maximum` runs was 8,951 tokens, 4% of it). `grok-4.5` ($2/$6) also exists and takes `reasoning_effort`; it is in no preset, and `pricing.yaml` has no row for it.
 
-**Billing:** xAI currently offers free tier credits. At low article volume you may stay within free limits. Check https://console.x.ai for current pricing.
+Reasoning on grok-4.6 (and grok-4.5) is set with `reasoning_effort: low | medium | high | xhigh`, default `high`, so leaving it unset buys the most expensive setting; every preset that runs grok-4.6 states an effort for that reason. On the older models reasoning is chosen by model name: the 4.20 generation has separate `-reasoning` and `-non-reasoning` variants, and the presets send grok-4.3 no `reasoning_effort`. The setting shows up in the bill: grok-4.6 at `high` wrote a median of about 15,300 tokens per call in saved runs (23 calls), against about 600 for grok-4.3 (30 calls). See [CONFIGURATION.md](CONFIGURATION.md#grok--reasoning_effort).
+
+**Billing:** per token, against credits on your xAI account; see https://console.x.ai for current pricing. xAI's own billing pages describe no free tier (checked 2026-09-19), so do not plan around one, and if your account shows promotional credits, read their terms on how your prompts may be used before sending unpublished drafts through them.
+
+**Expected cost:** measured per review call, tokens only, from saved runs and re-priced at the current rates: `grok-4.3` $0.009–$0.027, median $0.021 (30 calls, drafts of 9,456–73,786 characters); `grok-4.6` at `high` (or unset, which resolves to `high`) $0.01–$0.25, median $0.10 (23 calls, 2,182–27,113 characters).
 
 **What it adds:** A second red team pass. Grok is trained on a different corpus (heavy X/Twitter data) and tends toward more direct, contrarian responses — useful for attack angles the other models miss. At `standard` thoroughness, both Mistral and Grok red team results appear in Section 6 of the report.
 
