@@ -440,6 +440,8 @@ What it reports:
 
 - **Per-pass contribution** — for each `model:domain` pass: how often it ran, what it cost, how many of its findings reached consensus, and how many of those *only* it raised. This is the data for deciding whether every call in a `maximum` run earns its keep. Read it to form a hypothesis and confirm with `--only-model` / `--only-domain`; a pass with many sole-source findings scores badly on cost-per-hit and may still be the most valuable one you have.
 
+A `--retry-failed` run is saved beside the run it re-ran, and its report also lists every call it carried over from that run's capture. Since 2026-09-18 those calls are marked, and each counts once, in the run that made it: in spend, provider reliability and per-pass contribution alike. The cost trend also adds what a retry spent to the run whose failed calls it re-ran, so a few cents of gap-filling is not averaged as a run of its own, and the cost section says how many retries it folded in. A `--retry-failed` run from before 2026-09-18 carries no mark, so it counts as a full run.
+
 It reads `pipeline_history/` fresh every time — no database, no index. Reports missing a field are treated as "not enough history" rather than an error, since the report schema has grown over time.
 
 ### Recurring voice patterns
