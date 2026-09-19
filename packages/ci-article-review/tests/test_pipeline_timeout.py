@@ -521,6 +521,36 @@ class TestRecoverFailedCalls:
             "tokens": self._NO_TOKENS,
         }
 
+    def test_a_replaced_grounded_calls_searches_stay_billed(self):
+        """A malformed-JSON failure on a grounded call had searched before it
+        failed, and each of its attempts was billed for that. Recovery
+        replaced the result and, with it, the only record of the searches."""
+        failed = self._malformed_twice()
+        failed["searches"] = 3
+        failed["discarded_attempts"]["searches"] = [4]
+        own_retry = {
+            "count": 1,
+            "costed": 1,
+            "reasons": ["MalformedJSONError"],
+            "tokens": {"prompt": 6107, "completion": 7000},
+            "searches": [2],
+        }
+        recovered = self._recover(
+            failed, self._answer(searches=1, discarded_attempts=own_retry)
+        )
+
+        # One count per attempt, in order: the failed call's discarded one,
+        # its own last, then the replacement's retry.
+        assert recovered["discarded_attempts"]["searches"] == [4, 3, 2]
+        assert recovered["searches"] == 1
+        summary = self._cost(recovered)
+        assert summary["search_units"] == 4 + 3 + 2 + 1
+        assert summary["total_search_usd"] == 0.1
+
+    def test_a_replaced_call_that_could_not_search_adds_no_count(self):
+        recovered = self._recover(self._stalled_twice(), self._answer())
+        assert "searches" not in recovered["discarded_attempts"]
+
 
 class TestFailureReason:
     """``_failure_reason`` — which exception a failed result's text names.

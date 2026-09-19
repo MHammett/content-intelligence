@@ -148,6 +148,10 @@ def call_text(
         # cost log can key on, or the call bills at unknown_price.
         "model": result.get("model") or model or name,
     }
+    # A grounded call's searches bill like its tokens, so they travel with
+    # them. By presence: None means the provider did not say.
+    if "searches" in result:
+        out["searches"] = result["searches"]
     if failed:
         out["error"] = result.get("error", "")
         if result.get("error_body"):

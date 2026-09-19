@@ -1,4 +1,6 @@
 # Model pricing — per-million tokens: [input, output] or [input, output, cached_input].
+# Search and grounding fees, billed on top of tokens, are the second table,
+# `search_fees:`, at the end of this file.
 #
 # The optional third element is the rate for input served from the provider's
 # prompt cache. Without it, cached tokens are billed at the full input rate,
@@ -246,3 +248,96 @@ models:
   claude-opus-4-8:              [5.00,  25.00]
   claude-sonnet-4-6:            [3.00,  15.00]
   claude-haiku-4-5-20251001:    [1.00,   5.00]
+
+# ── Search and grounding fees ──────────────────────────────────────────────────
+# [USD per 1,000 billed units, unit], charged ON TOP of the token rates above.
+# Until 2026-09-19 this file priced tokens only, so every grounded pass was
+# under-reported by its fee. An isolated claude:fact_check on 2026-09-18
+# (claude-opus-5, final usage `server_tool_use: {web_search_requests: 5}`)
+# reported $1.1952 — exactly 139,051 x $5/M + 19,998 x $25/M. The $0.05 that
+# Anthropic bills for those 5 searches appeared nowhere.
+#
+# Keys prefix-match the model id, longest first, as `models:` does, so
+# "claude-" covers every Claude model, including the fallback chain's
+# claude-haiku-4-5.
+#
+# The unit says how a call's `searches` count (ci_core.llm.client) is billed:
+#   search   each search the provider reports              (Anthropic)
+#   call     each web_search_call whose action is a search  (OpenAI; xAI)
+#   query    each distinct non-empty search query           (Gemini 3)
+#   prompt   one per call that searched at all              (Gemini 2.5)
+#   request  one per request, whatever it searched          (Perplexity)
+#
+# All VERIFIED 2026-09-19 on each provider's own pricing page:
+#   Anthropic  $10 per 1,000 searches, platform.claude.com/docs/en/about-claude/
+#              pricing ("Web search tool"). Web fetch costs nothing extra.
+#   OpenAI     developers.openai.com/api/docs/pricing ("Built-in tools"):
+#              web_search_preview is $10 per 1,000 calls on reasoning models,
+#              which every gpt-5 model is, and $25 per 1,000 on non-reasoning
+#              models, none of which is configured here. The web-search guide
+#              says "Search actions incur a tool call cost" and says nothing of
+#              open_page or find_in_page, so only search actions are billed here.
+#   Gemini     ai.google.dev/gemini-api/docs/pricing: 2.5 Pro, Flash and
+#              Flash-Lite bill $35 per 1,000 grounded prompts; 3.x bills $14 per
+#              1,000 search queries. Google's grounding guide: on Gemini 3 "your
+#              project is billed for each search query that the model decides to
+#              execute", and empty queries are ignored; 2.5 and older are "billed
+#              per prompt". Its Cloud pricing page defines a grounding prompt as
+#              one "for which Gemini makes one or more queries", and says
+#              "there is only one charge" however many it makes. These are AI
+#              Studio's terms because every gemini call goes there: the client
+#              sends `gemini/` requests even where user.yaml says
+#              `provider: vertex_ai` (checked 2026-09-19 with a $0 wire probe).
+#              A gemini call can read as ungrounded and still have searched:
+#              litellm drops the grounding metadata on some streamed chunks
+#              (BerriAI/litellm#41492), and the client then falls back to
+#              litellm's own count of the queries (see _read_searches).
+#   Perplexity docs.perplexity.ai/getting-started/pricing: a request fee per
+#              1,000 requests at search_context_size low/medium/high of 5/8/12
+#              for sonar and 6/10/14 for sonar-pro and sonar-reasoning-pro.
+#              Nothing here sets search_context_size, and Perplexity's API
+#              reference gives "low" as the default, so these rows are the low
+#              column. sonar-deep-research bills $5 per 1,000 search queries
+#              instead, and no preset runs it.
+#   xAI        docs.x.ai/developers/pricing: web_search is $5 per 1,000 calls.
+#              grok's search is off in every preset (UPSTREAM.md, item 5), and
+#              the client reads no grok count, so this row prices nothing yet.
+#
+# NOT MODELLED. Each of these moves the true bill away from the figure:
+#   * Free allowances. Google's paid tier includes 1,500 grounded prompts a day
+#     on 2.5 Flash and Flash-Lite combined (2.5 Pro gets its own 1,500), and
+#     5,000 queries a month across Gemini 3. A run cannot see how much of that
+#     allowance the account has already used, so every unit is priced at list.
+#     At this repo's volume, the Gemini share is usually within the allowance,
+#     so the report overstates it.
+#   * Hidden sub-searches. On the OpenAI forum, users relay OpenAI support
+#     saying one search the dashboard shows can be billed as several. Nothing in
+#     the response shows that, so the OpenAI figure is a floor.
+#   * Perplexity reports its own request_cost in usage.cost, but litellm 1.96.2
+#     does not carry it through a stream. In a $0 wire probe (a stream built
+#     from Perplexity's API reference, not a capture), usage on every chunk
+#     came back as litellm's own token estimate, and a trailing usage chunk
+#     with a cost object raised TypeError inside litellm. So the table stands
+#     in for it.
+#
+# Why not litellm's own calculator (litellm_core_utils/llm_cost_calc/
+# tool_call_cost_tracking.py)? Checked 2026-09-19 against litellm 1.96.2. Its
+# per-model rates agree with the rows below where it has one, but:
+#   * it has no search rate for claude-haiku-4-5, gpt-5.4 or any grok model, so
+#     those would price at $0.00;
+#   * on the Responses API it charges one flat fee when any web_search_call is
+#     present, however many ran;
+#   * it needs litellm's response objects, and a --replay has only the capture;
+#   * importing litellm costs ~7s, and cost.py also serves the history reports.
+# What IS reused is litellm's parsing: the Anthropic count is litellm's
+# server_tool_use.web_search_requests, carried through the stream.
+search_fees:
+  claude-:                 [10.00, search]
+  gpt-5:                   [10.00, call]
+  gemini-3:                [14.00, query]
+  gemini-2.5:              [35.00, prompt]
+  sonar-deep-research:     [ 5.00, query]
+  sonar-reasoning-pro:     [ 6.00, request]
+  sonar-pro:               [ 6.00, request]
+  sonar:                   [ 5.00, request]
+  grok-:                   [ 5.00, call]

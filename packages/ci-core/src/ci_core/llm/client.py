@@ -88,6 +88,9 @@ report generator all read it:
   ``tokens``           ``{"prompt": int, "completion": int}``, plus
                        ``cached`` when the provider served part of the
                        prompt from its cache
+  ``searches``         billable searches the response reported, present only
+                       on a call that could search: an int, or None when the
+                       provider did not say (see :func:`_read_searches`)
   ``elapsed_seconds``  float
   ``error``            redacted exception text (failures only)
   ``error_body``       redacted excerpt of the HTTP error body
@@ -1001,6 +1004,12 @@ def _consume_completion_stream(stream, first_byte, gap, timing=None):
     citations = []
     search_results = []
     grounding_meta = {}
+    # Gemini's webSearchQueries from every metadata entry, not only the last:
+    # Google bills each distinct query, so a query that appeared on an earlier
+    # chunk alone would otherwise go unbilled.
+    search_queries = []
+    saw_grounding = False
+    saw_queries = False
 
     for chunk in _iter_with_gap(
         stream, first_byte, gap, _completion_is_progress, timing
@@ -1034,6 +1043,14 @@ def _consume_completion_stream(stream, first_byte, gap, timing=None):
             for entry in meta if isinstance(meta, list) else [meta]:
                 if isinstance(entry, dict) and entry:
                     grounding_meta = entry
+                    saw_grounding = True
+                    queries = entry.get("webSearchQueries")
+                    if isinstance(queries, list):
+                        saw_queries = True
+                        for query in queries:
+                            if isinstance(query, str) and query.strip():
+                                if query not in search_queries:
+                                    search_queries.append(query)
 
     # Repaired here, at the point the provider's bytes become our strings,
     # so everything downstream -- the JSON parse, the text shim,
@@ -1050,6 +1067,12 @@ def _consume_completion_stream(stream, first_byte, gap, timing=None):
             # consumers returning the same keys so _extras_from needs no branch.
             "web_search_used": False,
             "grounding_metadata": grounding_meta,
+            # [] when no grounding metadata arrived, None when it arrived and
+            # never named its queries. Neither proves no search ran: litellm
+            # can drop the metadata (see _read_searches).
+            "web_search_queries": (
+                search_queries if saw_queries or not saw_grounding else None
+            ),
         }
     )
 
@@ -1070,6 +1093,10 @@ def _consume_responses_stream(stream, first_byte, gap, timing=None):
     searched = False
     usage = None
     status = None
+    # web_search_call items, id -> action type: as each item finishes, and
+    # again from the final response, which is preferred when it lists any.
+    streamed_calls = {}
+    final_calls = {}
 
     for event in _iter_with_gap(
         stream, first_byte, gap, _responses_is_progress, timing
@@ -1099,6 +1126,8 @@ def _consume_responses_stream(stream, first_byte, gap, timing=None):
             for url in _url_citations(getattr(part, "annotations", None)):
                 if url not in citations:
                     citations.append(url)
+        elif etype == "response.output_item.done":
+            _note_web_search_call(streamed_calls, getattr(event, "item", None))
         elif etype in ("response.completed", "response.incomplete"):
             resp = getattr(event, "response", None)
             if resp is not None:
@@ -1107,6 +1136,20 @@ def _consume_responses_stream(stream, first_byte, gap, timing=None):
                 incomplete = getattr(resp, "incomplete_details", None)
                 if incomplete is not None:
                     status = getattr(incomplete, "reason", None) or status
+                for item in getattr(resp, "output", None) or []:
+                    _note_web_search_call(final_calls, item)
+
+    # OpenAI reports no search count in usage; the response's own list of
+    # web_search_call items is the count. Only search actions bill: the web
+    # search guide says "Search actions incur a tool call cost", and says
+    # nothing of the open_page and find_in_page actions reasoning models also
+    # take. An item with no action is counted, since it cannot be ruled out.
+    # Search events with no items to count leave the number unknown.
+    calls = final_calls or streamed_calls
+    if calls:
+        search_calls = sum(1 for kind in calls.values() if kind in (None, "search"))
+    else:
+        search_calls = None if searched else 0
 
     return text_repair.repair_tree(
         {
@@ -1125,8 +1168,32 @@ def _consume_responses_stream(stream, first_byte, gap, timing=None):
             "search_results": [],
             "web_search_used": searched,
             "grounding_metadata": {},
+            "web_search_calls": search_calls,
         }
     )
+
+
+def _note_web_search_call(calls, item):
+    """Record ``item`` in ``calls`` (id -> action type) if it is a web search.
+
+    litellm hands output items back as typed objects on one path and dicts on
+    another, and either may carry its ``type`` as a str enum, so both are read
+    the same way. An item without an id is still one call.
+    """
+    if item is None:
+        return
+
+    def _field(obj, key):
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+    def _name(value):
+        return getattr(value, "value", value)
+
+    if _name(_field(item, "type")) != "web_search_call":
+        return
+    action = _field(item, "action")
+    kind = _name(_field(action, "type")) if action is not None else None
+    calls[_field(item, "id") or f"#{len(calls)}"] = kind
 
 
 def _usage_as_dict(usage):
@@ -1195,6 +1262,103 @@ def _read_tokens(usage):
     rate, so they belong in ``completion``.
     """
     return normalize_tokens(_usage_as_dict(usage))
+
+
+def _search_enabled(provider, cfg, params):
+    """Whether this request could run a billable search at all.
+
+    Read off what the request carries rather than the provider's name alone:
+    gemini's search is a tool that a no-reasoning retry sends without, and
+    claude's and grok's are ``web_search_options``, present only where the
+    config asked for them. Perplexity bills a fee on every sonar request.
+    """
+    if provider == "perplexity":
+        return True
+    if provider == "openai":
+        return bool((cfg or {}).get("web_search"))
+    if provider == "gemini":
+        return any(
+            isinstance(tool, dict) and "googleSearch" in tool
+            for tool in params.get("tools") or []
+        )
+    return "web_search_options" in params
+
+
+def _read_searches(provider, assembled):
+    """Billable searches this response reports, or None if it does not say.
+
+    The count sits beside ``tokens`` in the result and is priced by
+    ``cost.calculate`` from pricing.yaml's ``search_fees``, which also names
+    each provider's unit. None is never guessed into a number: the cost summary
+    counts it in ``unmeasured_search_calls`` and calls its total a floor.
+
+    * claude: ``usage.server_tool_use.web_search_requests``, Anthropic's own
+      count, which litellm carries through the stream (checked 2026-09-19 with
+      the final usage of a real opus-5 fact_check: 5 searches arrive as 5).
+    * openai: search-action ``web_search_call`` items; see
+      :func:`_consume_responses_stream`.
+    * gemini: distinct non-empty ``webSearchQueries``. Google bills Gemini 3 per
+      query and 2.5 once per prompt that ran any; the fee table applies that.
+      Where the stream showed no queries, litellm's own count stands in:
+      ``usage.prompt_tokens_details.web_search_requests``, which it computes
+      from the raw candidates. litellm 1.96.2 drops a chunk's grounding
+      metadata when that chunk has no text and no groundingSupports, and the
+      count is all that survives. That drop is BerriAI/litellm#41492. Every
+      gemini call in saved reports through 2026-08-12 was grounded (153 of
+      153), and none of the 37 since the move to litellm on 2026-08-18.
+    * perplexity: 1. The fee is per request, and this response is one.
+      Perplexity also prices it in ``usage.cost.request_cost``, but litellm does
+      not carry that through a stream.
+    * grok: unknown. xAI reports ``num_sources_used`` and litellm maps it only
+      on a response that was not streamed. Grok's search is off in every preset
+      until the litellm fix in UPSTREAM.md lands.
+
+    For gemini and openai a zero is inferred from absence (no queries, no
+    search items), so it is only taken from a response that reported tokens.
+    An empty one is not a report of no searches. On 2026-09-19 a live
+    gemini:fact_check came back empty four times running, 0+0 tokens and no
+    text, and those counts are unknown, like its tokens.
+    """
+    if provider == "perplexity":
+        return 1
+    if provider == "gemini":
+        queries = assembled.get("web_search_queries")
+        details = _usage_as_dict(assembled.get("usage")).get("prompt_tokens_details")
+        listed = (details or {}).get("web_search_requests")
+        if queries:
+            count = len(queries)
+        elif listed:
+            count = int(listed)
+        elif queries is None:
+            # Metadata arrived and named no queries, and litellm counted none.
+            return None
+        else:
+            count = 0
+    elif provider == "openai":
+        count = assembled.get("web_search_calls")
+    elif provider == "claude":
+        server = _usage_as_dict(assembled.get("usage")).get("server_tool_use")
+        count = (
+            server.get("web_search_requests")
+            if isinstance(server, dict)
+            else getattr(server, "web_search_requests", None)
+        )
+        return None if count is None else int(count)
+    else:
+        return None
+    if count == 0 and not any(_read_tokens(assembled.get("usage")).values()):
+        return None
+    return count
+
+
+def _searches_field(assembled):
+    """``{"searches": n}`` if the call could search, else ``{}``.
+
+    Spread next to ``tokens`` in the result shapes that carry a response, so a
+    call that could not search has no key at all and one whose count is
+    unknown has an explicit None.
+    """
+    return {"searches": assembled["searches"]} if "searches" in assembled else {}
 
 
 def _grounding_chunks(metadata):
@@ -1323,7 +1487,13 @@ def _record_discarded(discarded, exc):
         return
     assembled = getattr(exc, "assembled", None)
     usage = assembled.get("usage") if isinstance(assembled, dict) else None
-    discarded.append({"reason": exc.__class__.__name__, "usage": usage})
+    attempt = {"reason": exc.__class__.__name__, "usage": usage}
+    # Its searches were billed too. Only an attempt that produced a response
+    # has a count; a stall has neither usage nor searches, and is already
+    # counted as uncosted.
+    if isinstance(assembled, dict) and "searches" in assembled:
+        attempt["searches"] = assembled["searches"]
+    discarded.append(attempt)
 
 
 def _discarded_field(discarded):
@@ -1363,6 +1533,10 @@ def _summarise_discarded(discarded):
     ``costed`` is how many of them carried usage we can price. The rest are real
     spend with no number attached, which is exactly why the run stops calling its
     total "exact" when any are present.
+
+    ``searches`` lists each attempt's own count, one entry per attempt that
+    could search, rather than their sum: a per-prompt fee bills every attempt
+    once, which a total would hide.
     """
     prompt = completion = costed = 0
     for attempt in discarded:
@@ -1373,12 +1547,16 @@ def _summarise_discarded(discarded):
         prompt += tokens.get("prompt", 0)
         completion += tokens.get("completion", 0)
         costed += 1
-    return {
+    summary = {
         "count": len(discarded),
         "costed": costed,
         "reasons": sorted({a.get("reason", "unknown") for a in discarded}),
         "tokens": {"prompt": prompt, "completion": completion},
     }
+    searches = [a["searches"] for a in discarded if "searches" in a]
+    if searches:
+        summary["searches"] = searches
+    return summary
 
 
 def _with_retry(fn, retry, retry_delay, label, discarded=None):
@@ -1474,6 +1652,7 @@ def _attempt(
         else {}
     )
     label = f"{provider} {model}"
+    searchable = _search_enabled(provider, cfg, params)
     # Two budgets, two jobs: the socket read timeout is the first-byte
     # allowance, and the gap is the liveness detector applied after the stream
     # has started. See DEFAULT_GAP_TIMEOUT for why one value cannot be both.
@@ -1495,13 +1674,18 @@ def _attempt(
         timing = _StreamTiming(first_byte, gap)
         streams.append(timing)
         try:
-            return _request(timing)
+            assembled = _request(timing)
         except BaseException as exc:
             # Raised before any stream existed — an HTTP error, or the socket
             # timing out while waiting for the response — so nothing below
             # recorded how it ended. A no-op when _iter_with_gap already did.
             timing.cut_short(exc)
             raise
+        if searchable:
+            # Read per stream, so an attempt a retry throws away carries its
+            # own count into the discarded record with its usage.
+            assembled["searches"] = _read_searches(provider, assembled)
+        return assembled
 
     def _request(timing):
         if spec["surface"] == "responses":
@@ -1657,6 +1841,7 @@ def _attempt(
             "raw": content,
             "model": model,
             "tokens": tokens,
+            **_searches_field(assembled),
             "elapsed_seconds": elapsed,
             **_extras_from(assembled),
             **_ceiling_field(params),
@@ -1721,6 +1906,7 @@ def _attempt(
         "data": parsed,
         "model": model,
         "tokens": tokens,
+        **_searches_field(assembled),
         "elapsed_seconds": elapsed,
         **extras,
         **_ceiling_field(params),

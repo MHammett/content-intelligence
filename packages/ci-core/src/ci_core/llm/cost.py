@@ -1,12 +1,14 @@
-"""Cost estimation from API token counts.
+"""Cost estimation from API token counts and search counts.
 
-Prices are per-million tokens (input, output).
-Perplexity pricing is per-request-based in practice but approximated here
-using token counts so the table stays consistent.
+Token prices are per-million tokens (input, output). Search and grounding fees
+are per 1,000 billed units and come on top of them: Anthropic and OpenAI charge
+per search, Gemini per query or per grounded prompt, and Perplexity a fee on
+every request. Each call's ``searches`` count is read off the provider's
+response by ci_core.llm.client.
 
 Pricing is loaded from configs/pricing.yaml at import time so model additions
-and price changes require only a YAML edit, not a code change.  The hardcoded
-The YAML is the single source of truth; there is no duplicate table in Python.
+and price changes require only a YAML edit, not a code change. The YAML is the
+single source of truth; there is no duplicate table in Python.
 """
 
 import logging
@@ -22,7 +24,7 @@ log = logging.getLogger(__name__)
 
 
 def _load_pricing():
-    """Load pricing from the packaged configs/pricing.yaml.
+    """Load token prices and search fees from the packaged configs/pricing.yaml.
 
     Raises PackagedConfigError if the file is missing, unparseable, or does not
     contain a usable pricing table. There is deliberately no hardcoded fallback:
@@ -53,10 +55,27 @@ def _load_pricing():
         raise PackagedConfigError(
             f"{yaml_path}: 'unknown_price' must be a [prompt, completion] pair"
         )
-    return pricing, (float(unknown_raw[0]), float(unknown_raw[1]))
+
+    search_fees = {}
+    for key, row in (data.get("search_fees") or {}).items():
+        if not (
+            isinstance(row, (list, tuple)) and len(row) == 2 and row[1] in _SEARCH_UNITS
+        ):
+            raise PackagedConfigError(
+                f"{yaml_path}: search_fees.{key} must be [usd_per_1000, unit] "
+                f"with unit one of {sorted(_SEARCH_UNITS)}, got {row!r}"
+            )
+        search_fees[str(key)] = (float(row[0]), str(row[1]))
+    return pricing, (float(unknown_raw[0]), float(unknown_raw[1])), search_fees
 
 
-_PRICING, _UNKNOWN_PRICE = _load_pricing()
+# What one billed unit of a search fee is. Every unit but "prompt" bills the
+# client's `searches` count as it stands; "prompt" bills a call once if it
+# searched at all (Gemini 2.5 charges one grounded prompt however many queries
+# it ran). See the search_fees block in pricing.yaml for each provider's source.
+_SEARCH_UNITS = frozenset({"search", "call", "query", "prompt", "request"})
+
+_PRICING, _UNKNOWN_PRICE, _SEARCH_FEES = _load_pricing()
 
 
 def known_price(model_id):
@@ -72,13 +91,28 @@ def known_price(model_id):
 
     Public because it crosses a package boundary (see docs/NAMING.md).
     """
+    return _lookup(_PRICING, model_id)
+
+
+def known_search_fee(model_id):
+    """``(usd_per_1000, unit)`` for this model's search fee, or ``None``.
+
+    ``None`` means the table has no rate, not that searching is free: a call
+    that reports searches against a model with no row is counted in
+    ``unpriced_searches`` rather than billed at $0.00.
+    """
+    return _lookup(_SEARCH_FEES, model_id)
+
+
+def _lookup(table, model_id):
+    """``table``'s row for ``model_id``: an exact key, else the longest prefix."""
     if not model_id:
         return None
-    if model_id in _PRICING:
-        return _PRICING[model_id]
-    for key in sorted(_PRICING, key=len, reverse=True):
+    if model_id in table:
+        return table[model_id]
+    for key in sorted(table, key=len, reverse=True):
         if model_id.startswith(key):
-            return _PRICING[key]
+            return table[key]
     return None
 
 
@@ -107,6 +141,12 @@ def call_log_entry(pass_name, result, default_model=""):
         "elapsed_seconds": result.get("elapsed_seconds"),
         "error": result.get("error") if result.get("failed") else None,
     }
+    # How many billable searches the call reported, next to its tokens. The key
+    # is present only on a call that could search, and None there means the
+    # provider did not say, which calculate() counts rather than prices.
+    # Copied by presence, not truthiness, so neither 0 nor None is lost.
+    if "searches" in result:
+        entry["searches"] = result["searches"]
     # Attempts the provider billed for and this call then threw away. Absent on
     # the overwhelming majority of calls, so only present when it happened.
     if result.get("discarded_attempts"):
@@ -154,24 +194,62 @@ def _entry_cost(entry):
     return (input_usd, completion_tok / 1_000_000 * out_price)
 
 
+def _search_cost(model_id, searches):
+    """Return ``(usd, billed_units, unpriced)`` for one call's search count.
+
+    ``searches`` is what the client read off the response, never None here:
+    the caller counts an unreported count before it gets this far. A model
+    with no row in pricing.yaml's ``search_fees`` bills nothing and returns the
+    count as ``unpriced``, so the summary can say the total is short rather than
+    quietly pricing the searches at zero.
+    """
+    searches = int(searches or 0)
+    if searches <= 0:
+        return 0.0, 0, 0
+    fee = known_search_fee(model_id)
+    if fee is None:
+        return 0.0, 0, searches
+    usd_per_1000, unit = fee
+    units = 1 if unit == "prompt" else searches
+    return units * usd_per_1000 / 1000, units, 0
+
+
 def calculate(api_call_log):
     """Return a cost summary dict from the api_call_log list.
 
     Keys in the returned dict:
-      total_usd         float  — grand total across all calls
+      total_usd         float  — grand total across all calls: input + output
+                                 + search
       total_input_usd   float
       total_output_usd  float
+      total_search_usd  float  — search and grounding fees, billed per search
+                                 on top of tokens (pricing.yaml ``search_fees``)
       by_pass           list   — [{pass, model, input_usd, output_usd, total_usd}],
-                                 each also ``replayed: True`` if its entry is
+                                 each also ``replayed: True`` if its entry is,
+                                 ``search_usd`` / ``search_units`` if the call
+                                 could search, and ``unmeasured_search_calls``
+                                 if any of its attempts' counts is unknown
       pricing_known     bool   — False when any model fell back to unknown pricing
       discarded_calls   int    — retried attempts whose output was thrown away
       uncosted_calls    int    — of those, how many carried no usage to price
+      search_units      int    — billed search units priced into total_search_usd
+      unmeasured_search_calls int — attempts that could search whose response
+                                 did not say how many times, retried ones
+                                 included: their fee is missing
+      unpriced_searches int    — searches reported against a model with no
+                                 search_fees row: also missing
       replayed_usd      float  — of total_usd, what ``replayed`` entries cost:
                                  a capture's spend, re-reported, not re-spent
       incurred_usd      float  — the rest: what this run actually bought
 
-    The two attempt counts describe total_usd, so a replayed entry's attempts
-    are counted too — they are what makes that history a floor.
+    The attempt and search counts describe total_usd, so a replayed entry's are
+    counted too — they are what makes that history a floor.
+
+    Search fees follow the same rule as discarded attempts: price what the
+    response reported, and count what it did not. A call carries ``searches``
+    only if it could search at all; ``None`` there means the provider did not
+    say, and that call lands in ``unmeasured_search_calls`` so the caller can
+    call the total a floor. Nothing is estimated.
 
     Discarded attempts are real spend. A retry replaces the failed attempt's
     result with the next one's, and the provider still billed for what it had
@@ -185,9 +263,13 @@ def calculate(api_call_log):
     by_pass = []
     total_in = 0.0
     total_out = 0.0
+    total_search = 0.0
     pricing_known = True
     discarded_calls = 0
     uncosted_calls = 0
+    search_units = 0
+    unmeasured_search_calls = 0
+    unpriced_searches = 0
     replayed_usd = 0.0
     incurred_usd = 0.0
 
@@ -199,6 +281,10 @@ def calculate(api_call_log):
             if not any(model_id.startswith(k) for k in _PRICING):
                 pricing_known = False
 
+        # One count per attempt that reached the provider and could search:
+        # the call's own, then any its retries threw away. Priced one by one,
+        # because a per-prompt fee bills each attempt once, not their sum once.
+        counts = [entry["searches"]] if "searches" in entry else []
         discarded = entry.get("discarded_attempts") or {}
         if discarded:
             discarded_calls += discarded.get("count", 0)
@@ -211,34 +297,62 @@ def calculate(api_call_log):
             )
             in_usd += d_in
             out_usd += d_out
+            counts += discarded.get("searches") or []
 
-        by_pass.append(
-            {
-                "pass": entry.get("pass", ""),
-                "model": entry.get("model", ""),
-                "input_usd": round(in_usd, 6),
-                "output_usd": round(out_usd, 6),
-                "total_usd": round(in_usd + out_usd, 6),
-            }
-        )
+        search_usd = 0.0
+        units = 0
+        unmeasured = 0
+        for count in counts:
+            if count is None:
+                unmeasured += 1
+                continue
+            s_usd, s_units, unpriced = _search_cost(model_id, count)
+            search_usd += s_usd
+            units += s_units
+            unpriced_searches += unpriced
+        unmeasured_search_calls += unmeasured
+
+        row = {
+            "pass": entry.get("pass", ""),
+            "model": entry.get("model", ""),
+            "input_usd": round(in_usd, 6),
+            "output_usd": round(out_usd, 6),
+            "total_usd": round(in_usd + out_usd + search_usd, 6),
+        }
+        if counts:
+            # Only on a call that could search, so a zero here means it could
+            # and did not, not that nobody looked.
+            row["search_usd"] = round(search_usd, 6)
+            row["search_units"] = units
+        if unmeasured:
+            # Without this, a pass whose count never came back reads the same
+            # as one that searched nothing: search_usd 0.0 either way.
+            row["unmeasured_search_calls"] = unmeasured
+        by_pass.append(row)
         total_in += in_usd
         total_out += out_usd
+        total_search += search_usd
+        search_units += units
         if entry.get("replayed"):
-            replayed_usd += in_usd + out_usd
+            replayed_usd += in_usd + out_usd + search_usd
             # So a reader of by_pass can tell history from spend pass by pass,
             # not only in total. Present only when true, like the entry's own.
             by_pass[-1]["replayed"] = True
         else:
-            incurred_usd += in_usd + out_usd
+            incurred_usd += in_usd + out_usd + search_usd
 
     return {
-        "total_usd": round(total_in + total_out, 4),
+        "total_usd": round(total_in + total_out + total_search, 4),
         "total_input_usd": round(total_in, 4),
         "total_output_usd": round(total_out, 4),
+        "total_search_usd": round(total_search, 4),
         "by_pass": by_pass,
         "pricing_known": pricing_known,
         "discarded_calls": discarded_calls,
         "uncosted_calls": uncosted_calls,
+        "search_units": search_units,
+        "unmeasured_search_calls": unmeasured_search_calls,
+        "unpriced_searches": unpriced_searches,
         # A replay re-reports the captured run's token counts. Splitting them
         # from what this process actually bought is what lets the summary say
         # "$0.0000" only when that is true.

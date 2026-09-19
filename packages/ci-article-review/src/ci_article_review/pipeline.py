@@ -2257,6 +2257,10 @@ def _keep_earlier_billing(failed, fresh):
         "reasons": [_failure_reason(failed.get("error"))],
         "tokens": tokens,
     }
+    # A malformed-JSON failure on a grounded call searched before it failed,
+    # and those searches were billed like its tokens.
+    if "searches" in failed:
+        last_attempt["searches"] = [failed["searches"]]
     summaries = [
         failed.get("discarded_attempts") or {},
         last_attempt,
@@ -2275,6 +2279,11 @@ def _keep_earlier_billing(failed, fresh):
         # prices a missing share at the full input rate.
         "tokens": total,
     }
+    # One count per attempt, concatenated rather than summed: cost.py bills a
+    # per-prompt fee once per attempt.
+    searches = [n for s in summaries for n in s.get("searches") or ()]
+    if searches:
+        fresh["discarded_attempts"]["searches"] = searches
 
 
 def _recover_failed_calls(
@@ -3380,6 +3389,10 @@ def run_draft_pipeline(
             "char_count": char_count,
             "status": status,
         }
+        # Billable searches, beside the tokens: present only on a call that
+        # could search, and None where the provider did not say how many.
+        if "searches" in result:
+            log_entry["searches"] = result["searches"]
         if result.get("discarded_attempts"):
             log_entry["discarded_attempts"] = result["discarded_attempts"]
         # How long each stream went silent, before and after real output — the
@@ -3791,18 +3804,40 @@ def run_draft_pipeline(
     # Cost tracking
     cost_summary = cost_analysis.calculate(api_call_log)
     report["cost_summary"] = cost_summary
-    if not cost_summary["pricing_known"]:
-        cost_basis = "estimated — some model prices unknown"
-    elif cost_summary.get("uncosted_calls"):
+    # Spend the provider billed that this run has no number for. Each makes
+    # the total a floor.
+    unpriced = []
+    if cost_summary.get("uncosted_calls"):
         # Retried attempts the provider billed for and this run cannot price,
-        # because a stalled stream reports no usage. The number is a floor.
-        cost_basis = (
-            f"at least — {cost_summary['uncosted_calls']} retried attempt(s) "
+        # because a stalled stream reports no usage.
+        unpriced.append(
+            f"{cost_summary['uncosted_calls']} retried attempt(s) "
             f"were billed by the provider with no usage reported"
         )
+    if cost_summary.get("unmeasured_search_calls"):
+        unpriced.append(
+            f"{cost_summary['unmeasured_search_calls']} attempt(s) that could "
+            f"search did not report how many searches they ran"
+        )
+    if cost_summary.get("unpriced_searches"):
+        unpriced.append(
+            f"{cost_summary['unpriced_searches']} search(es) ran on a model "
+            f"with no search fee in pricing.yaml"
+        )
+    if not cost_summary["pricing_known"]:
+        cost_basis = "estimated — some model prices unknown"
+    elif unpriced:
+        cost_basis = "at least — " + "; ".join(unpriced)
     else:
         cost_basis = "exact"
     log.info("Estimated cost: $%.4f (%s)", cost_summary["total_usd"], cost_basis)
+    if cost_summary.get("search_units"):
+        log.info(
+            "Search and grounding fees: $%.4f of that, for %d billed unit(s) at "
+            "list price, before any free allowance.",
+            cost_summary["total_search_usd"],
+            cost_summary["search_units"],
+        )
     if cost_summary.get("discarded_calls"):
         log.info(
             "Retries: %d attempt(s) discarded and re-run; %d of them had usage "
@@ -4546,6 +4581,10 @@ def _print_draft_summary(
                 if tokens
                 else ""
             )
+            if "searches" in entry:
+                # "?" where the provider did not say how many it ran.
+                n = entry["searches"]
+                tok_str += f"  {'?' if n is None else n} search(es)"
             print(
                 f"  {entry['pass']:30s} {status:6s} {elapsed:>8s}{budget_str:>7s} {head_str:>10s}  "
                 f"{entry['model']}  effort={effort}  {tok_str}"
@@ -4613,11 +4652,35 @@ def _print_draft_summary(
         carried = [e for e in cost.get("by_pass") or () if e.get("replayed")]
         spent = cost["incurred_usd"] if carried else cost["total_usd"]
         print(f"\nEstimated cost: ${spent:.4f}{known_flag}")
+        search_usd = 0.0
         for entry in cost.get("by_pass") or ():
             if entry["total_usd"] > 0 and not entry.get("replayed"):
+                fee = entry.get("search_usd") or 0.0
+                search_usd += fee
                 print(
                     f"  {entry['pass']:30s}  ${entry['total_usd']:.4f}  {entry['model']}"
+                    + (f"  (incl. ${fee:.4f} search fees)" if fee else "")
                 )
+        if search_usd:
+            # Its own line as well as inside each pass, so the fee that used
+            # to be missing entirely cannot be mistaken for token spend.
+            # Parenthesised like the other notes here: every other line in
+            # this block is a pass.
+            print(
+                f"  (search and grounding fees: ${search_usd:.4f} of that, at "
+                f"list price, before any free allowance)"
+            )
+        if cost.get("unmeasured_search_calls"):
+            print(
+                f"  ({cost['unmeasured_search_calls']} attempt(s) could search but "
+                f"did not report how many searches they ran — those fees are not "
+                f"in the total)"
+            )
+        if cost.get("unpriced_searches"):
+            print(
+                f"  ({cost['unpriced_searches']} search(es) ran on a model with no "
+                f"search fee in pricing.yaml — not in the total)"
+            )
         if carried:
             print(
                 f"  ({len(carried)} call(s) carried over from the capture were "
