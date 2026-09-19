@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -347,3 +348,106 @@ class TestCheckDraftNotImplemented:
         """--check-draft raises NotImplementedError."""
         with pytest.raises(NotImplementedError):
             _run_bootstrap("--publication", "test", "--check-draft", "/tmp/draft.md")
+
+
+def _preset_tiers():
+    """Every tier ``--preset`` accepts."""
+    from ci_style_profile.bootstrap import _build_parser
+
+    (action,) = [a for a in _build_parser()._actions if "--preset" in a.option_strings]
+    return list(action.choices)
+
+
+class TestShippedPresetsReachTheRun:
+    """--preset changes the models a run uses, through the real presets.yaml.
+
+    TestEffortNoneIsWarned patches _load_presets, so it cannot tell whether the
+    shipped file is found. This does not patch it. _load_presets looked for the
+    file beside bootstrap.py, where it is not, and answered with a table that had
+    no `models` block: main()'s merge never ran and every preset used user.yaml's
+    models as written.
+
+    The run is stopped at the hand-off to synthesize(), which is where the merged
+    models leave main(), so no model is called.
+    """
+
+    # The shape of a real user.yaml. The keys a preset does not name (provider,
+    # project, stream_read_timeout, web_search) are the ones that must survive,
+    # and each model is a sentinel, so a preset's is never mistaken for the user's.
+    USER = {
+        "claude": {"model": "claude-user-pick", "enabled": True},
+        "openai": {"model": "gpt-user-pick", "web_search": ["fact_check"]},
+        "gemini": {
+            "provider": "vertex_ai",
+            "model": "gemini-user-pick",
+            "project": "p",
+            "location": "us-central1",
+            "stream_read_timeout": 300,
+        },
+        "mistral": {"model": "mistral-user-pick"},
+        "grok": "grok-user-pick",
+    }
+
+    def _models_the_run_uses(self, preset):
+        from ci_style_profile.synthesize import SynthesisError
+
+        handed_over = {}
+
+        def _stop_at_synthesis(**kwargs):
+            handed_over.update(kwargs)
+            raise SynthesisError("stop: the models are what this test wants")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("ci_style_profile.logging_config.configure_logging"),
+                patch("ci_style_profile.bootstrap._load_sources_yaml", return_value={}),
+                patch(
+                    "ci_style_profile.bootstrap._load_user_config_lenient",
+                    return_value={"models": copy.deepcopy(self.USER)},
+                ),
+                patch(
+                    "ci_style_profile.collectors.REGISTRY",
+                    _make_mock_registry("wordpress"),
+                ),
+                patch(
+                    "ci_style_profile.bootstrap._collect_source",
+                    return_value=_MOCK_DOCS,
+                ),
+                patch("ci_style_profile.synthesize.synthesize", _stop_at_synthesis),
+            ):
+                rc = _run_bootstrap(
+                    "--output-yaml",
+                    str(Path(tmpdir) / "out.yaml"),
+                    "--sources",
+                    "wordpress",
+                    "--style",
+                    "canonical",
+                    "--preset",
+                    preset,
+                )
+        assert rc == 1, "main() should have stopped at synthesis"
+        return handed_over["user_config"]["models"]
+
+    @pytest.mark.parametrize("preset", _preset_tiers())
+    def test_the_presets_models_replace_the_users(self, preset):
+        from ci_style_profile import bootstrap
+
+        named = bootstrap._load_presets()[preset].get("models")
+        assert named, f"the shipped {preset!r} preset names no models"
+
+        models = self._models_the_run_uses(preset)
+
+        for provider, wanted in named.items():
+            if provider not in self.USER:
+                assert provider not in models, "the user never configured it"
+                continue
+            for key, value in wanted.items():
+                if key != "provider":
+                    assert models[provider][key] == value, (provider, key)
+
+    @pytest.mark.parametrize("preset", _preset_tiers())
+    def test_keys_the_preset_does_not_name_stay_the_users(self, preset):
+        models = self._models_the_run_uses(preset)
+        assert models["openai"]["web_search"] == ["fact_check"]
+        assert models["gemini"]["provider"] == "vertex_ai"
+        assert models["gemini"]["stream_read_timeout"] == 300

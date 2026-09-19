@@ -342,7 +342,7 @@ python style-profile-bootstrap/bootstrap.py \
 **Startup sequence:**
 1. Load `sources.yaml`, apply `_resolve_env_recursive`
 2. Apply logging config via `logging_config.configure_logging()` — before any module logs; `--log-level` CLI flag overrides config
-3. Load `configs/presets.yaml` (fall back to hardcoded defaults if missing); apply selected preset over base config; apply `sources.yaml` key overrides on top; apply CLI flags last
+3. Load `configs/presets.yaml` (required: raises `PackagedConfigError` if missing, no hardcoded fallback); apply selected preset over base config; apply `sources.yaml` key overrides on top; apply CLI flags last
 4. Build collector registry; raise `ConfigError` on duplicate `SOURCE_NAME`
 4. For each requested source: call `Collector.validate_config()` — abort on `ConfigError` (or skip if `--continue-on-error`)
 5. For each requested source: call `Collector.validate_config()` — abort on `ConfigError` (or skip if `--continue-on-error`)
@@ -458,7 +458,7 @@ Mirrors the pipeline's `configs/presets.yaml` pattern. A preset bundles corpus b
 **`maximum`** — all configured models run detection (not just style-weighted), maximum reasoning effort, 200k-char budget, 10-style ceiling. Appropriate for a comprehensive initial profiling of a large corpus, or when you want the most reliable possible profile and cost is secondary.
 
 **Preset application** in `bootstrap.py`:
-1. Load `configs/presets.yaml` (fall back to hardcoded defaults if file missing — same as pipeline)
+1. Load `configs/presets.yaml` (raise `PackagedConfigError` if missing or malformed; no hardcoded fallback, same as the pipeline)
 2. Apply preset: override `max_input_chars`, `max_styles`, `per_style_min_words`, `synthesis_models`, `detection_models`
 3. For each model in preset's `models:` dict: override `model`, `effort`, `reasoning_effort`, `thinking_budget` while preserving infrastructure keys (`provider`, `api_key`, `endpoint`, `timeout_seconds`, `prompts`)
 4. Apply any `sources.yaml` explicit keys on top (same override priority as pipeline's `preset_overrides`)
@@ -1044,7 +1044,7 @@ Split into two implementation sessions at the `--dry-run` milestone.
 | 1f | `collectors/textfiles.py` | 1a |
 | 1g | `collectors/__init__.py` registry + custom/ hook | 1b–1f |
 | 1h | `sources.example.yaml` + gitignore additions | nothing |
-| P  | `configs/presets.yaml` (five presets with hardcoded fallback in bootstrap.py) | nothing |
+| P  | `configs/presets.yaml` (five presets; required, no hardcoded fallback in bootstrap.py) | nothing |
 | L  | `logging_config.py` | nothing |
 | 2  | `normalize.py` (clean, split, metrics via readability_analyze + our own heuristics, deduplicate, summary, bias warnings) | 1a |
 | 5a | `tests/test_collectors.py` + `tests/test_normalize.py` + `tests/test_logging.py` + fixtures | 1a–1f, L, 2 |
@@ -1118,7 +1118,7 @@ End state: `python style-profile-bootstrap/bootstrap.py --sources wordpress --dr
 | `argparse` mutual exclusion | `--publication` and `--output-yaml` in `add_mutually_exclusive_group(required=False)` with `required=True` (one must be present) |
 | SOURCE_NAME uniqueness | Registry build raises `ConfigError` listing both conflicting class names on duplicate SOURCE_NAME |
 | Metrics in staging | Staged NDJSON omits `metrics`; normalize always recomputes from `text`; schema_version is collector-only |
-| Preset system | Five tiers (economy→maximum); `configs/presets.yaml`; hardcoded fallback if YAML missing; `--preset` CLI flag; individual `sources.yaml` keys override specific preset values; CLI flags override all |
+| Preset system | Five tiers (economy→maximum); `configs/presets.yaml`; required, no hardcoded fallback; `--preset` CLI flag; individual `sources.yaml` keys override specific preset values; CLI flags override all |
 | Preset priority order | `--preset` + `--style` + `--max-styles` CLI flags > `sources.yaml` explicit keys > preset bundle defaults |
 | `detection_models: "*"` | Sentinel value meaning "all configured models" (not just style-weighted subset); used in `maximum` preset; distinct from `[]` (style-weighted) and an explicit list |
 | Readability metrics in normalize | Import `analysis.readability.analyze` for Flesch-Kincaid grade + reading ease; add `flesch_kincaid_grade` and `flesch_reading_ease` to `Document.metrics`; better discriminator for style clusters than sentence-word count alone |
