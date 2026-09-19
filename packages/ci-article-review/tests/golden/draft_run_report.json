@@ -409,7 +409,8 @@
   "model_failure_details": [],
   "model_failures": [],
   "pre_analysis": {
-    "links": [],
+    "links": null,
+    "links_skipped_reason": "disabled",
     "readability": {
       "avg_sentence_length": 7.3,
       "avg_syllables_per_word": 1.51,

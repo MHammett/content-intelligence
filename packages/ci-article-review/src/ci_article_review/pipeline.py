@@ -2804,7 +2804,8 @@ def run_draft_pipeline(
     # --offline suppresses every pass that reaches the network, so the parts of
     # the pipeline that only transform data the run already has can be exercised
     # with no connection and no spend.
-    link_check_enabled = pipeline_cfg.get("link_validation", True) and not offline
+    link_validation = pipeline_cfg.get("link_validation", True)
+    link_check_enabled = link_validation and not offline
     if offline:
         log.info(
             "Offline: skipping link validation, Wayback, citation resolution "
@@ -2840,7 +2841,16 @@ def run_draft_pipeline(
             len(not_archived),
         )
     else:
-        pre_analysis["links"] = []
+        # Not checked, rather than checked and empty. An empty list here was
+        # indistinguishable from a draft with no links, so every reader took it
+        # as "no link is broken": one --offline run at the end of an article's
+        # history turned its broken-link trend from worsened to improved
+        # (2026-09-18). The config wins as the reason when both apply, because
+        # an online run would not have checked the links either.
+        pre_analysis["links"] = None
+        pre_analysis["links_skipped_reason"] = (
+            "offline" if link_validation else "disabled"
+        )
 
     # A calibration run is scoped to one model or domain on purpose and should
     # not pay for the two SEO calls it did not ask for. Cheap (~$0.0006 on the
@@ -4385,6 +4395,16 @@ def _print_draft_summary(
             _print_seo_suggestions(seo.get("suggestions"))
             _print_seo_content_review(seo.get("content_review"))
         links = pre.get("links", [])
+        skipped = pre.get("links_skipped_reason")
+        if skipped:
+            # Said rather than left blank. A run that never checked its links
+            # printed nothing here, which is also what a draft with no links
+            # prints, and so read as nothing to report.
+            why = {
+                "disabled": "link_validation is set to false in the pipeline config",
+                "offline": "--offline",
+            }.get(skipped, skipped)
+            print(f"\nLinks: not checked ({why})")
         if links:
             broken = [lk for lk in links if not lk.get("ok")]
             # A link we couldn't read — the origin refused us (401/403/429), we

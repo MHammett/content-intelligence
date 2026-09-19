@@ -1725,3 +1725,78 @@ class TestExpansionSurvivesRetryFailed:
                 assert report["section_10_expansion"] == {}
         assert "perplexity:expansion" in caplog.text
         assert "NOT re-attempted" in caplog.text
+
+
+class TestAReportSaysWhetherItsLinksWereChecked:
+    """``pre_analysis.links`` is None when link validation did not run.
+
+    It was ``[]``, which is also what a checked draft with no links gets, and
+    every reader took ``[]`` to mean nothing was broken: history analytics
+    counted an --offline run as zero broken links, turning an article's trend
+    from worsened to improved (2026-09-18).
+    """
+
+    _FOUND = [
+        {"url": "https://example.org/source-one", "ok": False, "status_code": 404}
+    ]
+
+    def _run(self, tmp_path, link_validation, checker=None, **run_kwargs):
+        """``checker`` stands in for ``validate_links``; None runs the real one."""
+        config = copy.deepcopy(_CONFIG)
+        config["pipeline"]["link_validation"] = link_validation
+        patches = [
+            patch("ci_article_review.pipeline.merge_configs", return_value=config)
+        ]
+        if checker is not None:
+            patches.append(
+                patch(
+                    "ci_article_review.analysis.links.validate_links",
+                    side_effect=checker,
+                )
+            )
+        return _stubbed_run(tmp_path, extra_patches=patches, **run_kwargs)
+
+    def _unused(self, text, **kw):
+        raise AssertionError("link validation ran on a run that skips it")
+
+    def test_offline_leaves_the_links_unchecked_and_says_why(self, tmp_path):
+        with self._run(tmp_path, True, self._unused, offline=True) as report:
+            pre = report["pre_analysis"]
+        assert pre["links"] is None
+        assert pre["links_skipped_reason"] == "offline"
+
+    def test_the_config_switch_leaves_them_unchecked_and_says_so(self, tmp_path):
+        with self._run(tmp_path, False, self._unused) as report:
+            pre = report["pre_analysis"]
+        assert pre["links"] is None
+        assert pre["links_skipped_reason"] == "disabled"
+
+    def test_the_config_is_the_reason_when_both_apply(self, tmp_path):
+        """An online run would not have checked them either."""
+        with self._run(tmp_path, False, self._unused, offline=True) as report:
+            assert report["pre_analysis"]["links_skipped_reason"] == "disabled"
+
+    def test_a_checked_run_keeps_what_it_found_and_gives_no_reason(self, tmp_path):
+        with self._run(tmp_path, True, lambda text, **kw: self._FOUND) as report:
+            pre = report["pre_analysis"]
+        assert pre["links"] == self._FOUND
+        assert "links_skipped_reason" not in pre
+
+    def test_a_checked_draft_with_no_links_is_still_an_empty_list(self, tmp_path):
+        """The real checker, over a draft it finds no URL in: checked, none."""
+        from ci_article_review.analysis import links as links_analysis
+
+        no_urls = patch.object(links_analysis, "extract_urls", return_value=[])
+        with no_urls, self._run(tmp_path, True) as report:
+            pre = report["pre_analysis"]
+        assert pre["links"] == []
+        assert "links_skipped_reason" not in pre
+
+    def test_the_saved_report_says_it_too(self, tmp_path):
+        """What history analytics reads is the file, not the returned dict."""
+        with self._run(tmp_path, True, self._unused, offline=True):
+            pass
+        (path,) = (tmp_path / "history").rglob("*_report.json")
+        pre = json.loads(path.read_text(encoding="utf-8"))["pre_analysis"]
+        assert pre["links"] is None
+        assert pre["links_skipped_reason"] == "offline"

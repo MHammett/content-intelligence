@@ -359,6 +359,13 @@ def _quality_metrics(report):
     seo_issues = seo.get("issues")
     seo_issue_count = len(seo_issues) if isinstance(seo_issues, list) else None
 
+    # A run that did not check its links (--offline, or link_validation: false)
+    # writes None, with links_skipped_reason saying which, and has no count:
+    # zero would say every link worked. Before this change (2026-09-18) such a
+    # run wrote [], the same as a checked draft with no links, and nothing else
+    # in those reports records whether the check ran, so in them an empty list
+    # is ambiguous. It is read as none broken, as it always was; this does not
+    # guess which of the two it was.
     links = pre.get("links")
     broken_link_count = (
         sum(1 for lk in links if not lk.get("ok")) if isinstance(links, list) else None
@@ -387,8 +394,24 @@ _QUALITY_LABELS = {
 }
 
 
+def _measured(metrics, key):
+    """One metric's values, in run order, from the runs that measured it."""
+    return [m[key] for m in metrics if m[key] is not None]
+
+
 def per_article_quality_trend(entries):
-    """First run -> latest run direction for each metric, per article."""
+    """First -> latest measurement of each metric, per article.
+
+    Each metric compares the first and the latest run that measured it. A run
+    with no value for a metric (links never checked, or a report older than the
+    field) is not a data point for it, so it can neither turn the trend nor
+    hide it. When the first and latest runs were compared instead, one
+    --offline run after an article's four checked runs turned its links from
+    "worsened" to "improved" while it counted as zero, and to "unknown" once it
+    counted as nothing (2026-09-18). A metric only one run measured is compared
+    with itself, "unchanged", as every metric of a single-run article always
+    has been.
+    """
     by_slug = {}
     for e in entries:
         by_slug.setdefault(e["slug"], []).append(e)
@@ -396,8 +419,13 @@ def per_article_quality_trend(entries):
     results = {}
     for slug, runs in by_slug.items():
         runs = sorted(runs, key=lambda e: e["timestamp"])
-        first_metrics = _quality_metrics(runs[0]["report"])
-        last_metrics = _quality_metrics(runs[-1]["report"])
+        metrics = [_quality_metrics(e["report"]) for e in runs]
+        first_metrics = {}
+        last_metrics = {}
+        for key in _QUALITY_LABELS:
+            values = _measured(metrics, key)
+            first_metrics[key] = values[0] if values else None
+            last_metrics[key] = values[-1] if values else None
         results[slug] = {
             "runs": len(runs),
             "article_title": runs[-1]["report"].get("article_title", slug),
@@ -417,20 +445,25 @@ def per_article_quality_trend(entries):
 
 
 def global_quality_trend(entries, recent_window=RECENT_WINDOW):
-    """Recent-runs vs baseline-runs average for each metric, across all articles."""
-    all_metrics = [_quality_metrics(e["report"]) for e in entries]
-    recent_metrics = all_metrics[-recent_window:]
-    baseline_metrics = all_metrics[:-recent_window]
+    """Recent vs baseline average for each metric, across all articles.
 
-    def _avg(metrics, key):
-        vals = [m[key] for m in metrics if m[key] is not None]
+    Windowed per metric over the runs that measured it: the latest
+    ``recent_window`` measurements against every one before them. Windowed
+    over runs, a run with no value still took a slot in the recent window, and
+    pushed a measured run into the baseline, moving both averages while adding
+    nothing to either.
+    """
+    all_metrics = [_quality_metrics(e["report"]) for e in entries]
+
+    def _avg(vals):
         return sum(vals) / len(vals) if vals else None
 
     out = {}
     for key in _QUALITY_LABELS:
-        avg_all = _avg(all_metrics, key)
-        avg_recent = _avg(recent_metrics, key)
-        avg_baseline = _avg(baseline_metrics, key)
+        values = _measured(all_metrics, key)
+        avg_all = _avg(values)
+        avg_recent = _avg(values[-recent_window:])
+        avg_baseline = _avg(values[:-recent_window])
         if avg_recent is None or avg_baseline is None:
             trend = "insufficient_history"
         else:
