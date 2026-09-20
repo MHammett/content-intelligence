@@ -354,8 +354,10 @@ pipeline:
   # "Cost presets", has the run counts and what was measured.
   #
   # `standard` was retired 2026-09-05 in favour of `wide`, which beat it on every
-  # measured axis at 55% of the cost; an existing `cost_preset: standard` still
-  # runs (as `wide`) and warns rather than erroring.
+  # measured axis at lower cost (first measured at 55% of it; the saving has since
+  # been re-priced smaller, and depends on what is counted -- see
+  # configs/presets.yaml); an existing `cost_preset: standard` still runs (as
+  # `wide`) and warns rather than erroring.
   #
   # DEFAULT CHANGED 2026-09-08 from `balanced` to `wide`: `balanced`'s measured
   # reproducibility (6.4%) is statistically no better than `wide`'s (6.8%) despite
