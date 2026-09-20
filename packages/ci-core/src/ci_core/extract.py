@@ -460,6 +460,12 @@ def claim_terms(claim):
     return numbers, words
 
 
+#: Per-term ceiling on how much repetition can add to a window's score. Without
+#: it, one word repeated down a long table outweighs a window matching several
+#: distinct claim terms; with it, breadth and density both count.
+_TERM_COUNT_CAP = 5
+
+
 def select_excerpt(text, claim, head=4000, tail=1000):
     """Return the region of ``text`` most likely to contain support for ``claim``.
 
@@ -471,6 +477,23 @@ def select_excerpt(text, claim, head=4000, tail=1000):
 
     Deliberately simple and deterministic: sliding-window term counting, no
     embeddings, no index. It only has to beat "always the first 4000 chars".
+
+    Scoring counts *occurrences*, not mere presence. Presence-scoring was the
+    original design and it silently reintroduced the head bias this function
+    exists to remove: in a document about one topic, the topic's vocabulary
+    appears in every window, so windows tie — and a strictly-greater comparison
+    hands a tie to the earliest, i.e. to the head.
+
+    Measured on Furuno's 9-page GPS rollover PDF (2026-09-19). For the claim
+    "lists the chips whose rollover date can be changed by command", six of the
+    eight candidate windows tied at score 5 on {"1", "command", "rollover"}, so
+    the head-most won at offset 2500 — while "command" occurs 17 times in
+    offsets 9793-11889, the Chapter 6 list that actually answers the claim.
+    Counting occurrences separates 17 from 1 and picks the right passage.
+
+    Each term's count is capped so one repeated word cannot swamp a window that
+    matches several distinct terms; the score still rewards both breadth and
+    density.
     """
     from ci_core import redact
 
@@ -484,16 +507,19 @@ def select_excerpt(text, claim, head=4000, tail=1000):
         return redact.truncate_excerpt(text, head=head, tail=tail)
 
     lowered = text.lower()
-    step = max(budget // 4, 1)
+    step = max(budget // 8, 1)
     best_score, best_start = 0, None
     for start in range(0, max(len(text) - budget, 0) + step, step):
-        window = lowered[start : start + budget]
-        if not window:
+        end = start + budget
+        if start >= len(lowered):
             break
         # Numbers weigh more than words: a matching figure is far stronger
         # evidence of the right passage than a matching common-ish term.
-        score = sum(3 for n in numbers if n.lower() in window)
-        score += sum(1 for w in words if w in window)
+        score = sum(
+            3 * min(lowered.count(n.lower(), start, end), _TERM_COUNT_CAP)
+            for n in numbers
+        )
+        score += sum(min(lowered.count(w, start, end), _TERM_COUNT_CAP) for w in words)
         if score > best_score:
             best_score, best_start = score, start
 
