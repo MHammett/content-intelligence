@@ -201,9 +201,42 @@ wide:
 
 # `standard` was retired 2026-09-05. `wide` above dominated it on every axis
 # measured -- more corroborated consensus, more claims, more findings that
-# survive a rerun, at 55% of the cost -- and a tier that costs more for less is
-# not a rung on a cost/benefit ladder. An existing `cost_preset: standard` still
-# runs (as `wide`) and warns; see _RETIRED_PRESETS in config_loader.py.
+# survive a rerun -- at lower cost, and a tier that costs more for less is not a
+# rung on a cost/benefit ladder. An existing `cost_preset: standard` still runs
+# (as `wide`) and warns; see _RETIRED_PRESETS in config_loader.py.
+#
+# How much lower depends on what is counted, and the first figure overstated it.
+# The comparison measured `wide` at 55% of `standard`'s cost ($0.119 against
+# $0.215, three isolated runs each, one 1,392-word draft), but it counted tokens
+# only and priced mistral-large 6x too high and mistral-small too low. Both rows
+# were verified 2026-09-18 and corrected in #216; #230 (2026-09-19) then began
+# billing search and grounding fees. Re-derived 2026-09-19 for that draft length,
+# `wide`'s cost as a share of `standard`'s is:
+#   - Tokens only, at the corrected Mistral rates: 72-86%, by two routes.
+#       * Reconstruct `standard` from each `wide` smoke-test run's own calls: the
+#         same 9,456-char draft, with mistral-small's and gpt-5.6-luna's tokens
+#         standing in for mistral-large's and gpt-5.6-terra's on the same
+#         domains. At the old rates this gives 57% against the measured 55%, so
+#         the method is calibrated; at the new ones, 72-77% (three complete
+#         runs).
+#       * Re-price the two complete `standard` runs on record and apply their
+#         change to the measured $0.215, as #216 did: 76-86%. Neither is the
+#         comparison's length (2,182 and ~74,000 chars), and both saved more
+#         (25% and 34%) than the reconstruction does at 9,456 chars (19-24%).
+#   - With search fees, using the reconstruction: 80-84% if gemini's fact_check
+#     searched (one grounded prompt billed), perplexity's fact_check and citation
+#     re-ask were billed a request each, and gemini's other calls did not search
+#     (as #230's live run saw of voice_style; its fact_check came back empty);
+#     80-89% if gemini's citation re-asks searched too, which both presets pay;
+#     and about 95-101% if the gemini voice_style call only `wide` makes (it
+#     stands in for claude, which drafted these runs) searched as well. The saved
+#     captures predate #230 and carry no search counts, so these fees are
+#     injected, not measured.
+# The six original runs are not among the saved runs, so none of this can be
+# checked against them, and only one draft length was ever compared: read it as
+# belonging to a ~1,400-word draft. On that draft `wide` cost less on every basis
+# above but the last, where it cost about the same, and it still wins every other
+# axis measured. Nothing user-facing quotes a percentage, for that reason.
 
 balanced:
   thoroughness: thorough

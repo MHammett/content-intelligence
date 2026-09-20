@@ -276,10 +276,12 @@ class TestRetiredPresets:
     """A retired preset name keeps working, loudly.
 
     `standard` was retired 2026-09-05: `wide` beat it on every axis measured
-    over three isolated runs each, at 55% of the cost. Deleting the name outright
-    would turn a `cost_preset: standard` that had been working for months into a
-    crash at config-load, so it maps to its replacement instead -- and warns,
-    because six models over twelve calls is not what `standard` used to do.
+    over three isolated runs each, at lower cost (first measured at 55% of it;
+    the saving has since been re-priced smaller -- see presets.yaml).
+    Deleting the name outright would turn a `cost_preset: standard` that had been
+    working for months into a crash at config-load, so it maps to its
+    replacement instead -- and warns, because six models over twelve calls is
+    not what `standard` used to do.
     """
 
     def test_the_retired_name_is_gone_from_the_live_tiers(self):

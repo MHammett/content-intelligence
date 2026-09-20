@@ -233,7 +233,7 @@ Two or more models reviewed the same claim and disagreed — one marked it confi
 **`Unknown cost_preset` error**  
 The `cost_preset` value in `pipeline:` isn't one of the supported values. Valid values: `economy`, `wide`, `balanced`, `thorough`, `maximum`. Check for typos.
 
-`standard` was retired on 2026-09-05 and is not an error: it still runs, as `wide`, and warns once per run until you change it. That is a real behaviour change rather than a rename — `wide` runs six models over twelve calls where `standard` ran five over seven, at roughly half the cost. See [CONFIGURATION.md](CONFIGURATION.md#cost-presets) for the measurements behind the retirement.
+`standard` was retired on 2026-09-05 and is not an error: it still runs, as `wide`, and warns once per run until you change it. That is a real behaviour change rather than a rename — `wide` runs six models over twelve calls where `standard` ran five over seven. On the ~1,400-word draft the two were compared on, `wide` cost less; by how much depends on whether search fees are counted, and on the draft's length, and no other length was compared. See [CONFIGURATION.md](CONFIGURATION.md#cost-presets) for why it was retired, and the note under `wide` in [`configs/presets.yaml`](../packages/ci-article-review/src/ci_article_review/configs/presets.yaml) for the cost comparison and the range it gives on each basis.
 
 **cost_preset isn't applying expected models**  
 The preset overrides model names for configured providers only. If a provider has no entry in your `models:` section (you removed it or never added it), the preset has nothing to override. Add the provider's model entry back — the preset will then apply its model selection on top.
