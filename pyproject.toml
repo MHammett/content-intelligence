@@ -30,6 +30,15 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-asyncio>=0.23",
     "pytest-socket>=0.8.1",
+    # Nothing in this repo imports httpx2; starlette.testclient does. It
+    # prefers httpx2 and, without it, falls back to plain httpx with a
+    # StarletteDeprecationWarning saying to install this. The only users are
+    # the two LoggingMiddleware tests in ci-core's test_logging.py.
+    #
+    # Dropping it works but is not clean. Measured 2026-09-19: every suite
+    # still passed and the lock lost only httpx2 and httpcore2, but the run
+    # gained that warning, and starlette's docs called the fallback
+    # deprecated without giving a removal date.
     "httpx2>=2.4.0",
     # Throwaway certificate authorities for ci-core's loopback TLS tests
     # (test_os_trust.py). Already installed through ci-style-profile's
