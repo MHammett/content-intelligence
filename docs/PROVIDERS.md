@@ -272,7 +272,7 @@ models:
 | `grok-4.20-0309-non-reasoning` | $1.25/MTok | $2.50/MTok | Explicit non-reasoning variant |
 | `grok-build-0.1` | $1.00/MTok | $2.00/MTok | 256K context; economy fallback |
 
-Prices are xAI's for prompts under 200K tokens ([models page](https://docs.x.ai/docs/models), checked 2026-09-19). A request whose prompt reaches 200K tokens is billed at double these rates for all its tokens; no prompt this pipeline sends comes near that (the largest in the two 2026-09-09 `maximum` runs was 8,951 tokens, 4% of it). `grok-4.5` ($2/$6) also exists and takes `reasoning_effort`; it is in no preset, and `pricing.yaml` has no row for it.
+Prices are xAI's for prompts under 200K tokens ([models page](https://docs.x.ai/docs/models), checked 2026-09-19). A request whose prompt reaches 200K tokens is billed at double these rates for all its tokens; no prompt this pipeline has sent comes near that (the largest in any saved run is 37,955 tokens, on a 135,514-character draft: 19% of it). `grok-4.5` ($2/$6) also exists and takes `reasoning_effort`; it is in no preset, and `pricing.yaml` has no row for it.
 
 Reasoning on grok-4.6 (and grok-4.5) is set with `reasoning_effort: low | medium | high | xhigh`, default `high`, so leaving it unset buys the most expensive setting; every preset that runs grok-4.6 states an effort for that reason. On the older models reasoning is chosen by model name: the 4.20 generation has separate `-reasoning` and `-non-reasoning` variants, and the presets send grok-4.3 no `reasoning_effort`. The setting shows up in the bill: grok-4.6 at `high` wrote a median of about 15,300 tokens per call in saved runs (23 calls), against about 600 for grok-4.3 (30 calls). See [CONFIGURATION.md](CONFIGURATION.md#grok--reasoning_effort).
 

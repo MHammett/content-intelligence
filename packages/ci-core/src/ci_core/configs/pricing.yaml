@@ -10,37 +10,41 @@
 # than sixfold.
 #
 # xAI also tiers by prompt size: a request whose prompt reaches 200k tokens is
-# billed at roughly double these rates for *all* its tokens. Not modelled, and
-# MEASURED not to apply: grok's largest single prompt across the two 2026-09-09
-# maximum-preset runs was 8,951 tokens — 4% of the threshold, not merely "under"
-# it. The earlier "~33k tokens" in this note was an estimate of whole-draft size,
-# not of any single prompt; per-call prompts are far smaller because each domain
-# sends its own slice. OpenAI has an analogous tier — see the note on its block
-# below. Revisit either only if per-call prompts grow by more than an order of
-# magnitude.
+# billed at exactly double these rates for *all* its tokens (grok-4.6: $4.00 in /
+# $1.00 cached / $12.00 out, https://docs.x.ai/developers/pricing, re-read
+# 2026-09-19). Not modelled, and MEASURED not to apply, though by less than this
+# note used to say. Across the 87 distinct live runs saved on this machine
+# (2026-09-19), grok's largest single prompt is 37,955 tokens, on the 135,514-char
+# maximum run: 19% of the threshold. The 8,951 quoted here before was the largest
+# on the 18,167-char run alone. A grok prompt is the whole draft plus a few
+# thousand tokens of instructions (the 135,514-char run's five grok calls sent
+# 36,098 to 37,955), so the earlier "~33k tokens" whole-draft estimate was close,
+# and "per-call prompts are far smaller because each domain sends its own slice"
+# was wrong.
+# Revisit the xAI tier if a draft reaches about five times that size (some
+# 700,000 characters). OpenAI has an analogous tier, with its own margin — see
+# the note on its block below.
 #
 # Last verified: OpenAI against developers.openai.com/api/docs/pricing 2026-09-17
 # (gpt-5.6 sol/terra/luna — sol's rate CHANGED, see its block below); Anthropic
 # against litellm's model_prices_and_context_window.json 2026-08-18 with
-# claude-opus-5's [5.00, 25.00] re-confirmed 2026-09-17; xAI against docs.x.ai
-# 2026-08-15 (grok-4.6 base rate only — see its note below); Mistral against
+# claude-opus-5's [5.00, 25.00] re-confirmed 2026-09-17; xAI against
+# docs.x.ai/developers/pricing 2026-09-19 (every grok row; grok-4.6's cached
+# rate CHANGED, $0.20 to $0.50 — see its block below); Mistral against
 # Mistral's own model cards and pricing page 2026-09-18 (all three rows, and
-# all three rates CHANGED — see its block below). Gemini/older entries still
-# June 2026. Update whenever provider pricing changes.
+# all three rates CHANGED — see its block below); Perplexity against
+# docs.perplexity.ai/docs/getting-started/pricing 2026-09-19 (all four rows;
+# sonar and sonar-pro CHANGED — see its block below). Gemini/older entries
+# still June 2026. Update whenever provider pricing changes.
 #
-# STILL UNVERIFIED. The 2026-09-17 pass checked OpenAI and Claude only, and the
-# 2026-09-18 passes checked the three Mistral rows only. Measured against the
-# 2026-09-09 maximum run, what is left splits unevenly, so verify in this order
-# rather than treating the rows as equal:
-#   gemini-*             — whole row June 2026, priced $0.31 of that run
-#   sonar-*              — whole row June 2026, priced $0.15 of that run
-#   grok-4.6 cached rate — carried forward, but only 8,960 cached tokens were
-#                          billed all run, so even a 3x error here is under a
-#                          cent. grok's BASE rate was confirmed at docs.x.ai.
-# So ~$0.46 of that run's $6.15 rests on unconfirmed rates — 7.5%, two thirds
-# of it gemini. ($6.15 is the sol-corrected $6.09 plus the two Mistral
-# corrections, +$0.06 for mistral-medium-3-5 and +$0.005 for
-# mistral-small-latest; see the Mistral block.)
+# STILL UNVERIFIED. The 2026-09-17 pass checked OpenAI and Claude only, the
+# 2026-09-18 passes checked the three Mistral rows only, and the 2026-09-19 pass
+# checked Perplexity and xAI. What is left is one family:
+#   gemini-*  — whole row June 2026, priced $0.31 of the 2026-09-09 maximum run
+# So ~$0.31 of that run's $6.16 rests on unconfirmed rates — 5%. ($6.16 is the
+# sol-corrected $6.09 plus the corrections since: +$0.06 for mistral-medium-3-5,
+# +$0.005 for mistral-small-latest and +$0.003 for grok-4.6's cached rate; see
+# their blocks.)
 #
 # Prefix matching applies: "gemini-2.5-flash-0520" matches "gemini-2.5-flash".
 # Sort longer IDs before shorter ones if two share a prefix.
@@ -55,25 +59,28 @@
 # actually run. "here" is this file as of that check; the last column is the
 # provider's own page, where checked:
 #
-#   model                   here          litellm       provider (2026-09-18)
+#   model                   here          litellm       provider (2026-09-18/19)
 #   mistral-large-latest     3.00/ 9.00    0.50/ 1.50    0.50/ 1.50  Large 3, now fixed
 #   mistral-medium-3-5       2.00/ 6.00    1.50/ 7.50    1.50/ 7.50  now fixed
 #   mistral-small-latest     0.10/ 0.30    0.06/ 0.18    0.15/ 0.60  Small 4, now fixed
-#   sonar-pro                1.00/ 8.00    3.00/15.00    not checked
-#   sonar                    0.50/ 1.50    1.00/ 1.00    not checked
+#   sonar-pro                1.00/ 8.00    3.00/15.00    3.00/15.00  now fixed
+#   sonar                    0.50/ 1.50    1.00/ 1.00    1.00/ 1.00  now fixed
 #
 # The disagreements run in both directions, so adopting it wholesale would not
 # even be uniformly conservative. But the provider column is what counts, and
-# on Mistral it sided with litellm twice and with neither source once. All
-# three Mistral rows now carry the provider's rate; the two sonar rows are the
-# disagreements still unsettled.
+# on Mistral it sided with litellm twice and with neither source once, and on
+# Perplexity it sided with litellm both times. All five rows now carry the
+# provider's rate.
 #
-# Three corrections have gone the other way — this file wrong, litellm right.
+# Five corrections have gone the other way — this file wrong, litellm right.
 # grok-build-0.1 was [0.30, 1.00] here, which matched no published xAI rate;
 # litellm said 1.00/2.00 and docs.x.ai agreed, so the 2026-08-15 check fixed
 # this file. mistral-medium-3-5 was [2.00, 6.00] and mistral-large-latest
 # [3.00, 9.00], neither ever checked against Mistral; litellm had both right and
-# Mistral's model cards agreed, so the 2026-09-18 checks fixed them.
+# Mistral's model cards agreed, so the 2026-09-18 checks fixed them. sonar was
+# [0.50, 1.50] and sonar-pro [1.00, 8.00], neither ever checked against
+# Perplexity; litellm had both right and Perplexity's pricing page agreed, so
+# the 2026-09-19 check fixed them.
 #
 # mistral-small-latest is the case to remember, because it was wrong in BOTH
 # places. litellm's 0.06/0.18 is the rate it lists for mistral-small-3-2-2506
@@ -214,22 +221,79 @@ models:
   mistral-small-latest:     [0.15,  0.60,  0.015]  # verified 2026-09-18 — see above
 
   # ── Perplexity ───────────────────────────────────────────────────────────────
-  sonar-reasoning-pro:      [2.00,  8.00]
-  sonar-deep-research:      [2.00,  8.00]
-  sonar-pro:                [1.00,  8.00]
-  sonar:                    [0.50,  1.50]
+  # VERIFIED 2026-09-19 on Perplexity's own pricing page, "Token Pricing" under
+  # Sonar API Pricing, https://docs.perplexity.ai/docs/getting-started/pricing
+  # (read as raw Markdown, not through a summariser). litellm 1.96.2's cost map
+  # agrees on all four rows:
+  #   sonar                $1 in /  $1 out     was [0.50, 1.50]
+  #   sonar-pro            $3 in / $15 out     was [1.00, 8.00]
+  #   sonar-reasoning-pro  $2 in /  $8 out     unchanged
+  #   sonar-deep-research  $2 in /  $8 out     unchanged — see below
+  # The two wrong rows were June 2026 estimates that nobody had checked. The page
+  # lists no cached-input rate, so no row has a third element. Its per-request
+  # fee is the other half of the bill and lives in search_fees, at the end of
+  # this file.
+  #
+  # sonar-deep-research also bills citation tokens ($2/M), reasoning tokens
+  # ($3/M) and $5 per 1,000 search queries. A two-element row cannot express the
+  # tokens, and cost.py prices only the prompt, completion and cached counts the
+  # client reports, so any citation and reasoning tokens are not in the figure.
+  # The per-query part is a search_fees row, but its count
+  # (usage.num_search_queries) does not survive litellm's stream, so those calls
+  # are counted as unmeasured rather than priced. No preset runs it; read a
+  # deep-research figure as a floor.
+  #
+  # Both corrections raise a cost. Re-costing the 87 distinct live runs saved on
+  # this machine (cost.calculate over each api_call_log, discarded attempts
+  # included) moves 6 of them, none down:
+  #   sonar      5 runs, all `wide` on the 9,456-char smoke test, where it is the
+  #              one perplexity ensemble call (fact_check) plus citation
+  #              re-asks. Its own cost +21.7% to +35.4%, the run +1.3% to +2.7%
+  #              (+$0.0015 to +$0.0043). Input doubled and output fell by a
+  #              third, so a call rises while its prompt is longer than its
+  #              completion; here prompts run 2 to 3 times longer. A bigger
+  #              draft widens it: sonar-reasoning-pro's fact_check sent ~36k
+  #              prompt tokens on the 135,514-char draft, against ~6k for
+  #              sonar's here.
+  #   sonar-pro  1 run, a single-call fragment from 2026-09-05 that cost $0.0370
+  #              and now costs $0.0761. It is in no preset.
+  # Neither row is in the balanced, thorough or maximum preset; those run
+  # sonar-reasoning-pro. So the $0.15 the old STILL UNVERIFIED list charged to
+  # `sonar-*` on the 2026-09-09 maximum run ($0.1534) was sonar-reasoning-pro's,
+  # a row that was right all along; the two wrong rows cost that run nothing.
+  #
+  # Perplexity's pricing page says Sonar "will be supported until September 27,
+  # 2026", the Agent API replacing it. Nothing here changes for that. Keep these
+  # rows past the date: saved runs are re-costed through them, and a deleted row
+  # would price them at unknown_price instead.
+  sonar-reasoning-pro:      [2.00,  8.00]          # verified 2026-09-19, unchanged
+  sonar-deep-research:      [2.00,  8.00]          # verified 2026-09-19, unchanged — tokens only, see above
+  sonar-pro:                [3.00, 15.00]          # verified 2026-09-19 — see above
+  sonar:                    [1.00,  1.00]          # verified 2026-09-19 — see above
 
   # ── xAI Grok ─────────────────────────────────────────────────────────────────
   # grok-4.6 released 2026-08-12, replacing the 4.20-reasoning variant this
-  # pipeline used for CoT. Base rate ($2.00/$6.00) confirmed against docs.x.ai;
-  # not yet in litellm's packaged pricing map as of 2026-08-18, so this is the
-  # only source. The [2] cached-input rate is CARRIED FORWARD from the older
-  # grok models rather than independently confirmed for 4.6 — treat as an
-  # estimate until verified. grok-4.6 also ships a 500k-token context window
-  # (vs. the ~256k the tiered-pricing note above was written against), so the
-  # "200k prompt doubles the rate" caveat applies more often here — still not
-  # modelled; revisit if this pipeline's prompts approach that size.
-  grok-4.6:                     [2.00,  6.00,  0.20]   # cached rate: estimate, see above
+  # pipeline used for CoT. VERIFIED 2026-09-19 at
+  # https://docs.x.ai/developers/pricing ("Text API Pricing", read as raw
+  # Markdown) for a prompt under 200k tokens: $2.00 in / $0.50 cached / $6.00
+  # out. Input and output were confirmed 2026-08-15; the cached rate had been
+  # CARRIED FORWARD from the older grok models' $0.20, and is $0.50. Not in
+  # litellm 1.96.2's packaged pricing map (checked 2026-09-19), so xAI's page is
+  # the only source. The four rows below were re-read the same day and stand.
+  #
+  # Only cached input moved, so a saved run rises by exactly $0.30 per million
+  # cached tokens and never falls. 17 of the 87 saved live runs billed grok-4.6,
+  # and every one of them cached some of it: 222,720 tokens in all, +$0.067
+  # across the lot. That is +$0.0027 on the 18,167-char maximum run ($6.1544 to
+  # $6.1571, +0.04%); +$0.0118 on the 135,514-char one ($9.5877 to $9.5995,
+  # +0.12%, nearly all of it one call that cached 37,248 of its 37,354 prompt
+  # tokens); and $0.0002 to $0.0013 at thorough, where grok makes a single call.
+  # A run made of nothing but grok-4.6 moves +0.6% to +1.4%. grok-4.3, which
+  # `wide` runs, is unchanged.
+  #
+  # grok-4.6 ships a 500k-token context window, so a prompt the model accepts can
+  # reach the 200k tier. Not modelled; the header has the measured margin.
+  grok-4.6:                     [2.00,  6.00,  0.50]   # verified 2026-09-19 — see above
   grok-4.20-0309-reasoning:     [1.25,  2.50,  0.20]
   grok-4.20-0309-non-reasoning: [1.25,  2.50,  0.20]
   grok-4.3:                     [1.25,  2.50,  0.20]
