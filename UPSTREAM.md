@@ -352,8 +352,12 @@ theirs — a regression test that injects an `httpx.MockTransport`, so it runs t
 HTTP path where ours mocked `client.post`, and proof through a live proxy on both
 `/v1/chat/completions` and `/v1/responses`, which their issue template asks for. What
 they took from us was the diagnosis and the reproduction, credited via `Fixes #37127`.
-**For litellm, the issue is the delivery vehicle and the PR adds nothing:** 0 of their
-last 100 merges came from a fork (measured 2026-09-21).
+**For entry 5 the issue was the delivery vehicle and the PR added nothing**, but
+that is not a rule for litellm in general. Outside PRs do land there, just
+rarely: 42 of the 1,500 merges from 2026-08-27 to 2026-09-21 came from forks, by
+38 authors (see entry 1). An earlier count the same day, 0 of their last 100
+merges from a fork, was true but covered only three days of merges. Lead with
+the issue; a PR is optional.
 
 With `web_search_options` set, litellm turns the request's system message into an
 `instructions` field and then rejects that field as unsupported for XAI. The
