@@ -451,15 +451,24 @@ def _load_presets_from_yaml(config_dir=None):
 #: `standard` was retired 2026-09-05 because `wide` dominated it on every axis
 #: measured over three isolated runs each: 33% more strongly-corroborated
 #: consensus flags, 74% more fact-check claims, findings that survive a rerun
-#: 67% of the time against 50%, and all of it at 55% of the cost. Keeping a tier
-#: that costs more for less is worse than the churn of retiring it.
+#: 67% of the time against 50%, and at lower cost. Keeping a tier that costs
+#: more for less is worse than the churn of retiring it.
+#:
+#: How much lower is an estimate, and the first figure overstated it: the
+#: comparison put `wide` at 55% of `standard`'s cost, but counted tokens only and
+#: priced mistral-large 6x too high and mistral-small too low (both rows
+#: corrected in #216; #230 then began billing search fees). The saving is
+#: smaller, depends on what is counted, and was only compared at one draft
+#: length. The warning quotes no percentage because any figure here rests on the
+#: price table and on what the cost summary counts, and both have moved since
+#: the comparison. configs/presets.yaml has the range on each basis.
 #:
 #: Mapped rather than deleted. A hard removal turns an existing
 #: `cost_preset: standard` into a crash at config-load, and a config that has
 #: been working for months is the worst place to discover a naming decision.
 #: The substitution is not silent: it is a real behaviour change (six models
-#: instead of five, twelve calls instead of seven, roughly half the cost), so it
-#: warns every run until the config is updated.
+#: instead of five, twelve calls instead of seven, a lower cost), so it warns
+#: every run until the config is updated.
 _RETIRED_PRESETS = {"standard": "wide"}
 
 
@@ -476,9 +485,10 @@ def resolve_preset_name(preset_name):
         f"cost_preset {preset_name!r} has been retired and is running as "
         f"{replacement!r}. That is a real change, not a rename: {replacement!r} "
         f"runs six models over twelve calls where {preset_name!r} ran five over "
-        f"seven, and costs roughly half as much. Measured 2026-09-05 — see "
-        f"configs/presets.yaml. Update cost_preset to {replacement!r} to silence "
-        f"this."
+        f"seven. On the ~1,400-word draft they were compared on, {replacement!r} "
+        f"cost less; by how much depends on whether search fees are counted, "
+        f"and on the draft's length. See configs/presets.yaml. Update "
+        f"cost_preset to {replacement!r} to silence this."
     )
 
 
@@ -680,9 +690,9 @@ def merge_configs(user_config, pub_config):
     models = _normalize_model_configs(models_raw)
 
     # Judged here, after the preset and its overrides, because that is the
-    # config that runs: a cost_preset replaces an `effort: none` written under
-    # models:, and one in preset_overrides survives it.
-    for warning in output_tokens.effort_none_warnings(models):
+    # config that runs: a cost_preset replaces an effort written under models:,
+    # and one in preset_overrides survives it.
+    for warning in output_tokens.effort_warnings(models):
         log.warning(warning)
 
     return {

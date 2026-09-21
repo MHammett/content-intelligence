@@ -26,10 +26,14 @@ So Anthropic is the one that needs telling, and it is also the most expensive
 model in the ensemble — exactly the wrong provider to have been silently not
 caching.
 
-Minimum sizes bite. ``claude-haiku-4-5`` needs **4096** tokens before it will
-cache anything, where opus and sonnet need 1024. A first attempt at the
-measurement above used haiku with a 2,874-token prefix, read zero, and looked
-like proof that ``cache_control`` does nothing at all.
+Minimum sizes bite, and they do not move monotonically with the version.
+``claude-haiku-4-5`` needs **4096** tokens before it will cache anything;
+``claude-opus-5`` needs **512** (halved from opus-4-8's 1024, so prompts that
+were previously too short now create entries with no code change); sonnet-5 and
+opus-4-8 need 1024. A first attempt at the measurement above used haiku with a
+2,874-token prefix, read zero, and looked like proof that ``cache_control``
+does nothing at all. Below the minimum there is no error — just
+``cache_creation_input_tokens: 0``.
 """
 
 __all__ = ["as_message_content", "as_request_params", "MARKS_A_BREAKPOINT"]
@@ -43,22 +47,29 @@ def as_message_content(provider, prefix, remainder):
     """User-message content for a prompt with a cacheable ``prefix``.
 
     Returns a plain string for providers that cache implicitly — no reason to
-    complicate a request that already works. For Anthropic, returns the two
-    text blocks it needs, with the breakpoint marked on the first: everything up
+    complicate a request that already works. For Anthropic, returns the text
+    blocks it needs, with the breakpoint marked on the first: everything up
     to and including that block is what gets cached, so the shared article is
     inside it and the per-domain task is not.
+
+    ``remainder`` is empty whenever the whole user prompt is cacheable — which
+    is the ordinary case with ``prompt_cache_layout`` off, since the user
+    prompt is then just the draft and carries no per-domain text. An empty
+    text block is a 400 from Anthropic, so emit one block, not two.
     """
     if provider not in MARKS_A_BREAKPOINT or not prefix:
         return prefix + remainder
 
-    return [
+    blocks = [
         {
             "type": "text",
             "text": prefix,
             "cache_control": {"type": "ephemeral"},
         },
-        {"type": "text", "text": remainder},
     ]
+    if remainder:
+        blocks.append({"type": "text", "text": remainder})
+    return blocks
 
 
 def as_request_params(provider, prefix):

@@ -72,6 +72,23 @@ class TestCallProvider:
 
 
 class TestCallText:
+    @pytest.mark.parametrize("searches", [0, 2, None])
+    def test_a_grounded_calls_search_count_travels_with_its_tokens(self, searches):
+        """ci-style-profile bills from what this returns, and gemini grounds
+        every call it makes. 0 and None both mean something."""
+        with patch.object(
+            llm.client, "call", return_value=_shim_result(searches=searches)
+        ):
+            out = llm.call_text("gemini", "s", "u", "k")
+
+        assert out["searches"] == searches
+
+    def test_a_call_that_could_not_search_has_no_count(self):
+        with patch.object(llm.client, "call", return_value=_shim_result()):
+            out = llm.call_text("mistral", "s", "u", "k")
+
+        assert "searches" not in out
+
     def test_successful_call_returns_text(self):
         with patch.object(llm.client, "call", return_value=_shim_result()):
             out = llm.call_text("mistral", "s", "u", "k")

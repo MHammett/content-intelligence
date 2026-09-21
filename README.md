@@ -510,7 +510,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--only-model PROVIDER` | Run only one provider (e.g. `openai`) instead of the full ensemble |
 | `--only-domain DOMAIN` | Run only one domain (`fact_check`, `voice_style`, `completeness`, `argument_integrity`, `red_team`, or `expansion` with `--expand`) |
 | `--replay RESULTS_JSON` | Replay a captured ensemble instead of calling any models — free |
-| `--offline` | Skip every pass that reaches the network (link validation, Wayback, citation resolution) |
+| `--offline` | Skip every pass that reaches the network (LanguageTool grammar, link validation, Wayback, citation resolution, the SEO model calls) |
 
 ### Iterating on the code without paying for the ensemble
 
@@ -522,7 +522,7 @@ uv run ci-review --draft handoff.md --publication mypub --replay pipeline_histor
 
 That re-runs consolidation, claim collection, report building, markdown rendering and the history save over real captured model output, with **no model calls and no network**. It's the fast loop for anything in `consolidation.py`, `report_markdown.py`, `history.py`, `config_loader.py` or the analysis passes.
 
-`--offline` on its own (without `--replay`) still calls the models but skips the network passes. `--replay` on its own replays the ensemble but still resolves citations and checks links, which is what you want when changing the citation adapters themselves.
+`--offline` on its own (without `--replay`) still calls the models but skips the network passes. LanguageTool is one of them, so the models review the draft as written, without its corrections, and the report says the grammar pass was skipped for `--offline`. `--replay` on its own replays the ensemble but still resolves citations and checks links, which is what you want when changing the citation adapters themselves.
 
 Example — measure one model/domain's true latency cheaply:
 

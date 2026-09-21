@@ -104,6 +104,189 @@ class TestDryRun:
             assert not output_path.exists()
 
 
+class TestModelCurrencyLog:
+    """The currency check logs what it found, not everything it returned.
+
+    check_model_currency returns a dict: the warnings and notices, and the
+    registry's date, age and two staleness flags. main() logged every truthy
+    value in it at WARNING, so each run said "Model currency: 2026-08-18" and
+    "Model currency: 32", and a superseded model came out as a raw list of
+    dicts. The wording is ci-review's, from pipeline.run_draft_pipeline.
+    """
+
+    CURRENT = {
+        "warnings": [],
+        "notices": [],
+        "registry_date": "2026-08-18",
+        "registry_age_days": 32,
+        "registry_stale": False,
+        "registry_warning": False,
+    }
+
+    def _logged(self, caplog, currency=None):
+        """(level, message) of every registry line a --dry-run logs.
+
+        ``currency`` stands in for check_model_currency's answer; without it the
+        real registry answers, for an empty models block.
+        """
+        import logging
+        from contextlib import ExitStack
+
+        with tempfile.TemporaryDirectory() as tmpdir, ExitStack() as stack:
+            stack.enter_context(caplog.at_level(logging.INFO))
+            # main() replaces the root handlers, caplog's among them.
+            stack.enter_context(
+                patch("ci_style_profile.logging_config.configure_logging")
+            )
+            stack.enter_context(
+                patch("ci_style_profile.bootstrap._load_sources_yaml", return_value={})
+            )
+            stack.enter_context(
+                patch(
+                    "ci_style_profile.bootstrap._load_user_config_lenient",
+                    return_value={},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "ci_style_profile.collectors.REGISTRY",
+                    _make_mock_registry("wordpress"),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "ci_style_profile.bootstrap._collect_source",
+                    return_value=_MOCK_DOCS,
+                )
+            )
+            if currency is not None:
+                stack.enter_context(
+                    patch(
+                        "ci_core.llm.model_registry.check_model_currency",
+                        return_value=currency,
+                    )
+                )
+            rc = _run_bootstrap(
+                "--output-yaml",
+                str(Path(tmpdir) / "out.yaml"),
+                "--sources",
+                "wordpress",
+                "--style",
+                "canonical",
+                "--dry-run",
+            )
+        assert rc == 0
+        return [
+            (r.levelname, r.getMessage())
+            for r in caplog.records
+            if r.getMessage().startswith(
+                ("Model currency", "Model registry", "Model upgrade")
+            )
+        ]
+
+    def test_the_real_registrys_date_and_age_are_not_logged(self, caplog):
+        """No models, so nothing is superseded. Whatever the registry holds, the
+        only line it may earn is about its own age, which starts "Model registry"."""
+        lines = self._logged(caplog)
+        assert not [m for _, m in lines if m.startswith("Model currency")]
+
+    def test_a_superseded_model_is_named_with_what_replaces_it(self, caplog):
+        warning = {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "replacement": "gpt-5.6-terra",
+            "note": "gpt-5.6 family launched at matching price tiers",
+        }
+        lines = self._logged(caplog, {**self.CURRENT, "warnings": [warning]})
+        assert lines == [
+            (
+                "WARNING",
+                "Model currency: openai is using 'gpt-5.4', which has been "
+                "superseded by 'gpt-5.6-terra'. gpt-5.6 family launched at "
+                "matching price tiers. Update user.yaml to use the newer model.",
+            )
+        ]
+
+    def test_a_superseded_model_with_no_note_has_no_stray_punctuation(self, caplog):
+        warning = {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "replacement": "gpt-5.6-terra",
+            "note": "",
+        }
+        lines = self._logged(caplog, {**self.CURRENT, "warnings": [warning]})
+        assert lines == [
+            (
+                "WARNING",
+                "Model currency: openai is using 'gpt-5.4', which has been "
+                "superseded by 'gpt-5.6-terra'. Update user.yaml to use the "
+                "newer model.",
+            )
+        ]
+
+    def test_a_newer_model_is_an_optional_notice_not_a_warning(self, caplog):
+        notice = {
+            "provider": "claude",
+            "model": "claude-haiku-4-5-20251001",
+            "newer": "claude-sonnet-5",
+            "note": "claude-sonnet-5 available; haiku remains better value",
+        }
+        lines = self._logged(caplog, {**self.CURRENT, "notices": [notice]})
+        assert lines == [
+            (
+                "INFO",
+                "Model upgrade available (optional): claude is using "
+                "'claude-haiku-4-5-20251001' — claude-sonnet-5 available; "
+                "haiku remains better value",
+            )
+        ]
+
+    def test_a_notice_with_no_note_names_the_newer_model(self, caplog):
+        notice = {
+            "provider": "claude",
+            "model": "claude-haiku-4-5-20251001",
+            "newer": "claude-sonnet-5",
+            "note": "",
+        }
+        lines = self._logged(caplog, {**self.CURRENT, "notices": [notice]})
+        assert lines == [
+            (
+                "INFO",
+                "Model upgrade available (optional): claude is using "
+                "'claude-haiku-4-5-20251001' — newer: claude-sonnet-5",
+            )
+        ]
+
+    def test_an_old_registry_warns_once_with_its_age(self, caplog):
+        old = {
+            **self.CURRENT,
+            "registry_age_days": 130,
+            "registry_stale": True,
+            "registry_warning": True,
+        }
+        assert self._logged(caplog, old) == [
+            (
+                "WARNING",
+                "Model registry is 130 days old (last updated 2026-08-18). "
+                "Provider APIs change frequently — re-check available models "
+                "and pricing.",
+            )
+        ]
+
+    def test_a_stale_registry_is_only_a_note(self, caplog):
+        stale = {**self.CURRENT, "registry_age_days": 70, "registry_stale": True}
+        assert self._logged(caplog, stale) == [
+            (
+                "INFO",
+                "Model registry last updated 2026-08-18 (70 days ago). "
+                "Consider re-checking for newer models.",
+            )
+        ]
+
+    def test_a_current_registry_and_models_log_nothing(self, caplog):
+        assert self._logged(caplog, self.CURRENT) == []
+
+
 class TestEffortNoneIsWarned:
     """`effort: none` in user.yaml does not stop claude-sonnet-5 thinking.
 
@@ -173,6 +356,53 @@ class TestEffortNoneIsWarned:
             caplog, "maximum", {"model": "claude-sonnet-5", "effort": "none"}
         )
         assert "effort: none" not in text
+
+
+class TestAnEffortThatDoesNotDoWhatItSaysIsWarned:
+    """`reasoning_effort` under claude, and `High` where litellm wants `high`.
+
+    The merge above is key by key, so what the preset leaves unset rides in from
+    user.yaml, and a key the preset does set sits beside the stray one. Both
+    checks are ci_core's (output_tokens.effort_warnings), the same ones
+    ci-review's config load runs.
+    """
+
+    PRESETS = TestEffortNoneIsWarned.PRESETS
+    _run = TestEffortNoneIsWarned._run
+
+    def test_a_reasoning_effort_left_beside_the_presets_effort_is_named(self, caplog):
+        text = self._run(
+            caplog,
+            "maximum",
+            {"model": "claude-sonnet-5", "reasoning_effort": "low"},
+        )
+        assert "sets both effort: 'high' and reasoning_effort: 'low'" in text
+
+    def test_a_reasoning_effort_the_preset_does_not_replace_is_warned(self, caplog):
+        text = self._run(
+            caplog,
+            "balanced",
+            {"model": "claude-haiku-4-5-20251001", "reasoning_effort": "low"},
+        )
+        assert "claude model claude-sonnet-5 sets reasoning_effort: 'low'" in text
+        assert "Rename it to effort." in text
+
+    def test_a_misspelled_effort_that_rides_into_the_presets_model_is_warned(
+        self, caplog
+    ):
+        text = self._run(
+            caplog,
+            "balanced",
+            {"model": "claude-haiku-4-5-20251001", "effort": "High"},
+        )
+        assert "claude model claude-sonnet-5 is set to effort: 'High'" in text
+        assert "every claude call will fail" in text
+
+    def test_a_config_that_runs_as_written_is_quiet(self, caplog):
+        text = self._run(
+            caplog, "maximum", {"model": "claude-sonnet-5", "effort": "medium"}
+        )
+        assert "effort" not in text
 
 
 class TestContinueOnError:

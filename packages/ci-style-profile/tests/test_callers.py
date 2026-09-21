@@ -198,6 +198,46 @@ class TestCallOneGemini:
         assert result["tokens"]["prompt"] == 100
         assert result["tokens"]["completion"] == 20
 
+    def test_gemini_search_fee_reaches_the_spend_log(self, caplog):
+        """gemini grounds every call, including a profile run's. Its queries
+        are billed on top of its tokens, and the spend line said nothing."""
+        from ci_style_profile.callers import (
+            call_one,
+            clear_api_call_log,
+            get_api_call_log,
+            log_cost_summary,
+        )
+
+        clear_api_call_log()
+        stream = _completion_stream('{"style_profile": "gemini result"}')
+        stream.append(
+            SimpleNamespace(
+                choices=[],
+                usage=None,
+                citations=None,
+                search_results=None,
+                vertex_ai_grounding_metadata=[
+                    {"webSearchQueries": ["one query", "another"]}
+                ],
+            )
+        )
+        with patch.object(litellm, "completion", return_value=stream):
+            call_one(
+                "gemini",
+                {"provider": "ai_studio", "model": "gemini-2.5-flash"},
+                {"gemini": {"api_key": "AIza-test"}},
+                "system",
+                "user",
+            )
+
+        (entry,) = get_api_call_log()
+        assert entry["searches"] == 2
+        with caplog.at_level(logging.INFO, logger="ci_style_profile.callers"):
+            log_cost_summary()
+        # One grounded 2.5 prompt, however many queries: $35 per 1,000.
+        assert "+ $0.0350 search" in caplog.text
+        clear_api_call_log()
+
 
 class TestCallAll:
     def test_call_all_three_models(self):

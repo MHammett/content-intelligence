@@ -45,7 +45,7 @@ from ci_core.console import force_utf8_stdio
 
 force_utf8_stdio()
 
-from ci_core.llm import client  # noqa: E402
+from ci_core.llm import client, output_tokens  # noqa: E402
 
 from .config_loader import (  # noqa: E402
     load_publication_config,
@@ -145,7 +145,10 @@ def probe_provider(provider, model_cfg, api_key):
     model_cfg["web_search"] = False
 
     model = model_cfg.get("model") or provider
-    effort = model_cfg.get("reasoning_effort")
+    # The key this provider's request reads: claude's is `effort`, so reading
+    # `reasoning_effort` printed effort=none for a claude probe that ran at high.
+    effort_key = output_tokens.effort_key(provider)
+    effort = model_cfg.get(effort_key) if effort_key else None
     detail_bits = [f"effort={effort}" if effort else "effort=none"]
 
     label = f"{provider}: {model}"

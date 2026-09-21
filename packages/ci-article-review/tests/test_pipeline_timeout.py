@@ -521,6 +521,72 @@ class TestRecoverFailedCalls:
             "tokens": self._NO_TOKENS,
         }
 
+    def test_a_replaced_grounded_calls_searches_stay_billed(self):
+        """A malformed-JSON failure on a grounded call had searched before it
+        failed, and each of its attempts was billed for that. Recovery
+        replaced the result and, with it, the only record of the searches."""
+        failed = self._malformed_twice()
+        failed["searches"] = 3
+        failed["discarded_attempts"]["searches"] = [4]
+        own_retry = {
+            "count": 1,
+            "costed": 1,
+            "reasons": ["MalformedJSONError"],
+            "tokens": {"prompt": 6107, "completion": 7000},
+            "searches": [2],
+        }
+        recovered = self._recover(
+            failed, self._answer(searches=1, discarded_attempts=own_retry)
+        )
+
+        # One count per attempt, in order: the failed call's discarded one,
+        # its own last, then the replacement's retry.
+        assert recovered["discarded_attempts"]["searches"] == [4, 3, 2]
+        assert recovered["searches"] == 1
+        summary = self._cost(recovered)
+        assert summary["search_units"] == 4 + 3 + 2 + 1
+        assert summary["total_search_usd"] == 0.1
+
+    def test_a_replaced_call_that_could_not_search_adds_no_count(self):
+        recovered = self._recover(self._stalled_twice(), self._answer())
+        assert "searches" not in recovered["discarded_attempts"]
+
+
+class TestCaptureCouldHaveSearched:
+    """Which calls in a capture from before PR #230 may have paid search fees.
+
+    Those captures record no count, so a replay prices none. Whether that
+    makes its total a floor is decided per provider, not by
+    ``grounding_available``: gemini decides per prompt whether to search, and
+    litellm can drop its grounding metadata on some stream shapes, so a gemini
+    result reading ungrounded does not prove no search ran.
+    """
+
+    _ANSWERED = {"tokens": {"prompt": 900, "completion": 300}}
+
+    @pytest.mark.parametrize("provider", ["gemini", "perplexity"])
+    def test_a_provider_that_always_could_search(self, provider):
+        result = dict(self._ANSWERED, grounding_available=False)
+        assert pipeline._capture_could_have_searched(provider, result) is True
+
+    @pytest.mark.parametrize("provider", ["claude", "openai"])
+    def test_a_configured_search_counts_only_where_it_shows(self, provider):
+        grounded = dict(self._ANSWERED, grounding_available=True)
+        plain = dict(self._ANSWERED, grounding_available=False)
+        assert pipeline._capture_could_have_searched(provider, grounded) is True
+        assert pipeline._capture_could_have_searched(provider, plain) is False
+
+    def test_a_provider_that_cannot_search(self):
+        assert pipeline._capture_could_have_searched("mistral", self._ANSWERED) is False
+
+    def test_a_call_that_never_answered_billed_nothing(self):
+        dead = {"failed": True, "tokens": {"prompt": 0, "completion": 0}}
+        assert pipeline._capture_could_have_searched("gemini", dead) is False
+
+    def test_an_unparseable_answer_was_still_billed(self):
+        malformed = dict(self._ANSWERED, failed=True)
+        assert pipeline._capture_could_have_searched("perplexity", malformed) is True
+
 
 class TestFailureReason:
     """``_failure_reason`` — which exception a failed result's text names.

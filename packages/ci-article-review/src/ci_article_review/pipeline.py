@@ -1423,9 +1423,43 @@ def _run_domain(
     # Off by default: it relocates the domain instruction from before the
     # article to after it, and this pipeline's output is the product. Turn it
     # on, diff a run against a prior live run, and keep it if the findings hold.
-    cache_prefix = None
     if pipeline_cfg.get("prompt_cache_layout", False):
         system, user, cache_prefix = _cache_friendly_layout(system, user)
+    else:
+        # Layout off, but the user prompt is still cacheable — all of it. It is
+        # the draft and handoff with no domain text in it, so it is
+        # byte-identical across all five domains and stable within a call.
+        #
+        # Marking it buys nothing across domains (`system` carries the
+        # per-domain instruction and renders ahead of `messages`, so each
+        # domain's prefix diverges before this block is reached). What it buys
+        # is caching *within* one request, and that is where the tokens are:
+        # measured on run_2 of honda-navigation-clock, 2026-09-09, fact_check
+        # alone was 141,259 of claude's 169,791 input tokens — 83% — because
+        # server-side web_search runs an agentic loop that re-reads a growing
+        # context on every internal turn. The four domains without search sat
+        # at ~9,500 each. Anthropic also inserts its own cache writes after
+        # tool results, but only for a request that already carries a marker.
+        #
+        # Verified live 2026-09-10, one opus-5 fact_check call on the
+        # short-example draft: 86,159 of 138,533 input tokens read from cache
+        # — 62% of a single request's input, where it had been 0 by
+        # construction. Note the draft's own user prompt is only ~3,954
+        # tokens; the other 134k is the search loop reading itself back.
+        #
+        # The four domains without search have no internal loop, so they read
+        # nothing back and pay the 1.25x write premium for an entry nobody
+        # reads: ~$0.012 a run against ~$0.39 saved. Left unconditional at
+        # that ratio rather than gated on `web_search`, which would silently
+        # stop caching the day another domain gains a tool — and a stream-stall
+        # retry (see ci_core.llm.client) re-sends the whole prompt within the
+        # 5-minute TTL, so the "wasted" write is what makes the retry cheap.
+        #
+        # This is deliberately NOT the layout change, and does not reopen the
+        # question PLAN.md §5 decision 2 closed: nothing about the prompt moves,
+        # so there is no quality question to re-litigate — only a marker on
+        # bytes that were already being sent in exactly this order.
+        cache_prefix = user
 
     api_key = api_keys.get(model_name, {}).get("api_key", "")
 
@@ -2223,6 +2257,30 @@ def _failure_reason(error_text):
     return "unknown"
 
 
+def _capture_could_have_searched(model_name, result):
+    """Whether a captured result with no ``searches`` may have paid search fees.
+
+    Captures written before calls recorded their searches (PR #230,
+    2026-09-19) carry no count at all. Which of their calls could have searched
+    is known by provider, not from the ``grounding_available`` they did record:
+    googleSearch rides on every gemini call and the model decides per prompt
+    whether to use it, and litellm can drop gemini's grounding metadata on some
+    stream shapes (BerriAI/litellm#41492), so a gemini result that reads
+    ungrounded does not prove no search ran. Every sonar request pays a fee.
+    claude's and openai's search is a per-domain setting, so only a result that
+    shows it grounded proves one ran. A call that never answered billed
+    nothing, searches included.
+    """
+    if not isinstance(result, dict):
+        return False
+    tokens = result.get("tokens") or {}
+    if result.get("failed") and not (tokens.get("prompt") or tokens.get("completion")):
+        return False
+    if model_name in ("gemini", "perplexity"):
+        return True
+    return bool(result.get("grounding_available"))
+
+
 def _keep_earlier_billing(failed, fresh):
     """Carry what a failed dispatch was billed for into the result replacing it.
 
@@ -2257,6 +2315,10 @@ def _keep_earlier_billing(failed, fresh):
         "reasons": [_failure_reason(failed.get("error"))],
         "tokens": tokens,
     }
+    # A malformed-JSON failure on a grounded call searched before it failed,
+    # and those searches were billed like its tokens.
+    if "searches" in failed:
+        last_attempt["searches"] = [failed["searches"]]
     summaries = [
         failed.get("discarded_attempts") or {},
         last_attempt,
@@ -2275,6 +2337,11 @@ def _keep_earlier_billing(failed, fresh):
         # prices a missing share at the full input rate.
         "tokens": total,
     }
+    # One count per attempt, concatenated rather than summed: cost.py bills a
+    # per-prompt fee once per attempt.
+    searches = [n for s in summaries for n in s.get("searches") or ()]
+    if searches:
+        fresh["discarded_attempts"]["searches"] = searches
 
 
 def _recover_failed_calls(
@@ -2581,6 +2648,30 @@ def _calibration_timing(streams):
     )
 
 
+def _grammar_skipped(reason):
+    """The Pass 1 result for a grammar pass that was decided against, not tried.
+
+    Not a failure. A skip is a decision, and marking it failed put
+    ``lt_failed: true`` into every report of a run that had deliberately
+    disabled grammar checking. The console and the markdown both test
+    ``skipped`` first so they read correctly; only anything consuming the JSON
+    was misled.
+
+    ``reason`` records which decision: ``"disabled"`` (``grammar_pass: false``),
+    ``"no_credentials"`` or ``"offline"`` (``--offline``). ``skipped`` alone
+    cannot say, and the summary used to print the credentials message for any of
+    them — telling an operator with working credentials in .env to go and
+    configure credentials.
+    """
+    return {
+        "failed": False,
+        "skipped": True,
+        "skipped_reason": reason,
+        "change_log": [],
+        "flagged_matches": [],
+    }
+
+
 def run_draft_pipeline(
     handoff_path,
     publication_name,
@@ -2728,40 +2819,24 @@ def run_draft_pipeline(
 
     if not grammar_enabled:
         log.info("Pass 1: Grammar pass disabled (grammar_pass: false) — skipping.")
-        lt_result = {
-            # Not a failure. A skip is a decision — either the config turned the
-            # pass off or there were no credentials to run it with — and marking
-            # it failed put `lt_failed: true` into every report of a run that
-            # had deliberately disabled grammar checking. The console and the
-            # markdown both test `skipped` first so they read correctly; only
-            # anything consuming the JSON was misled.
-            "failed": False,
-            "skipped": True,
-            # Both skip paths set skipped=True, and the summary used to print the
-            # credentials message for either — telling an operator with working
-            # credentials in .env to go and configure credentials. Record which.
-            "skipped_reason": "disabled",
-            "change_log": [],
-            "flagged_matches": [],
-        }
+        lt_result = _grammar_skipped("disabled")
         corrected_draft = handoff["draft"]
     elif not lt_has_creds:
         log.info(
             "Pass 1: No LanguageTool credentials configured — skipping grammar pass."
         )
-        lt_result = {
-            # Not a failure. A skip is a decision — either the config turned the
-            # pass off or there were no credentials to run it with — and marking
-            # it failed put `lt_failed: true` into every report of a run that
-            # had deliberately disabled grammar checking. The console and the
-            # markdown both test `skipped` first so they read correctly; only
-            # anything consuming the JSON was misled.
-            "failed": False,
-            "skipped": True,
-            "skipped_reason": "no_credentials",
-            "change_log": [],
-            "flagged_matches": [],
-        }
+        lt_result = _grammar_skipped("no_credentials")
+        corrected_draft = handoff["draft"]
+    elif offline:
+        # After the two config reasons, the way links_skipped_reason ranks them:
+        # "offline" is recorded only when --offline is what stopped a pass that
+        # would otherwise have run. The pass posts the whole draft to a server,
+        # hosted or self-hosted, so it is one of the passes --offline exists to
+        # suppress. It was the one missed: a `--replay --offline` of an
+        # unpublished draft sent its text to the hosted API while the flag's
+        # help promised a run with no network calls at all.
+        log.info("Pass 1: --offline — skipping the LanguageTool grammar pass.")
+        lt_result = _grammar_skipped("offline")
         corrected_draft = handoff["draft"]
     else:
         log.info("Pass 1: LanguageTool grammar correction")
@@ -2808,8 +2883,8 @@ def run_draft_pipeline(
     link_check_enabled = link_validation and not offline
     if offline:
         log.info(
-            "Offline: skipping link validation, Wayback, citation resolution "
-            "and the SEO model calls"
+            "Offline: skipping LanguageTool, link validation, Wayback, citation "
+            "resolution and the SEO model calls"
         )
     if link_check_enabled:
         from .analysis import links as links_analysis
@@ -3312,7 +3387,11 @@ def run_draft_pipeline(
         # that thinks with no effort set ran at high, and this field sits beside
         # the ceiling and budget sized for that. Read off the model that
         # answered, since a fallback need not think the way the primary does.
-        configured = mcfg.get("reasoning_effort") or mcfg.get("effort")
+        # Only the key the provider's request reads (claude's `effort`, the
+        # others' `reasoning_effort`): the client drops the other spelling, so a
+        # value under it never ran and must not be filed as though it had.
+        effort_key = output_tokens.effort_key(model_name)
+        configured = mcfg.get(effort_key) if effort_key else None
         if (
             model_name == "claude"
             and isinstance(configured, str)
@@ -3376,6 +3455,10 @@ def run_draft_pipeline(
             "char_count": char_count,
             "status": status,
         }
+        # Billable searches, beside the tokens: present only on a call that
+        # could search, and None where the provider did not say how many.
+        if "searches" in result:
+            log_entry["searches"] = result["searches"]
         if result.get("discarded_attempts"):
             log_entry["discarded_attempts"] = result["discarded_attempts"]
         # How long each stream went silent, before and after real output — the
@@ -3395,6 +3478,13 @@ def run_draft_pipeline(
             # discarded (2026-09-18, in the end-to-end suite's stubs: $0.0315
             # incurred for one $0.0045 retry).
             log_entry["replayed"] = True
+            if "searches" not in log_entry and _capture_could_have_searched(
+                model_name, result
+            ):
+                # Captured before calls recorded their searches (PR #230). It
+                # may have searched, and nothing says how often, so the replay
+                # calls its total "at least" rather than "exact".
+                log_entry["searches"] = None
         if (not status_ok or truncated) and result.get("raw"):
             log_entry["raw_excerpt"] = _raw_excerpt(result["raw"])
         if not status_ok and result.get("error_body"):
@@ -3787,18 +3877,40 @@ def run_draft_pipeline(
     # Cost tracking
     cost_summary = cost_analysis.calculate(api_call_log)
     report["cost_summary"] = cost_summary
-    if not cost_summary["pricing_known"]:
-        cost_basis = "estimated — some model prices unknown"
-    elif cost_summary.get("uncosted_calls"):
+    # Spend the provider billed that this run has no number for. Each makes
+    # the total a floor.
+    unpriced = []
+    if cost_summary.get("uncosted_calls"):
         # Retried attempts the provider billed for and this run cannot price,
-        # because a stalled stream reports no usage. The number is a floor.
-        cost_basis = (
-            f"at least — {cost_summary['uncosted_calls']} retried attempt(s) "
+        # because a stalled stream reports no usage.
+        unpriced.append(
+            f"{cost_summary['uncosted_calls']} retried attempt(s) "
             f"were billed by the provider with no usage reported"
         )
+    if cost_summary.get("unmeasured_search_calls"):
+        unpriced.append(
+            f"{cost_summary['unmeasured_search_calls']} attempt(s) that could "
+            f"search did not report how many searches they ran"
+        )
+    if cost_summary.get("unpriced_searches"):
+        unpriced.append(
+            f"{cost_summary['unpriced_searches']} search(es) ran on a model "
+            f"with no search fee in pricing.yaml"
+        )
+    if not cost_summary["pricing_known"]:
+        cost_basis = "estimated — some model prices unknown"
+    elif unpriced:
+        cost_basis = "at least — " + "; ".join(unpriced)
     else:
         cost_basis = "exact"
     log.info("Estimated cost: $%.4f (%s)", cost_summary["total_usd"], cost_basis)
+    if cost_summary.get("search_units"):
+        log.info(
+            "Search and grounding fees: $%.4f of that, for %d billed unit(s) at "
+            "list price, before any free allowance.",
+            cost_summary["total_search_usd"],
+            cost_summary["search_units"],
+        )
     if cost_summary.get("discarded_calls"):
         log.info(
             "Retries: %d attempt(s) discarded and re-run; %d of them had usage "
@@ -4312,14 +4424,16 @@ def _print_draft_summary(
         _print_live_model_check(currency.get("live") or {})
 
     if report.get("lt_skipped"):
-        # Both skip paths set lt_skipped, and this printed the credentials
-        # message for either — telling an operator whose credentials are sitting
-        # in .env and working to go and configure credentials, when the actual
-        # cause was grammar_pass: false in the config.
-        if report.get("lt_skipped_reason") == "disabled":
-            why = "grammar_pass is set to false in the pipeline config"
-        else:
-            why = "no LanguageTool credentials configured"
+        # Every skip path sets lt_skipped, and this printed the credentials
+        # message for any of them — telling an operator whose credentials are
+        # sitting in .env and working to go and configure credentials, when the
+        # actual cause was grammar_pass: false in the config, or --offline. A
+        # saved report from before the reason was recorded has none, and keeps
+        # the message it always had.
+        why = {
+            "disabled": "grammar_pass is set to false in the pipeline config",
+            "offline": "--offline was set, and the grammar check is a network call",
+        }.get(report.get("lt_skipped_reason"), "no LanguageTool credentials configured")
         print(
             f"\nGrammar pass: skipped ({why} — run a manual Grammarly pass "
             f"before publishing)"
@@ -4542,6 +4656,10 @@ def _print_draft_summary(
                 if tokens
                 else ""
             )
+            if "searches" in entry:
+                # "?" where the provider did not say how many it ran.
+                n = entry["searches"]
+                tok_str += f"  {'?' if n is None else n} search(es)"
             print(
                 f"  {entry['pass']:30s} {status:6s} {elapsed:>8s}{budget_str:>7s} {head_str:>10s}  "
                 f"{entry['model']}  effort={effort}  {tok_str}"
@@ -4609,11 +4727,35 @@ def _print_draft_summary(
         carried = [e for e in cost.get("by_pass") or () if e.get("replayed")]
         spent = cost["incurred_usd"] if carried else cost["total_usd"]
         print(f"\nEstimated cost: ${spent:.4f}{known_flag}")
+        search_usd = 0.0
         for entry in cost.get("by_pass") or ():
             if entry["total_usd"] > 0 and not entry.get("replayed"):
+                fee = entry.get("search_usd") or 0.0
+                search_usd += fee
                 print(
                     f"  {entry['pass']:30s}  ${entry['total_usd']:.4f}  {entry['model']}"
+                    + (f"  (incl. ${fee:.4f} search fees)" if fee else "")
                 )
+        if search_usd:
+            # Its own line as well as inside each pass, so the fee that used
+            # to be missing entirely cannot be mistaken for token spend.
+            # Parenthesised like the other notes here: every other line in
+            # this block is a pass.
+            print(
+                f"  (search and grounding fees: ${search_usd:.4f} of that, at "
+                f"list price, before any free allowance)"
+            )
+        if cost.get("unmeasured_search_calls"):
+            print(
+                f"  ({cost['unmeasured_search_calls']} attempt(s) could search but "
+                f"did not report how many searches they ran — those fees are not "
+                f"in the total)"
+            )
+        if cost.get("unpriced_searches"):
+            print(
+                f"  ({cost['unpriced_searches']} search(es) ran on a model with no "
+                f"search fee in pricing.yaml — not in the total)"
+            )
         if carried:
             print(
                 f"  ({len(carried)} call(s) carried over from the capture were "
@@ -5307,9 +5449,9 @@ def build_parser():
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Skip every pass that reaches the network (link validation, Wayback, "
-        "citation resolution). Combine with --replay for a run that makes no "
-        "network calls at all.",
+        help="Skip every pass that reaches the network (LanguageTool grammar, link "
+        "validation, Wayback, citation resolution, the SEO model calls). Combine "
+        "with --replay for a run that makes no network calls at all.",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable DEBUG logging"

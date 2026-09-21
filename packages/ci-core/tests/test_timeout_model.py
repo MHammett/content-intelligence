@@ -146,15 +146,52 @@ class TestComputeAll:
         assert "openai" not in out
         assert "grok" in out
 
-    def test_reads_effort_from_either_key(self):
-        # reasoning_effort (openai/mistral/grok) and effort (claude) both recognized.
-        a = tm.compute_all(
-            ANCHOR, {"x": {"model": "gpt-5.4", "reasoning_effort": "high"}}, CEILING
+    def _budget(self, provider, **cfg):
+        return tm.compute_all(ANCHOR, {provider: cfg}, CEILING)[provider]
+
+    def test_each_provider_reads_its_own_effort_key(self):
+        """reasoning_effort for openai/mistral/grok/perplexity and effort for
+        claude, the key each request is built from (output_tokens._EFFORT_KEY).
+        A budget sized on an effort the request never carried is the wrong
+        budget, so the other spelling counts for nothing."""
+        openai = {"model": "gpt-5.4"}
+        assert self._budget("openai", **openai, reasoning_effort="high") > self._budget(
+            "openai", **openai
         )
-        b = tm.compute_all(
-            ANCHOR, {"x": {"model": "gpt-5.4", "effort": "high"}}, CEILING
+        assert self._budget("openai", **openai, effort="high") == self._budget(
+            "openai", **openai
         )
-        assert a["x"] == b["x"]
+        claude = {"model": "claude-opus-4-8"}
+        assert self._budget("claude", **claude, effort="high") > self._budget(
+            "claude", **claude
+        )
+        assert self._budget("claude", **claude, reasoning_effort="high") == (
+            self._budget("claude", **claude)
+        )
+
+    def test_a_stray_key_beside_the_right_one_changes_nothing(self):
+        """The shape a preset's `effort` takes beside a `reasoning_effort` left in
+        user.yaml. The stray value used to win, and sized the budget for an
+        effort the call never ran at.
+
+        The stray is the higher of the two on purpose. Time to fill the output
+        ceiling is sized from the right key and sets the budget whenever it
+        exceeds the formula's, so a stray *lower* than the real effort was
+        hidden behind it and this test could not tell the two readers apart."""
+        right = self._budget("claude", model="claude-opus-4-8", effort="low")
+        both = self._budget(
+            "claude", model="claude-opus-4-8", effort="low", reasoning_effort="xhigh"
+        )
+        assert both == right
+
+    def test_a_provider_that_reads_no_effort_ignores_both_spellings(self):
+        """gemini thinks by thinking_budget; neither key reaches its request."""
+        bare = self._budget("gemini", model="gemini-2.5-pro")
+        assert self._budget("gemini", model="gemini-2.5-pro", effort="xhigh") == bare
+        assert (
+            self._budget("gemini", model="gemini-2.5-pro", reasoning_effort="xhigh")
+            == bare
+        )
 
 
 class TestFlagStaleOverrides:
