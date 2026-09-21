@@ -7,6 +7,10 @@ code grew to ten, and doc links pointing at paths that moved during the monorepo
 migration. Every one of those was mechanically detectable. These tests detect
 them, in the PR that introduces them.
 
+Links are checked past the path, too: a `#anchor` has to match a heading in the
+file it points at. Renaming a heading breaks every link to it without moving a
+file, and three such links had to be fixed by hand in PR #213.
+
 Each failure message names the specific flag/module/adapter/link and the file
 that needs updating — the point is that whoever trips one can fix it in a minute.
 """
@@ -15,9 +19,13 @@ import ast
 import re
 import subprocess
 import sys
+import unicodedata
+from difflib import get_close_matches
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
+from markdown_it import MarkdownIt
 
 
 def _find_repo_root():
@@ -328,7 +336,10 @@ def _markdown_files():
 
 
 def _relative_link_targets(text):
-    """Link targets in `text`, excluding anything inside code.
+    """Link targets in `text` that stay in the repo, excluding anything inside code.
+
+    A bare `#anchor` stays in the repo: it is a link into the file it is written
+    in. Only a scheme (`https:`, `mailto:`) or a leading `//` takes a link out.
 
     Code spans and fences are stripped first rather than skipped file by file:
     ci-style-profile/PLAN.md documents its own markdown handling with a literal
@@ -339,7 +350,7 @@ def _relative_link_targets(text):
     text = _FENCED_CODE.sub("", text)
     text = _INLINE_CODE.sub("", text)
     for target in _MD_LINK.findall(text):
-        if re.match(r"^(?:[a-z][a-z0-9+.-]*:|//|#)", target, re.IGNORECASE):
+        if re.match(r"^(?:[a-z][a-z0-9+.-]*:|//)", target, re.IGNORECASE):
             continue
         yield target
 
@@ -351,7 +362,7 @@ def test_all_relative_markdown_links_resolve():
         for target in _relative_link_targets(text):
             path_part = target.split("#", 1)[0]
             if not path_part:
-                continue  # pure in-page anchor
+                continue  # pure in-page anchor; test_all_relative_markdown_anchors_resolve
             resolved = (md_path.parent / path_part).resolve()
             if not resolved.exists():
                 broken.append(
@@ -360,6 +371,308 @@ def test_all_relative_markdown_links_resolve():
                 )
 
     assert not broken, "Broken relative markdown links:\n  " + "\n  ".join(broken)
+
+
+# A link's #anchor is checked as well as its path. Renaming a heading breaks
+# every link to it without any path changing, which is how README.md and
+# docs/TROUBLESHOOTING.md went on pointing at
+# CONFIGURATION.md#timeouts-are-automatic-sliding-scale after that section became
+# "Wall-clock backstop is automatic (sliding scale)". PR #213 fixed them by hand.
+#
+# What was reused and what was not, decided before writing any of it:
+#   - GitHub's anchor rule is the JS package github-slugger. Its only Python
+#     port (PyPI github-slugger 0.0.3) had a single release day, 2022-12-12,
+#     carries a hand-transcribed copy of the Unicode table, and has not moved
+#     since. The rule is short, so it is written out below and checked against
+#     GitHub's own output instead of taking on that dependency.
+#   - Ready-made link checkers such as remark-validate-links (Node) and lychee
+#     (Rust) need a toolchain that nothing else in this suite runs.
+#   - Parsing is the part worth borrowing. A line scan built on _FENCED_CODE
+#     reads the `# configs/mypub.yaml` comment in docs/CONFIGURATION.md's
+#     indented ```yaml fence as a heading, and misses setext (underlined)
+#     headings. markdown-it-py, a CommonMark parser, does neither: over every
+#     tracked doc it gave the same heading ids GitHub renders for them (fetched
+#     through the contents API with `Accept: application/vnd.github.html+json`;
+#     335 of 335 when this was written), none extra and none missing.
+
+_MARKDOWN = MarkdownIt("commonmark")
+
+# Circled and squared Latin letters are symbols by Unicode category but count as
+# letters to GitHub, and unicodedata has no property that says so.
+_ALPHABETIC_SYMBOLS = (
+    (0x24B6, 0x24E9),
+    (0x1F130, 0x1F149),
+    (0x1F150, 0x1F169),
+    (0x1F170, 0x1F189),
+)
+
+# `#L10` and `#L10-L12` name lines of a file, not headings.
+_LINE_ANCHOR = re.compile(r"L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?")
+
+# On GitHub an `id` on any element, and a `name` on an <a>, is an anchor too. The
+# lookbehind keeps `data-id=` and the like from counting.
+_HTML_TAG = re.compile(r"<([a-z][a-z0-9]*)\b([^>]*)>", re.IGNORECASE)
+_HTML_ID_OR_NAME = re.compile(
+    r"""(?<![\w-])(id|name)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""",
+    re.IGNORECASE,
+)
+
+
+def _github_slug(heading):
+    """The anchor GitHub gives a heading's text, before repeats are numbered.
+
+    Lowercase, keep the characters Unicode calls word characters (letters, marks,
+    decimal digits, connector punctuation such as `_`) plus `-` and spaces, drop
+    everything else, then turn each space into `-`. Dropping is not replacing, so
+    an em dash leaves the spaces around it behind: "Claude — adaptive vs extended
+    thinking" becomes `claude--adaptive-vs-extended-thinking`.
+
+    This is github-slugger 2.0.0's rule. Compared with that package's table over
+    every code point, it drops nothing the table keeps, and the only extra
+    characters it keeps are ones Unicode added after version 13, which the table
+    predates. Like that package it does not strip: the parser has already trimmed
+    the heading.
+    """
+    kept = []
+    for char in heading.lower():
+        category = unicodedata.category(char)
+        if (
+            char in "- "
+            or category[0] in "LM"
+            or category in ("Nd", "Nl", "Pc")
+            or any(low <= ord(char) <= high for low, high in _ALPHABETIC_SYMBOLS)
+        ):
+            kept.append(char)
+    return "".join(kept).replace(" ", "-")
+
+
+def _html_anchors(html):
+    for tag, attributes in _HTML_TAG.findall(html):
+        for attribute, double, single, bare in _HTML_ID_OR_NAME.findall(attributes):
+            if attribute.lower() == "id" or tag.lower() == "a":
+                yield double or single or bare
+
+
+def _anchors_in(text):
+    """Every `#fragment` a link into `text`, as GitHub renders it, can use.
+
+    That is each heading's slug, with a repeated one numbered `-1`, `-2`, ... the
+    way github-slugger numbers them, and any `id` or `<a name>` written as raw
+    HTML. `text` is parsed as CommonMark rather than scanned, so a `# comment`
+    inside a fence is not a heading even when the fence is indented inside a list
+    item, and an underlined (setext) heading is one.
+    """
+    tokens = _MARKDOWN.parse(text)
+    anchors = set()
+    occurrences = {}  # github-slugger's name for it: slug -> repeats so far
+    for index, token in enumerate(tokens):
+        if token.type == "heading_open":
+            heading = "".join(
+                child.content
+                for child in tokens[index + 1].children
+                if child.type in ("text", "code_inline")
+            )
+            slug = unique = _github_slug(heading)
+            while unique in occurrences:
+                occurrences[slug] += 1
+                unique = f"{slug}-{occurrences[slug]}"
+            occurrences[unique] = 0
+            anchors.add(unique)
+        elif token.type == "html_block":
+            anchors.update(_html_anchors(token.content))
+        elif token.type == "inline":
+            for child in token.children:
+                if child.type == "html_inline":
+                    anchors.update(_html_anchors(child.content))
+    return anchors
+
+
+def _broken_anchor_links(md_paths, root):
+    """One line per relative link whose `#anchor` names nothing in its target.
+
+    Only links that reach an existing markdown file are judged. A missing file is
+    test_all_relative_markdown_links_resolve's finding, and an anchor on any other
+    kind of file (`resolver.py#L60`) is a line number, not a heading. A bare
+    `#anchor` is a link into the file it is written in.
+    """
+    anchors_by_file = {}
+    broken = []
+    for md_path in md_paths:
+        for target in _relative_link_targets(md_path.read_text(encoding="utf-8")):
+            path_part, _, fragment = target.partition("#")
+            fragment = unquote(fragment)
+            if not fragment or fragment.lower() == "top":
+                continue  # `#` and `#top` mean the top of any page
+            if _LINE_ANCHOR.fullmatch(fragment):
+                continue
+            if path_part:
+                linked = (md_path.parent / path_part).resolve()
+            else:
+                linked = md_path.resolve()
+            if linked.suffix != ".md" or not linked.is_file():
+                continue
+
+            if linked not in anchors_by_file:
+                text = linked.read_text(encoding="utf-8")
+                anchors_by_file[linked] = _anchors_in(text)
+            anchors = anchors_by_file[linked]
+            if fragment in anchors:
+                continue
+
+            near = get_close_matches(fragment, anchors, n=1)
+            hint = f"; did you mean #{near[0]}?" if near else ""
+            broken.append(
+                f"{md_path.relative_to(root).as_posix()} → {target} "
+                f"(no heading or id there produces #{fragment}{hint})"
+            )
+    return broken
+
+
+def test_all_relative_markdown_anchors_resolve():
+    broken = _broken_anchor_links(_markdown_files(), REPO_ROOT)
+    assert not broken, (
+        "Markdown links whose #anchor matches no heading in the file they point "
+        "to. An anchor is GitHub's slug of the heading text, so renaming a "
+        "heading breaks every link to it. Fix the link, not the heading, unless "
+        "the rename was the mistake:\n  " + "\n  ".join(broken)
+    )
+
+
+# What follows tests the checker itself, on throwaway trees. The real test above
+# can only ever say "this repo is fine today"; these say it would notice.
+
+
+def _anchor_report(tmp_path, files):
+    """Write `files` (name -> text) under tmp_path; return the broken-anchor report."""
+    for name, text in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    markdown = [tmp_path / name for name in sorted(files) if name.endswith(".md")]
+    return _broken_anchor_links(markdown, tmp_path)
+
+
+def test_a_renamed_heading_is_caught_and_its_new_anchor_suggested(tmp_path):
+    """The bug PR #213 fixed by hand: the heading changed, the links did not."""
+    stale = "timeouts-are-automatic-sliding-scale"
+    current = "wall-clock-backstop-is-automatic-sliding-scale"
+    files = {
+        "docs/CONFIGURATION.md": "## Wall-clock backstop is automatic (sliding scale)\n",
+        "README.md": f"[t](docs/CONFIGURATION.md#{stale})\n",
+    }
+    (report,) = _anchor_report(tmp_path, files)
+    assert f"README.md → docs/CONFIGURATION.md#{stale}" in report
+    assert f"did you mean #{current}?" in report
+
+    files["README.md"] = f"[t](docs/CONFIGURATION.md#{current})\n"
+    assert _anchor_report(tmp_path, files) == []
+
+
+def test_a_bare_anchor_is_checked_against_its_own_file(tmp_path):
+    doc = "## Present\n\n[ok](#present) [bad](#absent)\n"
+    (report,) = _anchor_report(tmp_path, {"A.md": doc})
+    assert report.startswith("A.md → #absent ")
+
+
+def test_a_comment_in_a_fence_indented_in_a_list_item_is_not_a_heading(tmp_path):
+    """docs/CONFIGURATION.md nests ```yaml fences inside list items."""
+    doc = (
+        "1. Step\n"
+        "   ```yaml\n"
+        "   # configs/mypub.yaml\n"
+        "   ```\n\n"
+        "## Real\n\n"
+        "[fake](#configsmypubyaml) [real](#real)\n"
+    )
+    (report,) = _anchor_report(tmp_path, {"A.md": doc})
+    assert "#configsmypubyaml" in report
+
+
+def test_repeated_headings_are_numbered_the_way_github_numbers_them():
+    assert _anchors_in("## Setup\n\n## Setup\n\n## Setup\n") == {
+        "setup",
+        "setup-1",
+        "setup-2",
+    }
+    # github-slugger's own edge: a heading that already looks like a numbered repeat.
+    assert _anchors_in("## a\n\n## a\n\n## a-1\n") == {"a", "a-1", "a-1-1"}
+
+
+def test_underlined_headings_are_headings():
+    assert _anchors_in("Title\n=====\n\nSub-title\n--------\n") == {
+        "title",
+        "sub-title",
+    }
+
+
+def test_heading_markup_is_reduced_to_its_text():
+    text = "## The `--cost-preset` flag, _really_ (and [more](x.md))\n"
+    assert _anchors_in(text) == {"the---cost-preset-flag-really-and-more"}
+
+
+def test_explicit_html_anchors_count():
+    text = (
+        '<a name="legacy"></a>\n\n'
+        '<div id="box">x</div>\n\n'
+        'text <span id="inline"></span>\n\n'
+        '<meta name="not-an-anchor"> <p data-id="nor-this">\n'
+    )
+    assert _anchors_in(text) == {"legacy", "box", "inline"}
+
+
+def test_only_anchors_into_markdown_headings_are_judged(tmp_path):
+    files = {
+        "A.md": (
+            "[line](code.py#L60) [range](B.md#L10-L12) [top](#top) [bare](#) "
+            "[gone](missing.md#x)\n"
+        ),
+        "B.md": "# B\n",
+        "code.py": "x = 1\n",
+    }
+    assert _anchor_report(tmp_path, files) == []
+
+
+def test_a_percent_encoded_anchor_is_decoded_before_matching(tmp_path):
+    assert _anchor_report(tmp_path, {"A.md": "## Café\n\n[x](#caf%C3%A9)\n"}) == []
+
+
+# Headings from this repo with the ids GitHub renders for them, and cases from
+# github-slugger's fixtures (which it generated from GitHub's rendering).
+@pytest.mark.parametrize(
+    "heading, slug",
+    [
+        (
+            "Claude — adaptive vs extended thinking",
+            "claude--adaptive-vs-extended-thinking",
+        ),
+        (
+            "Option B — Vertex AI (reserved capacity, no 503s)",
+            "option-b--vertex-ai-reserved-capacity-no-503s",
+        ),
+        (
+            "Resolved: ci-web-intel → ci-style-profile",
+            "resolved-ci-web-intel--ci-style-profile",
+        ),
+        (
+            'Pointer only — verification: "pointer"',
+            "pointer-only--verification-pointer",
+        ),
+        (
+            "4. Perplexity's grounded search citations are captured and thrown away",
+            "4-perplexitys-grounded-search-citations-are-captured-and-thrown-away",
+        ),
+        ("bravoCharlieDelta", "bravocharliedelta"),
+        ("heading with a - dash", "heading-with-a---dash"),
+        ("heading with an _ underscore", "heading-with-an-_-underscore"),
+        ("heading with a period.txt", "heading-with-a-periodtxt"),
+        ("apostrophe’s should be trimmed", "apostrophes-should-be-trimmed"),
+        ("en–dash", "endash"),
+        ("😄 unicode emoji", "-unicode-emoji"),
+        ("Привет non-latin 你好", "привет-non-latin-你好"),
+    ],
+)
+def test_github_slug_matches_githubs(heading, slug):
+    assert _github_slug(heading) == slug
 
 
 # ---------------------------------------------------------------------------
