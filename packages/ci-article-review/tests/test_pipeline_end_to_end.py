@@ -1158,6 +1158,138 @@ class TestRetryFailedBillsOnlyTheCallsItMakes:
         assert "\nCost: $0.0000 — replayed from a capture" in capsys.readouterr().out
 
 
+class TestSearchFeesReachTheReport:
+    """A grounded call's searches, from the adapter's result to the bill.
+
+    The fee was missing from every report until 2026-09-19: an isolated
+    claude:fact_check reported $1.1952 for its tokens and nothing for the 5
+    searches Anthropic billed. Each gemini call here carries a real model id
+    so the fee table prices it: googleSearch rides on every gemini call, and
+    Gemini 2.5 bills one grounded prompt per call that searched at all.
+    """
+
+    @staticmethod
+    def _run_domain(model_name, domain, *a, **kw):
+        result = _fake_run_domain(model_name, domain, *a, **kw)
+        if model_name == "gemini":
+            result["model"] = "gemini-2.5-pro"
+            result["searches"] = 3 if domain == "fact_check" else 0
+        return result
+
+    def _run(self, tmp_path, **kwargs):
+        stub = patch(
+            "ci_article_review.pipeline._run_domain", side_effect=self._run_domain
+        )
+        with _stubbed_run(
+            tmp_path, extra_patches=[stub], offline=True, **kwargs
+        ) as report:
+            pass
+        return report
+
+    def test_the_count_is_logged_beside_the_tokens(self, tmp_path):
+        log = {e["pass"]: e for e in self._run(tmp_path)["api_call_log"]}
+        assert log["gemini:fact_check"]["searches"] == 3
+        # Could search and did not: a known zero, not a missing count.
+        assert log["gemini:red_team"]["searches"] == 0
+        assert "searches" not in log["openai:voice_style"]
+
+    def test_the_fee_is_billed_and_shown_on_its_own_line(self, tmp_path, capsys):
+        summary = self._run(tmp_path)["cost_summary"]
+        out = capsys.readouterr().out
+
+        assert summary["total_search_usd"] == 0.035
+        assert summary["search_units"] == 1
+        assert summary["unmeasured_search_calls"] == 0
+        block = out[out.index("\nEstimated cost: ") :].strip().split("\n\n")[0]
+        assert (
+            "  (search and grounding fees: $0.0350 of that, at list price, "
+            "before any free allowance)"
+        ) in block.splitlines()
+        assert "gemini:fact_check" in block and "(incl. $0.0350 search fees)" in block
+
+    def test_a_replay_re_reports_the_fee_as_history(self, tmp_path, capsys):
+        """The capture keeps each result's count, so a replay prices it again
+        and files it with the rest of the capture's spend."""
+        self._run(tmp_path / "original")
+        capture = next((tmp_path / "original" / "history").rglob("*_results.json"))
+        capsys.readouterr()
+        with _stubbed_run(
+            tmp_path / "replay", offline=True, replay_results=str(capture)
+        ) as report:
+            pass
+
+        summary = report["cost_summary"]
+        assert summary["total_search_usd"] == 0.035
+        assert summary["incurred_usd"] == 0.0
+        assert summary["replayed_usd"] == summary["total_usd"]
+        # Every gemini result said how often it searched, so nothing is unknown.
+        assert summary["unmeasured_search_calls"] == 0
+
+    #: Priced models, so the basis can say "at least": with any model unknown
+    #: to pricing.yaml it says "estimated" instead, which outranks it.
+    _PRICED = {
+        "gemini": "gemini-2.5-pro",
+        "openai": "gpt-5.4",
+        "mistral": "mistral-small-latest",
+    }
+
+    def _old_capture(self, tmp_path, **gemini_result):
+        """A capture from before calls recorded their searches: the plain stub
+        run's own, whose results carry no ``searches`` key."""
+        with _stubbed_run(tmp_path / "original", offline=True):
+            pass
+        written = next((tmp_path / "original" / "history").rglob("*_results.json"))
+        raw = ensemble_capture.load(written)
+        assert not any("searches" in r for r in raw.values())
+        for name, result in raw.items():
+            result["model"] = self._PRICED[name.split(":")[0]]
+            if name.startswith("gemini:"):
+                result.update(gemini_result)
+        path = tmp_path / "old_capture_results.json"
+        ensemble_capture.save(path, raw, article_title="T", run_number=1)
+        return str(path)
+
+    def _replay(self, tmp_path, capture, caplog):
+        with caplog.at_level("INFO", logger="pipeline"):
+            with _stubbed_run(
+                tmp_path / "replay", offline=True, replay_results=capture
+            ) as report:
+                pass
+        return report
+
+    def test_an_old_ungrounded_gemini_capture_is_not_called_exact(
+        self, tmp_path, caplog
+    ):
+        """googleSearch rides on every gemini call and the model decides per
+        prompt whether to use it, and litellm can drop gemini's grounding
+        metadata on some stream shapes, so a gemini result reading ungrounded
+        does not prove no search ran. Keyed on "grounded", a gemini-only
+        history would still have been called exact."""
+        capture = self._old_capture(tmp_path, grounding_available=False)
+        report = self._replay(tmp_path, capture, caplog)
+
+        gemini = [e for e in report["api_call_log"] if e["pass"].startswith("gemini:")]
+        assert gemini and all(e["searches"] is None for e in gemini)
+        summary = report["cost_summary"]
+        assert summary["pricing_known"] is True
+        assert summary["unmeasured_search_calls"] == len(gemini)
+        assert (
+            f"(at least — {len(gemini)} attempt(s) that could search did not "
+            "report how many searches they ran)"
+        ) in caplog.text
+        assert "(exact)" not in caplog.text
+
+    def test_an_old_capture_marks_only_calls_that_could_have_searched(
+        self, tmp_path, caplog
+    ):
+        report = self._replay(tmp_path, self._old_capture(tmp_path), caplog)
+
+        for entry in report["api_call_log"]:
+            could = entry["pass"].startswith("gemini:")
+            # openai and mistral here neither searched nor could have.
+            assert ("searches" in entry) == could, entry["pass"]
+
+
 class TestATruncatedPassIsReportedAsIncomplete:
     """A pass cut off at its output ceiling, carried to every place it is read.
 
@@ -1353,6 +1485,91 @@ class TestTheCallLogRecordsTheEffortThatRan:
         # A provider off the list, with no effort set, still logs none.
         others = [e for e in report["api_call_log"] if e["pass"].startswith("openai:")]
         assert others and {e["effort"] for e in others} == {"none"}
+
+
+class TestTheCallLogReadsOnlyTheKeyTheProviderReads:
+    """claude's key is `effort` and openai's is `reasoning_effort`.
+
+    The client drops the other spelling, so a value under it never ran. The log
+    read `reasoning_effort` first for every provider, and so recorded a stray
+    `reasoning_effort: low` for a claude pass that ran at high, beside the budget
+    and ceiling sized for high: the record retuning configs/timeouts.yaml is
+    mined from, wrong in its one column that says what the pass was.
+    """
+
+    def _efforts(self, tmp_path, provider, cfg):
+        config = copy.deepcopy(_CONFIG)
+        config["api_keys"]["claude"] = {"api_key": "k"}
+        config["models"][provider] = cfg
+        # The model that answered is the one asked for, so an unset effort is
+        # judged on it, as it is in a run with no fallback.
+        answered = cfg["model"]
+
+        def _answered_by(model_name, domain, *a, **kw):
+            result = _fake_run_domain(model_name, domain, *a, **kw)
+            if model_name == provider:
+                result["model"] = answered
+            return result
+
+        with _stubbed_run(
+            tmp_path,
+            extra_patches=[
+                patch("ci_article_review.pipeline.merge_configs", return_value=config),
+                patch(
+                    "ci_article_review.pipeline._run_domain", side_effect=_answered_by
+                ),
+            ],
+            offline=True,
+        ) as report:
+            pass
+        passes = [
+            e for e in report["api_call_log"] if e["pass"].startswith(f"{provider}:")
+        ]
+        assert passes, f"{provider} reviewed nothing, so this proves nothing"
+        return {e["effort"] for e in passes}
+
+    @pytest.mark.parametrize(
+        "cfg,expected",
+        [
+            ({"model": "claude-opus-5", "effort": "medium"}, "medium"),
+            # The stray key alone: nothing was sent, so it ran at its default.
+            ({"model": "claude-opus-5", "reasoning_effort": "low"}, "high"),
+            # Beside the right one, it is not the one that ran.
+            (
+                {
+                    "model": "claude-opus-5",
+                    "effort": "medium",
+                    "reasoning_effort": "low",
+                },
+                "medium",
+            ),
+            # A model that thinks only when asked, and was not asked.
+            ({"model": "claude-opus-4-8", "reasoning_effort": "high"}, "none"),
+        ],
+        ids=["right-key", "stray-only", "stray-beside-right", "not-asked"],
+    )
+    def test_claude_logs_its_effort_key(self, tmp_path, cfg, expected):
+        assert self._efforts(tmp_path, "claude", cfg) == {expected}
+
+    @pytest.mark.parametrize(
+        "cfg,expected",
+        [
+            ({"model": "gpt-5.4", "reasoning_effort": "high"}, "high"),
+            # claude's spelling under openai: nothing was sent.
+            ({"model": "gpt-5.4", "effort": "high"}, "none"),
+            (
+                {"model": "gpt-5.4", "reasoning_effort": "low", "effort": "high"},
+                "low",
+            ),
+        ],
+        ids=["right-key", "stray-only", "stray-beside-right"],
+    )
+    def test_the_other_providers_log_theirs(self, tmp_path, cfg, expected):
+        assert self._efforts(tmp_path, "openai", cfg) == {expected}
+
+    def test_gemini_reads_neither_spelling(self, tmp_path):
+        cfg = {"model": "gemini-2.5-flash", "reasoning_effort": "high", "effort": "low"}
+        assert self._efforts(tmp_path, "gemini", cfg) == {"none"}
 
 
 class TestADomainWithNoReviewerReachesTheReport:

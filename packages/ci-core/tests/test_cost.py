@@ -1,5 +1,7 @@
 """Tests for analysis.cost."""
 
+import pytest
+
 from ci_core.llm import cost
 from ci_core.llm.cost import calculate, _price_for_model
 
@@ -544,3 +546,232 @@ class TestCallLogEntryBuilder:
         assert ok["error"] is None
         bad = cost.call_log_entry("x", {"failed": True, "error": "HTTP 503"})
         assert bad["error"] == "HTTP 503"
+
+    @pytest.mark.parametrize("searches", [0, 3, None])
+    def test_it_carries_the_search_count_by_presence(self, searches):
+        """The same trap again: citation re-asks run sonar, which bills every
+        request, and they build their entry here. 0 and None both mean
+        something, so neither may be dropped as falsy."""
+        entry = cost.call_log_entry(
+            "citation_reask:perplexity",
+            {"model": "sonar", "tokens": {}, "searches": searches},
+        )
+        assert entry["searches"] == searches
+
+    def test_the_search_count_is_absent_when_the_call_could_not_search(self):
+        entry = cost.call_log_entry(
+            "x", {"model": "mistral-small-latest", "tokens": {}}
+        )
+        assert "searches" not in entry
+
+
+class TestSearchFeeTable:
+    """pricing.yaml's ``search_fees``, one rate per provider family.
+
+    Each rate was read off the provider's own pricing page on 2026-09-19; the
+    YAML cites them. These pin the lookup, not the numbers' provenance.
+    """
+
+    @pytest.mark.parametrize(
+        "model, fee",
+        [
+            ("claude-opus-5", (10.00, "search")),
+            # litellm's model map has no search rate for this one, the last
+            # model in claude's fallback chain; the prefix row covers it.
+            ("claude-haiku-4-5-20251001", (10.00, "search")),
+            ("gpt-5.6-sol", (10.00, "call")),
+            ("gpt-5.4", (10.00, "call")),
+            ("gemini-2.5-pro", (35.00, "prompt")),
+            ("gemini-2.5-flash-lite", (35.00, "prompt")),
+            ("gemini-3.5-flash", (14.00, "query")),
+            ("sonar", (5.00, "request")),
+            ("sonar-pro", (6.00, "request")),
+            ("sonar-reasoning-pro", (6.00, "request")),
+            ("sonar-deep-research", (5.00, "query")),
+            ("grok-4.6", (5.00, "call")),
+        ],
+    )
+    def test_each_grounded_family_has_a_rate(self, model, fee):
+        assert cost.known_search_fee(model) == fee
+
+    @pytest.mark.parametrize("model", ["mistral-small-latest", "", None])
+    def test_a_model_that_never_searches_has_none(self, model):
+        assert cost.known_search_fee(model) is None
+
+    def test_a_malformed_row_refuses_to_load(self, monkeypatch):
+        from ci_core.config_helpers import PackagedConfigError
+
+        monkeypatch.setattr(
+            cost,
+            "load_packaged_yaml",
+            lambda path: {
+                "unknown_price": [2.5, 10.0],
+                "models": {"m": [1.0, 2.0]},
+                "search_fees": {"m": [10.0, "per-search"]},
+            },
+        )
+        with pytest.raises(PackagedConfigError, match="search_fees.m"):
+            cost._load_pricing()
+
+
+class TestSearchFeesAreBilled:
+    """Every grounded pass was under-reported by its search fee.
+
+    2026-09-18, an isolated claude:fact_check on claude-opus-5 streamed a final
+    usage of 139,051 input and 19,998 output tokens and
+    ``server_tool_use: {web_search_requests: 5}``. The report said $1.1952, which
+    is the tokens alone; the $0.05 Anthropic bills for 5 searches was nowhere.
+    """
+
+    def _entry(self, model="claude-opus-5 [grounded]", searches=5, **extra):
+        entry = {
+            "pass": "claude:fact_check",
+            "model": model,
+            "tokens": {"prompt": 139051, "completion": 19998},
+            **extra,
+        }
+        if searches != "absent":
+            entry["searches"] = searches
+        return entry
+
+    def test_the_measured_pass_now_includes_its_searches(self):
+        summary = calculate([self._entry()])
+        tokens_only = summary["total_input_usd"] + summary["total_output_usd"]
+        assert tokens_only == pytest.approx(1.1952, abs=1e-9)
+        assert summary["total_search_usd"] == 0.05
+        assert summary["total_usd"] == 1.2452
+        assert summary["search_units"] == 5
+        (row,) = summary["by_pass"]
+        assert row["search_usd"] == 0.05
+        assert row["search_units"] == 5
+        assert row["total_usd"] == pytest.approx(1.245205, abs=1e-6)
+
+    def test_a_call_that_could_not_search_is_priced_as_before(self):
+        """The control: no count, no fee and no new by_pass keys."""
+        summary = calculate([self._entry(searches="absent")])
+        assert summary["total_usd"] == 1.1952
+        assert summary["total_search_usd"] == 0.0
+        assert "search_usd" not in summary["by_pass"][0]
+
+    def test_a_grounded_call_that_ran_no_search_owes_no_fee(self):
+        summary = calculate([self._entry(searches=0)])
+        assert summary["total_search_usd"] == 0.0
+        assert summary["by_pass"][0]["search_usd"] == 0.0
+        assert summary["unmeasured_search_calls"] == 0
+
+    def test_an_unreported_count_is_counted_not_guessed(self):
+        """The rule uncosted_calls follows: bill what the response reported,
+        and say how much it did not."""
+        summary = calculate([self._entry(searches=None)])
+        assert summary["unmeasured_search_calls"] == 1
+        assert summary["total_search_usd"] == 0.0
+        assert summary["total_usd"] == 1.1952
+        # And the pass says so, or its search_usd of 0.0 would read as a call
+        # that searched nothing.
+        assert summary["by_pass"][0]["unmeasured_search_calls"] == 1
+
+    def test_a_measured_pass_carries_no_unmeasured_marker(self):
+        row = calculate([self._entry(searches=0)])["by_pass"][0]
+        assert "unmeasured_search_calls" not in row
+
+    def test_searches_on_a_model_with_no_rate_are_not_billed_at_zero(self):
+        summary = calculate([self._entry(model="some-new-model", searches=4)])
+        assert summary["unpriced_searches"] == 4
+        assert summary["total_search_usd"] == 0.0
+
+    def test_gemini_2_5_bills_one_grounded_prompt_however_many_queries(self):
+        summary = calculate([self._entry(model="gemini-2.5-pro", searches=4)])
+        assert summary["total_search_usd"] == 0.035
+        assert summary["search_units"] == 1
+
+    def test_gemini_3_bills_every_query(self):
+        summary = calculate([self._entry(model="gemini-3.5-flash", searches=3)])
+        assert summary["total_search_usd"] == 0.042
+        assert summary["search_units"] == 3
+
+    @pytest.mark.parametrize(
+        "model, fee", [("sonar", 0.005), ("sonar-reasoning-pro", 0.006)]
+    )
+    def test_perplexity_bills_its_request_fee(self, model, fee):
+        summary = calculate([self._entry(model=model, searches=1)])
+        assert summary["total_search_usd"] == fee
+
+    def test_the_total_is_the_sum_of_its_three_lines(self):
+        summary = calculate(
+            [
+                self._entry(),
+                self._entry(model="gemini-2.5-flash", searches=2),
+                self._entry(model="sonar", searches=1),
+            ]
+        )
+        parts = (
+            summary["total_input_usd"]
+            + summary["total_output_usd"]
+            + summary["total_search_usd"]
+        )
+        # Each line rounds to 4dp on its own, as the replayed/incurred split does.
+        assert abs(parts - summary["total_usd"]) < 0.0002
+
+    def test_a_discarded_attempts_searches_are_billed_one_attempt_at_a_time(self):
+        """Two grounded 2.5 attempts are two grounded prompts. Summed first,
+        a per-prompt fee would bill them once."""
+        discarded = {
+            "count": 2,
+            "costed": 2,
+            "reasons": ["MalformedJSONError"],
+            "tokens": {"prompt": 0, "completion": 0},
+            "searches": [3, 2],
+        }
+        summary = calculate(
+            [
+                self._entry(
+                    model="gemini-2.5-pro",
+                    searches=1,
+                    discarded_attempts=discarded,
+                )
+            ]
+        )
+        assert summary["search_units"] == 3
+        assert summary["total_search_usd"] == 0.105
+
+    def test_a_discarded_attempt_with_no_count_is_counted(self):
+        discarded = {
+            "count": 1,
+            "costed": 1,
+            "reasons": ["MalformedJSONError"],
+            "tokens": {"prompt": 10, "completion": 10},
+            "searches": [None],
+        }
+        summary = calculate([self._entry(discarded_attempts=discarded)])
+        assert summary["unmeasured_search_calls"] == 1
+        assert summary["total_search_usd"] == 0.05
+
+    def test_a_replayed_calls_searches_are_history_not_spend(self):
+        summary = calculate([self._entry(replayed=True)])
+        assert summary["incurred_usd"] == 0.0
+        assert summary["replayed_usd"] == summary["total_usd"] == 1.2452
+
+
+class TestDiscardedSearchesAreRecorded:
+    """The client side of the same contract: a retried grounded attempt's
+    count travels with its usage into ``discarded_attempts``."""
+
+    def test_each_attempt_keeps_its_own_count(self):
+        from ci_core.llm.client import _summarise_discarded
+
+        summary = _summarise_discarded(
+            [
+                {"reason": "MalformedJSONError", "usage": None, "searches": 3},
+                {"reason": "MalformedJSONError", "usage": None, "searches": None},
+                {"reason": "StreamStalled", "usage": None},
+            ]
+        )
+        # A stall produced no response, so it has no count: it is already
+        # counted as uncosted.
+        assert summary["searches"] == [3, None]
+
+    def test_no_key_when_no_attempt_could_search(self):
+        from ci_core.llm.client import _summarise_discarded
+
+        summary = _summarise_discarded([{"reason": "StreamStalled", "usage": None}])
+        assert "searches" not in summary

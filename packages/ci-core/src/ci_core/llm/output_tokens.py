@@ -36,9 +36,26 @@ from ci_core.llm import timeout_model
 #: one for them would change nothing and read as though it did.
 CAPPED_PROVIDERS = frozenset({"claude", "mistral"})
 
-#: The config key each capped provider takes its reasoning level from — the same
-#: key ``client._provider_params`` reads, so this agrees with what is sent.
-_EFFORT_KEY = {"claude": "effort", "mistral": "reasoning_effort"}
+#: The config key each provider takes its reasoning level from — the key
+#: ``client._provider_params`` reads (openai's Responses call reads the same one),
+#: so this agrees with what is sent. There are two spellings and a provider reads
+#: exactly one: claude's is ``effort``; openai, mistral, grok and perplexity take
+#: ``reasoning_effort``. The other spelling is dropped, not forwarded, so a config
+#: that uses it asks for nothing (``effort_key_warnings``). gemini has no entry:
+#: it thinks by ``thinking_budget`` and is sent no effort at all. Pinned against
+#: the request in tests/test_llm_client.py.
+_EFFORT_KEY = {
+    "claude": "effort",
+    "openai": "reasoning_effort",
+    "mistral": "reasoning_effort",
+    "grok": "reasoning_effort",
+    "perplexity": "reasoning_effort",
+}
+
+#: Both spellings, for spotting the one a provider does not read; gemini reads
+#: neither. In the order the warnings walk the providers.
+_EFFORT_SPELLINGS = ("effort", "reasoning_effort")
+_JUDGED_PROVIDERS = (*_EFFORT_KEY, "gemini")
 
 #: The effort a model reasons at when its config sets none. Unset is not "none":
 #: it is the provider's default, and for these models the default is to think.
@@ -112,6 +129,15 @@ def effort_when_unset(provider, model):
     return _EFFORT_WHEN_UNSET.get(provider, {}).get(str(model).rsplit("/", 1)[-1])
 
 
+def effort_key(provider):
+    """The config key ``provider``'s request reads its effort from, or None.
+
+    Anything that reports what a pass ran at reads this key and no other: the
+    client ignores the other spelling, so a value under it never ran.
+    """
+    return _EFFORT_KEY.get(provider)
+
+
 def effort_of(provider, cfg):
     """The reasoning level ``provider`` will run at, or None for a plain pass.
 
@@ -121,11 +147,29 @@ def effort_of(provider, cfg):
     default (``_EFFORT_WHEN_UNSET``). That holds for a claude ``"none"`` too,
     since litellm drops it before sending, leaving a request with no effort.
     """
-    key = _EFFORT_KEY.get(provider)
+    key = effort_key(provider)
     effort = (cfg or {}).get(key) if key else None
     if not effort or str(effort).lower() == "none":
         return effort_when_unset(provider, (cfg or {}).get("model"))
     return str(effort).lower()
+
+
+def _claude_config(model_configs):
+    """The claude config the effort checks judge, or None when there is none.
+
+    Nothing to judge: no claude section, one written as a bare model string (the
+    form ci-style-profile's user.yaml allows), one that is switched off, and one
+    with a ``thinking_budget``, which the client sends in place of any effort.
+    """
+    if not isinstance(model_configs, dict):
+        return None
+    cfg = model_configs.get("claude")
+    if not isinstance(cfg, dict) or cfg.get("enabled", True) is False:
+        return None
+    if cfg.get("thinking_budget") is not None:
+        # client._provider_params sends the budget and never reads the effort.
+        return None
+    return cfg
 
 
 def effort_none_warnings(model_configs):
@@ -151,15 +195,12 @@ def effort_none_warnings(model_configs):
     Matched case-insensitively, but litellm matches exactly. It rejects
     ``None``, ``NONE`` or a padded ``" none "`` before sending, so every call
     fails. That is loud already, but only once calls are being made, and the
-    warning for it says so rather than promising a high-effort run.
+    warning for it says so rather than promising a high-effort run. Only a model
+    that thinks by default is judged here; ``effort_spelling_warnings`` says the
+    same of every other claude model, and of every other spelling.
     """
-    if not isinstance(model_configs, dict):
-        return []
-    cfg = model_configs.get("claude")
-    if not isinstance(cfg, dict) or cfg.get("enabled", True) is False:
-        return []
-    if cfg.get("thinking_budget") is not None:
-        # client._provider_params sends the budget and never reads the effort.
+    cfg = _claude_config(model_configs)
+    if cfg is None:
         return []
     effort = cfg.get(_EFFORT_KEY["claude"])
     if effort is not False and not (
@@ -197,6 +238,126 @@ def effort_none_warnings(model_configs):
         f"at its default, {default}, and is billed for it. Set effort: low or "
         f"medium to spend less on thinking."
     ]
+
+
+def effort_key_warnings(model_configs):
+    """A warning for each provider config that spells its effort the other way.
+
+    Claude reads ``effort`` and openai, mistral, grok and perplexity read
+    ``reasoning_effort`` (``_EFFORT_KEY``); gemini reads neither. The client
+    drops the spelling a provider does not read, so nothing of it reaches the
+    request and the model runs as though no effort were set. On claude-opus-5
+    that is high, and billed. Nothing fails, so nothing else says so.
+
+    Both spellings in one config is warned too: the stray one is inert, but
+    whoever wrote it believes it does something. That is how a preset's
+    ``effort`` ends up beside a ``reasoning_effort`` left in user.yaml, or in
+    ``preset_overrides``. A ``thinking_budget`` on claude decides instead of any
+    effort (``_claude_config``), so a claude config with one is not judged.
+    """
+    if not isinstance(model_configs, dict):
+        return []
+    warnings = []
+    for provider in _JUDGED_PROVIDERS:
+        cfg = model_configs.get(provider)
+        if not isinstance(cfg, dict) or cfg.get("enabled", True) is False:
+            continue
+        if provider == "claude" and _claude_config(model_configs) is None:
+            continue
+        right = _EFFORT_KEY.get(provider)
+        strays = [k for k in _EFFORT_SPELLINGS if k != right and cfg.get(k)]
+        if not strays:
+            continue
+        from ci_core.llm import client  # lazy, as in effort_none_warnings
+
+        model = client._resolve_model(provider, None, cfg)
+        for stray in strays:
+            said = f"{stray}: {cfg[stray]!r}"
+            if right is None:
+                warnings.append(
+                    f"{provider} model {model} sets {said}, a key the {provider} "
+                    f"request does not use: it sends no effort, only "
+                    f"thinking_budget. Remove it, or set thinking_budget to size "
+                    f"its thinking."
+                )
+            elif cfg.get(right):
+                warnings.append(
+                    f"{provider} model {model} sets both {right}: "
+                    f"{cfg[right]!r} and {said}. The {provider} request uses "
+                    f"only {right}, so {stray} does nothing; remove it."
+                )
+            else:
+                default = effort_when_unset(provider, model)
+                ran = (
+                    f"thinks at its default, {default}, and is billed for it"
+                    if default
+                    else "runs at its default"
+                )
+                warnings.append(
+                    f"{provider} model {model} sets {said}, a key the {provider} "
+                    f"request does not use: its effort key is {right}. No effort "
+                    f"is sent, so {model} {ran}. Rename it to {right}."
+                )
+    return warnings
+
+
+def effort_spelling_warnings(model_configs):
+    """A warning for a claude effort spelled in a way litellm rejects.
+
+    litellm matches effort levels exactly, in lowercase: ``High``, ``Medium``,
+    ``HIGH`` or a padded ``" high "`` fail every claude call before anything is
+    sent, on every claude model (litellm 1.96.2, captured on the wire in
+    tests/test_llm_client.py). That is loud, but only at call time, after the
+    other providers' calls have been made and billed, and the run has no claude
+    in it.
+
+    A warning, not a rejection: the sibling ``effort_none_warnings`` warns, a
+    reject would be a new hard failure in the config every entry point loads, and
+    it can be promoted later where the reverse cannot. It judges the spelling
+    only. A typo such as ``hgih`` fails the same way and is not caught, and
+    neither is a lowercase level that one model does not support: both are loud
+    at call time too, and naming them here would mean keeping litellm's list.
+
+    Only claude is judged. Every other provider is forwarded the value as
+    written (also pinned in tests/test_llm_client.py), so whether ``High`` is
+    rejected is the provider's to say, and this has not measured it.
+    """
+    cfg = _claude_config(model_configs)
+    if cfg is None:
+        return []
+    effort = cfg.get(_EFFORT_KEY["claude"])
+    if not isinstance(effort, str) or effort == effort.strip().lower():
+        return []
+    from ci_core.llm import client  # lazy, as in effort_none_warnings
+
+    model = client._resolve_model("claude", None, cfg)
+    fixed = effort.strip().lower()
+    if fixed == "none" and effort_when_unset("claude", model):
+        # effort_none_warnings speaks for these, and for what they cost.
+        return []
+    fix = (
+        f"Write effort: {fixed}."
+        if fixed
+        else "Write the level in lowercase, with nothing around it: effort: high."
+    )
+    return [
+        f"claude model {model} is set to effort: {effort!r}, which litellm "
+        f"rejects before sending (it matches effort levels exactly, in "
+        f"lowercase), so every claude call will fail. {fix}"
+    ]
+
+
+def effort_warnings(model_configs):
+    """Every warning config load has about how the models' effort is written.
+
+    The one call both loaders make (ci-review's ``merge_configs`` and
+    ci-style-profile's bootstrap), so a check added here reaches both.
+    """
+    return (
+        effort_none_warnings(model_configs)
+        + effort_key_warnings(model_configs)
+        + effort_spelling_warnings(model_configs)
+    )
 
 
 @functools.lru_cache(maxsize=None)

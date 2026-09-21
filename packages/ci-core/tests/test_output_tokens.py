@@ -384,6 +384,335 @@ class TestEffortNoneThatStillThinksIsWarned:
         assert ot.effort_none_warnings(configs) == []
 
 
+class TestEachProviderHasOneEffortKey:
+    """The table config load, the call log, the timeout budget and the probe
+    read. That it matches the request is pinned in test_llm_client.py, for every
+    provider; these cover what is done with it."""
+
+    @pytest.mark.parametrize(
+        "provider,key",
+        [
+            ("claude", "effort"),
+            ("openai", "reasoning_effort"),
+            ("mistral", "reasoning_effort"),
+            ("grok", "reasoning_effort"),
+            ("perplexity", "reasoning_effort"),
+        ],
+    )
+    def test_the_key_a_provider_reads(self, provider, key):
+        assert ot.effort_key(provider) == key
+
+    @pytest.mark.parametrize("provider", ["gemini", "nonsense", None])
+    def test_a_provider_that_reads_none_has_none(self, provider):
+        """gemini thinks by thinking_budget and is sent no effort."""
+        assert ot.effort_key(provider) is None
+
+    def test_effort_of_reads_only_that_key(self):
+        assert ot.effort_of("openai", {"reasoning_effort": "High"}) == "high"
+        assert ot.effort_of("openai", {"effort": "high"}) is None
+        assert ot.effort_of("gemini", {"reasoning_effort": "high"}) is None
+
+    def test_reading_openais_key_does_not_give_it_a_ceiling(self):
+        """The table now names every provider, but only claude and mistral send
+        a ceiling (CAPPED_PROVIDERS), and effort_of must not change that."""
+        cfg = {"model": "gpt-5.6-terra", "reasoning_effort": "high"}
+        assert ot.effort_of("openai", cfg) == "high"
+        assert ot.compute_max_tokens("openai", cfg, "fact_check", 27113) is None
+
+
+class TestAnEffortUnderTheWrongKeyIsWarned:
+    """`reasoning_effort` under claude, or `effort` under everyone else.
+
+    Claude reads `effort` and the others read `reasoning_effort`; the client
+    drops the other spelling, so nothing reaches the request and the model runs
+    as though no effort were set. On claude-opus-5 that is high. Nothing fails,
+    so nothing else says so. That the request drops it is pinned in
+    test_llm_client.py; these cover who is warned, and with what.
+    """
+
+    THINK_BY_DEFAULT = sorted(ot._EFFORT_WHEN_UNSET["claude"])
+    THINK_WHEN_ASKED = TestAnUnsetEffortIsTheModelsDefault.THINK_WHEN_ASKED
+    READS_REASONING_EFFORT = ["openai", "mistral", "grok", "perplexity"]
+
+    @staticmethod
+    def _warned(provider="claude", **cfg):
+        return ot.effort_key_warnings({provider: cfg})
+
+    @pytest.mark.parametrize("model", THINK_BY_DEFAULT)
+    def test_claude_names_the_model_the_key_and_what_it_costs(self, model):
+        (warning,) = self._warned(model=model, reasoning_effort="low")
+        default = ot.effort_when_unset("claude", model)
+        assert f"claude model {model} sets reasoning_effort: 'low'" in warning
+        assert "its effort key is effort" in warning
+        assert f"{model} thinks at its default, {default}, and is billed" in warning
+        assert "Rename it to effort." in warning
+
+    @pytest.mark.parametrize("model", THINK_WHEN_ASKED)
+    def test_a_model_that_thinks_only_when_asked_is_not_said_to_bill_thinking(
+        self, model
+    ):
+        (warning,) = self._warned(model=model, reasoning_effort="low")
+        assert f"{model} runs at its default." in warning
+        assert "billed" not in warning
+
+    @pytest.mark.parametrize("provider", READS_REASONING_EFFORT)
+    def test_the_other_providers_are_warned_the_other_way_round(self, provider):
+        (warning,) = self._warned(provider, model="some-model", effort="high")
+        assert f"{provider} model some-model sets effort: 'high'" in warning
+        assert "its effort key is reasoning_effort" in warning
+        assert "some-model runs at its default." in warning
+        assert "Rename it to reasoning_effort." in warning
+
+    @pytest.mark.parametrize("stray", ["effort", "reasoning_effort"])
+    def test_gemini_reads_neither_spelling(self, stray):
+        (warning,) = self._warned("gemini", model="gemini-2.5-pro", **{stray: "high"})
+        assert f"gemini model gemini-2.5-pro sets {stray}: 'high'" in warning
+        assert "it sends no effort, only thinking_budget" in warning
+
+    def test_both_spellings_in_one_config_names_the_inert_one(self):
+        """The ordinary way to meet it: a preset's `effort` beside a
+        `reasoning_effort` left in user.yaml, or in preset_overrides."""
+        (warning,) = self._warned(
+            model="claude-opus-5", effort="high", reasoning_effort="low"
+        )
+        assert "sets both effort: 'high' and reasoning_effort: 'low'" in warning
+        assert "uses only effort, so reasoning_effort does nothing" in warning
+
+    def test_both_spellings_under_another_provider(self):
+        (warning,) = self._warned(
+            "openai", model="gpt-5.6-terra", reasoning_effort="low", effort="high"
+        )
+        assert "sets both reasoning_effort: 'low' and effort: 'high'" in warning
+        assert "uses only reasoning_effort, so effort does nothing" in warning
+
+    def test_each_stray_key_is_its_own_warning(self):
+        assert len(self._warned("gemini", effort="low", reasoning_effort="high")) == 2
+
+    @pytest.mark.parametrize(
+        "provider,cfg",
+        [
+            ("claude", {"model": "claude-opus-5", "effort": "low"}),
+            ("claude", {"model": "claude-opus-5"}),
+            ("openai", {"model": "gpt-5.6-terra", "reasoning_effort": "low"}),
+            ("mistral", {"model": "mistral-medium-3-5", "reasoning_effort": "none"}),
+            ("gemini", {"model": "gemini-2.5-pro", "thinking_budget": 8192}),
+            # Asking for nothing under the wrong key is not asking for anything.
+            ("claude", {"model": "claude-opus-5", "reasoning_effort": None}),
+            ("claude", {"model": "claude-opus-5", "reasoning_effort": ""}),
+            ("claude", {"model": "claude-opus-5", "reasoning_effort": False}),
+            ("openai", {"model": "gpt-5.6-terra", "effort": None}),
+            ("gemini", {"model": "gemini-2.5-pro", "reasoning_effort": None}),
+        ],
+    )
+    def test_a_config_that_runs_as_written_is_quiet(self, provider, cfg):
+        assert ot.effort_key_warnings({provider: cfg}) == []
+
+    def test_a_disabled_provider_is_not_warned(self):
+        assert self._warned(model="claude-opus-5", reasoning_effort="low") != []
+        assert (
+            self._warned(model="claude-opus-5", reasoning_effort="low", enabled=False)
+            == []
+        )
+
+    def test_a_thinking_budget_decides_instead_and_is_not_warned(self):
+        """The client sends the budget for claude and reads no effort key, so
+        "No effort is sent, so it thinks at its default" would be false."""
+        cfg = {"model": "claude-opus-5", "reasoning_effort": "low"}
+        assert (
+            ot.effort_key_warnings({"claude": {**cfg, "thinking_budget": 4096}}) == []
+        )
+
+    def test_a_pinned_route_is_the_model_it_routes_to(self):
+        (warning,) = self._warned(
+            model="anthropic/claude-opus-5", reasoning_effort="low"
+        )
+        assert "claude model anthropic/claude-opus-5 sets" in warning
+        assert "anthropic/claude-opus-5 thinks at its default, high" in warning
+
+    def test_no_model_is_judged_on_the_model_the_client_calls(self, monkeypatch):
+        from ci_core.llm import client
+
+        monkeypatch.setitem(
+            client._PROVIDERS["claude"], "default_model", "claude-opus-5"
+        )
+        (warning,) = self._warned(reasoning_effort="low")
+        assert "claude model claude-opus-5 sets" in warning
+        assert "thinks at its default, high" in warning
+
+    def test_only_the_named_providers_are_judged(self):
+        assert ot.effort_key_warnings({"other": {"effort": "high"}}) == []
+
+    def test_providers_are_walked_in_a_fixed_order(self):
+        configs = {
+            "gemini": {"reasoning_effort": "low"},
+            "openai": {"effort": "low"},
+            "claude": {"reasoning_effort": "low"},
+        }
+        got = [w.split(" model ")[0] for w in ot.effort_key_warnings(configs)]
+        assert got == ["claude", "openai", "gemini"]
+
+    @pytest.mark.parametrize(
+        "configs", [None, {}, [], "claude", {"claude": "claude-opus-5"}]
+    )
+    def test_a_config_it_cannot_read_is_not_an_error(self, configs):
+        assert ot.effort_key_warnings(configs) == []
+
+
+class TestASpellingLitellmRejectsIsWarned:
+    """`High`, `Medium`, `HIGH` and a padded `" high "` on claude.
+
+    litellm matches the levels exactly, in lowercase, and rejects anything else
+    before a request is built, on every claude model. What reaches the wire for
+    each spelling is pinned in test_llm_client.py; these cover who is warned,
+    and with what. Only claude is judged: every other provider is forwarded the
+    value as written (pinned there too), and whether its server rejects `High`
+    is not measured.
+    """
+
+    THINK_BY_DEFAULT = sorted(ot._EFFORT_WHEN_UNSET["claude"])
+    THINK_WHEN_ASKED = TestAnUnsetEffortIsTheModelsDefault.THINK_WHEN_ASKED
+    # The warning names the model and nothing else about it, bar the none case
+    # below; one of each kind covers it.
+    ONE_THAT_THINKS_BY_DEFAULT = ["claude-opus-5", "claude-sonnet-5"]
+    ONE_THAT_THINKS_WHEN_ASKED = ["claude-opus-4-8", "claude-haiku-4-5-20251001"]
+
+    @staticmethod
+    def _warned(model="claude-opus-5", **cfg):
+        cfg["model"] = model
+        return ot.effort_spelling_warnings({"claude": cfg})
+
+    @pytest.mark.parametrize(
+        "written,fixed",
+        [
+            ("High", "high"),
+            ("HIGH", "high"),
+            ("Medium", "medium"),
+            (" high", "high"),
+            ("high ", "high"),
+            ("XHigh", "xhigh"),
+            ("Low", "low"),
+        ],
+    )
+    def test_names_the_value_and_says_what_to_write(self, written, fixed):
+        (warning,) = self._warned(effort=written)
+        assert f"claude model claude-opus-5 is set to effort: {written!r}" in warning
+        assert "every claude call will fail" in warning
+        assert f"Write effort: {fixed}." in warning
+        # A refusal, not a bill: nothing is sent, so nothing is spent.
+        assert "billed" not in warning
+
+    @pytest.mark.parametrize("model", THINK_BY_DEFAULT + THINK_WHEN_ASKED)
+    def test_it_names_whichever_model_it_is(self, model):
+        (warning,) = self._warned(model, effort="High")
+        assert f"claude model {model} is set to effort: 'High'" in warning
+
+    @pytest.mark.parametrize("written", ["None", "NONE", " none "])
+    @pytest.mark.parametrize("model", ONE_THAT_THINKS_WHEN_ASKED)
+    def test_a_none_on_a_model_that_thinks_only_when_asked(self, model, written):
+        """effort_none_warnings is silent here (there is no thinking to mention),
+        and every call still fails."""
+        (warning,) = self._warned(model, effort=written)
+        assert f"is set to effort: {written!r}" in warning
+        assert "every claude call will fail" in warning
+        assert "Write effort: none." in warning
+
+    @pytest.mark.parametrize("written", ["None", "NONE", " none "])
+    @pytest.mark.parametrize("model", ONE_THAT_THINKS_BY_DEFAULT)
+    def test_a_none_on_a_model_that_thinks_by_default_is_left_to_effort_none(
+        self, model, written
+    ):
+        """effort_none_warnings already says it, and what it costs; two
+        warnings for one value would read as two problems."""
+        assert self._warned(model, effort=written) == []
+        assert (
+            len(
+                ot.effort_none_warnings({"claude": {"model": model, "effort": written}})
+            )
+            == 1
+        )
+        assert (
+            len(ot.effort_warnings({"claude": {"model": model, "effort": written}}))
+            == 1
+        )
+
+    def test_a_blank_string_has_no_level_to_write(self):
+        (warning,) = self._warned(effort="  ")
+        assert "Write the level in lowercase, with nothing around it" in warning
+        assert "Write effort: ." not in warning
+
+    @pytest.mark.parametrize(
+        "effort", ["", "minimal", "low", "medium", "high", "xhigh", "max", "none"]
+    )
+    def test_the_levels_in_lowercase_are_not_warned(self, effort):
+        assert self._warned(effort=effort) == []
+
+    @pytest.mark.parametrize("effort", [None, False, True, 5, ["high"]])
+    def test_a_value_that_is_not_a_string_is_not_this_checks_business(self, effort):
+        assert self._warned(effort=effort) == []
+
+    def test_a_typo_is_not_a_spelling_problem(self):
+        """It fails at call time too, but calling it a spelling of a real level
+        would be a guess; naming every litellm level would mean keeping its list."""
+        assert self._warned(effort="hgih") == []
+
+    def test_a_disabled_claude_is_not_warned(self):
+        assert self._warned(effort="High", enabled=False) == []
+
+    def test_a_thinking_budget_decides_instead_and_is_not_warned(self):
+        assert self._warned(effort="High", thinking_budget=4096) == []
+
+    def test_only_claude_is_judged(self):
+        """The others are forwarded the value as written; whether the provider
+        rejects `High` is not measured here."""
+        configs = {
+            "openai": {"model": "gpt-5.6-terra", "reasoning_effort": "High"},
+            "mistral": {"model": "mistral-medium-3-5", "reasoning_effort": "None"},
+            "grok": {"model": "grok-4.6", "reasoning_effort": " high"},
+        }
+        assert ot.effort_spelling_warnings(configs) == []
+
+    def test_a_pinned_route_is_the_model_it_routes_to(self):
+        (warning,) = self._warned("anthropic/claude-opus-4-8", effort="High")
+        assert "claude model anthropic/claude-opus-4-8 is set to" in warning
+
+    @pytest.mark.parametrize(
+        "configs", [None, {}, [], "claude", {"claude": "claude-opus-5"}]
+    )
+    def test_a_config_it_cannot_read_is_not_an_error(self, configs):
+        assert ot.effort_spelling_warnings(configs) == []
+
+
+class TestEveryEffortWarningComesThroughOneCall:
+    """The call both loaders make, so a check added to it reaches both."""
+
+    def test_it_is_the_three_checks_in_order(self):
+        configs = {
+            "claude": {
+                "model": "claude-opus-4-8",
+                "effort": "High",
+                "reasoning_effort": "low",
+            },
+            "openai": {"model": "gpt-5.6-terra", "effort": "high"},
+        }
+        got = ot.effort_warnings(configs)
+        assert got == (
+            ot.effort_none_warnings(configs)
+            + ot.effort_key_warnings(configs)
+            + ot.effort_spelling_warnings(configs)
+        )
+        assert [w.split(" model ")[0] for w in got] == ["claude", "openai", "claude"]
+        assert "sets both effort: 'High'" in got[0]
+        assert "is set to effort: 'High'" in got[2]
+
+    def test_a_config_that_runs_as_written_is_quiet(self):
+        configs = {
+            "claude": {"model": "claude-opus-5", "effort": "medium"},
+            "openai": {"model": "gpt-5.6-terra", "reasoning_effort": "low"},
+            "gemini": {"model": "gemini-2.5-pro", "thinking_budget": 8192},
+        }
+        assert ot.effort_warnings(configs) == []
+
+
 class TestTheModelsOwnLimit:
     def test_a_ceiling_above_the_models_limit_is_clamped(self, monkeypatch):
         monkeypatch.setattr(ot, "model_output_limit", lambda p, m: 20000)
