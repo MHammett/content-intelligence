@@ -252,6 +252,17 @@ class TestCallSurface:
             "vertex_ai/gemini-2.5-pro"
         )
 
+    @pytest.mark.parametrize(
+        "cfg,expected",
+        [
+            (None, "gemini/gemini-2.5-pro"),
+            ({"provider": "ai_studio"}, "gemini/gemini-2.5-pro"),
+            ({"provider": "vertex_ai"}, "vertex_ai/gemini-2.5-pro"),
+        ],
+    )
+    def test_geminis_prefix_follows_the_endpoint_it_names(self, cfg, expected):
+        assert client._qualified("gemini", "gemini-2.5-pro", cfg) == expected
+
     def test_unknown_provider_raises_keyerror(self):
         with pytest.raises(KeyError, match="Unknown provider"):
             _call("not-a-provider")
@@ -3549,3 +3560,206 @@ class TestSearchCountsOnTheWire:
         )
         assert result["failed"] is False, result
         assert result["searches"] == 2
+
+
+class TestGeminiRoute:
+    """``models.gemini.provider`` names one of two endpoints, or is refused."""
+
+    @pytest.mark.parametrize(
+        "cfg,expected",
+        [
+            (None, "ai_studio"),
+            ({}, "ai_studio"),
+            ({"provider": None}, "ai_studio"),
+            ({"provider": "ai_studio"}, "ai_studio"),
+            ({"provider": "vertex_ai"}, "vertex_ai"),
+        ],
+    )
+    def test_the_two_endpoints(self, cfg, expected):
+        assert client.gemini_route(cfg) == expected
+
+    @pytest.mark.parametrize("value", ["vertex", "Vertex_AI", "vertexai", "google"])
+    def test_anything_else_is_refused_by_name(self, value):
+        """These all used to reach AI Studio without a word."""
+        with pytest.raises(ValueError, match="ai_studio, vertex_ai") as e:
+            client.gemini_route({"provider": value})
+        assert repr(value) in str(e.value)
+
+
+def _vertex_config(**overrides):
+    return {
+        "provider": "vertex_ai",
+        "model": "gemini-2.5-flash",
+        "project": "test-project",
+        "location": "us-central1",
+        **overrides,
+    }
+
+
+class TestGeminiRoutesOnTheWire:
+    """Where a gemini call goes, captured below litellm.
+
+    Until this was fixed, ``provider: vertex_ai`` reached
+    generativelanguage.googleapis.com on the AI Studio key: the litellm
+    migration dropped the old adapter's Vertex routing and nothing noticed.
+    These pin both endpoints at the one place the kwargs we hand litellm cannot
+    misrepresent: the request that leaves it.
+
+    ``httpx.Client.send`` is replaced as in TestClaudeRequestOnTheWire. On the
+    Vertex route litellm also exchanges the service account for a token; only
+    that exchange (``VertexBase._ensure_access_token``) is stubbed, so the URL,
+    headers and body are litellm's own.
+    """
+
+    TOKEN = "ya29.stub-token"
+    AI_STUDIO_KEY = "AIza-ai-studio-sentinel"
+
+    @pytest.fixture
+    def wire(self, monkeypatch):
+        client._litellm()
+        from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+
+        wire = {"requests": [], "auth": [], "replies": []}
+        token = self.TOKEN
+
+        def _send(http_client, request, *args, **kwargs):
+            wire["requests"].append(request)
+            if wire["replies"]:
+                status, body = wire["replies"].pop(0)
+                return httpx.Response(status, request=request, json=body)
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                content=_gemini_sse(["q one", "q two"]),
+            )
+
+        def _token(vertex_base, credentials, project_id, custom_llm_provider):
+            if custom_llm_provider == "gemini":
+                return "", ""  # litellm asks on AI Studio too; this is its answer
+            wire["auth"].append(
+                {
+                    "credentials": credentials,
+                    "project": project_id,
+                    "provider": custom_llm_provider,
+                }
+            )
+            return token, project_id
+
+        monkeypatch.setattr(httpx.Client, "send", _send)
+        monkeypatch.setattr(VertexBase, "_ensure_access_token", _token)
+        return wire
+
+    def _gemini(self, config, **kwargs):
+        return _call(
+            "gemini", api_key=self.AI_STUDIO_KEY, provider_config=config, **kwargs
+        )
+
+    def test_a_vertex_config_reaches_vertex(self, wire):
+        result = self._gemini(_vertex_config())
+        assert result["failed"] is False, result
+        (request,) = wire["requests"]
+        assert str(request.url) == (
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/"
+            "test-project/locations/us-central1/publishers/google/models/"
+            "gemini-2.5-flash:streamGenerateContent?alt=sse"
+        )
+        assert request.headers["authorization"] == f"Bearer {self.TOKEN}"
+        assert "x-goog-api-key" not in request.headers
+        assert wire["auth"] == [
+            {"credentials": None, "project": "test-project", "provider": "vertex_ai"}
+        ]
+
+    def test_the_ai_studio_key_never_reaches_a_vertex_request(self, wire):
+        self._gemini(_vertex_config())
+        (request,) = wire["requests"]
+        sent = str(request.url) + repr(dict(request.headers)) + request.content.decode()
+        assert self.AI_STUDIO_KEY not in sent
+
+    @pytest.mark.parametrize("config", [{}, {"provider": "ai_studio"}])
+    def test_ai_studio_is_still_the_default(self, wire, config):
+        result = self._gemini({"model": "gemini-2.5-flash", **config})
+        assert result["failed"] is False, result
+        (request,) = wire["requests"]
+        assert str(request.url) == (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.5-flash:streamGenerateContent?alt=sse"
+        )
+        assert request.headers["x-goog-api-key"] == self.AI_STUDIO_KEY
+        assert "authorization" not in request.headers
+        assert wire["auth"] == []
+
+    def test_both_routes_send_the_same_body_and_read_the_same_answer(self, wire):
+        """One transformation builds both, so grounding and the search count
+        cannot differ by route. Pinned because a Vertex call that lost its
+        googleSearch tool would still succeed, answering from training alone."""
+        vertex = self._gemini(_vertex_config())
+        studio = self._gemini({"model": "gemini-2.5-flash"})
+        vertex_body, studio_body = (json.loads(r.content) for r in wire["requests"])
+        assert vertex_body["tools"] == [{"googleSearch": {}}]
+        assert vertex_body == studio_body
+        for key in ("data", "tokens", "searches", "grounding_available"):
+            assert vertex[key] == studio[key], key
+        assert vertex["grounding_available"] is True
+        assert vertex["searches"] == 2
+
+    def test_the_result_names_the_bare_model_so_it_still_prices(self, wire):
+        """The route prefix is litellm's business. The pricing table is keyed
+        on bare ids, and a "vertex_ai/..." model would price at unknown_price."""
+        from ci_core.llm import cost
+
+        result = self._gemini(_vertex_config())
+        assert result["model"] == "gemini-2.5-flash"
+        assert cost.known_price(result["model"]) is not None
+
+    def test_a_configured_location_is_used(self, wire):
+        self._gemini(_vertex_config(location="europe-west4"))
+        (request,) = wire["requests"]
+        assert request.url.host == "europe-west4-aiplatform.googleapis.com"
+        assert "/locations/europe-west4/" in request.url.path
+
+    def test_no_location_is_litellms_default(self, wire):
+        config = _vertex_config()
+        del config["location"]
+        self._gemini(config)
+        (request,) = wire["requests"]
+        assert request.url.host == "us-central1-aiplatform.googleapis.com"
+
+    def test_a_credentials_file_is_handed_to_litellm_as_a_path(self, wire, tmp_path):
+        key_file = tmp_path / "sa.json"
+        key_file.write_text("{}")
+        self._gemini(_vertex_config(credentials_file=str(key_file)))
+        assert [a["credentials"] for a in wire["auth"]] == [str(key_file)]
+
+    def test_a_missing_credentials_file_fails_once_and_sends_nothing(self, wire):
+        """litellm would read the path as inline JSON and report "Ensure the JSON
+        is valid" under a retryable 500. This names the file instead, sends no
+        request, is not retried, and does not walk the fallback chain."""
+        config = _vertex_config(credentials_file=r"C:\no\such\dir\sa.json")
+        result = self._gemini(config, retry=True, retry_delay=0)
+        assert result["failed"] is True
+        assert "credentials_file" in result["error"]
+        assert "sa.json" in result["error"]
+        assert wire["requests"] == []
+        assert wire["auth"] == []
+        assert result["model"] == "gemini-2.5-flash"  # not the fallback's
+        assert "stream_timing" not in result  # no stream was started
+
+    def test_a_fallback_model_stays_on_vertex(self, wire):
+        unavailable = {"error": {"code": 503, "message": "overloaded"}}
+        wire["replies"].append((503, unavailable))
+        result = self._gemini(_vertex_config())
+        assert result["failed"] is False, result
+        assert result["fallback_from"] == "gemini-2.5-flash"
+        assert [r.url.host for r in wire["requests"]] == [
+            "us-central1-aiplatform.googleapis.com"
+        ] * 2
+        assert [r.url.path.rsplit("/", 1)[-1] for r in wire["requests"]] == [
+            "gemini-2.5-flash:streamGenerateContent",
+            "gemini-2.5-flash-lite:streamGenerateContent",
+        ]
+
+    def test_an_unknown_endpoint_raises_before_anything_is_sent(self, wire):
+        with pytest.raises(ValueError, match="'vertex'"):
+            self._gemini(_vertex_config(provider="vertex"))
+        assert wire["requests"] == []

@@ -127,3 +127,34 @@ class TestConfigHelpers:
             env={"PIPELINE_TEST_VAR_ABC": "from_dotenv"},
         )
         assert result["api_keys"]["openai"]["api_key"] == "from_dotenv"
+
+
+class TestHasCredentials:
+    """Which models can be called: a key, or gemini on Vertex with a project."""
+
+    def test_a_key_is_enough(self):
+        from ci_core.config_helpers import has_credentials
+
+        assert has_credentials("mistral", "k", {"model": "m"})
+        assert has_credentials("gemini", "k", None)
+
+    def test_no_key_is_not(self):
+        from ci_core.config_helpers import has_credentials
+
+        assert not has_credentials("mistral", "", {"model": "m"})
+        assert not has_credentials("gemini", None, {"provider": "ai_studio"})
+
+    def test_gemini_on_vertex_needs_a_project_and_no_key(self):
+        from ci_core.config_helpers import has_credentials
+
+        assert has_credentials(
+            "gemini", None, {"provider": "vertex_ai", "project": "p"}
+        )
+        assert not has_credentials("gemini", "k", {"provider": "vertex_ai"})
+
+    def test_only_gemini_has_a_vertex_route(self):
+        """A stray provider: vertex_ai elsewhere does not excuse a missing key."""
+        from ci_core.config_helpers import has_credentials
+
+        vertex = {"provider": "vertex_ai", "project": "p"}
+        assert not has_credentials("claude", None, vertex)

@@ -424,7 +424,7 @@ models:
     # credentials_file: path\to\key.json  # omit to use Application Default Credentials
 ```
 
-See [PROVIDERS.md](PROVIDERS.md#option-b--vertex-ai-reserved-capacity-no-503s) for the full setup walkthrough.
+`provider` takes `ai_studio`, the default, or `vertex_ai`. Any other value is refused when the config loads. `location` defaults to `us-central1`. See [PROVIDERS.md](PROVIDERS.md#option-b--vertex-ai-reserved-capacity-no-503s) for the full setup walkthrough.
 
 ---
 

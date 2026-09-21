@@ -73,6 +73,34 @@ class TestWhichResultsAreActedOn:
         assert reask.reask_refuted(results, api_keys={}) == 0
         assert "reask" not in results[0]
 
+    def test_gemini_on_vertex_is_re_asked_with_no_ai_studio_key(self):
+        """Vertex authenticates with a service account, so a Vertex config may
+        carry no AI Studio key. Checking the key alone skipped gemini's
+        re-asks on that config, and said so only at debug level."""
+        results = [_refuted()]
+        vertex = {"provider": "vertex_ai", "project": "p", "model": "gemini-2.5-flash"}
+        with patch.object(
+            reask.llm,
+            "call_provider",
+            return_value=_response({"action": "stand", "reason": "r"}),
+        ) as call:
+            asked = reask.reask_refuted(
+                results, api_keys={}, model_configs={"gemini": vertex}
+            )
+        assert asked == 1
+        assert call.call_args.args[0] == "gemini"
+        assert call.call_args.kwargs["provider_config"]["provider"] == "vertex_ai"
+
+    def test_gemini_on_vertex_without_a_project_is_still_skipped(self):
+        results = [_refuted()]
+        vertex = {"provider": "vertex_ai", "model": "gemini-2.5-flash"}
+        with patch.object(reask.llm, "call_provider") as call:
+            asked = reask.reask_refuted(
+                results, api_keys={}, model_configs={"gemini": vertex}
+            )
+        assert asked == 0
+        assert not call.called
+
     def test_the_asserting_model_is_the_one_asked(self):
         results = [_refuted(source_model="perplexity")]
         with patch.object(

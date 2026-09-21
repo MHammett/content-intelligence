@@ -154,7 +154,7 @@ models:
     location: us-central1
 ```
 
-**Billing:** The same per-token list prices as the AI Studio paid tier for 2.5 Pro, 2.5 Flash and 3.5 Flash (Vertex AI's pricing page lists them alike). What a run costs is under **Expected cost** in the Gemini section above: a few cents at `wide`, and tens of cents at `maximum`.
+**Billing:** The same per-token list prices as the AI Studio paid tier for 2.5 Pro, 2.5 Flash and 3.5 Flash (Vertex AI's pricing page lists them alike). Search grounding bills at the same rates on both too. The free daily allowance is where they differ: Vertex AI gives Gemini 2.5 Pro, which `thorough` and `maximum` run, 10,000 grounded prompts a day at no charge where AI Studio gives it 1,500, while 2.5 Flash and Flash-Lite share 1,500 a day on either. What a run costs is under **Expected cost** in the Gemini section above: a few cents at `wide`, and tens of cents at `maximum`.
 
 **Retirement:** the 2.5 models are listed for retirement on Vertex AI on 2026-10-20; see **Retirement** above.
 
