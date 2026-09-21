@@ -32,10 +32,13 @@ No models passed credential and enabled checks. Make sure at least one model has
 ## Gemini / Google
 
 **Gemini returns 503 (capacity)**  
-AI Studio draws from a shared capacity pool that fills up at peak hours. The pipeline retries once automatically. If 503s are a consistent pattern, switch to Vertex AI. See [PROVIDERS.md](PROVIDERS.md#option-b--vertex-ai-reserved-capacity-no-503s) for setup. Your fact-check pass routes automatically once you update `user.yaml` — the check command will confirm.
+AI Studio draws from a shared capacity pool that fills up at peak hours. The pipeline retries once automatically. If 503s are a consistent pattern, switch to Vertex AI. See [PROVIDERS.md](PROVIDERS.md#option-b--vertex-ai-reserved-capacity-no-503s) for setup. Every Gemini call routes there once you update `user.yaml`, and the check command tests the same endpoint. (Releases from 2026-08-14 until this was fixed ignored the setting and stayed on AI Studio.)
 
-**Vertex AI: `No such file or directory` on credentials_file**  
-The path in `credentials_file` doesn't point to the downloaded service account JSON. Move the file and update the path, or remove the key and use Application Default Credentials (`gcloud auth application-default login`) instead.
+**Vertex AI: `credentials_file is '...', which is not a file`** (or `No such file or directory` from the check command)  
+The path in `credentials_file` doesn't point to the downloaded service account JSON. Move the file and update the path, or remove the key and use Application Default Credentials (`gcloud auth application-default login`) instead. A review reports this on each Gemini call and sends nothing to Google.
+
+**`models.gemini.provider is '...', which is not a Gemini endpoint`**  
+`provider` under `models: gemini:` takes `ai_studio` (the default) or `vertex_ai`, spelled exactly. Anything else is refused when the config loads, rather than quietly running on AI Studio.
 
 **Vertex AI: `'parts'` or `KeyError` in response**  
 `gemini-2.5-flash` is a thinking model that returns internal reasoning traces before the actual output. The pipeline filters these out automatically. If you see this in the pipeline adapter (not just the check command), update to the latest version.

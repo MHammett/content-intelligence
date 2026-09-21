@@ -131,6 +131,21 @@ def normalize_model_configs(models_raw):
     return result
 
 
+def has_credentials(model_name, api_key, model_cfg):
+    """Whether ``model_name`` has what it authenticates with.
+
+    An API key, except for gemini on Vertex AI, which authenticates with a
+    Google Cloud service account and needs a project instead: its AI Studio key
+    may be absent altogether. The review pipeline decides which models run by
+    this, and the citation re-ask which models it can hand a claim back to.
+    Here rather than in either, because the re-ask is an adapter and adapters
+    do not import the pipeline.
+    """
+    if model_name == "gemini" and (model_cfg or {}).get("provider") == "vertex_ai":
+        return bool(model_cfg.get("project"))
+    return bool(api_key)
+
+
 class PackagedConfigError(RuntimeError):
     """A YAML file shipped inside the package is missing or unreadable."""
 

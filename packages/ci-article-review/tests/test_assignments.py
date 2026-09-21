@@ -351,6 +351,28 @@ class TestConfigFormNormalisation:
         )
         assert {d for m, d in assignments if m == "gemini"} == set(_DEFAULT_DOMAINS)
 
+    def test_vertex_gemini_runs_on_a_project_with_no_key(self):
+        """Vertex authenticates with a service account; a Vertex config may carry
+        no AI Studio key at all, and gemini must still be assigned."""
+        vertex = {
+            "gemini": {
+                "provider": "vertex_ai",
+                "project": "p",
+                "model": "gemini-2.5-flash",
+            }
+        }
+        assignments = _build_assignments("maximum", vertex, {})
+        assert {d for m, d in assignments if m == "gemini"} == set(_DEFAULT_DOMAINS)
+
+    def test_vertex_gemini_without_a_project_is_skipped_even_with_a_key(self):
+        vertex = {"gemini": {"provider": "vertex_ai", "model": "gemini-2.5-flash"}}
+        skips = []
+        assignments = _build_assignments(
+            "maximum", vertex, {"gemini": {"api_key": "k"}}, skips=skips
+        )
+        assert not any(m == "gemini" for m, _ in assignments)
+        assert "no credentials" in _skip_for(skips, "gemini")
+
     def test_empty_prompts_override_runs_nothing_rather_than_raising(self):
         """`prompts:` with no value parses as None; it used to raise TypeError."""
         configs = dict(_SIMPLE_CONFIGS)
