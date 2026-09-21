@@ -557,8 +557,9 @@ class TestCaptureCouldHaveSearched:
 
     Those captures record no count, so a replay prices none. Whether that
     makes its total a floor is decided per provider, not by
-    ``grounding_available``: litellm drops gemini's grounding metadata on some
-    streams, so every gemini result on record since 2026-08-18 reads ungrounded.
+    ``grounding_available``: gemini decides per prompt whether to search, and
+    litellm can drop its grounding metadata on some stream shapes, so a gemini
+    result reading ungrounded does not prove no search ran.
     """
 
     _ANSWERED = {"tokens": {"prompt": 900, "completion": 300}}

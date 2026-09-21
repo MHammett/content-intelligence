@@ -2229,12 +2229,13 @@ def _capture_could_have_searched(model_name, result):
     Captures written before calls recorded their searches (PR #230,
     2026-09-19) carry no count at all. Which of their calls could have searched
     is known by provider, not from the ``grounding_available`` they did record:
-    googleSearch rides on every gemini call, and litellm drops gemini's grounding
-    metadata on some streams (BerriAI/litellm#41492), so every gemini result
-    since 2026-08-18 reads ungrounded whether it searched or not. Every sonar
-    request pays a fee. claude's and openai's search is a per-domain setting,
-    so only a result that shows it grounded proves one ran. A call that never
-    answered billed nothing, searches included.
+    googleSearch rides on every gemini call and the model decides per prompt
+    whether to use it, and litellm can drop gemini's grounding metadata on some
+    stream shapes (BerriAI/litellm#41492), so a gemini result that reads
+    ungrounded does not prove no search ran. Every sonar request pays a fee.
+    claude's and openai's search is a per-domain setting, so only a result that
+    shows it grounded proves one ran. A call that never answered billed
+    nothing, searches included.
     """
     if not isinstance(result, dict):
         return False

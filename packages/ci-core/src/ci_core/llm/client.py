@@ -1302,10 +1302,15 @@ def _read_searches(provider, assembled, model=""):
       Where the stream showed no queries, litellm's own count stands in:
       ``usage.prompt_tokens_details.web_search_requests``, which it computes
       from the raw candidates. litellm 1.96.2 drops a chunk's grounding
-      metadata when that chunk has no text and no groundingSupports, and the
-      count is all that survives. That drop is BerriAI/litellm#41492. Every
-      gemini call in saved reports through 2026-08-12 was grounded (153 of
-      153), and none of the 37 since the move to litellm on 2026-08-18.
+      metadata when that chunk has no text and no groundingSupports (the class
+      of drop reported as BerriAI/litellm#41492), and the count is then all
+      that survives. That was reproduced on canned streams only. Three real
+      2.5 streams (2026-09-20) surfaced the metadata whenever Google sent it,
+      and on a production-shaped fact_check call Gemini did not search, so
+      ``searches`` 0 and ``grounding_available`` False were right. The tool is
+      optional per call, and the old adapter's ``grounding_available`` meant
+      only "tool attached", so its 153 of 153 is no baseline for 0 of 37 since
+      the move to litellm.
     * perplexity: 1. The fee is per request, and this response is one.
       Perplexity also prices it in ``usage.cost.request_cost``, but litellm does
       not carry that through a stream. sonar-deep-research is the exception:
