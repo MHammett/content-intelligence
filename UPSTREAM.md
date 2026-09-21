@@ -335,10 +335,25 @@ Recording these so nobody re-investigates them.
 
 ## 5. litellm — `web_search_options` + a system prompt breaks XAI
 
-**Status:** filed as
-[BerriAI/litellm#37127](https://github.com/BerriAI/litellm/issues/37127) with
-[PR #37128](https://github.com/BerriAI/litellm/pull/37128), both 2026-08-16.
+**Status:** landed 2026-09-16 — through BerriAI's own reimplementation, not our PR.
+Filed as [BerriAI/litellm#37127](https://github.com/BerriAI/litellm/issues/37127)
+with [PR #37128](https://github.com/BerriAI/litellm/pull/37128), both 2026-08-16. Their
+Devin bot opened [#38254](https://github.com/BerriAI/litellm/pull/38254) from the issue
+on 2026-08-25; a maintainer merged it to `main` (`d108cdc43`) on 2026-09-16 and the
+issue closed as completed. #37128 was never reviewed or mentioned, and we closed it as
+superseded on 2026-09-21. The fix is only in pre-releases so far (`v1.103.0-dev.2`,
+`v1.103.0-rc.1`), so the xAI Live Search line in `configs/presets.yaml` stays commented
+until a stable 1.103.0 ships and we move off 1.96.2.
 See the root-cause note at the end — the fix is a deletion, not a remapping.
+
+*What the comparison showed.* #38254's source change is byte-identical to #37128's,
+which is not evidence of copying: there is exactly one minimal fix. Everything else was
+theirs — a regression test that injects an `httpx.MockTransport`, so it runs the real
+HTTP path where ours mocked `client.post`, and proof through a live proxy on both
+`/v1/chat/completions` and `/v1/responses`, which their issue template asks for. What
+they took from us was the diagnosis and the reproduction, credited via `Fixes #37127`.
+**For litellm, the issue is the delivery vehicle and the PR adds nothing:** 0 of their
+last 100 merges came from a fork (measured 2026-09-21).
 
 With `web_search_options` set, litellm turns the request's system message into an
 `instructions` field and then rejects that field as unsupported for XAI. The
