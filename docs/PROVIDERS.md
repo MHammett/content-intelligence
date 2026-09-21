@@ -336,7 +336,7 @@ The grammar correction pass applies deterministic rule-based corrections before 
 
 Skip it if you already do a manual, thorough pass yourself (e.g. Grammarly Premium) — you're covering the same ground.
 
-**To skip:** Set `grammar_pass: false` in `configs/user.yaml`, or simply omit the `languagetool` credentials block. The pipeline skips automatically and reminds you to run a manual check.
+**To skip:** Set `grammar_pass: false` in `configs/user.yaml`, or simply omit the `languagetool` credentials block. The pipeline skips automatically and reminds you to run a manual check. To skip it for a single run, pass `--offline`, which skips every pass that reaches the network, a self-hosted server included: the pass sends the whole draft to that server, and `server_url` can name any host.
 
 Two ways to use it, at different cost:
 
