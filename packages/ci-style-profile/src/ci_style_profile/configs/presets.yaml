@@ -2,6 +2,16 @@
 # Five tiers: economy → maximum
 # Individual sources.yaml keys override specific preset values.
 # CLI --style and --max-styles override preset style settings.
+#
+# `models:` is laid over the `models:` block of configs/user.yaml, key by key
+# (bootstrap._apply_preset_models). A key named here replaces the user's, a key
+# left out stays the user's, `provider` is never replaced, and a provider the
+# user has not configured is skipped. Leaving `effort` out does not turn
+# thinking off: claude-sonnet-5 and claude-opus-5 think at high with none set
+# (ci_core.llm.output_tokens._EFFORT_WHEN_UNSET).
+#
+# This file is required. A missing or malformed one raises PackagedConfigError,
+# and the CLI's --preset choices must name the same five tiers.
 
 economy:
   style_mode: canonical

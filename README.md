@@ -898,9 +898,9 @@ content-intelligence/
 │   └── ci-style-profile/         style-profile bootstrapping (see PLAN.md)
 │       ├── pyproject.toml
 │       ├── sources.example.yaml  copy to src/ci_style_profile/sources.yaml
-│       ├── configs/presets.yaml
 │       ├── src/ci_style_profile/
 │       │   ├── bootstrap.py      entry point (style-profile-bootstrap)
+│       │   ├── configs/          presets.yaml: the five --preset tiers (required)
 │       │   ├── collectors/       wordpress, gmail, outlook365, twitter, textfiles, custom/
 │       │   ├── detect.py         style detection pass
 │       │   ├── synthesize.py     profile synthesis
