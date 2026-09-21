@@ -12,7 +12,13 @@ pipeline_out.txt
 # Cached provider model listings (live_model_check / ci-discover). Derived data
 # with a TTL — regenerated on demand, never worth committing.
 .cache/
-handoff_templates/dc-environment*.md
+# Private article drafts and handoffs. Deliberately no leading path: git anchors
+# a line that has one to the repo root, and hatchling matches it against each
+# package's directory instead (pypa/hatch#304). The old
+# `handoff_templates/dc-environment*.md` therefore never matched the templates'
+# new home under packages/. Bare, this matches at any depth in both, and still
+# covers the repo-root handoff_templates/ where the real drafts sit.
+dc-environment*.md
 .env
 .env.*
 !.env.example
