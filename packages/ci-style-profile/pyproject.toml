@@ -26,6 +26,32 @@ ci-core = { workspace = true }
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+# Runtime state that lives INSIDE the package directory: bootstrap.py keeps its
+# staging corpus (which can hold Gmail, Outlook and Twitter text),
+# `.watermarks.json` and sources.yaml there, and output.py its profile
+# snapshots. The repo-root .gitignore ignores all three, but hatchling does not
+# honour those lines. It finds that file by walking up from this directory, then
+# matches every line against paths relative to THIS directory rather than the
+# file's own (pypa/hatch#304, open), so the anchored
+# `packages/ci-style-profile/src/ci_style_profile/staging/` never matches
+# `src/ci_style_profile/staging/...`. Lines with no leading path (.env, *.pem,
+# credentials*.json) match at any depth and were never affected. Measured
+# 2026-09-19 on hatchling 1.32.3: staging/, profiles/ and sources.yaml all
+# shipped, in the wheel and in the sdist.
+#
+# `exclude` is added to the .gitignore's patterns, not a replacement for them,
+# and is relative to this directory. It is set here, not on the wheel target
+# alone, because `uv build` (and `make build`) makes an sdist too. A target's own
+# `exclude` REPLACES this list for that target, so do not add one without
+# repeating these. tests/test_packaging.py builds both artifacts and fails if an
+# entry the root .gitignore names under src/ci_style_profile/ is missing here.
+exclude = [
+    "/src/ci_style_profile/sources.yaml",
+    "/src/ci_style_profile/staging/",
+    "/src/ci_style_profile/profiles/",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/ci_style_profile"]
 
