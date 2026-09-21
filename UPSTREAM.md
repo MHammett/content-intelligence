@@ -399,7 +399,9 @@ change was wrong on its own, which is why nobody caught it.
 **Status:** filed as
 [BerriAI/litellm#37125](https://github.com/BerriAI/litellm/issues/37125) with
 [PR #37126](https://github.com/BerriAI/litellm/pull/37126), both 2026-08-16.
-**Repo:** BerriAI/litellm (tested against 1.96.2)
+Still unreviewed on 2026-09-21, when the PR was retargeted to `main`; see
+*Five weeks on* below.
+**Repo:** BerriAI/litellm (tested against 1.96.2, re-checked on `main` 2026-09-21)
 
 `response_format` is the spelling every other litellm surface uses. On the
 Responses API it is accepted and does nothing. The call succeeds, the caller
@@ -465,8 +467,50 @@ thing, sending the reader somewhere there is nothing to find.
 
 The test note is the reusable part. A test asserting the call succeeds passes
 against the broken version, which is presumably how this survived; the PR's
-tests assert on the params bound for the provider, and 5 of 8 fail without the
-fix.
+tests assert on the params bound for the provider, and 8 of its 11 fail
+without the fix.
+
+**Five weeks on (2026-09-21).** No maintainer has reviewed it. The one staff
+touch was mechanical: on 2026-09-13 `litellm_internal_staging` was deleted and
+recreated, which auto-closed the PR, and it was reopened the same morning.
+Meanwhile litellm had moved its default branch back to `main`, now 3,081 commits
+ahead of staging and the base for 36 of the 39 fork PRs among the 60 most
+recently opened, so this one was sitting on an abandoned branch. A PR can go
+stale because its base is abandoned, not only because it conflicts; check the
+default branch on every revisit.
+
+The bug is unchanged on `main` (`1cac8bd9ab`), re-checked live against
+`xai/grok-4.3`: `response_format` is still ignored and the model answers in
+prose. Retargeting to `main` hit three CI obstacles, none in the fix itself:
+
+- **Their type-discipline gate.** LIT002 (mutable-collection construction) on
+  `main` is already over its own ceiling, 26724 against 26715, so the gate
+  rejects any net-new dict literal, and the converter added five. Rebuilt with
+  the forms their checker exempts, TypedDict-annotated literals and
+  `MappingProxyType`, rather than suppressed.
+- **The branch predated their CI.** `test-linting.yml` checks out the PR head
+  and runs `.github/actions/detect-changes`, which landed on `main` on
+  2026-08-19, after this branch was cut, so `lint` failed before it reached our
+  code. Merging `main` in fixed that without a force-push, so every commit hash
+  cited in the PR is still valid.
+- **Their test-quality gate.** It counts `sys.path.insert` under TQ003, and
+  `main` is already over that ceiling too, 63 against 62. The line had been
+  copied from the sibling `text_format` test, which `main` had since cleaned up
+  the same way.
+
+Two of the three were ratchets that `main` itself already exceeds, so an outside
+PR can land only by adding none of whatever those gates count. Running their
+gate scripts locally before pushing is cheaper than finding each one in CI.
+
+One correction of our own: the PR text said "12 passed" and "5 of the 12 fail
+without the fix". The new test file has 11 tests and 8 of them fail without the
+fix; 12 was the total including a pre-existing test. Corrected in the PR body
+and in both comments that repeated it, each with a visible note.
+
+With all three cleared, CI on the tip (`b2ef9d5b64`) is green against `main`:
+89 checks passed, 1 skipped, none failed. Mechanically the PR is as ready as an
+outside contribution gets, with the CLA signed, Greptile at 5/5 and CI green, and
+it is still waiting on a human.
 
 ---
 
