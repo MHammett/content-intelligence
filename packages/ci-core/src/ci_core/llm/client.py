@@ -61,10 +61,12 @@ terminal-vs-transient check the 429 makes unavoidable. The full classifier
 belongs upstream, where each provider's exhaustion wording is better known than
 it is here.
 
-Two known gaps in litellm that this file works around, both worth reporting
-upstream: the credit-exhaustion classification above, and litellm's per-provider
+Three known gaps in litellm that this file works around, each worth reporting
+upstream: the credit-exhaustion classification above; litellm's per-provider
 parameter allowlist rejecting ``reasoning_effort`` for Mistral even though the
-model accepts it (see :func:`_provider_params`).
+model accepts it (see :func:`_provider_params`); and ``responses()`` faking the
+stream for any model its map does not list, as almost every Azure deployment is
+(see :func:`_stream_azure_deployment` and UPSTREAM.md #9).
 
 Importing litellm
 -----------------
@@ -499,7 +501,8 @@ def _stream_azure_deployment(deployment, model):
     or failing that on openai.com. So it streams exactly when that model does,
     and litellm's own records of it carry that model's rates rather than none.
     A deployment named after a model the map knows streams already, and is left
-    alone. Once per deployment per process.
+    alone. Once per deployment per process. Delete this when the upstream fix
+    queued as UPSTREAM.md #9 ships.
     """
     key = f"azure/{deployment}"
     with _azure_stream_lock:

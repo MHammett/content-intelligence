@@ -700,3 +700,70 @@ check #482 added. `socket_guard.py` does exactly this from outside, by wrapping
 `socket_allow_hosts` and `_remove_restrictions`. Its tests in
 `packages/ci-article-review/tests/test_socket_guard.py` cover the exemptions,
 and the guard's lifecycle across markers, fixtures, collection and teardown.
+
+---
+
+## 9. litellm — `responses()` fakes the stream for any model its map does not list
+
+**Status:** `ready`. This is the defect [BerriAI/litellm#21090](https://github.com/BerriAI/litellm/issues/21090)
+reported on 2026-02-13, for custom models behind vLLM, where the fake stream
+dropped function-call events. It was closed as stale on 2026-05-22, and a
+comment on 2026-09-09 asks why. The measurement below adds a second consequence
+and a second class of model, so it goes on that thread, or in a new issue that
+links it now that the thread is closed. Worked around here by
+`_stream_azure_deployment` in `ci_core/llm/client.py`, which is written to be
+deleted when this ships.
+**Repo:** BerriAI/litellm (1.96.2)
+
+`OpenAIResponsesAPIConfig.should_fake_stream` fakes the stream whenever
+`litellm.utils.supports_native_streaming` returns False, and that function
+returns False from its `except` when the model is not in the map. So a
+streaming `responses()` call to any unmapped model goes out as a non-streaming
+request, and the finished answer is replayed through
+`MockResponsesAPIStreamingIterator`. Unmapped models include every Azure
+deployment named by its owner, every OpenAI-compatible server, and any model
+newer than the map. Besides dropping event types (#21090), nothing arrives
+until the model is done. A reasoning model can be silent for minutes, and a
+client that bounds the wait for the first byte, as this one does, kills the
+call.
+
+**Reproduction** (`httpx.Client.send` replaced, nothing leaves the machine):
+
+```python
+import httpx
+import litellm
+
+sent = []
+
+
+def _send(client, request, *args, **kwargs):
+    sent.append((request, kwargs.get("stream")))
+    return httpx.Response(400, request=request, json={"error": {"message": "x"}})
+
+
+httpx.Client.send = _send
+for model, base in (("azure/my-dep", "https://r.openai.azure.com"), ("gpt-5.4", None)):
+    try:
+        for _ in litellm.responses(model=model, input="hi", stream=True, api_key="k",
+                                   api_base=base, num_retries=0):
+            pass
+    except Exception:
+        pass
+    request, streamed = sent[-1]
+    print(model, request.url.host, request.content, "send(stream=)", streamed)
+```
+
+**Measured 2026-09-21**, litellm 1.96.2 with its bundled map:
+
+```
+azure/my-dep r.openai.azure.com b'{"model":"my-dep","input":"hi"}' send(stream=) False
+gpt-5.4 api.openai.com b'{"model":"gpt-5.4","input":"hi","stream":true}' send(stream=) True
+```
+
+**Proposed change:** the one #21090 proposed. `supports_native_streaming`
+returns True, not False, for a model the map does not list. The four models the
+map marks `supports_native_streaming: false` never reach the `except`, so they
+are unaffected. An unmapped model that really cannot stream then gets an error
+from its server, instead of a slowdown nothing reports. The workaround here uses
+`litellm.register_model`, the call litellm's own Router makes per deployment,
+to describe each Azure deployment as the model it serves.
