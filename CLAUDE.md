@@ -59,7 +59,7 @@ then, for every iteration after that:
 uv run ci-review --draft packages/ci-article-review/src/ci_article_review/handoff_templates/examples/draft_submission.short-example.full-coverage.md --publication mikehammett --replay pipeline_history/short-example-smoke-test/run_1_<ts>_results.json --offline
 ```
 
-`--offline` additionally skips link validation, Wayback, citation resolution and the two SEO model calls. Note that a replay still prints `Estimated cost:` from the *captured* run's call log — it did not spend that; the "No model calls made" line above it is the true one.
+`--offline` additionally skips the LanguageTool grammar pass, link validation, Wayback, citation resolution and the two SEO model calls. Note that a replay still prints `Estimated cost:` from the *captured* run's call log — it did not spend that; the "No model calls made" line above it is the true one.
 
 Replay is a real verification for anything in consolidation, scoring, the report, citations or history. It is **not** sufficient for changes to assignment, dispatch, retry, recovery or substitution — those decide which calls get made, and a replay makes none. Verify those live, at `--cost-preset wide` (12 calls, ~$0.12), not at `maximum`.
 

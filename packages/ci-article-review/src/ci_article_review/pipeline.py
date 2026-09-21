@@ -2614,6 +2614,30 @@ def _calibration_timing(streams):
     )
 
 
+def _grammar_skipped(reason):
+    """The Pass 1 result for a grammar pass that was decided against, not tried.
+
+    Not a failure. A skip is a decision, and marking it failed put
+    ``lt_failed: true`` into every report of a run that had deliberately
+    disabled grammar checking. The console and the markdown both test
+    ``skipped`` first so they read correctly; only anything consuming the JSON
+    was misled.
+
+    ``reason`` records which decision: ``"disabled"`` (``grammar_pass: false``),
+    ``"no_credentials"`` or ``"offline"`` (``--offline``). ``skipped`` alone
+    cannot say, and the summary used to print the credentials message for any of
+    them — telling an operator with working credentials in .env to go and
+    configure credentials.
+    """
+    return {
+        "failed": False,
+        "skipped": True,
+        "skipped_reason": reason,
+        "change_log": [],
+        "flagged_matches": [],
+    }
+
+
 def run_draft_pipeline(
     handoff_path,
     publication_name,
@@ -2761,40 +2785,24 @@ def run_draft_pipeline(
 
     if not grammar_enabled:
         log.info("Pass 1: Grammar pass disabled (grammar_pass: false) — skipping.")
-        lt_result = {
-            # Not a failure. A skip is a decision — either the config turned the
-            # pass off or there were no credentials to run it with — and marking
-            # it failed put `lt_failed: true` into every report of a run that
-            # had deliberately disabled grammar checking. The console and the
-            # markdown both test `skipped` first so they read correctly; only
-            # anything consuming the JSON was misled.
-            "failed": False,
-            "skipped": True,
-            # Both skip paths set skipped=True, and the summary used to print the
-            # credentials message for either — telling an operator with working
-            # credentials in .env to go and configure credentials. Record which.
-            "skipped_reason": "disabled",
-            "change_log": [],
-            "flagged_matches": [],
-        }
+        lt_result = _grammar_skipped("disabled")
         corrected_draft = handoff["draft"]
     elif not lt_has_creds:
         log.info(
             "Pass 1: No LanguageTool credentials configured — skipping grammar pass."
         )
-        lt_result = {
-            # Not a failure. A skip is a decision — either the config turned the
-            # pass off or there were no credentials to run it with — and marking
-            # it failed put `lt_failed: true` into every report of a run that
-            # had deliberately disabled grammar checking. The console and the
-            # markdown both test `skipped` first so they read correctly; only
-            # anything consuming the JSON was misled.
-            "failed": False,
-            "skipped": True,
-            "skipped_reason": "no_credentials",
-            "change_log": [],
-            "flagged_matches": [],
-        }
+        lt_result = _grammar_skipped("no_credentials")
+        corrected_draft = handoff["draft"]
+    elif offline:
+        # After the two config reasons, the way links_skipped_reason ranks them:
+        # "offline" is recorded only when --offline is what stopped a pass that
+        # would otherwise have run. The pass posts the whole draft to a server,
+        # hosted or self-hosted, so it is one of the passes --offline exists to
+        # suppress. It was the one missed: a `--replay --offline` of an
+        # unpublished draft sent its text to the hosted API while the flag's
+        # help promised a run with no network calls at all.
+        log.info("Pass 1: --offline — skipping the LanguageTool grammar pass.")
+        lt_result = _grammar_skipped("offline")
         corrected_draft = handoff["draft"]
     else:
         log.info("Pass 1: LanguageTool grammar correction")
@@ -2841,8 +2849,8 @@ def run_draft_pipeline(
     link_check_enabled = link_validation and not offline
     if offline:
         log.info(
-            "Offline: skipping link validation, Wayback, citation resolution "
-            "and the SEO model calls"
+            "Offline: skipping LanguageTool, link validation, Wayback, citation "
+            "resolution and the SEO model calls"
         )
     if link_check_enabled:
         from .analysis import links as links_analysis
@@ -4382,14 +4390,16 @@ def _print_draft_summary(
         _print_live_model_check(currency.get("live") or {})
 
     if report.get("lt_skipped"):
-        # Both skip paths set lt_skipped, and this printed the credentials
-        # message for either — telling an operator whose credentials are sitting
-        # in .env and working to go and configure credentials, when the actual
-        # cause was grammar_pass: false in the config.
-        if report.get("lt_skipped_reason") == "disabled":
-            why = "grammar_pass is set to false in the pipeline config"
-        else:
-            why = "no LanguageTool credentials configured"
+        # Every skip path sets lt_skipped, and this printed the credentials
+        # message for any of them — telling an operator whose credentials are
+        # sitting in .env and working to go and configure credentials, when the
+        # actual cause was grammar_pass: false in the config, or --offline. A
+        # saved report from before the reason was recorded has none, and keeps
+        # the message it always had.
+        why = {
+            "disabled": "grammar_pass is set to false in the pipeline config",
+            "offline": "--offline was set, and the grammar check is a network call",
+        }.get(report.get("lt_skipped_reason"), "no LanguageTool credentials configured")
         print(
             f"\nGrammar pass: skipped ({why} — run a manual Grammarly pass "
             f"before publishing)"
@@ -5405,9 +5415,9 @@ def build_parser():
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Skip every pass that reaches the network (link validation, Wayback, "
-        "citation resolution). Combine with --replay for a run that makes no "
-        "network calls at all.",
+        help="Skip every pass that reaches the network (LanguageTool grammar, link "
+        "validation, Wayback, citation resolution, the SEO model calls). Combine "
+        "with --replay for a run that makes no network calls at all.",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable DEBUG logging"

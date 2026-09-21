@@ -3072,15 +3072,17 @@ def render_report_markdown(report):
 
     corrections = report.get("lt_corrections_applied", [])
     if report.get("lt_skipped"):
-        # Name the actual reason. Both skip paths land here, and asserting "no
+        # Name the actual reason. Every skip path lands here, and asserting "no
         # credentials configured" at a reader who had turned the pass off in
-        # config sends them to fix something that is not broken — the same
-        # wrong-message bug the console summary was already corrected for.
-        why = (
-            "grammar_pass is set to false in the pipeline config"
-            if report.get("lt_skipped_reason") == "disabled"
-            else "no LanguageTool credentials configured"
-        )
+        # config, or run --offline, sends them to fix something that is not
+        # broken — the same wrong-message bug the console summary was already
+        # corrected for. A saved report from before the reason was recorded has
+        # none, and keeps the message it always had. (The wording matches the
+        # console's; test_grammar_skip_reasons.py holds the two together.)
+        why = {
+            "disabled": "grammar_pass is set to false in the pipeline config",
+            "offline": "--offline was set, and the grammar check is a network call",
+        }.get(report.get("lt_skipped_reason"), "no LanguageTool credentials configured")
         lines.append(f"LanguageTool: skipped ({why})")
     elif report.get("lt_failed"):
         lines.append("LanguageTool: FAILED — draft not grammar-corrected")
