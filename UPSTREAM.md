@@ -709,14 +709,24 @@ and the guard's lifecycle across markers, fixtures, collection and teardown.
 
 ## 9. litellm — `responses()` fakes the stream for any model its map does not list
 
-**Status:** `ready`. This is the defect [BerriAI/litellm#21090](https://github.com/BerriAI/litellm/issues/21090)
-reported on 2026-02-13, for custom models behind vLLM, where the fake stream
-dropped function-call events. It was closed as stale on 2026-05-22, and a
-comment on 2026-09-09 asks why. The measurement below adds a second consequence
-and a second class of model, so it goes on that thread, or in a new issue that
-links it now that the thread is closed. Worked around here by
-`_stream_azure_deployment` in `ci_core/llm/client.py`, which is written to be
-deleted when this ships.
+**Status:** contributed 2026-09-21 — to the fix that already existed, not as a new
+issue. [BerriAI/litellm#31220](https://github.com/BerriAI/litellm/pull/31220), open
+since 2026-06-24, is exactly the change proposed below, and a BerriAI staffer called it
+"well-justified" on 2026-06-25; then nothing. Our evidence went there as
+[a comment](https://github.com/BerriAI/litellm/pull/31220#issuecomment-5764797107),
+with a pointer on the closed [#21090](https://github.com/BerriAI/litellm/issues/21090#issuecomment-5764800449),
+where someone had asked on 2026-09-09 why it was closed. Verified on `main`
+(`1cac8bd9ab`): the reproduction below still fakes the stream, the PR's one-line
+change applied by hand makes it stream, and the four models the map marks
+non-streaming stay faked. What blocks the PR is mechanical: its base,
+`litellm_oss_branch`, is 12,531 commits behind `main`, the diff no longer applies,
+and its CLA is unsigned. [#37801](https://github.com/BerriAI/litellm/pull/37801)
+reported the same silence for Azure deployment names and was closed unmerged on
+2026-09-16. Worked around here by `_stream_azure_deployment` in
+`ci_core/llm/client.py`, which is written to be deleted when this ships.
+
+The first draft of this entry found #21090 and missed #31220, because it searched
+issues and not pull requests. The fix was sitting there. Search both.
 **Repo:** BerriAI/litellm (1.96.2)
 
 `OpenAIResponsesAPIConfig.should_fake_stream` fakes the stream whenever
