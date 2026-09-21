@@ -43,7 +43,7 @@ Reasoning is controlled via `reasoning_effort: none | low | medium | high | xhig
 
 ## Google Gemini (required)
 
-Gemini runs the fact-check pass with live Google Search grounding. There are two access paths. Start with AI Studio; move to Vertex AI if you hit consistent 503 capacity errors.
+Gemini's fact-check pass has Google Search grounding attached, so it can check claims against live sources. Whether it searches on a given call is the model's decision, not the pipeline's, and the report marks the calls where it did with `[grounded]`. There are two access paths. Start with AI Studio; move to Vertex AI if you hit consistent 503 capacity errors.
 
 ### Option A — AI Studio (quick start, free tier available)
 
@@ -76,7 +76,7 @@ Google's newer Flash models, 3.6, 3.7 and 3.8, are also GA on the Gemini API, at
 
 `thinking_budget` controls reasoning token allocation on the 2.5 models, and it is the only Gemini thinking setting this pipeline sends: 2.5 Flash takes 1–24,576 tokens, 2.5 Flash-Lite 512–24,576, 2.5 Pro 128–32,768, and unset each thinks dynamically, up to 8,192. `0` turns thinking off on 2.5 Flash and Flash-Lite. **Thinking cannot be turned off on 2.5 Pro.** Gemini 3.x models use a different parameter, `thinking_level`, which the pipeline does not send. Details and Google's source are in [CONFIGURATION.md](CONFIGURATION.md#gemini--thinking_budget).
 
-**Expected cost:** measured per review call, tokens only, from saved runs and re-priced at the current rates: `gemini-2.5-flash` $0.007–$0.033, median $0.023 (14 calls, drafts of 9,456–73,786 characters); `gemini-2.5-pro` $0.02–$0.15, median $0.05 (177 calls, 2,182–135,514 characters). Across a whole run, Gemini's share was $0.02–$0.07 at `wide` (four runs, a 9,456-character draft), $0.17 at `thorough` (one run, 18,167 characters) and $0.22–$0.49 at `maximum` (four runs, 3,999–27,113 characters). Search grounding is separate: every Gemini call here is grounded, and Google's pricing page lists a daily allowance of grounded prompts at no charge (1,500 for the 2.5 Flash models combined, 10,000 for 2.5 Pro on Vertex AI) before per-1,000 charges apply. A run makes up to five Gemini calls, one per domain, before any retries.
+**Expected cost:** measured per review call, tokens only, from saved runs and re-priced at the current rates: `gemini-2.5-flash` $0.007–$0.033, median $0.023 (14 calls, drafts of 9,456–73,786 characters); `gemini-2.5-pro` $0.02–$0.15, median $0.05 (177 calls, 2,182–135,514 characters). Across a whole run, Gemini's share was $0.02–$0.07 at `wide` (four runs, a 9,456-character draft), $0.17 at `thorough` (one run, 18,167 characters) and $0.22–$0.49 at `maximum` (four runs, 3,999–27,113 characters). Search grounding is separate: it is attached to every Gemini call here and the model decides whether to use it, and Google's pricing page lists a daily allowance of grounded prompts at no charge (1,500 for the 2.5 Flash models combined, 10,000 for 2.5 Pro on Vertex AI) before per-1,000 charges apply. A run makes up to five Gemini calls, one per domain, before any retries.
 
 **Config:**
 ```yaml

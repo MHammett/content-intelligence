@@ -1260,9 +1260,10 @@ class TestSearchFeesReachTheReport:
     def test_an_old_ungrounded_gemini_capture_is_not_called_exact(
         self, tmp_path, caplog
     ):
-        """googleSearch rides on every gemini call, and litellm drops gemini's
-        grounding metadata on some streams, so every gemini result on record
-        since 2026-08-18 reads ungrounded. Keyed on "grounded", a gemini-only
+        """googleSearch rides on every gemini call and the model decides per
+        prompt whether to use it, and litellm can drop gemini's grounding
+        metadata on some stream shapes, so a gemini result reading ungrounded
+        does not prove no search ran. Keyed on "grounded", a gemini-only
         history would still have been called exact."""
         capture = self._old_capture(tmp_path, grounding_available=False)
         report = self._replay(tmp_path, capture, caplog)
