@@ -34,7 +34,7 @@ resolved differently — say which) · `dropped` (with the reason).
 ## 1. litellm — credit exhaustion is classified as a rate limit
 
 **Status:** contributed — twice, and **deliberately not turned into a PR.** No
-maintainer has responded to any of it as of 2026-08-16; see "Why no PR" below,
+maintainer has responded to any of it as of 2026-09-21; see "Why no PR" below,
 which is the part worth reading before anyone picks this up again.
 [BerriAI/litellm#32785](https://github.com/BerriAI/litellm/issues/32785) already
 reported this on 2026-07-10 (and traced it further than we had, to the OpenAI
@@ -135,6 +135,28 @@ retryable status (a dead account arrives as a 429 directly and as a synthesised
 503 mid-stream), existing only to stop our own single retry. The full
 cross-provider classifier stays unbuilt here on purpose — it belongs upstream,
 where each provider's wording is better known than we know it.
+
+**Checked independently, 2026-08-21.** Four days after our review input on
+#32798, another contributor re-ran every row of our table against `main` rather
+than taking it on trust
+([their comment](https://github.com/BerriAI/litellm/pull/32798#issuecomment-5366100115)).
+All four rows held, including the 402 one: `nlp_cloud`'s `429 or 402` really
+does send an out-of-credit response to `RateLimitError`. They added a scope point
+that changes what our follow-up offer means. `_map_openai_exception` has no 403
+branch at all, so the per-provider table we offered to write has nothing to
+attach to yet: whoever writes it has to add that branch first and choose a
+default class for a 403 across the ~30 openai-compatible providers that share
+the function. That is a more contentious change than adding a row, and bigger
+than we framed it.
+
+**State on 2026-09-21.** Still no maintainer comment on #32785 or #32798;
+#32785's only new comment is a +1 linking the commenter's own blog. #32798 is
+now `CONFLICTING` and still targets `litellm_internal_staging`, which litellm
+has since abandoned for `main` (see entry 6). Like our #37126, it was closed and
+reopened mechanically on 2026-09-13 when that branch was recreated. Retargeting
+and rebasing it is its author's call. Outside PRs do land there, just rarely: 42
+of the 1,500 merges from 2026-08-27 to 2026-09-21 came from forks, by 38
+distinct authors.
 
 ---
 
@@ -510,7 +532,10 @@ and in both comments that repeated it, each with a visible note.
 With all three cleared, CI on the tip (`b2ef9d5b64`) is green against `main`:
 89 checks passed, 1 skipped, none failed. Mechanically the PR is as ready as an
 outside contribution gets, with the CLA signed, Greptile at 5/5 and CI green, and
-it is still waiting on a human.
+it is still waiting on a human. Whether one comes is a separate question: outside
+PRs are about 3% of litellm's merges (see entry 1), and entry 5 landed the other
+way, with their bot reimplementing the fix from the issue. So #37125 is as likely
+a route to a fix as the PR, and both carry the same diagnosis.
 
 ---
 
