@@ -101,10 +101,10 @@ def normalize_model_configs(models_raw):
             location: us-central1
           openai:
             provider: azure
-            model: gpt-4o
+            model: gpt-5.6-terra
             endpoint: https://my-resource.openai.azure.com
-            deployment: my-gpt4o-deployment
-            api_version: "2024-02-01"
+            deployment: my-gpt5-deployment
+            api_version: 2025-04-01-preview
           mistral:
             provider: azure
             model: mistral-large-latest
