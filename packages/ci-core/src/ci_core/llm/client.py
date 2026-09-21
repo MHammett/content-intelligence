@@ -108,6 +108,7 @@ after real output began, each flagged when it is only a lower bound. See
 import logging
 import os
 import queue
+import re
 import threading
 import time
 
@@ -329,22 +330,25 @@ PROVIDERS = tuple(_PROVIDERS)
 
 
 # ---------------------------------------------------------------------------
-# Gemini's two endpoints
+# Endpoints
 # ---------------------------------------------------------------------------
 #
-# Gemini is the one provider here with two endpoints, and the model config's
-# ``provider`` key picks between them: AI Studio on an API key, or Vertex AI on
-# a Google Cloud project and service account. AI Studio is the default, and
-# ci_core.config_helpers.normalize_model_configs fills it in as "ai_studio"
-# when user.yaml names neither.
+# The model config's ``provider`` key names the endpoint a provider's requests
+# go to. Every provider has a default, the first entry below, which
+# ci_core.config_helpers.normalize_model_configs fills in when user.yaml names
+# none (TestRoutes pins its table to this one). Three have a second: gemini on
+# Vertex AI, and openai and mistral on Azure. Any other value is refused, at
+# config load and again by ``call``, because a value this client does not act
+# on is one it ignores without a word.
 #
-# Vertex went missing in the litellm migration (271eb75, 2026-08-14). The
-# hand-written adapter built the Vertex URL itself and nothing replaced it, so
-# every gemini call went to AI Studio on the AI Studio key whatever user.yaml
-# said, while ci-check tested Vertex on a path of its own and passed. Found by a
-# $0 wire probe on 2026-09-19.
+# That is how both second endpoints went missing in the litellm migration
+# (271eb75, 2026-08-14): the hand-written adapters built those URLs themselves
+# and nothing replaced them, while ci-check tested each on a path of its own and
+# passed. $0 wire probes found them. Vertex on 2026-09-19: every gemini call went
+# to AI Studio. Azure on 2026-09-20: the Azure key went, as a Bearer token, to
+# api.openai.com and api.mistral.ai.
 #
-# litellm's vertex_ai/ route takes vertex_project, vertex_location and
+# Vertex. litellm's vertex_ai/ route takes vertex_project, vertex_location and
 # vertex_credentials, the last a service-account file's path, which litellm
 # opens itself. Whatever is left unset falls through to litellm's own defaults:
 # the VERTEXAI_PROJECT, VERTEXAI_LOCATION and VERTEXAI_CREDENTIALS variables,
@@ -355,34 +359,173 @@ PROVIDERS = tuple(_PROVIDERS)
 # litellm 1.96.2's bundled map nor its live one (checked 2026-09-20) lists any
 # for a gemini model. The request body, grounding tool included, is built by
 # the same transformation as AI Studio's.
-GEMINI_ROUTES = frozenset({"ai_studio", "vertex_ai"})
+#
+# Azure, for openai: litellm's azure/ route on responses(), the surface openai
+# must stay on (see the module docstring). Azure routes on the deployment, not
+# the model: the deployment is the request's `model` field, the endpoint is
+# api_base, and the key travels in an `api-key` header. The config's `model`
+# still names the model, as a label only: it prices the call and names it in the
+# report. The old adapter used Chat Completions, which sends nothing while a
+# reasoning model thinks, and api_version 2024-02-01, which predates Azure's
+# Responses API; see _azure_settings for the version this sends.
+#
+# Azure, for mistral: litellm's azure_ai/ route on completion(), with the
+# endpoint as api_base and the model as named. A serverless endpoint serves one
+# model and takes the key as a Bearer token; a Foundry endpoint
+# (*.services.ai.azure.com) takes a deployment name as the model, the key as
+# `api-key`, and an api_version, which is forwarded when set. litellm picks the
+# header by host.
+#
+# Two things differ on Azure beyond the request. The fallback chain is not
+# walked: a fallback is a model id, and an Azure endpoint takes only its own
+# deployments, so openai would call the same deployment again and mistral a
+# deployment that is not there. The old adapters skipped it too. And litellm has
+# to be told the openai deployment streams; see _stream_azure_deployment.
+#
+# Wire-verified only: no Azure resource was available, so nothing here has
+# reached a real Azure endpoint. TestAzureRoutesOnTheWire pins every request
+# above at the transport.
+ROUTES = {
+    "openai": ("openai", "azure"),
+    "gemini": ("ai_studio", "vertex_ai"),
+    "mistral": ("mistral", "azure"),
+    "grok": ("grok",),
+    "claude": ("anthropic",),
+    "perplexity": ("perplexity",),
+}
+
+# Sent when an openai Azure config names no api_version. litellm 1.96.2 builds
+# /openai/v1/responses?api-version=preview for it, Azure's v1 API, which needs
+# no dated version. litellm's own default is the same today, but an
+# AZURE_DEFAULT_RESPONSES_API_VERSION in the environment can move that one.
+DEFAULT_AZURE_API_VERSION = "preview"
+
+# Azure added the Responses API in 2025-03-01-preview. A dated api_version before
+# it names an API with no /responses route to send to.
+_AZURE_RESPONSES_SINCE = "2025-03-01"
 
 
-def gemini_route(provider_config):
-    """The gemini endpoint ``provider_config`` names, one of ``GEMINI_ROUTES``.
+def route(provider, provider_config):
+    """The endpoint ``provider_config`` names for ``provider``, from ``ROUTES``.
 
-    Any other value raises ``ValueError`` rather than falling back to AI Studio,
-    because a misspelt ``vertex_ai`` is exactly what this client used to ignore
-    without a word. Public because config loading calls it too, to refuse the
-    value before a run spends anything (docs/NAMING.md).
+    A config that names none gets the provider's default. Any other value
+    raises ``ValueError`` rather than falling back to the default, because a
+    value this client ignored is how Vertex and Azure both went missing. So
+    does an Azure config that lacks what Azure needs (``_azure_settings``), so
+    that it fails before anything is sent. Public because config loading calls
+    it too, to refuse the value before a run spends anything (docs/NAMING.md).
     """
-    route = (provider_config or {}).get("provider") or "ai_studio"
-    if route not in GEMINI_ROUTES:
+    cfg = provider_config or {}
+    routes = ROUTES[provider]
+    where = cfg.get("provider") or routes[0]
+    if where not in routes:
         raise ValueError(
-            f"models.gemini.provider is {route!r}, which is not a Gemini "
-            f"endpoint. Use one of: {', '.join(sorted(GEMINI_ROUTES))}."
+            f"models.{provider}.provider is {where!r}, which is not an endpoint "
+            f"{provider} can be sent to. Use one of: {', '.join(sorted(routes))}."
         )
-    return route
+    if where == "azure":
+        _azure_settings(provider, cfg)
+    return where
 
 
-def _auth_kwargs(provider, api_key, cfg):
-    """How one request authenticates, as litellm keyword arguments.
+def _azure_settings(provider, cfg):
+    """``api_base`` and ``api_version`` for an Azure request, or ``ValueError``.
+
+    openai needs an endpoint and a deployment, and mistral an endpoint, as the
+    old adapters did. openai's endpoint is the resource URL; Microsoft's v1
+    samples give the OpenAI SDK's base URL instead, which ends in /openai/v1,
+    and litellm appends its own /openai/responses to whatever it is given. So a
+    trailing /openai/v1 or /openai is dropped, which leaves one URL either way.
+
+    ``api_version`` is str()-ed because YAML reads an unquoted 2025-04-01 as a
+    date. openai's is refused when it is a dated version from before the
+    Responses API.
+    """
+    needs = ("endpoint", "deployment") if provider == "openai" else ("endpoint",)
+    missing = [key for key in needs if not cfg.get(key)]
+    if missing:
+        raise ValueError(
+            f"models.{provider}.provider is 'azure', which needs "
+            f"{' and '.join(missing)} in the same block. See "
+            f"configs/user.example.yaml."
+        )
+    endpoint = str(cfg["endpoint"]).strip()
+    version = cfg.get("api_version")
+    version = str(version) if version else None
+    if provider == "openai":
+        base = endpoint.rstrip("/")
+        for suffix in ("/openai/v1", "/openai"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        endpoint = base
+        version = version or DEFAULT_AZURE_API_VERSION
+        dated = re.match(r"\d{4}-\d{2}-\d{2}", version)
+        if dated and dated.group() < _AZURE_RESPONSES_SINCE:
+            raise ValueError(
+                f"models.openai.api_version is {version!r}, which is older than "
+                f"Azure's Responses API (2025-03-01-preview), the API openai "
+                f"requests go to. Remove it to use {DEFAULT_AZURE_API_VERSION!r}, "
+                f"or name a version from 2025-03-01-preview on."
+            )
+    settings = {"api_base": endpoint}
+    if version:
+        settings["api_version"] = version
+    return settings
+
+
+# One lock and one record for the whole process: the review pass fans calls out
+# across threads, and litellm's model map is shared by all of them.
+_azure_stream_lock = threading.Lock()
+_azure_streaming: set[str] = set()
+
+
+def _stream_azure_deployment(deployment, model):
+    """Make litellm stream an openai Azure deployment rather than fake it.
+
+    litellm asks its model map whether a model streams, and reads a model the
+    map does not list as one that does not (``supports_native_streaming``
+    returns False on a failed lookup). It then sends one non-streaming request
+    and replays the finished answer as a stream. Nothing arrives until the model
+    is done, and a reasoning call's silence outlasts the first-byte allowance.
+    A deployment is named by whoever created it, so the map rarely lists one:
+    BerriAI/litellm#21090 reported this for every unmapped model on responses()
+    and was closed as not planned. Measured on the wire, 2026-09-21: a
+    deployment named "my-dep" went out with no "stream" in its body.
+
+    ``register_model`` is how litellm is told about a deployment; its own Router
+    registers each one the same way. This registers the deployment as the model
+    the config says it serves, copying litellm's entry for that model on Azure,
+    or failing that on openai.com. So it streams exactly when that model does,
+    and litellm's own records of it carry that model's rates rather than none.
+    A deployment named after a model the map knows streams already, and is left
+    alone. Once per deployment per process.
+    """
+    key = f"azure/{deployment}"
+    with _azure_stream_lock:
+        if key in _azure_streaming:
+            return
+        litellm = _litellm()
+        if not litellm.utils.supports_native_streaming(
+            model=key, custom_llm_provider="azure"
+        ):
+            cost_map = litellm.model_cost
+            served = dict(cost_map.get(f"azure/{model}") or cost_map.get(model) or {})
+            served["litellm_provider"] = "azure"
+            served.setdefault("supports_native_streaming", True)
+            litellm.register_model({key: served})
+        _azure_streaming.add(key)
+
+
+def _route_kwargs(provider, api_key, cfg):
+    """Where one request goes and how it authenticates, as litellm keyword
+    arguments.
 
     Every route takes the provider's API key except Vertex, which takes a project
     and a service account instead and is not handed the key at all. litellm
     1.96.2 ignores a key on that route and sends its own Bearer token, but a key
     that never reaches litellm cannot turn up in a Vertex request whatever a
-    later release does with one.
+    later release does with one. Azure adds the endpoint and an API version.
 
     Raises ``FileNotFoundError`` when ``credentials_file`` names no file. litellm
     would read the path as inline JSON instead and report "Unable to load vertex
@@ -390,7 +533,10 @@ def _auth_kwargs(provider, api_key, cfg):
     APIConnectionError with status 500, which this client retries: the wrong
     problem, reported twice per domain.
     """
-    if provider != "gemini" or gemini_route(cfg) != "vertex_ai":
+    where = route(provider, cfg)
+    if where == "azure":
+        return {"api_key": api_key, **_azure_settings(provider, cfg)}
+    if where != "vertex_ai":
         return {"api_key": api_key}
     kwargs = {"api_key": None}
     if cfg.get("project"):
@@ -714,21 +860,33 @@ def _iter_with_gap(stream, first_byte, gap, is_progress=None, timing=None):
 
 
 def _resolve_model(provider, model_arg, cfg):
-    return (
-        model_arg or (cfg or {}).get("model") or _PROVIDERS[provider]["default_model"]
-    )
+    cfg = cfg or {}
+    default = _PROVIDERS[provider]["default_model"]
+    if provider == "openai" and cfg.get("provider") == "azure":
+        # What an Azure deployment serves, when the config does not say: Azure
+        # names a deployment after its model unless told otherwise, and the
+        # provider's default would price the call as a model that may not be
+        # the one running.
+        default = cfg.get("deployment") or default
+    return model_arg or cfg.get("model") or default
 
 
 def _qualified(provider, model, cfg=None):
     """Prefix a bare model id for litellm's provider routing.
 
     A model that already carries a ``provider/`` prefix is left alone so an
-    operator can pin an exact litellm route in user.yaml. ``cfg`` matters only to
-    gemini, whose prefix follows the endpoint it names (see ``gemini_route``).
+    operator can pin an exact litellm route in user.yaml. ``cfg`` names the
+    endpoint (see ``route``): Vertex and Azure each have litellm routes of their
+    own, and openai on Azure is called by its deployment, whatever the model.
     """
     prefix = _PROVIDERS[provider]["prefix"]
-    if provider == "gemini" and gemini_route(cfg) == "vertex_ai":
+    where = route(provider, cfg)
+    if where == "vertex_ai":
         prefix = "vertex_ai/"
+    elif where == "azure":
+        if provider == "openai":
+            return f"azure/{cfg['deployment']}"
+        prefix = "azure_ai/"
     if not prefix or "/" in model:
         return model
     return f"{prefix}{model}"
@@ -1764,14 +1922,14 @@ def _attempt(
         # Ahead of the timing record, so a missing service-account file fails
         # before any request is made, and is not recorded as a stream that
         # died. It carries no status, so it is not retried either.
-        auth = _auth_kwargs(provider, api_key, cfg)
+        routing = _route_kwargs(provider, api_key, cfg)
         # Started before litellm is called, so no wait for the provider goes
         # unmeasured — including the one inside completion() itself, which is
         # bounded by the socket timeout rather than by _iter_with_gap.
         timing = _StreamTiming(first_byte, gap)
         streams.append(timing)
         try:
-            assembled = _request(timing, auth)
+            assembled = _request(timing, routing)
         except BaseException as exc:
             # Raised before any stream existed — an HTTP error, or the socket
             # timing out while waiting for the response — so nothing below
@@ -1784,16 +1942,16 @@ def _attempt(
             assembled["searches"] = _read_searches(provider, assembled, model)
         return assembled
 
-    def _request(timing, auth):
+    def _request(timing, routing):
         if spec["surface"] == "responses":
             kwargs = {
-                "model": _qualified(provider, model),
+                "model": _qualified(provider, model, cfg),
                 "instructions": system_prompt,
                 "input": user_prompt,
                 "stream": True,
                 "timeout": timeout,
                 "num_retries": 0,
-                **auth,
+                **routing,
             }
             effort = (cfg or {}).get("reasoning_effort")
             if with_reasoning and effort:
@@ -1868,7 +2026,7 @@ def _attempt(
                 stream_options={"include_usage": True},
                 timeout=timeout,
                 num_retries=0,
-                **auth,
+                **routing,
                 **params,
             ),
             first_byte,
@@ -2048,8 +2206,9 @@ def call(
 ):
     """Call ``provider`` and return the shared result dict.
 
-    Walks the fallback chain on capacity errors and retries once without
-    reasoning parameters when a model rejects them.
+    Walks the fallback chain on capacity errors, except on Azure (see
+    ``ROUTES``), and retries once without reasoning parameters when a model
+    rejects them.
     """
     if provider not in _PROVIDERS:
         raise KeyError(
@@ -2058,16 +2217,20 @@ def call(
         )
 
     cfg = provider_config or {}
-    if provider == "gemini":
-        # A config error, like an unknown provider, so it raises rather than
-        # coming back as a failed call. Config loading refuses it first; this
-        # covers the callers that do not load config through it.
-        gemini_route(cfg)
+    # A config error, like an unknown provider, so it raises rather than coming
+    # back as a failed call, and before anything is sent. Config loading refuses
+    # it first; this covers the callers that do not load config through it.
+    where = route(provider, cfg)
     requested = _resolve_model(provider, model, cfg)
     timeout = _stream_timeout(cfg, _PROVIDERS[provider]["read_timeout"])
-    chain = [requested] + [
-        m for m in _PROVIDERS[provider]["fallbacks"] if m != requested
-    ]
+    if where == "azure":
+        chain = [requested]
+        if provider == "openai":
+            _stream_azure_deployment(cfg["deployment"], requested)
+    else:
+        chain = [requested] + [
+            m for m in _PROVIDERS[provider]["fallbacks"] if m != requested
+        ]
 
     result = None
     for attempt_model in chain:

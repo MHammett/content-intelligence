@@ -18,6 +18,7 @@ everything that would break silently if the shim mapped something wrong:
     empty rather than by raising.
 """
 
+import datetime
 import json
 import subprocess
 import sys
@@ -116,6 +117,25 @@ def _call(provider="mistral", **kwargs):
     )
     defaults.update(kwargs)
     return client.call(provider, **defaults)
+
+
+def _azure_openai_config(**overrides):
+    return {
+        "provider": "azure",
+        "model": "gpt-5.6-terra",
+        "endpoint": "https://my-resource.openai.azure.com",
+        "deployment": "my-deployment",
+        **overrides,
+    }
+
+
+def _azure_mistral_config(**overrides):
+    return {
+        "provider": "azure",
+        "model": "mistral-large-latest",
+        "endpoint": "https://Mistral-Large-abc.eastus2.inference.ai.azure.com",
+        **overrides,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -253,15 +273,35 @@ class TestCallSurface:
         )
 
     @pytest.mark.parametrize(
-        "cfg,expected",
+        "provider,model,cfg,expected",
         [
-            (None, "gemini/gemini-2.5-pro"),
-            ({"provider": "ai_studio"}, "gemini/gemini-2.5-pro"),
-            ({"provider": "vertex_ai"}, "vertex_ai/gemini-2.5-pro"),
+            ("gemini", "gemini-2.5-pro", None, "gemini/gemini-2.5-pro"),
+            (
+                "gemini",
+                "gemini-2.5-pro",
+                {"provider": "ai_studio"},
+                "gemini/gemini-2.5-pro",
+            ),
+            (
+                "gemini",
+                "gemini-2.5-pro",
+                {"provider": "vertex_ai"},
+                "vertex_ai/gemini-2.5-pro",
+            ),
+            # Azure routes openai on the deployment, whatever the model is.
+            ("openai", "gpt-5.6-terra", _azure_openai_config(), "azure/my-deployment"),
+            (
+                "mistral",
+                "mistral-large-latest",
+                _azure_mistral_config(),
+                "azure_ai/mistral-large-latest",
+            ),
         ],
     )
-    def test_geminis_prefix_follows_the_endpoint_it_names(self, cfg, expected):
-        assert client._qualified("gemini", "gemini-2.5-pro", cfg) == expected
+    def test_the_prefix_follows_the_endpoint_named(
+        self, provider, model, cfg, expected
+    ):
+        assert client._qualified(provider, model, cfg) == expected
 
     def test_unknown_provider_raises_keyerror(self):
         with pytest.raises(KeyError, match="Unknown provider"):
@@ -3562,28 +3602,429 @@ class TestSearchCountsOnTheWire:
         assert result["searches"] == 2
 
 
-class TestGeminiRoute:
-    """``models.gemini.provider`` names one of two endpoints, or is refused."""
+class TestRoutes:
+    """``models.<provider>.provider`` names one of that provider's endpoints, or
+    is refused."""
 
     @pytest.mark.parametrize(
-        "cfg,expected",
+        "provider,cfg,expected",
         [
-            (None, "ai_studio"),
-            ({}, "ai_studio"),
-            ({"provider": None}, "ai_studio"),
-            ({"provider": "ai_studio"}, "ai_studio"),
-            ({"provider": "vertex_ai"}, "vertex_ai"),
+            ("gemini", None, "ai_studio"),
+            ("gemini", {}, "ai_studio"),
+            ("gemini", {"provider": None}, "ai_studio"),
+            ("gemini", {"provider": "ai_studio"}, "ai_studio"),
+            ("gemini", {"provider": "vertex_ai"}, "vertex_ai"),
+            ("openai", None, "openai"),
+            ("openai", {"provider": "openai"}, "openai"),
+            ("openai", _azure_openai_config(), "azure"),
+            ("mistral", None, "mistral"),
+            ("mistral", _azure_mistral_config(), "azure"),
+            ("grok", None, "grok"),
+            ("claude", {"provider": "anthropic"}, "anthropic"),
+            ("perplexity", None, "perplexity"),
         ],
     )
-    def test_the_two_endpoints(self, cfg, expected):
-        assert client.gemini_route(cfg) == expected
+    def test_the_endpoints(self, provider, cfg, expected):
+        assert client.route(provider, cfg) == expected
 
-    @pytest.mark.parametrize("value", ["vertex", "Vertex_AI", "vertexai", "google"])
-    def test_anything_else_is_refused_by_name(self, value):
-        """These all used to reach AI Studio without a word."""
-        with pytest.raises(ValueError, match="ai_studio, vertex_ai") as e:
-            client.gemini_route({"provider": value})
+    @pytest.mark.parametrize(
+        "provider,value,listed",
+        [
+            ("gemini", "vertex", "ai_studio, vertex_ai"),
+            ("gemini", "Vertex_AI", "ai_studio, vertex_ai"),
+            ("gemini", "vertexai", "ai_studio, vertex_ai"),
+            ("gemini", "google", "ai_studio, vertex_ai"),
+            ("openai", "azure_openai", "azure, openai"),
+            ("openai", "Azure", "azure, openai"),
+            ("mistral", "azure_ai", "azure, mistral"),
+            ("claude", "bedrock", "anthropic"),
+            ("grok", "xai", "grok"),
+            ("perplexity", "sonar", "perplexity"),
+        ],
+    )
+    def test_anything_else_is_refused_by_name(self, provider, value, listed):
+        """These all used to reach the provider's default endpoint without a
+        word, and an Azure spelling carried the Azure key there."""
+        with pytest.raises(ValueError, match=f"Use one of: {listed}\\.") as e:
+            client.route(provider, {"provider": value})
         assert repr(value) in str(e.value)
+        assert f"models.{provider}.provider" in str(e.value)
+
+    def test_every_default_is_the_one_config_loading_fills_in(self):
+        """normalize_model_configs writes DEFAULT_PROVIDERS into every model
+        config that names no endpoint. A default this table did not accept would
+        refuse every one of those configs."""
+        from ci_core.config_helpers import DEFAULT_PROVIDERS
+
+        assert set(client.ROUTES) == set(client.PROVIDERS)
+        assert {p: routes[0] for p, routes in client.ROUTES.items()} == (
+            DEFAULT_PROVIDERS
+        )
+
+    @pytest.mark.parametrize(
+        "provider,cfg,named",
+        [
+            ("openai", _azure_openai_config(endpoint=None), "needs endpoint in"),
+            ("openai", _azure_openai_config(deployment=""), "needs deployment in"),
+            (
+                "openai",
+                {"provider": "azure", "model": "gpt-5.4"},
+                "needs endpoint and deployment in",
+            ),
+            ("mistral", _azure_mistral_config(endpoint=None), "needs endpoint in"),
+        ],
+    )
+    def test_azure_needs_somewhere_to_send(self, provider, cfg, named):
+        """The old adapters failed the call without these. Refused before
+        anything is sent instead, and a deployment is openai's alone: mistral's
+        endpoint names what it serves."""
+        with pytest.raises(ValueError, match=named):
+            client.route(provider, cfg)
+
+    @pytest.mark.parametrize(
+        "version,sent",
+        [
+            (None, "preview"),
+            ("preview", "preview"),
+            ("latest", "latest"),
+            ("2025-03-01-preview", "2025-03-01-preview"),
+            ("2025-04-01-preview", "2025-04-01-preview"),
+            (datetime.date(2026, 1, 1), "2026-01-01"),
+        ],
+    )
+    def test_openais_api_version(self, version, sent):
+        settings = client._azure_settings(
+            "openai", _azure_openai_config(api_version=version)
+        )
+        assert settings["api_version"] == sent
+
+    @pytest.mark.parametrize(
+        "version",
+        ["2024-02-01", "2024-10-21", "2025-02-01-preview", datetime.date(2024, 2, 1)],
+    )
+    def test_a_version_older_than_the_responses_api_is_refused(self, version):
+        """2024-02-01 is what the docs told Azure users to write, from the days
+        the old adapter used Chat Completions. It names an API with no
+        /responses route. The date is YAML reading it unquoted."""
+        with pytest.raises(ValueError, match="2025-03-01-preview"):
+            client.route("openai", _azure_openai_config(api_version=version))
+
+    def test_mistral_sends_an_api_version_only_when_given_one(self):
+        """A serverless endpoint takes none; a Foundry endpoint needs one."""
+        assert "api_version" not in client._azure_settings(
+            "mistral", _azure_mistral_config()
+        )
+        assert (
+            client._azure_settings(
+                "mistral", _azure_mistral_config(api_version="2024-05-01-preview")
+            )["api_version"]
+            == "2024-05-01-preview"
+        )
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "https://my-resource.openai.azure.com",
+            "https://my-resource.openai.azure.com/",
+            "https://my-resource.openai.azure.com/openai",
+            "https://my-resource.openai.azure.com/openai/v1/",
+        ],
+    )
+    def test_openais_endpoint_may_be_the_sdks_base_url(self, endpoint):
+        """Microsoft's v1 samples hand the OpenAI SDK <resource>/openai/v1/, and
+        litellm appends its own /openai/responses to whatever it gets."""
+        settings = client._azure_settings(
+            "openai", _azure_openai_config(endpoint=endpoint)
+        )
+        assert settings["api_base"] == "https://my-resource.openai.azure.com"
+
+
+def _chat_sse(text='{"flags": []}'):
+    """An OpenAI-compatible Chat Completions stream: what Azure's Mistral
+    endpoints send, as La Plateforme does."""
+    base = {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "m"}
+    chunks = [
+        {
+            **base,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}}],
+        },
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        {
+            **base,
+            "choices": [],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13},
+        },
+    ]
+    events = [f"data: {json.dumps(c)}\n\n" for c in chunks] + ["data: [DONE]\n\n"]
+    return "".join(events).encode()
+
+
+@pytest.mark.filterwarnings(
+    # litellm 1.96.2's, not ours, and a dozen of them would bury the socket
+    # guard's in the summary: it reads model_fields off an instance while it
+    # parses a Chat Completions stream, which pydantic 2.11 deprecates, and it
+    # serialises a Responses usage dict as its own ResponseAPIUsage type.
+    "ignore::pydantic.warnings.PydanticDeprecatedSince211",
+    "ignore:Pydantic serializer warnings:UserWarning",
+)
+class TestAzureRoutesOnTheWire:
+    """Where an Azure call goes, captured below litellm.
+
+    From the litellm migration until this was fixed, ``provider: azure`` was
+    ignored: openai went to api.openai.com and mistral to api.mistral.ai, each
+    carrying the Azure key as a Bearer token. ``httpx.Client.send`` is replaced
+    as in TestGeminiRoutesOnTheWire, so the URL, headers and body are litellm's
+    own. Wire-verified only: none of these requests has reached a real Azure
+    endpoint.
+    """
+
+    KEY = "azure-key-sentinel"
+
+    @pytest.fixture
+    def wire(self, monkeypatch):
+        litellm = client._litellm()
+        # _stream_azure_deployment registers deployments process-wide. Each test
+        # gets its own record and its own copy of the map, and whatever litellm
+        # cached from that copy is dropped before the original comes back.
+        monkeypatch.setattr(client, "_azure_streaming", set())
+        monkeypatch.setattr(litellm, "model_cost", dict(litellm.model_cost))
+        wire = {"requests": [], "streamed": [], "replies": []}
+
+        def _send(http_client, request, *args, **kwargs):
+            wire["requests"].append(request)
+            wire["streamed"].append(kwargs.get("stream"))
+            if wire["replies"]:
+                status, body = wire["replies"].pop(0)
+                return httpx.Response(status, request=request, json=body)
+            responses = request.url.path.endswith("/responses")
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                content=_openai_responses_sse([]) if responses else _chat_sse(),
+            )
+
+        monkeypatch.setattr(httpx.Client, "send", _send)
+        yield wire
+        litellm.utils._invalidate_model_cost_lowercase_map()
+
+    def _call(self, provider, config, **kwargs):
+        return _call(provider, api_key=self.KEY, provider_config=config, **kwargs)
+
+    @staticmethod
+    def _sent(request):
+        return str(request.url) + repr(dict(request.headers)) + request.content.decode()
+
+    def test_openai_reaches_the_deployment(self, wire):
+        result = self._call("openai", _azure_openai_config())
+        assert result["failed"] is False, result
+        (request,) = wire["requests"]
+        assert str(request.url) == (
+            "https://my-resource.openai.azure.com/openai/v1/responses"
+            "?api-version=preview"
+        )
+        assert request.headers["api-key"] == self.KEY
+        assert "authorization" not in request.headers
+        assert json.loads(request.content)["model"] == "my-deployment"
+
+    def test_mistral_reaches_its_endpoint(self, wire):
+        result = self._call("mistral", _azure_mistral_config())
+        assert result["failed"] is False, result
+        (request,) = wire["requests"]
+        assert str(request.url) == (
+            "https://mistral-large-abc.eastus2.inference.ai.azure.com/chat/completions"
+        )
+        assert request.headers["authorization"] == f"Bearer {self.KEY}"
+        assert json.loads(request.content)["model"] == "mistral-large-latest"
+
+    def test_mistral_on_a_foundry_endpoint(self, wire):
+        """A Foundry resource takes the key as api-key and needs a version."""
+        config = _azure_mistral_config(
+            endpoint="https://my-foundry.services.ai.azure.com/models",
+            model="mistral-medium-2505",
+            api_version="2024-05-01-preview",
+        )
+        result = self._call("mistral", config)
+        assert result["failed"] is False, result
+        (request,) = wire["requests"]
+        assert str(request.url) == (
+            "https://my-foundry.services.ai.azure.com/models/chat/completions"
+            "?api-version=2024-05-01-preview"
+        )
+        assert request.headers["api-key"] == self.KEY
+        assert "authorization" not in request.headers
+
+    @pytest.mark.parametrize(
+        "provider,config",
+        [("openai", _azure_openai_config()), ("mistral", _azure_mistral_config())],
+    )
+    def test_the_azure_key_goes_to_azure_alone(self, wire, provider, config):
+        self._call(provider, config)
+        (request,) = wire["requests"]
+        assert request.url.host.endswith(".azure.com")
+        for host in ("api.openai.com", "api.mistral.ai"):
+            assert host not in self._sent(request)
+
+    @pytest.mark.parametrize(
+        "provider,model,host",
+        [
+            ("openai", "gpt-5.4", "api.openai.com"),
+            ("mistral", "mistral-large-latest", "api.mistral.ai"),
+        ],
+    )
+    def test_each_providers_own_endpoint_is_still_the_default(
+        self, wire, provider, model, host
+    ):
+        result = self._call(provider, {"model": model})
+        assert result["failed"] is False, result
+        (request,) = wire["requests"]
+        assert request.url.host == host
+        assert request.headers["authorization"] == f"Bearer {self.KEY}"
+        assert "api-key" not in request.headers
+
+    def test_a_dated_api_version_takes_the_dated_route(self, wire):
+        self._call("openai", _azure_openai_config(api_version="2025-04-01-preview"))
+        (request,) = wire["requests"]
+        assert str(request.url) == (
+            "https://my-resource.openai.azure.com/openai/responses"
+            "?api-version=2025-04-01-preview"
+        )
+
+    def test_an_unmapped_deployment_streams(self, wire):
+        """litellm fakes the stream for a model its map does not list: one
+        request with no "stream" in it, and nothing back until the model is done.
+        A deployment is almost never listed (BerriAI/litellm#21090)."""
+        assert not client._litellm().utils.supports_native_streaming(
+            model="azure/my-deployment", custom_llm_provider="azure"
+        ), "litellm's map now lists this deployment name; pick another"
+        self._call("openai", _azure_openai_config())
+        (request,) = wire["requests"]
+        assert request.url.host == "my-resource.openai.azure.com"
+        assert json.loads(request.content)["stream"] is True
+        assert wire["streamed"] == [True]
+
+    def test_a_deployment_named_after_a_model_is_left_to_litellm(
+        self, wire, monkeypatch
+    ):
+        registered = []
+        monkeypatch.setattr(
+            client._litellm(), "register_model", lambda cost: registered.append(cost)
+        )
+        self._call("openai", _azure_openai_config(deployment="gpt-5.4"))
+        assert registered == []
+        (request,) = wire["requests"]
+        assert request.url.host == "my-resource.openai.azure.com"
+        body = json.loads(request.content)
+        assert body["model"] == "gpt-5.4"
+        assert body["stream"] is True
+
+    def test_a_deployment_is_registered_once_as_the_model_it_serves(
+        self, wire, monkeypatch
+    ):
+        litellm = client._litellm()
+        registered = []
+        real = litellm.register_model
+        monkeypatch.setattr(
+            litellm,
+            "register_model",
+            lambda cost: registered.append(cost) or real(cost),
+        )
+        self._call("openai", _azure_openai_config())
+        self._call("openai", _azure_openai_config())
+        ((entry,),) = [list(cost.values()) for cost in registered]
+        assert entry["litellm_provider"] == "azure"
+        assert entry["supports_native_streaming"] is True
+        # Azure's rates for gpt-5.6-terra, which are not openai.com's, so
+        # litellm's own records of the call are neither zeros nor OpenAI's.
+        served = litellm.model_cost["azure/gpt-5.6-terra"]
+        assert entry["input_cost_per_token"] == served["input_cost_per_token"]
+        assert (
+            entry["input_cost_per_token"]
+            != (litellm.model_cost["gpt-5.6-terra"]["input_cost_per_token"])
+        )
+
+    def test_a_model_litellm_does_not_know_still_streams(self, wire):
+        """Nothing to copy, so the entry says only what is needed."""
+        self._call("openai", _azure_openai_config(model="not-a-mapped-model"))
+        (request,) = wire["requests"]
+        assert json.loads(request.content)["stream"] is True
+        entry = client._litellm().model_cost["azure/my-deployment"]
+        assert entry == {"litellm_provider": "azure", "supports_native_streaming": True}
+
+    def test_the_request_is_the_one_openai_com_gets(self, wire):
+        """Only the address, the key's header and the model field differ.
+        Effort, its audible summary, search, the cache key and the schema all
+        reach Azure as they reach openai.com."""
+        shape = {"reasoning_effort": "high", "web_search": True}
+        schema = {
+            "name": "flags",
+            "schema": {
+                "type": "object",
+                "properties": {"flags": {"type": "array", "items": {}}},
+                "required": ["flags"],
+                "additionalProperties": False,
+            },
+        }
+        kwargs = {"response_schema": schema, "cache_prefix": "user"}
+        self._call("openai", _azure_openai_config(**shape), **kwargs)
+        self._call("openai", {"model": "gpt-5.6-terra", **shape}, **kwargs)
+        azure, direct = (json.loads(r.content) for r in wire["requests"])
+        assert azure.pop("model") == "my-deployment"
+        assert direct.pop("model") == "gpt-5.6-terra"
+        assert azure == direct
+        assert azure["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert azure["tools"] == [{"type": "web_search_preview"}]
+        assert "prompt_cache_key" in azure
+        assert azure["text"]["format"]["type"] == "json_schema"
+
+    @pytest.mark.parametrize(
+        "provider,config",
+        [("openai", _azure_openai_config()), ("mistral", _azure_mistral_config())],
+    )
+    def test_no_fallback_model_is_tried(self, wire, provider, config):
+        """A fallback is a model id and Azure takes deployments: openai would
+        call the same deployment again, mistral one that is not there."""
+        wire["replies"].append((503, {"error": {"code": 503, "message": "busy"}}))
+        result = self._call(provider, config)
+        assert result["failed"] is True
+        assert len(wire["requests"]) == 1
+        assert "fallback_from" not in result
+
+    def test_the_result_names_the_configured_model_so_it_prices(self, wire):
+        """The deployment is what was called, but not what pricing.yaml knows."""
+        from ci_core.llm import cost
+
+        result = self._call("openai", _azure_openai_config())
+        (request,) = wire["requests"]
+        assert json.loads(request.content)["model"] == "my-deployment"
+        assert result["model"] == "gpt-5.6-terra"
+        assert cost.known_price(result["model"]) is not None
+
+    def test_with_no_model_the_deployment_names_the_call(self, wire):
+        """Azure names a deployment after its model unless told otherwise, so
+        that is the better guess than openai's default model."""
+        config = _azure_openai_config(deployment="gpt-5.6-luna")
+        del config["model"]
+        result = self._call("openai", config)
+        assert result["model"] == "gpt-5.6-luna"
+        (request,) = wire["requests"]
+        assert request.url.host == "my-resource.openai.azure.com"
+
+    @pytest.mark.parametrize(
+        "provider,config",
+        [
+            ("openai", _azure_openai_config(deployment=None)),
+            ("openai", _azure_openai_config(api_version="2024-02-01")),
+            ("mistral", _azure_mistral_config(endpoint="")),
+            ("openai", _azure_openai_config(provider="azure_openai")),
+        ],
+    )
+    def test_a_config_azure_cannot_take_raises_before_anything_is_sent(
+        self, wire, provider, config
+    ):
+        with pytest.raises(ValueError):
+            self._call(provider, config)
+        assert wire["requests"] == []
 
 
 def _vertex_config(**overrides):

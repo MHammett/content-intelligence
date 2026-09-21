@@ -251,6 +251,26 @@ def _finding(provider, model_id, entry):
     }
 
 
+def _sweep_configs(ran, model_configs):
+    """The models config ``collect_available_models`` is handed for ``ran``.
+
+    It takes the models config shape, and the model that ran is what is to be
+    compared, so that goes in as the configured id. Of the run's own config only
+    an Azure route comes too, so the sweep skips that provider as ci-discover
+    does: its key is an Azure key, and the sweep would otherwise hand it to
+    OpenAI's or Mistral's model listing. Vertex is left out on purpose. Its
+    AI Studio key, where there is one, belongs to the listing it would query.
+    """
+    configs = {}
+    for provider, model_id in ran.items():
+        entry = {"model": model_id}
+        run_cfg = (model_configs or {}).get(provider)
+        if isinstance(run_cfg, dict) and run_cfg.get("provider") == "azure":
+            entry.update(provider="azure", endpoint=run_cfg.get("endpoint"))
+        configs[provider] = entry
+    return configs
+
+
 def check(
     ran,
     api_keys,
@@ -258,10 +278,13 @@ def check(
     refresh=False,
     max_age_hours=DEFAULT_MAX_AGE_HOURS,
     cache_path=None,
+    model_configs=None,
 ):
     """Report on models newer than the ones in ``ran``. Never raises.
 
     ``ran`` is ``{provider_key: model_id}`` — see ``models_that_ran``.
+    ``model_configs`` is the run's models config, read only for which providers
+    it sends to Azure: see ``_sweep_configs``.
 
     ``refresh`` allows this call to query providers whose cached answer is
     older than ``max_age_hours`` (or missing). With ``refresh=False`` the check
@@ -298,10 +321,7 @@ def check(
     if refresh and stale:
         try:
             swept = discover.collect_available_models(
-                # collect_available_models takes the models config shape; the
-                # model that ran is what we want compared, so it goes in as the
-                # configured id.
-                {p: {"model": m} for p, m in ran.items()},
+                _sweep_configs(ran, model_configs),
                 api_keys or {},
                 providers=stale,
             )
@@ -387,6 +407,11 @@ def _reason_text(entry):
     if reason == "vertex_ai":
         base = "configured via Vertex AI, whose model listing needs the gcloud SDK"
         return f"{base} ({detail})" if detail else base
+    if reason == "azure":
+        return (
+            "configured via Azure, where what runs is a deployment rather than "
+            "a provider catalogue"
+        )
     if reason == "request_failed":
         base = "the models API could not be reached"
         return f"{base} ({detail})" if detail else base

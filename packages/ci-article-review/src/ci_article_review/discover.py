@@ -355,6 +355,16 @@ def collect_available_models(model_configs, api_keys, providers=None):
             )
             continue
 
+        # On Azure the key under api_keys is an Azure key, and the listings
+        # below are OpenAI's and Mistral's own: asking them would send it to the
+        # wrong company, as every model call did until the client learned the
+        # route. What an Azure resource offers is its deployments, which are
+        # the operator's to choose, not a provider catalogue to compare with.
+        if cfg.get("provider") == "azure":
+            record["reason"] = "azure"
+            record["detail"] = f"endpoint={cfg.get('endpoint', '?')}"
+            continue
+
         if not api_key:
             record["reason"] = "no_api_key"
             continue
@@ -489,6 +499,15 @@ def main():
                     "       Model listing against Vertex AI requires the gcloud SDK and is "
                     "not supported here.\n"
                     "       Check https://ai.google.dev/models for available Gemini models.\n"
+                    f"       Configured model: {configured_id!r}"
+                )
+            elif reason == "azure":
+                print(
+                    f"  {SKIP}  Configured via Azure ({record['detail']}).\n"
+                    "       The key is an Azure key, so the provider's own model "
+                    "listing is not asked.\n"
+                    "       What runs is the deployment you configured; the Azure "
+                    "portal lists what you can deploy.\n"
                     f"       Configured model: {configured_id!r}"
                 )
             elif reason == "no_api_key":
