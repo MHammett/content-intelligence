@@ -34,7 +34,7 @@ resolved differently — say which) · `dropped` (with the reason).
 ## 1. litellm — credit exhaustion is classified as a rate limit
 
 **Status:** contributed — twice, and **deliberately not turned into a PR.** No
-maintainer has responded to any of it as of 2026-08-16; see "Why no PR" below,
+maintainer has responded to any of it as of 2026-09-21; see "Why no PR" below,
 which is the part worth reading before anyone picks this up again.
 [BerriAI/litellm#32785](https://github.com/BerriAI/litellm/issues/32785) already
 reported this on 2026-07-10 (and traced it further than we had, to the OpenAI
@@ -135,6 +135,28 @@ retryable status (a dead account arrives as a 429 directly and as a synthesised
 503 mid-stream), existing only to stop our own single retry. The full
 cross-provider classifier stays unbuilt here on purpose — it belongs upstream,
 where each provider's wording is better known than we know it.
+
+**Checked independently, 2026-08-21.** Four days after our review input on
+#32798, another contributor re-ran every row of our table against `main` rather
+than taking it on trust
+([their comment](https://github.com/BerriAI/litellm/pull/32798#issuecomment-5366100115)).
+All four rows held, including the 402 one: `nlp_cloud`'s `429 or 402` really
+does send an out-of-credit response to `RateLimitError`. They added a scope point
+that changes what our follow-up offer means. `_map_openai_exception` has no 403
+branch at all, so the per-provider table we offered to write has nothing to
+attach to yet: whoever writes it has to add that branch first and choose a
+default class for a 403 across the ~30 openai-compatible providers that share
+the function. That is a more contentious change than adding a row, and bigger
+than we framed it.
+
+**State on 2026-09-21.** Still no maintainer comment on #32785 or #32798;
+#32785's only new comment is a +1 linking the commenter's own blog. #32798 is
+now `CONFLICTING` and still targets `litellm_internal_staging`, which litellm
+has since abandoned for `main` (see entry 6). Like our #37126, it was closed and
+reopened mechanically on 2026-09-13 when that branch was recreated. Retargeting
+and rebasing it is its author's call. Outside PRs do land there, just rarely: 42
+of the 1,500 merges from 2026-08-27 to 2026-09-21 came from forks, by 38
+distinct authors.
 
 ---
 
@@ -414,7 +436,9 @@ change was wrong on its own, which is why nobody caught it.
 **Status:** filed as
 [BerriAI/litellm#37125](https://github.com/BerriAI/litellm/issues/37125) with
 [PR #37126](https://github.com/BerriAI/litellm/pull/37126), both 2026-08-16.
-**Repo:** BerriAI/litellm (tested against 1.96.2)
+Still unreviewed on 2026-09-21, when the PR was retargeted to `main`; see
+*Five weeks on* below.
+**Repo:** BerriAI/litellm (tested against 1.96.2, re-checked on `main` 2026-09-21)
 
 `response_format` is the spelling every other litellm surface uses. On the
 Responses API it is accepted and does nothing. The call succeeds, the caller
@@ -480,8 +504,53 @@ thing, sending the reader somewhere there is nothing to find.
 
 The test note is the reusable part. A test asserting the call succeeds passes
 against the broken version, which is presumably how this survived; the PR's
-tests assert on the params bound for the provider, and 5 of 8 fail without the
-fix.
+tests assert on the params bound for the provider, and 8 of its 11 fail
+without the fix.
+
+**Five weeks on (2026-09-21).** No maintainer has reviewed it. The one staff
+touch was mechanical: on 2026-09-13 `litellm_internal_staging` was deleted and
+recreated, which auto-closed the PR, and it was reopened the same morning.
+Meanwhile litellm had moved its default branch back to `main`, now 3,081 commits
+ahead of staging and the base for 36 of the 39 fork PRs among the 60 most
+recently opened, so this one was sitting on an abandoned branch. A PR can go
+stale because its base is abandoned, not only because it conflicts; check the
+default branch on every revisit.
+
+The bug is unchanged on `main` (`1cac8bd9ab`), re-checked live against
+`xai/grok-4.3`: `response_format` is still ignored and the model answers in
+prose. Retargeting to `main` hit three CI obstacles, none in the fix itself:
+
+- **Their type-discipline gate.** LIT002 (mutable-collection construction) on
+  `main` is already over its own ceiling, 26724 against 26715, so the gate
+  rejects any net-new dict literal, and the converter added five. Rebuilt with
+  the forms their checker exempts, TypedDict-annotated literals and
+  `MappingProxyType`, rather than suppressed.
+- **The branch predated their CI.** `test-linting.yml` checks out the PR head
+  and runs `.github/actions/detect-changes`, which landed on `main` on
+  2026-08-19, after this branch was cut, so `lint` failed before it reached our
+  code. Merging `main` in fixed that without a force-push, so every commit hash
+  cited in the PR is still valid.
+- **Their test-quality gate.** It counts `sys.path.insert` under TQ003, and
+  `main` is already over that ceiling too, 63 against 62. The line had been
+  copied from the sibling `text_format` test, which `main` had since cleaned up
+  the same way.
+
+Two of the three were ratchets that `main` itself already exceeds, so an outside
+PR can land only by adding none of whatever those gates count. Running their
+gate scripts locally before pushing is cheaper than finding each one in CI.
+
+One correction of our own: the PR text said "12 passed" and "5 of the 12 fail
+without the fix". The new test file has 11 tests and 8 of them fail without the
+fix; 12 was the total including a pre-existing test. Corrected in the PR body
+and in both comments that repeated it, each with a visible note.
+
+With all three cleared, CI on the tip (`b2ef9d5b64`) is green against `main`:
+89 checks passed, 1 skipped, none failed. Mechanically the PR is as ready as an
+outside contribution gets, with the CLA signed, Greptile at 5/5 and CI green, and
+it is still waiting on a human. Whether one comes is a separate question: outside
+PRs are about 3% of litellm's merges (see entry 1), and entry 5 landed the other
+way, with their bot reimplementing the fix from the issue. So #37125 is as likely
+a route to a fix as the PR, and both carry the same diagnosis.
 
 ---
 
