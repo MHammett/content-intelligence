@@ -106,6 +106,7 @@ after real output began, each flagged when it is only a lower bound. See
 """
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -325,6 +326,87 @@ _PROVIDERS = {
 }
 
 PROVIDERS = tuple(_PROVIDERS)
+
+
+# ---------------------------------------------------------------------------
+# Gemini's two endpoints
+# ---------------------------------------------------------------------------
+#
+# Gemini is the one provider here with two endpoints, and the model config's
+# ``provider`` key picks between them: AI Studio on an API key, or Vertex AI on
+# a Google Cloud project and service account. AI Studio is the default, and
+# ci_core.config_helpers.normalize_model_configs fills it in as "ai_studio"
+# when user.yaml names neither.
+#
+# Vertex went missing in the litellm migration (271eb75, 2026-08-14). The
+# hand-written adapter built the Vertex URL itself and nothing replaced it, so
+# every gemini call went to AI Studio on the AI Studio key whatever user.yaml
+# said, while ci-check tested Vertex on a path of its own and passed. Found by a
+# $0 wire probe on 2026-09-19.
+#
+# litellm's vertex_ai/ route takes vertex_project, vertex_location and
+# vertex_credentials, the last a service-account file's path, which litellm
+# opens itself. Whatever is left unset falls through to litellm's own defaults:
+# the VERTEXAI_PROJECT, VERTEXAI_LOCATION and VERTEXAI_CREDENTIALS variables,
+# then the project named in the credentials, us-central1, and Application
+# Default Credentials (the old adapter's fallback too). A location that is set
+# is sent as given unless litellm's model map lists supported_regions for the
+# model, in which case litellm quietly swaps it for the first of those; neither
+# litellm 1.96.2's bundled map nor its live one (checked 2026-09-20) lists any
+# for a gemini model. The request body, grounding tool included, is built by
+# the same transformation as AI Studio's.
+GEMINI_ROUTES = frozenset({"ai_studio", "vertex_ai"})
+
+
+def gemini_route(provider_config):
+    """The gemini endpoint ``provider_config`` names, one of ``GEMINI_ROUTES``.
+
+    Any other value raises ``ValueError`` rather than falling back to AI Studio,
+    because a misspelt ``vertex_ai`` is exactly what this client used to ignore
+    without a word. Public because config loading calls it too, to refuse the
+    value before a run spends anything (docs/NAMING.md).
+    """
+    route = (provider_config or {}).get("provider") or "ai_studio"
+    if route not in GEMINI_ROUTES:
+        raise ValueError(
+            f"models.gemini.provider is {route!r}, which is not a Gemini "
+            f"endpoint. Use one of: {', '.join(sorted(GEMINI_ROUTES))}."
+        )
+    return route
+
+
+def _auth_kwargs(provider, api_key, cfg):
+    """How one request authenticates, as litellm keyword arguments.
+
+    Every route takes the provider's API key except Vertex, which takes a project
+    and a service account instead and is not handed the key at all. litellm
+    1.96.2 ignores a key on that route and sends its own Bearer token, but a key
+    that never reaches litellm cannot turn up in a Vertex request whatever a
+    later release does with one.
+
+    Raises ``FileNotFoundError`` when ``credentials_file`` names no file. litellm
+    would read the path as inline JSON instead and report "Unable to load vertex
+    credentials from environment. Ensure the JSON is valid", as an
+    APIConnectionError with status 500, which this client retries: the wrong
+    problem, reported twice per domain.
+    """
+    if provider != "gemini" or gemini_route(cfg) != "vertex_ai":
+        return {"api_key": api_key}
+    kwargs = {"api_key": None}
+    if cfg.get("project"):
+        kwargs["vertex_project"] = cfg["project"]
+    if cfg.get("location"):
+        kwargs["vertex_location"] = cfg["location"]
+    path = cfg.get("credentials_file")
+    if path:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"models.gemini.credentials_file is {path!r}, which is not a "
+                f"file. Correct the path in user.yaml, or remove the key to use "
+                f"Application Default Credentials."
+            )
+        kwargs["vertex_credentials"] = path
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -637,13 +719,16 @@ def _resolve_model(provider, model_arg, cfg):
     )
 
 
-def _qualified(provider, model):
+def _qualified(provider, model, cfg=None):
     """Prefix a bare model id for litellm's provider routing.
 
     A model that already carries a ``provider/`` prefix is left alone so an
-    operator can pin an exact litellm route in user.yaml.
+    operator can pin an exact litellm route in user.yaml. ``cfg`` matters only to
+    gemini, whose prefix follows the endpoint it names (see ``gemini_route``).
     """
     prefix = _PROVIDERS[provider]["prefix"]
+    if provider == "gemini" and gemini_route(cfg) == "vertex_ai":
+        prefix = "vertex_ai/"
     if not prefix or "/" in model:
         return model
     return f"{prefix}{model}"
@@ -1676,13 +1761,17 @@ def _attempt(
     streams = []
 
     def _invoke():
+        # Ahead of the timing record, so a missing service-account file fails
+        # before any request is made, and is not recorded as a stream that
+        # died. It carries no status, so it is not retried either.
+        auth = _auth_kwargs(provider, api_key, cfg)
         # Started before litellm is called, so no wait for the provider goes
         # unmeasured — including the one inside completion() itself, which is
         # bounded by the socket timeout rather than by _iter_with_gap.
         timing = _StreamTiming(first_byte, gap)
         streams.append(timing)
         try:
-            assembled = _request(timing)
+            assembled = _request(timing, auth)
         except BaseException as exc:
             # Raised before any stream existed — an HTTP error, or the socket
             # timing out while waiting for the response — so nothing below
@@ -1695,7 +1784,7 @@ def _attempt(
             assembled["searches"] = _read_searches(provider, assembled, model)
         return assembled
 
-    def _request(timing):
+    def _request(timing, auth):
         if spec["surface"] == "responses":
             kwargs = {
                 "model": _qualified(provider, model),
@@ -1704,7 +1793,7 @@ def _attempt(
                 "stream": True,
                 "timeout": timeout,
                 "num_retries": 0,
-                "api_key": api_key,
+                **auth,
             }
             effort = (cfg or {}).get("reasoning_effort")
             if with_reasoning and effort:
@@ -1770,7 +1859,7 @@ def _attempt(
 
         return _consume_completion_stream(
             _litellm().completion(
-                model=_qualified(provider, model),
+                model=_qualified(provider, model, cfg),
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": content},
@@ -1779,7 +1868,7 @@ def _attempt(
                 stream_options={"include_usage": True},
                 timeout=timeout,
                 num_retries=0,
-                api_key=api_key,
+                **auth,
                 **params,
             ),
             first_byte,
@@ -1969,6 +2058,11 @@ def call(
         )
 
     cfg = provider_config or {}
+    if provider == "gemini":
+        # A config error, like an unknown provider, so it raises rather than
+        # coming back as a failed call. Config loading refuses it first; this
+        # covers the callers that do not load config through it.
+        gemini_route(cfg)
     requested = _resolve_model(provider, model, cfg)
     timeout = _stream_timeout(cfg, _PROVIDERS[provider]["read_timeout"])
     chain = [requested] + [

@@ -41,6 +41,7 @@ the one thing this pass must not be able to assert.
 import logging
 
 from ci_core import llm
+from ci_core.config_helpers import has_credentials
 from ci_core.llm import cost
 
 log = logging.getLogger(__name__)
@@ -205,7 +206,8 @@ def reask_one(
     its answer could not be used. Never raises: this pass is advisory, and a
     failure here must leave the refutation exactly as it was.
     """
-    if not api_key:
+    # Not the key alone: gemini on Vertex AI may have none (see has_credentials).
+    if not has_credentials(provider, api_key, provider_config):
         return None
 
     config = dict(provider_config or {})
@@ -302,14 +304,17 @@ def reask_refuted(
         if not provider:
             continue
         api_key = (api_keys.get(provider) or {}).get("api_key", "")
-        if not api_key:
-            log.debug("Citation re-ask skipped for %s: no API key configured", provider)
+        provider_config = model_configs.get(provider, {})
+        if not has_credentials(provider, api_key, provider_config):
+            log.debug(
+                "Citation re-ask skipped for %s: no credentials configured", provider
+            )
             continue
         recorded = reask_one(
             result,
             provider,
             api_key,
-            model_configs.get(provider, {}),
+            provider_config,
             call_log,
             author,
         )

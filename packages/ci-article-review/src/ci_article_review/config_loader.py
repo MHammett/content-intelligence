@@ -17,7 +17,7 @@ from ci_core.env_provenance import (
     shadowed_mismatches as _shadowed_mismatches,
     snapshot as _snapshot_dotenv,
 )
-from ci_core.llm import output_tokens
+from ci_core.llm import client, output_tokens
 from ci_core.redact import mask_secret
 
 log = logging.getLogger("config_loader")
@@ -219,7 +219,29 @@ def load_publication_config(publication_name, config_dir="configs"):
     return config
 
 
+def _validate_gemini_route(config):
+    """Refuse a ``models.gemini.provider`` that names no Gemini endpoint.
+
+    Refused at load, before a run spends anything, because the client once sent
+    every gemini call to AI Studio whatever this said (see
+    ci_core.llm.client.gemini_route). A plain model string names no provider
+    and runs on the default.
+    """
+    gemini = (config.get("models") or {}).get("gemini")
+    if not isinstance(gemini, dict):
+        return
+    try:
+        client.gemini_route(gemini)
+    except ValueError as e:
+        raise ValueError(
+            f"User config: {e}\nSee configs/user.example.yaml, which shows both."
+        ) from None
+
+
 def _validate_user_config(config):
+    # First: a misspelt vertex_ai would otherwise be reported as the missing
+    # AI Studio key that the spelling below fails to excuse.
+    _validate_gemini_route(config)
     missing = []
     for key_path in REQUIRED_USER_KEYS:
         # Gemini API key is not required when using Vertex AI (which uses google-auth instead).

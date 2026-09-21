@@ -359,10 +359,15 @@ models:
 #              execute", and empty queries are ignored; 2.5 and older are "billed
 #              per prompt". Its Cloud pricing page defines a grounding prompt as
 #              one "for which Gemini makes one or more queries", and says
-#              "there is only one charge" however many it makes. These are AI
-#              Studio's terms because every gemini call goes there: the client
-#              sends `gemini/` requests even where user.yaml says
-#              `provider: vertex_ai` (checked 2026-09-19 with a $0 wire probe).
+#              "there is only one charge" however many it makes. Vertex AI's
+#              pricing page (cloud.google.com/vertex-ai/generative-ai/pricing,
+#              read in a browser 2026-09-20) lists the same two rates, so these
+#              rows hold on either endpoint; only the free allowance differs
+#              (NOT MODELLED, below). Which endpoint a run used matters for
+#              reading old runs: from the litellm migration (271eb75,
+#              2026-08-14) until gemini_route was added to ci_core/llm/client.py,
+#              every gemini call went to AI Studio even where user.yaml said
+#              `provider: vertex_ai`. It now reaches Vertex.
 #              A gemini call can read as ungrounded and still have searched:
 #              litellm drops the grounding metadata on some streamed chunks
 #              (BerriAI/litellm#41492), and the client then falls back to
@@ -380,11 +385,13 @@ models:
 #
 # NOT MODELLED. Each of these moves the true bill away from the figure:
 #   * Free allowances. Google's paid tier includes 1,500 grounded prompts a day
-#     on 2.5 Flash and Flash-Lite combined (2.5 Pro gets its own 1,500), and
-#     5,000 queries a month across Gemini 3. A run cannot see how much of that
-#     allowance the account has already used, so every unit is priced at list.
-#     At this repo's volume, the Gemini share is usually within the allowance,
-#     so the report overstates it.
+#     on 2.5 Flash and Flash-Lite combined, and 5,000 queries a month across
+#     Gemini 3, on either endpoint. 2.5 Pro gets its own allowance: 1,500 a day
+#     on AI Studio, 10,000 on Vertex AI (both pricing pages, read 2026-09-20).
+#     A run cannot see how much of that allowance the account has already used,
+#     so every unit is priced at list. At this repo's volume, the Gemini share
+#     is usually within the allowance, so the report overstates it, and on
+#     Vertex, where thorough and maximum run 2.5 Pro, by more.
 #   * Hidden sub-searches. On the OpenAI forum, users relay OpenAI support
 #     saying one search the dashboard shows can be billed as several. Nothing in
 #     the response shows that, so the OpenAI figure is a floor.

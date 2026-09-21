@@ -70,7 +70,7 @@ from . import consolidation
 from . import handoff_gaps
 from . import reproducibility
 from ci_core import redact
-from ci_core.config_helpers import normalize_model_configs
+from ci_core.config_helpers import has_credentials, normalize_model_configs
 from ci_core import llm
 from . import schemas
 from ci_core.concurrency import (
@@ -305,12 +305,8 @@ def _preset_domains(thoroughness: str) -> list[str]:
 
 def _model_has_credentials(model_name: str, api_keys: dict, model_cfg: dict) -> bool:
     """Return True if the model has credentials to run."""
-    if model_name == "gemini":
-        if model_cfg.get("provider") == "vertex_ai":
-            # Vertex AI uses google-auth; project ID is the required field.
-            return bool(model_cfg.get("project"))
-        return bool(api_keys.get("gemini", {}).get("api_key"))
-    return bool(api_keys.get(model_name, {}).get("api_key"))
+    api_key = (api_keys.get(model_name) or {}).get("api_key")
+    return has_credentials(model_name, api_key, model_cfg)
 
 
 #: Domains the drafting model is not allowed to review.
