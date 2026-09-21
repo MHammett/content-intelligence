@@ -438,17 +438,26 @@ api_keys:
 models:
   openai:
     provider: azure
-    model: gpt-5.6-terra               # informational label only
+    model: gpt-5.6-terra               # the model the deployment serves
     endpoint: https://my-resource.openai.azure.com
     deployment: my-gpt5-deployment
-    api_version: "2024-02-01"          # optional; defaults to 2024-02-01
+    # api_version: 2025-04-01-preview  # optional; defaults to preview
 ```
 
-Azure provisioned throughput deployments do not 503; the fallback chain is bypassed.
+`provider` takes `openai`, the default, or `azure`. Any other value is refused when the config loads, and so is an Azure block without an `endpoint` and a `deployment`.
+
+Requests go to the Responses API on your resource, `<endpoint>/openai/v1/responses`, with the deployment as the model and the key in an `api-key` header. The endpoint is the resource URL; the OpenAI SDK base URL from Microsoft's samples, which ends in `/openai/v1/`, works too.
+
+- **`deployment` decides what runs.** `model` names what it serves: it prices the call and names it in the report, and no cost preset changes it. Without one, the call is named after the deployment, which Azure names after its model unless told otherwise.
+- **`api_version`** defaults to `preview`, Azure's v1 API. A dated version must be `2025-03-01-preview` or later, when Azure added the Responses API; an older one is refused when the config loads. This page used to show `2024-02-01`, from when this route used Chat Completions.
+- **No fallback model.** A fallback is a model id, and Azure takes only your deployments. Provisioned throughput deployments do not 503 anyway.
+- **Pricing** uses OpenAI's rates from `pricing.yaml`. Azure's can differ, and provisioned throughput bills by the hour, not the token.
+- **Live search** (`web_search`) uses Azure's own web search tool, which runs on Grounding with Bing and may need enabling for your resource. Data sent to it leaves your Azure compliance boundary ([Microsoft](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/web-search)).
+- **Wire-verified only.** This route has been checked against the requests litellm builds, never against a live Azure resource. Run `ci-check` first: its Azure check makes the pipeline's own call.
 
 ---
 
-### Azure AI (Mistral serverless)
+### Azure AI (Mistral)
 
 ```yaml
 api_keys:
@@ -458,9 +467,16 @@ api_keys:
 models:
   mistral:
     provider: azure
-    model: mistral-large-latest        # informational label only
+    model: mistral-large-latest        # the name the endpoint is called with
     endpoint: https://Mistral-Large-abc.eastus2.inference.ai.azure.com
+    # api_version: 2024-05-01-preview  # a Foundry endpoint needs one
 ```
+
+`provider` takes `mistral`, the default, or `azure`, and an Azure block needs an `endpoint`.
+
+- A **serverless endpoint** serves one model and takes the key as a Bearer token. Requests go to `<endpoint>/chat/completions`.
+- A **Foundry endpoint**, `https://<resource>.services.ai.azure.com/models`, takes `model` as the deployment name, the key in an `api-key` header, and needs `api_version`.
+- As for Azure OpenAI: no cost preset changes `model`, there is no fallback model, calls are priced at Mistral's rates, and the route is wire-verified only.
 
 ---
 
@@ -880,7 +896,7 @@ The `cost_preset` setting is the easiest way to control quality vs cost. It sets
 Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article-review/src/ci_article_review/configs/presets.yaml). When providers release new models, edit that file to update the model names — no code change needed.
 
 **When `cost_preset` is set:**
-- It overrides model names and reasoning flags for all configured providers
+- It overrides model names and reasoning flags for all configured providers, except the model name on Azure, where the deployment decides it
 - Provider infrastructure settings (vertex_ai, azure, credentials_file) are preserved
 - Providers you haven't configured (no API key) are skipped
 - Setting `enabled: false` on a provider still takes precedence
@@ -991,7 +1007,7 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 - Gemini's `thinking_budget` is only set at `maximum`, on `gemini-2.5-pro`; everywhere else the model uses its dynamic default. `thinking_budget` under `models:` is not one of the keys a preset preserves, so to change it under a preset use `preset_overrides` (below). `0` turns thinking off on the Flash models only: `thorough` and `maximum` run `gemini-2.5-pro`, where thinking cannot be turned off.
 - `mistral-medium-3-5` is the reasoning-capable Mistral model (replaces the deprecated `magistral-medium-latest`). It only accepts `reasoning_effort: "high"` or `"none"` — not `"low"` or `"medium"`. The `-latest` suffix variant (`mistral-medium-3-5-latest`) does not exist and returns a 400 error.
 - Claude Opus 5 and Sonnet 5 think by default, at effort `high`; the `effort:` parameter sets the depth, and both reject `thinking_budget:`. Other Claude models differ — see [Claude — adaptive vs extended thinking](#claude--adaptive-vs-extended-thinking).
-- Provider infrastructure settings (Vertex AI, Azure, credentials) are always preserved regardless of preset.
+- Provider infrastructure settings (Vertex AI, Azure, credentials) are always preserved regardless of preset, and so is the model name on Azure.
 - If you haven't configured a provider (no API key), the preset silently skips it.
 
 **Per-model cost reference**: list-price arithmetic for one call of 4,000 input and 2,000 output tokens (6,000 in all). Reasoning tokens bill as output, so a call that reasons costs more; the last column links to measured per-call costs where saved runs have them.

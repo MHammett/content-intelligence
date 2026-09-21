@@ -219,29 +219,32 @@ def load_publication_config(publication_name, config_dir="configs"):
     return config
 
 
-def _validate_gemini_route(config):
-    """Refuse a ``models.gemini.provider`` that names no Gemini endpoint.
+def _validate_routes(config):
+    """Refuse a ``models.<provider>.provider`` no endpoint answers to, and an
+    Azure block missing what Azure needs.
 
-    Refused at load, before a run spends anything, because the client once sent
-    every gemini call to AI Studio whatever this said (see
-    ci_core.llm.client.gemini_route). A plain model string names no provider
-    and runs on the default.
+    Refused at load, before a run spends anything, because the client once
+    ignored this key for every provider: gemini on Vertex went to AI Studio, and
+    openai and mistral on Azure went to their own APIs carrying the Azure key
+    (see ci_core.llm.client.ROUTES). A plain model string names no provider and
+    runs on the default.
     """
-    gemini = (config.get("models") or {}).get("gemini")
-    if not isinstance(gemini, dict):
-        return
-    try:
-        client.gemini_route(gemini)
-    except ValueError as e:
-        raise ValueError(
-            f"User config: {e}\nSee configs/user.example.yaml, which shows both."
-        ) from None
+    for provider, model_cfg in (config.get("models") or {}).items():
+        if provider not in client.ROUTES or not isinstance(model_cfg, dict):
+            continue
+        try:
+            client.route(provider, model_cfg)
+        except ValueError as e:
+            raise ValueError(
+                f"User config: {e}\nSee configs/user.example.yaml, which shows "
+                f"each provider's endpoints."
+            ) from None
 
 
 def _validate_user_config(config):
     # First: a misspelt vertex_ai would otherwise be reported as the missing
     # AI Studio key that the spelling below fails to excuse.
-    _validate_gemini_route(config)
+    _validate_routes(config)
     missing = []
     for key_path in REQUIRED_USER_KEYS:
         # Gemini API key is not required when using Vertex AI (which uses google-auth instead).
@@ -380,7 +383,8 @@ def _validate_publication_keys(config, publication_name):
 #
 # Behavior when cost_preset is set:
 #   - Sets thoroughness (unless the user also set thoroughness explicitly).
-#   - Overrides model name and reasoning flags for each configured provider.
+#   - Overrides model name and reasoning flags for each configured provider,
+#     except the model name on Azure, where the deployment decides it.
 #   - Preserves user's infrastructure settings: provider, project, location,
 #     credentials_file, endpoint, deployment, api_version, prompts, web_search,
 #     and the two user-tuned limits, timeout_seconds and max_tokens.
@@ -594,6 +598,18 @@ def _apply_cost_preset(pipeline_cfg, models_raw, user_set=None):
         for key in _INFRA_KEYS:
             if key in user_dict:
                 new_cfg[key] = user_dict[key]
+
+        # The model too, on Azure, where a preset cannot change it: the
+        # deployment decides what runs. user.yaml's `model` names what the
+        # deployment serves (openai) or is the name the endpoint is called by
+        # (mistral), and pricing and the report read it. The preset's would
+        # misname every call, and for mistral would be sent as a deployment
+        # that does not exist. With none in user.yaml the client falls back to
+        # its own default for Azure.
+        if user_dict.get("provider") == "azure":
+            new_cfg.pop("model", None)
+            if "model" in user_dict:
+                new_cfg["model"] = user_dict["model"]
 
         merged_models[provider] = new_cfg
 

@@ -138,34 +138,54 @@ def check_openai(api_key, model):
     return f"model={model}, replied: {reply!r}"
 
 
-def check_openai_azure(api_key, cfg):
-    endpoint = cfg.get("endpoint", "").rstrip("/")
-    deployment = cfg.get("deployment", "")
-    api_version = cfg.get("api_version", "2024-02-01")
-    model_label = cfg.get("model", deployment or "unknown")
+#: What an Azure check takes from the model config: where to go, not what a
+#: preset asks for there.
+_AZURE_ROUTE_KEYS = ("model", "endpoint", "deployment", "api_version")
 
-    if not endpoint:
-        raise Exception(
-            "Missing 'endpoint' in openai model config (required for provider: azure)"
-        )
-    if not deployment:
-        raise Exception(
-            "Missing 'deployment' in openai model config (required for provider: azure)"
-        )
 
-    url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
-    resp = requests.post(
-        url,
-        headers={"api-key": api_key, "Content-Type": "application/json"},
-        json={
-            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
-            "max_tokens": 5,
-        },
-        timeout=30,
+def _check_azure(provider, api_key, cfg):
+    """One call down the route the pipeline uses to Azure.
+
+    These checks used to build requests of their own: Chat Completions at
+    api-version 2024-02-01 for openai. They passed while every run sent the
+    Azure key to api.openai.com and api.mistral.ai instead, and the pipeline
+    now sends openai to the Responses API, which 2024-02-01 does not have.
+    Going through ci_core.llm.client, as ci-probe does, makes this module's
+    promise true by construction: the same URL, key header, api_version and
+    streaming as a run.
+
+    Only the route comes from the config. The preset's effort and search stay
+    out: this checks the endpoint, the deployment and the key, and ci-probe
+    checks what a preset asks of them.
+    """
+    from ci_core.llm import client
+
+    from .probe import PROBE_PROMPT, PROBE_SCHEMA, PROBE_SYSTEM
+
+    azure_cfg = {key: cfg[key] for key in _AZURE_ROUTE_KEYS if cfg.get(key)}
+    azure_cfg["provider"] = "azure"
+    result = client.call(
+        provider,
+        PROBE_SYSTEM,
+        PROBE_PROMPT,
+        api_key,
+        retry=False,
+        provider_config=azure_cfg,
+        response_schema=PROBE_SCHEMA,
     )
-    resp.raise_for_status()
-    reply = resp.json()["choices"][0]["message"]["content"].strip()
-    return f"provider=azure deployment={deployment} model={model_label}, replied: {reply!r}"
+    if result.get("failed"):
+        body = result.get("error_body")
+        raise Exception(result["error"] + (f"\n         {body}" if body else ""))
+    deployment = azure_cfg.get("deployment")
+    deployment = f" deployment={deployment}" if deployment else ""
+    return (
+        f"provider=azure{deployment} model={result['model']}, "
+        f"replied: {result['data']!r}"
+    )
+
+
+def check_openai_azure(api_key, cfg):
+    return _check_azure("openai", api_key, cfg)
 
 
 def _extract_gemini_text(candidate):
@@ -296,31 +316,7 @@ def check_mistral(api_key, model):
 
 
 def check_mistral_azure(api_key, cfg):
-    """Azure AI serverless inference for Mistral — same Bearer auth, just a different endpoint."""
-    endpoint = cfg.get("endpoint", "").rstrip("/")
-    model_label = cfg.get("model", "unknown")
-
-    if not endpoint:
-        raise Exception(
-            "Missing 'endpoint' in mistral model config (required for provider: azure)"
-        )
-
-    url = f"{endpoint}/v1/chat/completions"
-    resp = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
-            "max_tokens": 5,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    reply = resp.json()["choices"][0]["message"]["content"].strip()
-    return f"provider=azure model={model_label}, replied: {reply!r}"
+    return _check_azure("mistral", api_key, cfg)
 
 
 def check_claude(api_key, model):

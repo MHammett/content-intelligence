@@ -645,45 +645,8 @@ class TestCheckProviderDispatch:
         assert "api.openai.com" in url
         assert "gpt-4o" in str(mock_post.call_args)
 
-    def test_check_openai_azure_uses_api_key_header(self):
-        import ci_article_review.check as check
-
-        resp = self._ok_response({"choices": [{"message": {"content": "ok"}}]})
-        cfg = {
-            "endpoint": "https://res.openai.azure.com",
-            "deployment": "my-dep",
-            "model": "gpt-4o",
-        }
-        with patch(
-            "ci_article_review.check.requests.post", return_value=resp
-        ) as mock_post:
-            check.check_openai_azure("key", cfg)
-        headers = mock_post.call_args[1]["headers"]
-        assert "api-key" in headers
-        assert "Authorization" not in headers
-        url = mock_post.call_args[0][0]
-        assert "my-dep" in url
-
-    def test_check_openai_azure_missing_endpoint_raises(self):
-        import ci_article_review.check as check
-
-        with pytest.raises(Exception, match="endpoint"):
-            check.check_openai_azure("key", {"deployment": "dep"})
-
-    def test_check_mistral_azure_uses_bearer_auth(self):
-        import ci_article_review.check as check
-
-        resp = self._ok_response({"choices": [{"message": {"content": "ok"}}]})
-        cfg = {
-            "endpoint": "https://Mistral-abc.eastus2.inference.ai.azure.com",
-            "model": "mistral-large",
-        }
-        with patch(
-            "ci_article_review.check.requests.post", return_value=resp
-        ) as mock_post:
-            check.check_mistral_azure("key", cfg)
-        headers = mock_post.call_args[1]["headers"]
-        assert headers["Authorization"] == "Bearer key"
+    # The Azure checks go through the pipeline's client now, so what they send
+    # is pinned on the wire: test_azure_route_config.TestCiCheckGoesWhereARunGoes.
 
     def test_check_claude_uses_x_api_key_header(self):
         import ci_article_review.check as check

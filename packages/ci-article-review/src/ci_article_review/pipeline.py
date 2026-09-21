@@ -3952,6 +3952,7 @@ def run_draft_pipeline(
             api_keys,
             refresh=pipeline_cfg.get("live_model_check", False) and not offline,
             max_age_hours=pipeline_cfg.get("live_model_check_max_age_hours", 24),
+            model_configs=model_configs,
         )
     except Exception as exc:  # noqa: BLE001 — advisory information, never fatal
         log.debug("Live model check failed: %s", exc)

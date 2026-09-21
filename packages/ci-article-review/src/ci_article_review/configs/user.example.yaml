@@ -217,21 +217,26 @@ models:
 #
 # Azure OpenAI — data residency, SOC2, provisioned throughput.
 # The api_key above should be your Azure resource key (not an OpenAI key).
+# Wire-verified only: never yet run against a live Azure resource, so run
+# ci-check first. docs/CONFIGURATION.md has the details.
 #
 #  openai:
 #    provider: azure
-#    model: gpt-5.6-terra           # informational label only
+#    model: gpt-5.6-terra           # what the deployment serves; prices the call,
+#                                   # and no cost preset changes it
 #    endpoint: https://my-resource.openai.azure.com
-#    deployment: my-gpt5-deployment
-#    api_version: "2024-02-01"      # optional; defaults to 2024-02-01
+#    deployment: my-gpt5-deployment # what actually runs
+#    # api_version: 2025-04-01-preview  # optional; defaults to preview. Nothing
+#                                       # older than 2025-03-01-preview works.
 #
-# Azure AI (Mistral serverless) — same auth format as La Plateforme.
-# Store your Azure endpoint key in api_keys.mistral.api_key above.
+# Azure AI (Mistral) — same key format as La Plateforme, and wire-verified only
+# too. Store your Azure endpoint key in api_keys.mistral.api_key above.
 #
 #  mistral:
 #    provider: azure
-#    model: mistral-large-latest    # informational label only
+#    model: mistral-large-latest    # the name the endpoint is called with
 #    endpoint: https://Mistral-Large-abc.eastus2.inference.ai.azure.com
+#    # api_version: 2024-05-01-preview  # a Foundry endpoint needs one
 
 
 # Pipeline behavior
@@ -339,7 +344,8 @@ pipeline:
   # Cost preset — sets model variants, reasoning flags, and thoroughness as a bundle.
   # When set, the preset overrides model names and reasoning flags for all configured
   # providers.  Provider infrastructure settings (vertex_ai, azure, credentials) are
-  # preserved.  Use thoroughness: below to override just that part of the preset.
+  # preserved, and so is the model name on Azure, where the deployment decides it.
+  # Use thoroughness: below to override just that part of the preset.
   #
   # Preset    Thoroughness  Reasoning     Measured cost (draft size in words)
   # --------  ------------  ------------  --------------------------------------------------
