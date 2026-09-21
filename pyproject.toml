@@ -54,6 +54,13 @@ dev = [
     # github-slugger is dormant (a single release day, 2022-12-12), and the rule
     # is a short function, tested in that file against GitHub's own output.
     "markdown-it-py>=4.2,<5",
+    # ci-style-profile's tests/test_packaging.py runs the real build backend to
+    # prove what a wheel or sdist contains. Every package's [build-system] names
+    # hatchling, but `uv build` fetches it into an isolated environment, so it was
+    # never importable from the test venv, and a test cannot fetch it itself: the
+    # socket guard blocks the network. The floor is the release the hatchling
+    # behaviour that test depends on was verified against (2026-09-19).
+    "hatchling>=1.32.3",
 ]
 
 [tool.uv.sources]
