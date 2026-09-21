@@ -61,8 +61,11 @@ consensus detection (`ensemble.lt_weight`, default 0.5) — if a model and a
 deterministic grammar checker independently flag the same sentence, that
 agreement means something.
 
-Skipped cleanly when unconfigured. The report says so rather than implying a
-clean grammar result.
+Skipped cleanly when unconfigured, when `grammar_pass` is false, and under
+`--offline`, since it sends the draft to a server and `--offline` skips every
+pass that does. The report says so, and says which, rather than implying a clean
+grammar result. A skipped pass leaves the draft as written: the review models
+read it uncorrected, and no flagged passage votes in consensus.
 
 ---
 
