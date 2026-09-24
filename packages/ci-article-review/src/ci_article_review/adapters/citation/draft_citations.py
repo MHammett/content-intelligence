@@ -92,7 +92,13 @@ _MIN_SCORE = 0.55
 #: the *next* marker still reaches the source the author meant. Each candidate
 #: past the first costs a fetch and a verification call, and only claims the
 #: first candidate failed to support ever reach them.
-MAX_CANDIDATES = 3
+#:
+#: Raised from 3 once ``_urls_for_keys`` became breadth-first. At 3, a claim
+#: citing three markers was exactly at the limit, so a single marker carrying
+#: two URLs (a bulletin published in two versions) pushed a cited source off the
+#: end. The ordering change alone stops whole markers being dropped; this leaves
+#: room to also reach a second version when the first does not carry the text.
+MAX_CANDIDATES = 5
 
 #: Weighting between vocabulary overlap and figure agreement, for claims that
 #: carry figures. Numbers are more discriminating but sparser, so neither alone
@@ -276,11 +282,27 @@ class DraftCitations:
         return len(self.entries)
 
     def _urls_for_keys(self, keys):
+        """Candidate URLs for ``keys``, breadth-first across the markers.
+
+        Order is one URL from each marker, then each marker's second, and so on
+        — not marker 1's URLs exhausted before marker 2 is reached. The caller
+        truncates this list to ``MAX_CANDIDATES``, and with a depth-first order
+        that truncation silently drops whole markers: a claim cited ``[9][3][4]``
+        where ``[9]`` carries two URLs spent two of its three slots inside
+        ``[9]`` and never checked ``[4]`` at all. That is a real case from the
+        2026-09-18 GPS run — the claim was then reported unsupported having
+        never been compared against one of the sources the draft cited for it.
+
+        Breadth-first makes the cap bound *depth per marker* rather than
+        deciding which markers get looked at, so every cited source is
+        represented before any source is examined twice.
+        """
+        per_key = [self.entries.get(key, {}).get("urls", []) for key in keys]
         urls = []
-        for key in keys:
-            for url in self.entries.get(key, {}).get("urls", []):
-                if url not in urls:
-                    urls.append(url)
+        for depth in range(max((len(u) for u in per_key), default=0)):
+            for candidate in per_key:
+                if depth < len(candidate) and candidate[depth] not in urls:
+                    urls.append(candidate[depth])
         return urls
 
     def candidates_for(self, claim, source_text=""):
