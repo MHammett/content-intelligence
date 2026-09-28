@@ -1212,3 +1212,131 @@ class TestTheSummarySaysWhenLinksWereNotChecked:
         out = self._out({"links": links}, capsys)
         assert "Links: 2 found, 1 broken/error" in out
         assert "not checked" not in out
+
+
+@pytest.mark.usefixtures("tmp_history_root")
+class TestArchiveOnlyArgparse:
+    """--archive-only needs a draft to read and cannot coexist with --offline."""
+
+    def test_requires_draft_or_raw_draft(self):
+        import ci_article_review.pipeline as pipeline
+
+        argv = [
+            "pipeline.py",
+            "--url",
+            "https://example.com/post",
+            "--publication",
+            "myblog",
+            "--archive-only",
+        ]
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit):
+                pipeline.main()
+
+    def test_rejected_with_publish(self):
+        import ci_article_review.pipeline as pipeline
+
+        argv = [
+            "pipeline.py",
+            "--publish",
+            "handoff.md",
+            "--publication",
+            "myblog",
+            "--archive-only",
+        ]
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit):
+                pipeline.main()
+
+    def test_mutually_exclusive_with_offline(self):
+        import ci_article_review.pipeline as pipeline
+
+        argv = [
+            "pipeline.py",
+            "--raw-draft",
+            "draft.md",
+            "--publication",
+            "myblog",
+            "--archive-only",
+            "--offline",
+        ]
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit):
+                pipeline.main()
+
+
+@pytest.mark.usefixtures("tmp_history_root")
+class TestArchiveOnlyFlowsIntoRunArchiveOnly:
+    """--archive-only must reach run_archive_only, not run_draft_pipeline."""
+
+    def test_raw_draft_path_reaches_run_archive_only(self):
+        import ci_article_review.pipeline as pipeline
+
+        argv = [
+            "pipeline.py",
+            "--raw-draft",
+            "draft.md",
+            "--publication",
+            "myblog",
+            "--archive-only",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("ci_article_review.pipeline.logging.FileHandler"),
+            patch("logging.Logger.addHandler"),
+            patch("ci_article_review.pipeline.run_archive_only") as mock_run,
+            patch("ci_article_review.pipeline.run_draft_pipeline") as mock_full_run,
+        ):
+            pipeline.main()
+
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == "draft.md"
+        assert mock_run.call_args.args[1] == "myblog"
+        mock_full_run.assert_not_called()
+
+    def test_draft_path_reaches_run_archive_only(self):
+        import ci_article_review.pipeline as pipeline
+
+        argv = [
+            "pipeline.py",
+            "--draft",
+            "handoff.md",
+            "--publication",
+            "myblog",
+            "--archive-only",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("ci_article_review.pipeline.logging.FileHandler"),
+            patch("logging.Logger.addHandler"),
+            patch("ci_article_review.pipeline.run_archive_only") as mock_run,
+        ):
+            pipeline.main()
+
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == "handoff.md"
+        assert mock_run.call_args.args[1] == "myblog"
+
+    def test_api_key_overrides_are_forwarded(self):
+        import ci_article_review.pipeline as pipeline
+
+        argv = [
+            "pipeline.py",
+            "--raw-draft",
+            "draft.md",
+            "--publication",
+            "myblog",
+            "--archive-only",
+            "--api-key",
+            "archive_org.access_key=abc123",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("ci_article_review.pipeline.logging.FileHandler"),
+            patch("logging.Logger.addHandler"),
+            patch("ci_article_review.pipeline.run_archive_only") as mock_run,
+        ):
+            pipeline.main()
+
+        overrides = mock_run.call_args.kwargs["api_key_overrides"]
+        assert overrides[("archive_org", "access_key")] == "abc123"
