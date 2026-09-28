@@ -147,6 +147,11 @@ def call_log_entry(pass_name, result, default_model=""):
     # Copied by presence, not truthiness, so neither 0 nor None is lost.
     if "searches" in result:
         entry["searches"] = result["searches"]
+    # What the provider itself billed, where it says (Perplexity's Agent API).
+    # Recorded, not used: calculate() prices from the table, and the two agreeing
+    # is how the table is checked.
+    if result.get("provider_cost_usd") is not None:
+        entry["provider_cost_usd"] = result["provider_cost_usd"]
     # Attempts the provider billed for and this call then threw away. Absent on
     # the overwhelming majority of calls, so only present when it happened.
     if result.get("discarded_attempts"):

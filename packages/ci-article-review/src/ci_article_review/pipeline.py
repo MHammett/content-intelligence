@@ -3510,6 +3510,10 @@ def run_draft_pipeline(
         # could search, and None where the provider did not say how many.
         if "searches" in result:
             log_entry["searches"] = result["searches"]
+        # What the provider itself billed, where it says (Perplexity's Agent
+        # API): beside the tokens so the table's figure can be checked.
+        if result.get("provider_cost_usd") is not None:
+            log_entry["provider_cost_usd"] = result["provider_cost_usd"]
         if result.get("discarded_attempts"):
             log_entry["discarded_attempts"] = result["discarded_attempts"]
         # How long each stream went silent, before and after real output — the

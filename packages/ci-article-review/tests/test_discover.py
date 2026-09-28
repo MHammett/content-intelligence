@@ -151,17 +151,28 @@ class TestProviderDiscovery:
             ids = [m for m, _ in discover._discover_gemini_aistudio("k", "x")]
         assert ids == ["gemini-2.5-pro"]
 
-    def test_perplexity_returns_its_documented_static_set(self):
-        """Perplexity publishes no models endpoint, so this list is hardcoded.
+    def test_perplexity_lists_the_agent_apis_models(self):
+        """Its Agent API publishes a models endpoint; Sonar never did, so this
+        was a list hardcoded in June 2026 until the Sonar retirement. The shape
+        is the one the live endpoint returned on 2026-09-28."""
+        payload = {
+            "object": "list",
+            "data": [
+                {"id": "perplexity/sonar", "created": 0, "owned_by": "perplexity"},
+                {"id": "perplexity/kimi-k3", "created": 0, "owned_by": "perplexity"},
+            ],
+        }
+        with patch.object(discover.requests, "get", return_value=_resp(payload)) as get:
+            got = discover._discover_perplexity("k", "perplexity/sonar")
+        assert get.call_args.args[0] == "https://api.perplexity.ai/v1/models"
+        assert [m for m, _ in got] == ["perplexity/sonar", "perplexity/kimi-k3"]
 
-        That makes it the one provider whose output can silently go stale
-        without any API disagreeing — worth asserting it is non-empty and
-        contains the model the presets actually use.
-        """
-        got = discover._discover_perplexity("k", "sonar-pro")
-        ids = [m for m, _ in got]
-        assert ids, "perplexity discovery returned nothing at all"
-        assert "sonar-pro" in ids
+    def test_perplexity_created_zero_is_no_date(self):
+        """Perplexity reports every model as created 0, which is not 1970."""
+        payload = {"data": [{"id": "perplexity/sonar", "created": 0}]}
+        with patch.object(discover.requests, "get", return_value=_resp(payload)):
+            got = discover._discover_perplexity("k", "perplexity/sonar")
+        assert got == [("perplexity/sonar", None)]
 
     def test_every_registered_provider_is_callable(self):
         for name, (fn, label) in discover._PROVIDERS.items():

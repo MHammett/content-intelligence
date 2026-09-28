@@ -173,6 +173,11 @@ model_multipliers:
                              # a row on the same run's other domains. Raised decisively
                              # (5.0 -> 7.0, -> 525s) to sit above the new 500s read-gap
                              # rather than nudge again; see presets.yaml's note.
+  perplexity/:        4.0   # Perplexity's Agent API ids (perplexity/sonar, ...), the
+                             # successor to the sonar rows above. It searches on every
+                             # call, so like gemini's it carries the search here.
+                             # gemini's value to start; see presets.yaml for what the
+                             # 2026-09-28 fact_check runs measured.
   default:            1.0
 
 # From reasoning_effort / effort in the model config. Calibration showed effort is

@@ -8,3 +8,9 @@
 # CRLF — which is exactly how litellm's own copy of this file broke in its
 # Windows wheel. `binary` also keeps a 100,000-line diff out of every review.
 packages/ci-core/tests/fixtures/tiktoken_cache/* binary
+
+# A real Perplexity Agent API stream (2026-09-19), replayed by
+# test_llm_perplexity_agent.py. Its bytes are the point: it is how the
+# `"truncation": ""` that crashes litellm 1.96.2's route was found, and a stream
+# built from the docs does not carry it. Byte for byte, like the cache above.
+packages/ci-core/tests/fixtures/perplexity_agent/* binary

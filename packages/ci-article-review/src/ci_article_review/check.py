@@ -363,6 +363,8 @@ def check_claude(api_key, model):
 
 
 def check_perplexity(api_key, model):
+    if "/" in model:
+        return _check_perplexity_agent(api_key, model)
     resp = requests.post(
         "https://api.perplexity.ai/chat/completions",
         headers={
@@ -378,6 +380,23 @@ def check_perplexity(api_key, model):
     )
     resp.raise_for_status()
     reply = resp.json()["choices"][0]["message"]["content"].strip()
+    return f"model={model}, replied: {reply!r}"
+
+
+def _check_perplexity_agent(api_key, model):
+    """An Agent API id (``perplexity/sonar``): Perplexity's SDK, as the pipeline
+    calls it (see ci_core.llm.client). No web_search tool, so no search fee: this
+    checks the key and the model, not the search."""
+    import perplexity
+
+    with perplexity.Perplexity(api_key=api_key, max_retries=0, timeout=30) as sdk:
+        response = sdk.responses.create(
+            model=model,
+            input="Reply with the single word: ok",
+            max_output_tokens=64,
+            store=False,
+        )
+    reply = (getattr(response, "output_text", "") or "").strip()
     return f"model={model}, replied: {reply!r}"
 
 

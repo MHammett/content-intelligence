@@ -258,16 +258,19 @@ def _discover_grok(api_key, configured_id):
     return [(m["id"], _iso(m.get("created"))) for m in models]
 
 
-def _discover_perplexity(_api_key, _configured_id):
-    # Perplexity does not publish a models list endpoint.
-    # Return the documented set from June 2026 as a static fallback.
-    static = [
-        ("sonar-deep-research", None),
-        ("sonar-reasoning-pro", None),
-        ("sonar-pro", None),
-        ("sonar", None),
-    ]
-    return static  # caller will note this is static
+def _discover_perplexity(api_key, _configured_id):
+    # The Agent API lists its models; Sonar Chat Completions, which it replaced,
+    # never did, so this used to return a set hardcoded in June 2026. Sonar ids
+    # are not in this list: they are the API being retired. Perplexity reports
+    # every model as created 0, which is no date at all, not 1970-01-01.
+    resp = requests.get(
+        "https://api.perplexity.ai/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    return [(m["id"], _iso(m.get("created") or None)) for m in data if m.get("id")]
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +343,10 @@ def collect_available_models(model_configs, api_keys, providers=None):
             "status": "skipped",
             "reason": "",
             "detail": "",
-            "static": provider_key == "perplexity",
+            # Every provider's list is fetched now: perplexity's was the one
+            # hardcoded set until its Agent API published a models endpoint.
+            # Kept, False, because run reports carry the field.
+            "static": False,
             "models": [],
         }
         results[provider_key] = record
@@ -522,9 +528,6 @@ def main():
             else:
                 print(f"  {ERR}  {reason}: {record['detail']}")
             continue
-
-        if record["static"]:
-            print("  (No models endpoint — showing documented set from June 2026)")
 
         if not record["models"]:
             print("  (No models returned)")
