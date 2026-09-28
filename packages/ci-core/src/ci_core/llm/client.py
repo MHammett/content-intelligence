@@ -1068,9 +1068,9 @@ def _temperature(provider, model, cfg):
     pipeline's runs repeat little at any temperature (about a quarter of a run's
     findings come back on a rerun), so the model's own setting is the default.
 
-    A gemini config may name one, for either generation (``temperature``). A
-    cost preset rebuilds the model config and keeps only the infrastructure keys,
-    so it is written under ``pipeline.preset_overrides`` to survive one.
+    A gemini config may name one, for either generation (``temperature``),
+    under ``models:`` or ``pipeline.preset_overrides``. Both survive a cost
+    preset: ``temperature`` is one of config_loader's ``_INFRA_KEYS``.
     """
     if provider not in _SENDS_TEMPERATURE:
         return None

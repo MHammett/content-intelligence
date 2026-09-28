@@ -6,8 +6,13 @@
 #   - Sets thoroughness (unless user also set thoroughness: explicitly).
 #   - Overrides model name and reasoning flags for each configured provider.
 #   - Preserves infrastructure keys: provider, project, location, credentials_file,
-#     endpoint, deployment, api_version, prompts, web_search, timeout_seconds,
-#     max_tokens.
+#     endpoint, deployment, api_version, prompts, web_search, the search controls
+#     (search_mode, search_recency_filter, search_domain_filter,
+#     search_context_size), temperature, timeout_seconds, max_tokens,
+#     stream_read_timeout and
+#     stream_gap_timeout. Where a tier below sets one of these too — the
+#     stream_read_timeout values are the only ones that do — the user's wins, and
+#     config load warns when theirs is the lower of the two.
 #   - Skips providers with no API key or no models: entry in user.yaml.
 #   - Respects enabled: false set by the user — disabled models stay disabled.
 #
