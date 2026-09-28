@@ -164,6 +164,21 @@ def compute_budget(char_count, provider, cfg, task_ceiling_seconds, config=None)
     return budget
 
 
+def search_budget(budget, task_ceiling_seconds, config=None):
+    """``budget`` for a call that searches because ``web_search`` asked it to.
+
+    Multiplied by ``search_multiplier`` from timeouts.yaml and clamped to the
+    task ceiling, like every other budget here. A separate step rather than a
+    term in ``compute_timeout`` because it is per call, not per model: openai
+    with ``web_search: [fact_check]`` searches on fact_check and nowhere else,
+    and only that call needs the room. See timeouts.yaml for the measurement.
+    """
+    cfg = config or _CONFIG
+    mult = float(cfg.get("search_multiplier", 1.0))
+    ceiling = max(int(cfg["floor_seconds"]), int(task_ceiling_seconds) - 15)
+    return int(min(max(budget * mult, budget), ceiling))
+
+
 def compute_all(char_count, model_configs, task_ceiling_seconds, config=None):
     """Compute effective timeouts for every enabled model.
 

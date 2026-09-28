@@ -118,6 +118,47 @@ class TestRunReviewsInParallel:
         assert results["claude:accuracy"]["failed"] is True
         assert "timed out" in results["claude:accuracy"]["error"].lower()
 
+    def test_a_call_that_searches_runs_under_its_search_budget(self):
+        """openai searches on fact_check and nowhere else, so only that call
+        gets the larger budget. Measured 2026-09-28: a grounded fact_check was
+        killed at the 120s sized for openai's calls that do not search."""
+        model_configs = {
+            "openai": {
+                "timeout_seconds": 0.2,
+                "search_timeout_seconds": 5,
+                "web_search": ["fact_check"],
+            }
+        }
+        # voice_style is held past its 0.2s by a gate, so it is still running
+        # when its budget runs out; work that finishes late is kept, which a
+        # plain sleep would let it do. fact_check outlives 0.2s but not 5s.
+        release = threading.Event()
+
+        def _held():
+            release.wait(timeout=5)
+            return {"failed": False}
+
+        def _searches_for_half_a_second():
+            time.sleep(0.5)
+            return {"failed": False}
+
+        try:
+            results = pipeline._run_reviews_in_parallel(
+                [
+                    ("openai:voice_style", _held),
+                    ("openai:fact_check", _searches_for_half_a_second),
+                ],
+                {"provider_stagger_seconds": 0},
+                model_configs,
+                task_timeout=10,
+            )
+        finally:
+            release.set()
+
+        assert results["openai:fact_check"] == {"failed": False}
+        assert results["openai:voice_style"]["failed"] is True
+        assert "timed out after 0.2s" in results["openai:voice_style"]["error"].lower()
+
     def test_an_explicit_null_task_timeout_does_not_crash(self):
         """``task_timeout_seconds: null`` in user.yaml is a real, reachable
         value — config_loader's 180 default only fires when the key is
@@ -844,3 +885,35 @@ class TestSameProviderStagger:
         with patch.object(pipeline.time, "sleep", side_effect=slept.append):
             assert fn() == "ran"
         assert slept == [6]
+
+
+class TestCallBudget:
+    """``_call_budget`` is the one place a call's budget is chosen, for the task
+    that enforces it and the call log that reports it alike."""
+
+    def test_a_domain_the_model_searches_on_gets_the_search_budget(self):
+        cfg = {
+            "timeout_seconds": 120,
+            "search_timeout_seconds": 480,
+            "web_search": ["fact_check"],
+        }
+        assert pipeline._call_budget("openai", "fact_check", cfg) == 480
+        assert pipeline._call_budget("openai", "voice_style", cfg) == 120
+
+    def test_web_search_true_covers_every_domain(self):
+        cfg = {
+            "timeout_seconds": 120,
+            "search_timeout_seconds": 480,
+            "web_search": True,
+        }
+        assert pipeline._call_budget("claude", "red_team", cfg) == 480
+
+    def test_without_a_search_budget_the_model_budget_stands(self):
+        """An explicit timeout_seconds gets no search budget beside it, so it
+        governs every call, searching or not."""
+        cfg = {"timeout_seconds": 300, "web_search": ["fact_check"]}
+        assert pipeline._call_budget("openai", "fact_check", cfg) == 300
+
+    def test_falls_back_to_the_default_when_nothing_is_set(self):
+        assert pipeline._call_budget("openai", "fact_check", {}, 180) == 180
+        assert pipeline._call_budget("openai", "fact_check", None, 180) == 180

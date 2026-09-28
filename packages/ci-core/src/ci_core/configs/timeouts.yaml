@@ -190,3 +190,16 @@ effort_multipliers:
                  # Raised from 8.3 after a run showed gpt-5.5 xhigh exceed 632s on
                  # this doc (heavy tail; typical 240-360s but occasional long outliers).
   default: 1.0
+
+# For a call that searches because the model's `web_search` covers its domain:
+# openai, claude or grok on the domains listed. The model's budget is multiplied
+# by this, clamped to the task ceiling, for those calls only (the pipeline keeps
+# it as search_timeout_seconds). gemini and sonar are not multiplied: they search
+# on every call, so their model multipliers above already carry it.
+#
+# Same value as gemini's grounded multiplier. MEASURED 2026-09-28 at `wide` on a
+# 9,456-char draft: gpt-5.6-luna on fact_check with web_search ran ~40s of search
+# before its first output token and read 80,268 prompt tokens of results. Its
+# model budget was 120s, sized for a call that does not search, and its first
+# attempt was killed there; the recovery pass got it back in 63s.
+search_multiplier: 4.0
