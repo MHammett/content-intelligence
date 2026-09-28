@@ -29,6 +29,71 @@ class TestPriceForModel:
         assert _price_for_model(None) == _UNKNOWN_PRICE
 
 
+class TestGeminiRates:
+    """Every Gemini id a preset or the fallback chain can call has its own row.
+
+    Verified 2026-09-19 against the Gemini API's and Vertex AI's pricing pages
+    (pricing.yaml has the sources). The point of a row per id: lookup takes the
+    longest prefix, so a 3.x id with no row of its own prices at a shorter one.
+    """
+
+    @pytest.mark.parametrize(
+        "model,rates",
+        [
+            ("gemini-2.5-pro", (1.25, 10.00)),
+            ("gemini-2.5-flash", (0.30, 2.50)),
+            ("gemini-2.5-flash-lite", (0.10, 0.40)),
+            ("gemini-3.5-flash", (1.50, 9.00)),
+            ("gemini-3.5-flash-lite", (0.30, 2.50)),
+            ("gemini-3.1-flash-lite", (0.25, 1.50)),
+            # Promotional through 2026-12-31; 1.50 / 7.50 from 2027-01-01.
+            ("gemini-3.6-flash", (0.75, 3.75)),
+            ("gemini-3.7-flash", (0.75, 3.75)),
+            ("gemini-3.8-flash", (0.75, 3.75)),
+        ],
+    )
+    def test_the_rate_is_the_providers(self, model, rates):
+        assert cost.known_price(model)[:2] == rates
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-2.5-flash-lite",
+        ],
+    )
+    def test_a_longer_id_never_prices_at_a_shorter_ones_row(self, model):
+        """gemini-3.5-flash-lite starts with gemini-3.5-flash, and once priced
+        at its $1.50 / $9.00: 3.7 times too high, with pricing_known true."""
+        assert model in cost._PRICING
+
+    def test_a_flash_lite_call_is_not_billed_as_a_flash_call(self):
+        entry = {
+            "pass": "gemini:fact_check",
+            "model": "gemini-3.5-flash-lite",
+            "tokens": {"prompt": 6500, "completion": 7000},
+        }
+        summary = calculate([entry])
+        assert summary["pricing_known"] is True
+        # 6500 in at $0.30 and 7000 out at $2.50, per million.
+        assert summary["total_usd"] == pytest.approx(0.01945, abs=0.0001)
+
+    @pytest.mark.parametrize(
+        "model,fee",
+        [
+            ("gemini-2.5-pro", (35.00, "prompt")),
+            ("gemini-3.5-flash", (14.00, "query")),
+            ("gemini-3.5-flash-lite", (14.00, "query")),
+            ("gemini-3.1-flash-lite", (14.00, "query")),
+            ("gemini-3.8-flash", (14.00, "query")),
+        ],
+    )
+    def test_the_search_fee_follows_the_generation(self, model, fee):
+        assert cost.known_search_fee(model) == fee
+
+
 class TestCalculate:
     def _log(self, model, prompt_tok, completion_tok, failed=False):
         return {

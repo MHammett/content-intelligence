@@ -867,6 +867,9 @@ content-intelligence/
 │   │   │   │   │                      completion(), OpenAI through responses(),
 │   │   │   │   │                      all streaming under a first-byte allowance
 │   │   │   │   │                      plus an independent stall detector
+│   │   │   │   ├── vertex.py          where a Gemini model is served on Vertex AI:
+│   │   │   │   │                      3.x at `global` and the `us`/`eu` multi-regions
+│   │   │   │   │                      only, 2.5 at the US regions; defaults to `us`
 │   │   │   │   ├── cache.py           marks the cacheable prefix in each provider's
 │   │   │   │   │                      own terms (Anthropic caches nothing without it)
 │   │   │   │   ├── schema.py          puts a caller's JSON schema on the wire in each

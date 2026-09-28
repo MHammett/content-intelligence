@@ -34,17 +34,15 @@
 # Mistral's own model cards and pricing page 2026-09-18 (all three rows, and
 # all three rates CHANGED — see its block below); Perplexity against
 # docs.perplexity.ai/docs/getting-started/pricing 2026-09-19 (all four rows;
-# sonar and sonar-pro CHANGED — see its block below). Gemini/older entries
-# still June 2026. Update whenever provider pricing changes.
+# sonar and sonar-pro CHANGED — see its block below); Gemini against the Gemini
+# API's and Vertex AI's own pricing pages 2026-09-19 (every gemini row; the
+# 3.x rows are new — see its block). Older entries still June 2026. Update
+# whenever provider pricing changes.
 #
-# STILL UNVERIFIED. The 2026-09-17 pass checked OpenAI and Claude only, the
-# 2026-09-18 passes checked the three Mistral rows only, and the 2026-09-19 pass
-# checked Perplexity and xAI. What is left is one family:
-#   gemini-*  — whole row June 2026, priced $0.31 of the 2026-09-09 maximum run
-# So ~$0.31 of that run's $6.16 rests on unconfirmed rates — 5%. ($6.16 is the
-# sol-corrected $6.09 plus the corrections since: +$0.06 for mistral-medium-3-5,
-# +$0.005 for mistral-small-latest and +$0.003 for grok-4.6's cached rate; see
-# their blocks.)
+# STILL UNVERIFIED. Nothing a preset runs. The passes of 2026-09-17 to
+# 2026-09-19 checked OpenAI and Claude, Mistral, Perplexity and xAI, and then
+# Gemini, which was the last family (it priced $0.31 of the 2026-09-09 maximum
+# run, 5% of it). What is left is the older rows no preset uses.
 #
 # Prefix matching applies: "gemini-2.5-flash-0520" matches "gemini-2.5-flash".
 # Sort longer IDs before shorter ones if two share a prefix.
@@ -141,7 +139,37 @@ models:
   gpt-5.4-mini:          [0.75,  4.50,  0.075]
 
   # ── Google Gemini ────────────────────────────────────────────────────────────
+  # VERIFIED 2026-09-19 against the Gemini API's pricing page (ai.google.dev/
+  # gemini-api/docs/pricing, the Standard tables) and Vertex AI's (cloud.google.
+  # com/vertex-ai/generative-ai/pricing, the `global` rows). The two agree on
+  # every row here. Text input and output (thinking included) per million tokens.
+  #
+  # Every 3.x id needs a row of its own. Lookup takes the longest prefix, so
+  # "gemini-3.5-flash-lite" with no row here would price at gemini-3.5-flash's,
+  # 3.7 times too high, and report pricing_known as true.
+  #
+  # gemini-3.6 / 3.7 / 3.8 Flash are PROMOTIONAL: $0.75 in / $3.75 out "through
+  # December 31, 2026", then $1.50 / $7.50 "starting January 1, 2027" (both
+  # pages). Set the second pair on that date.
+  #
+  # NOT MODELLED:
+  #   * Vertex charges 10% more for a non-global endpoint on Gemini 3 and later,
+  #     from 2026-07-01 (its "Non-global" rows: 3.5 Flash $1.65 / $9.90). The
+  #     default location for these models is `us` (ci_core.llm.vertex), which is
+  #     non-global, so a Vertex run of a 3.x model costs 10% more than these rows
+  #     say. The Gemini API has no such rate.
+  #   * gemini-2.5-pro above 200K prompt tokens: $2.50 / $15.00. The largest
+  #     Gemini prompt in the saved runs is about 38K.
+  #   * Cached input. Google prices it at a tenth of the input rate, and these
+  #     rows have no third element, so a cached token bills in full: an
+  #     over-report, by an amount nobody has measured (whether this pipeline's
+  #     Gemini calls hit Google's implicit cache is not recorded).
+  gemini-3.8-flash:         [0.75,  3.75]
+  gemini-3.7-flash:         [0.75,  3.75]
+  gemini-3.6-flash:         [0.75,  3.75]
+  gemini-3.5-flash-lite:    [0.30,  2.50]
   gemini-3.5-flash:         [1.50,  9.00]
+  gemini-3.1-flash-lite:    [0.25,  1.50]
   gemini-2.5-pro:           [1.25, 10.00]
   gemini-2.5-flash:         [0.30,  2.50]
   gemini-2.5-flash-lite:    [0.10,  0.40]

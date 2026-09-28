@@ -27,7 +27,9 @@ economy:
     openai:
       model: gpt-5.6-luna   # was gpt-5.4-mini; matching price tier, 2026-08-18 refresh
     gemini:
-      model: gemini-2.5-flash-lite
+      model: gemini-3.5-flash-lite   # was gemini-2.5-flash-lite; 2.5 retires on Vertex AI 2026-10-20.
+      thinking_level: low            # `low` does not search (measured 2026-09-27); style analysis has no use for it.
+                                     # See ci-article-review's presets.yaml, "Gemini refresh".
     mistral:
       model: mistral-small-latest
 
@@ -44,7 +46,8 @@ standard:
     openai:
       model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
     gemini:
-      model: gemini-2.5-flash
+      model: gemini-3.5-flash-lite   # was gemini-2.5-flash
+      thinking_level: low
     mistral:
       model: mistral-large-latest
 
@@ -61,7 +64,8 @@ balanced:
     openai:
       model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
     gemini:
-      model: gemini-2.5-flash
+      model: gemini-3.5-flash-lite   # was gemini-2.5-flash
+      thinking_level: low
     mistral:
       model: mistral-large-latest
 
@@ -80,7 +84,8 @@ thorough:
       model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
       reasoning_effort: medium
     gemini:
-      model: gemini-2.5-pro
+      model: gemini-3.5-flash   # was gemini-2.5-pro
+      thinking_level: low
     mistral:
       model: mistral-large-latest
 
@@ -99,7 +104,7 @@ maximum:
       model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
       reasoning_effort: high
     gemini:
-      model: gemini-2.5-pro
-      thinking_budget: 8192
+      model: gemini-3.5-flash   # was gemini-2.5-pro + thinking_budget 8192; a budget does nothing on a 3.x model.
+      thinking_level: low       # `medium` and `high` make 80 searches a call on 3.5 Flash; `low`, 20.
     mistral:
       model: mistral-large-latest

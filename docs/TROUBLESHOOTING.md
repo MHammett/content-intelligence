@@ -46,6 +46,9 @@ The path in `credentials_file` doesn't point to the downloaded service account J
 **Vertex AI: `403 Permission denied`**  
 The service account doesn't have the **Agent Platform User** role on the project, or the Agent Platform API isn't enabled. Check IAM in the GCP console and verify the API is enabled at https://console.cloud.google.com/apis/library/aiplatform.googleapis.com.
 
+**Vertex AI: `404`, "Publisher model ... was not found or your project does not have access to it"**  
+On a Gemini 3 model this is almost always the location. Vertex serves the 3.x models at `global` and the `us` and `eu` multi-regions and at no regional endpoint, `us-central1` included, so a request sent there is a 404. The pipeline sends a 3.x model to `us` whatever `location` says, and logs a warning when it corrects a US region, so if you see this you are probably on a model that is not in the list above (a 2.5 model sent to `eu`, say), or you pinned a route, `model: vertex_ai/gemini-3.5-flash`, without `provider: vertex_ai`. That skips the Vertex settings altogether and leaves litellm its default, `us-central1`; write `provider: vertex_ai` with a plain model name instead. See [PROVIDERS.md](PROVIDERS.md#option-b--vertex-ai-reserved-capacity-no-503s) for what each `location` does.
+
 **Vertex AI: `project` not found**  
 Verify you are using the project **ID** (like `my-project-123`), not the display name. The ID appears in smaller text below the project name in the GCP console's project selector, and in the browser URL.
 
@@ -165,7 +168,7 @@ By default the pipeline produces a partial report rather than aborting. To make 
 At `standard` thoroughness, consensus requires the same passage to be flagged by multiple models in different domains (e.g., Mistral's argument flags + OpenAI's voice flags). This happens when a passage has both a logical and a style problem. To get within-domain consensus, switch to `thorough` or `maximum` thoroughness so multiple models cover each domain. You can also lower `ensemble.consensus_threshold` in `user.yaml` — the default is 2.0.
 
 **Fallback model warning in summary**  
-A model returned 503 capacity errors and the pipeline fell back to a less capable variant (e.g., `gemini-2.5-flash-lite` instead of `gemini-2.5-flash`). The findings are valid but may be less thorough. Re-run when the preferred model is available to confirm.
+A model returned 503 capacity errors and the pipeline fell back to a less capable variant (e.g., `gemini-3.5-flash-lite` instead of `gemini-3.5-flash`). The findings are valid but may be less thorough. Re-run when the preferred model is available to confirm.
 
 **MODEL CURRENCY warning in summary**  
 One of your configured model IDs has been superseded by a newer model. The old model still works; this is informational. Update `user.yaml` to the replacement model shown. The registry tracking this lives in [`ci-core`'s `model_registry.yaml`](../packages/ci-core/src/ci_core/configs/model_registry.yaml) — if you're confident the current model is still the best choice, you can remove its entry from `superseded:`.
