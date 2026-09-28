@@ -681,3 +681,48 @@ class TestShippedPresetsReachTheRun:
         assert models["openai"]["web_search"] == ["fact_check"]
         assert models["gemini"]["provider"] == "vertex_ai"
         assert models["gemini"]["stream_read_timeout"] == 300
+
+
+class TestAnAzureModelSurvivesEveryPreset:
+    """On Azure, user.yaml's `model` is the one the run uses, whatever --preset.
+
+    Every shipped tier names an openai and a mistral model, and each replaced an
+    Azure block's: the openai call was then named and priced as a model its
+    deployment may not serve, and mistral on a Foundry endpoint was sent a
+    deployment that does not exist. Through main() and the real presets.yaml,
+    stopped where the merged models leave main(), as above.
+    """
+
+    USER = {
+        "claude": {"model": "claude-user-pick"},
+        "openai": {
+            "provider": "azure",
+            "model": "gpt-user-pick",
+            "endpoint": "https://example.openai.azure.com",
+            "deployment": "user-deployment",
+        },
+        "mistral": {
+            "provider": "azure",
+            "model": "mistral-user-deployment",
+            "endpoint": "https://example.services.ai.azure.com/models",
+            "api_version": "2024-05-01-preview",
+        },
+    }
+
+    _models_the_run_uses = TestShippedPresetsReachTheRun._models_the_run_uses
+
+    @pytest.mark.parametrize("preset", _preset_tiers())
+    def test_the_azure_models_are_the_users(self, preset):
+        from ci_style_profile import bootstrap
+
+        tier = bootstrap._load_presets()[preset]["models"]
+        models = self._models_the_run_uses(preset)
+
+        # The tier was applied: claude, off Azure, runs the tier's model, and
+        # the Azure block takes the rest of what the tier names.
+        assert models["claude"]["model"] == tier["claude"]["model"]
+        assert models["openai"].get("reasoning_effort") == tier["openai"].get(
+            "reasoning_effort"
+        )
+        assert models["openai"]["model"] == "gpt-user-pick"
+        assert models["mistral"]["model"] == "mistral-user-deployment"

@@ -172,9 +172,10 @@ def _apply_preset_models(models: dict, preset_models: dict) -> dict:
 
     Key by key: what the preset names replaces the user's value, and every other
     key the user set stays theirs (project, stream_read_timeout, web_search, and
-    an ``effort`` the preset leaves unset). ``provider`` is never replaced. A
-    provider the user has not configured is not added, and one the preset does
-    not name is left as written. Returns a new dict.
+    an ``effort`` the preset leaves unset). ``provider`` is never replaced, and
+    on Azure neither is ``model``. A provider the user has not configured is not
+    added, and one the preset does not name is left as written. Returns a new
+    dict.
 
     This is not ci-article-review's rule, which rebuilds the entry from the
     preset and copies back a fixed list of keys (``_INFRA_KEYS``). The
@@ -192,10 +193,22 @@ def _apply_preset_models(models: dict, preset_models: dict) -> dict:
             existing = {"model": existing}
         elif not isinstance(existing, dict):
             continue
+        on_azure = existing.get("provider") == "azure"
         merged = dict(existing)
         for key, value in preset_cfg.items():
-            if key != "provider":  # infrastructure: the user's, not the tier's
-                merged[key] = value
+            if key == "provider":  # infrastructure: the user's, not the tier's
+                continue
+            # The model too, on Azure, where a preset cannot change it: the
+            # deployment decides what runs. user.yaml's `model` names what the
+            # deployment serves (openai) or is the name the endpoint is called
+            # by (mistral), and pricing reads it. The preset's would misname
+            # every call, and for mistral would be sent as a deployment that
+            # does not exist. With none in user.yaml the preset's is not added
+            # either, so the client falls back to its own default for Azure.
+            # ci-article-review's _apply_cost_preset keeps it the same way.
+            if key == "model" and on_azure:
+                continue
+            merged[key] = value
         merged_models[name] = merged
     return merged_models
 
