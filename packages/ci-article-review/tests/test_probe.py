@@ -54,7 +54,7 @@ class TestPresetDiscovery:
     def test_the_expensive_maximum_models_are_reachable(self):
         maximum = (_presets().get("maximum", {}).get("models")) or {}
         named = {c.get("model") for c in maximum.values() if isinstance(c, dict)}
-        for model in ("gpt-5.6-sol", "claude-opus-5", "gemini-2.5-pro"):
+        for model in ("gpt-5.6-sol", "claude-opus-5", "gemini-3.5-flash"):
             assert model in named, model
 
 

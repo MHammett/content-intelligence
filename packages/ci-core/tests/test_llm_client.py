@@ -20,6 +20,7 @@ everything that would break silently if the shim mapped something wrong:
 
 import datetime
 import json
+import logging
 import subprocess
 import sys
 import threading
@@ -899,9 +900,103 @@ class TestReasoningParameters:
             return _completion_stream()
 
         with patch.object(client.litellm, "completion", side_effect=_capture):
-            _call("gemini", provider_config={"thinking_budget": 16000})
+            _call(
+                "gemini",
+                provider_config={"model": "gemini-2.5-pro", "thinking_budget": 16000},
+            )
 
         assert seen["thinking"] == {"type": "enabled", "budget_tokens": 16000}
+        assert "reasoning_effort" not in seen
+
+    @pytest.mark.parametrize("level", ["high", "HIGH", " high "])
+    def test_gemini_3_thinking_level_maps_to_reasoning_effort(self, level):
+        """litellm turns reasoning_effort into thinkingConfig {thinkingLevel,
+        includeThoughts} on a gemini-3 model; the level is what a Gemini 3
+        request is steered by, and includeThoughts is what streams the thought
+        summaries while it thinks."""
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call(
+                "gemini",
+                provider_config={"model": "gemini-3.5-flash", "thinking_level": level},
+            )
+
+        assert seen["reasoning_effort"] == "high"
+        assert "thinking" not in seen
+
+    def test_gemini_3_is_never_sent_a_thinking_budget(self):
+        """litellm 1.96.2 drops the number on a gemini-3 model, so a budget
+        would leave the model at Google's default level while the config read as
+        a budget; and beside a level, litellm refuses the request."""
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call(
+                "gemini",
+                provider_config={
+                    "model": "gemini-3.5-flash",
+                    "thinking_budget": 16000,
+                    "thinking_level": "high",
+                },
+            )
+
+        assert "thinking" not in seen
+        assert seen["reasoning_effort"] == "high"
+
+    def test_gemini_3_with_no_level_sends_no_thinking_control(self):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call("gemini", provider_config={"model": "gemini-3.5-flash-lite"})
+
+        assert "thinking" not in seen
+        assert "reasoning_effort" not in seen
+
+    def test_gemini_2_5_takes_no_level(self):
+        """Google refuses thinking_level on a model earlier than Gemini 3, and
+        litellm would turn the effort into a small budget: send neither."""
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call(
+                "gemini",
+                provider_config={"model": "gemini-2.5-pro", "thinking_level": "high"},
+            )
+
+        assert "thinking" not in seen
+        assert "reasoning_effort" not in seen
+
+    def test_a_fallback_gets_the_thinking_control_its_generation_takes(self):
+        """The attempt's model decides, not the configured one: a 2.5 primary
+        with a budget falls back to a 3.x model that must not be sent it."""
+        cfg = {
+            "model": "gemini-2.5-pro",
+            "thinking_budget": 16000,
+            "thinking_level": "low",
+        }
+        assert "thinking" in client._provider_params(
+            "gemini", cfg, model="gemini-2.5-pro"
+        )
+        fallback = client._provider_params("gemini", cfg, model="gemini-3.5-flash-lite")
+        assert "thinking" not in fallback
+        assert fallback["reasoning_effort"] == "low"
 
     def test_unknown_config_keys_are_not_forwarded(self):
         """A stray key reaching a provider is a 400 mid-run, which costs a whole
@@ -1106,8 +1201,16 @@ class TestTemperature:
     Anthropic; this keeps that.
     """
 
-    @pytest.mark.parametrize("provider", ["gemini", "mistral", "grok", "perplexity"])
-    def test_providers_that_accept_temperature_get_it(self, provider):
+    @pytest.mark.parametrize(
+        "provider,config",
+        [
+            ("gemini", {"model": "gemini-2.5-flash"}),
+            ("mistral", {}),
+            ("grok", {}),
+            ("perplexity", {}),
+        ],
+    )
+    def test_providers_that_accept_temperature_get_it(self, provider, config):
         seen = {}
 
         def _capture(**kwargs):
@@ -1115,9 +1218,59 @@ class TestTemperature:
             return _completion_stream()
 
         with patch.object(client.litellm, "completion", side_effect=_capture):
-            _call(provider)
+            _call(provider, provider_config=config)
 
         assert seen["temperature"] == 0.2
+
+    @pytest.mark.parametrize(
+        "model", ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+    )
+    def test_gemini_3_is_sent_none(self, model):
+        """Google: "we strongly recommend keeping the temperature parameter at
+        its default value of 1.0" for every Gemini 3 model; lower "may lead to
+        unexpected behavior, such as looping or degraded performance"."""
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call("gemini", provider_config={"model": model})
+
+        assert "temperature" not in seen
+
+    @pytest.mark.parametrize("model", ["gemini-3.5-flash", "gemini-2.5-pro"])
+    def test_a_gemini_config_can_name_a_temperature(self, model):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call("gemini", provider_config={"model": model, "temperature": 0.5})
+
+        assert seen["temperature"] == 0.5
+
+    def test_a_named_temperature_of_zero_is_sent(self):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call(
+                "gemini",
+                provider_config={"model": "gemini-3.5-flash", "temperature": 0},
+            )
+
+        assert seen["temperature"] == 0.0
+
+    def test_a_fallback_gets_the_temperature_its_generation_takes(self):
+        assert client._temperature("gemini", "gemini-2.5-pro", {}) == 0.2
+        assert client._temperature("gemini", "gemini-3.5-flash-lite", {}) is None
 
     def test_claude_is_sent_no_temperature(self):
         seen = {}
@@ -4186,19 +4339,139 @@ class TestGeminiRoutesOnTheWire:
         assert result["model"] == "gemini-2.5-flash"  # not the fallback's
         assert "stream_timing" not in result  # no stream was started
 
-    def test_a_fallback_model_stays_on_vertex(self, wire):
+    def test_a_fallback_model_stays_on_vertex_and_goes_where_it_is_served(self, wire):
+        """The location is the attempt's model's to choose. The primary is a 2.5
+        model, at us-central1; the fallback is 3.5 Flash-Lite, which Vertex serves
+        at `global` and the `us` and `eu` multi-regions and at no region."""
         unavailable = {"error": {"code": 503, "message": "overloaded"}}
         wire["replies"].append((503, unavailable))
         result = self._gemini(_vertex_config())
         assert result["failed"] is False, result
         assert result["fallback_from"] == "gemini-2.5-flash"
-        assert [r.url.host for r in wire["requests"]] == [
-            "us-central1-aiplatform.googleapis.com"
-        ] * 2
+        first, second = wire["requests"]
+        assert first.url.host == "us-central1-aiplatform.googleapis.com"
+        assert second.url.host == "aiplatform.us.rep.googleapis.com"
+        assert "/locations/us/" in second.url.path
         assert [r.url.path.rsplit("/", 1)[-1] for r in wire["requests"]] == [
             "gemini-2.5-flash:streamGenerateContent",
-            "gemini-2.5-flash-lite:streamGenerateContent",
+            "gemini-3.5-flash-lite:streamGenerateContent",
         ]
+
+    # Gemini 3 and later: where they are served, and how they think. Google's
+    # tables list them at `global` and the `us` and `eu` multi-regions and at no
+    # regional endpoint; litellm sends whatever location it is given.
+
+    def test_a_3x_model_with_no_location_goes_to_the_us_multi_region(self, wire):
+        config = _vertex_config(model="gemini-3.5-flash")
+        del config["location"]
+        result = self._gemini(config)
+        assert result["failed"] is False, result
+        (request,) = wire["requests"]
+        assert str(request.url) == (
+            "https://aiplatform.us.rep.googleapis.com/v1/projects/test-project/"
+            "locations/us/publishers/google/models/"
+            "gemini-3.5-flash:streamGenerateContent?alt=sse"
+        )
+        assert request.headers["authorization"] == f"Bearer {self.TOKEN}"
+
+    def test_a_us_region_is_sent_to_the_us_multi_region_for_a_3x_model(
+        self, wire, caplog, monkeypatch
+    ):
+        """Mike's user.yaml says us-central1, and a cost preset that moves gemini
+        to 3.x keeps it. Said once, not on every call."""
+        from ci_core.llm import vertex
+
+        monkeypatch.setattr(vertex, "_said", set())
+        with caplog.at_level(logging.WARNING, logger="ci_core.llm.vertex"):
+            self._gemini(_vertex_config(model="gemini-3.5-flash"))
+            self._gemini(_vertex_config(model="gemini-3.5-flash"))
+        for request in wire["requests"]:
+            assert request.url.host == "aiplatform.us.rep.googleapis.com"
+            assert "/locations/us/" in request.url.path
+        said = [r for r in caplog.records if "not served at any US region" in r.message]
+        assert len(said) == 1
+
+    @pytest.mark.parametrize(
+        "location,host",
+        [
+            ("global", "aiplatform.googleapis.com"),
+            ("us", "aiplatform.us.rep.googleapis.com"),
+            ("eu", "aiplatform.eu.rep.googleapis.com"),
+        ],
+    )
+    def test_a_3x_model_uses_the_locations_it_is_served_at(self, wire, location, host):
+        self._gemini(_vertex_config(model="gemini-3.5-flash", location=location))
+        (request,) = wire["requests"]
+        assert request.url.host == host
+        assert f"/locations/{location}/" in request.url.path
+
+    def test_a_3x_model_keeps_a_region_outside_the_us(self, wire):
+        """Google lists some for these models, and whoever names one meant it."""
+        self._gemini(_vertex_config(model="gemini-3.5-flash", location="europe-west4"))
+        (request,) = wire["requests"]
+        assert request.url.host == "europe-west4-aiplatform.googleapis.com"
+
+    def test_a_2_5_model_asked_for_us_goes_to_us_central1(self, wire):
+        """`us` means "in the United States" for both generations, and 2.5 has no
+        multi-region endpoint."""
+        self._gemini(_vertex_config(model="gemini-2.5-pro", location="us"))
+        (request,) = wire["requests"]
+        assert request.url.host == "us-central1-aiplatform.googleapis.com"
+        assert "/locations/us-central1/" in request.url.path
+
+    def test_litellms_own_variable_counts_as_the_location_asked_for(
+        self, wire, monkeypatch
+    ):
+        monkeypatch.setenv("VERTEXAI_LOCATION", "global")
+        config = _vertex_config(model="gemini-3.5-flash")
+        del config["location"]
+        self._gemini(config)
+        (request,) = wire["requests"]
+        assert request.url.host == "aiplatform.googleapis.com"
+
+    def test_a_level_reaches_the_vertex_request(self, wire):
+        self._gemini(
+            _vertex_config(
+                model="gemini-3.5-flash", location="us", thinking_level="high"
+            )
+        )
+        (request,) = wire["requests"]
+        body = json.loads(request.content)
+        assert body["generationConfig"]["thinkingConfig"] == {
+            "thinkingLevel": "high",
+            "includeThoughts": True,
+        }
+        assert body["tools"] == [{"googleSearch": {}}]
+
+    def test_a_3x_budget_never_reaches_the_wire(self, wire):
+        """The number is dropped by litellm for a gemini-3 model, and by the
+        client before it gets there: no thinkingConfig at all, rather than
+        includeThoughts alone with the config reading as a budget."""
+        self._gemini(
+            _vertex_config(
+                model="gemini-3.5-flash", location="us", thinking_budget=16000
+            )
+        )
+        (request,) = wire["requests"]
+        assert "thinkingConfig" not in json.loads(request.content)["generationConfig"]
+
+    def test_the_temperature_on_the_wire_follows_the_generation(self, wire):
+        self._gemini(_vertex_config(model="gemini-2.5-pro"))
+        self._gemini(_vertex_config(model="gemini-3.5-flash", location="us"))
+        old, new = (json.loads(r.content)["generationConfig"] for r in wire["requests"])
+        assert old["temperature"] == 0.2
+        # None is sent; whatever litellm fills in is Google's own default.
+        assert new.get("temperature", 1.0) == 1.0
+
+    def test_ai_studio_takes_a_3x_model_and_its_level(self, wire):
+        self._gemini({"model": "gemini-3.5-flash", "thinking_level": "medium"})
+        (request,) = wire["requests"]
+        assert request.url.host == "generativelanguage.googleapis.com"
+        assert request.url.path.endswith(
+            "/models/gemini-3.5-flash:streamGenerateContent"
+        )
+        config = json.loads(request.content)["generationConfig"]
+        assert config["thinkingConfig"]["thinkingLevel"] == "medium"
 
     def test_an_unknown_endpoint_raises_before_anything_is_sent(self, wire):
         with pytest.raises(ValueError, match="'vertex'"):

@@ -135,7 +135,7 @@ Two forms are accepted. Mix and match — each model can use either form indepen
 ```yaml
 models:
   openai: gpt-5.6-terra       # gpt-5.6-sol for max quality, gpt-5.6-luna for economy
-  gemini: gemini-2.5-flash    # best price-performance; its retirement date is in PROVIDERS.md
+  gemini: gemini-3.5-flash    # what every preset runs; the 2.5 models retire on Vertex AI 2026-10-20 (PROVIDERS.md)
   mistral: mistral-large-latest
   perplexity: sonar-reasoning-pro   # Sonar retires 2026-09-27; see PROVIDERS.md
   grok: grok-4.3              # what `wide` runs; grok-4.6 adds reasoning_effort (low to xhigh)
@@ -148,9 +148,9 @@ models:
 models:
   gemini:
     provider: vertex_ai
-    model: gemini-2.5-flash
+    model: gemini-3.5-flash
     project: your-gcp-project-id
-    location: us-central1
+    location: us                 # the US multi-region; see "Vertex AI (Gemini)" below
     # credentials_file: C:\Users\you\keys\my-project.json   # omit = ADC
 ```
 
@@ -311,19 +311,24 @@ models:
     timeout_seconds: 240
 ```
 
-#### Gemini — `thinking_budget`
+#### Gemini — `thinking_level` and `thinking_budget`
 
 ```yaml
 models:
   gemini:
-    provider: vertex_ai
-    model: gemini-2.5-flash
-    thinking_budget: 8192   # 0 = off (Flash models only); omit = dynamic default
-    project: your-gcp-project-id
-    location: us-central1
+    model: gemini-3.5-flash
+    thinking_level: medium   # minimal, low, medium or high; omit = Google's default for the model
 ```
 
-`thinking_budget` is the control for the 2.5 models, and the only Gemini thinking setting this pipeline sends. Google's limits (from its Vertex AI [thinking guide](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking)): 2.5 Flash takes 1–24,576 tokens, 2.5 Flash-Lite 512–24,576 and 2.5 Pro 128–32,768; unset, each thinks dynamically, up to 8,192. `0` turns thinking off on 2.5 Flash and Flash-Lite. **Thinking cannot be turned off on 2.5 Pro**, which is what `thorough` and `maximum` run. Gemini 3.x models are steered by a different parameter, `thinking_level`, which this pipeline does not send; Google's guide says a 3.x request that sets both returns an error, and that a model earlier than 3 rejects `thinking_level`.
+The two generations take different controls, and the client sends the one the model takes:
+
+- **Gemini 3 and later** (`gemini-3.5-flash`, `gemini-3.5-flash-lite`, ...) think by `thinking_level`: `minimal`, `low`, `medium` or `high` (3.7 and 3.8 Flash take no `minimal`). Google's defaults, from its Vertex AI [thinking guide](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking), are `medium` for 3.5 Flash and `minimal` for 3.5 Flash-Lite and 3.1 Flash-Lite. The client hands the level to litellm as `reasoning_effort`, which turns it into `thinkingConfig {thinkingLevel, includeThoughts}`. **State one:** `includeThoughts` is what streams the model's thought summaries while it thinks, and a request with no level sends no `thinkingConfig` at all, so the model thinks silently and the connection sits idle.
+- **A `thinking_budget` does nothing on a 3.x model.** litellm discards the number and sends `includeThoughts: true` alone, so the model runs at its default level while the config reads as a budget (checked on the wire against litellm 1.96.2 on 2026-09-19; the source reads the same through 1.103-dev). Config load warns. Google's guide says a 3.x request that sets both a level and a budget returns an error.
+- **Gemini 2.5** thinks by `thinking_budget`: 2.5 Flash takes 1–24,576 tokens, 2.5 Flash-Lite 512–24,576 and 2.5 Pro 128–32,768; unset, each thinks dynamically, up to 8,192. `0` turns thinking off on 2.5 Flash and Flash-Lite. **Thinking cannot be turned off on 2.5 Pro.** A `thinking_level` on a 2.5 model is not sent (Google rejects it), and config load warns.
+
+**The level also decides how much the model searches.** Every Gemini call carries the Google Search tool, and 3.5 Flash searched 20 times in one fact_check at `low`, 82 at `medium` and 77 at `high`; 3.5 Flash-Lite searched 0 times at `low` and 8 at `medium` (measured 2026-09-27, one 9,456-character draft; the figures are in `presets.yaml`). Each query is billed after the first 5,000 a month, which is why the presets use `low` below `thorough`.
+
+**Temperature.** The client sends 0.2 to Gemini 2.5 and none to Gemini 3 and later, because Google says to leave theirs at the default, 1.0. To send one, put `temperature: 0.2` under `pipeline.preset_overrides.gemini`; a cost preset rebuilds the model config and would drop it from `models:`.
 
 #### Grok — `reasoning_effort`
 
@@ -418,13 +423,15 @@ Switch Gemini from AI Studio to a reserved capacity pool:
 models:
   gemini:
     provider: vertex_ai
-    model: gemini-2.5-flash
+    model: gemini-3.5-flash
     project: your-gcp-project-id       # GCP project ID (not display name)
-    location: us-central1
+    location: us                       # optional; see below
     # credentials_file: path\to\key.json  # omit to use Application Default Credentials
 ```
 
-`provider` takes `ai_studio`, the default, or `vertex_ai`. Any other value is refused when the config loads. `location` defaults to `us-central1`. See [PROVIDERS.md](PROVIDERS.md#option-b--vertex-ai-reserved-capacity-no-503s) for the full setup walkthrough.
+`provider` takes `ai_studio`, the default, or `vertex_ai`. Any other value is refused when the config loads.
+
+`location` is optional and depends on the model, because Vertex serves the Gemini 3.x models at `global` and the `us` and `eu` multi-regions and at no regional endpoint (`us-central1` included), and the 2.5 models the other way about. Not set, it is **`us` for a 3.x model** (the US multi-region, which keeps processing in the United States) and litellm's `us-central1` for a 2.5 model. `global` is available at 10% less, without a say in where the processing happens. A US region such as `us-central1` on a 3.x model is sent to `us`, with a warning, so a config written for 2.5 keeps working. The full table is in [PROVIDERS.md](PROVIDERS.md#option-b--vertex-ai-reserved-capacity-no-503s), which also has the setup walkthrough.
 
 ---
 
@@ -906,15 +913,17 @@ Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article
 
 | Preset | Thoroughness | Models used | Reasoning |
 |---|---|---|---|
-| `economy` | standard | gpt-5.6-luna, gemini-2.5-flash, mistral-small-latest, sonar | not set (each provider's default applies) |
-| `wide` | thorough | gpt-5.6-luna, gemini-2.5-flash, mistral-small-latest, sonar, grok-4.3, claude-haiku-4-5 | not set (each provider's default applies) |
-| `balanced` | thorough | gpt-5.6-terra (low), gemini-2.5-flash, mistral-medium-3-5, sonar-reasoning-pro, grok-4.6 (low), claude-sonnet-5 (effort medium) | light |
-| `thorough` | thorough | gpt-5.6-terra (high), gemini-2.5-pro, mistral-medium-3-5 (high), sonar-reasoning-pro, grok-4.6 (high), claude-sonnet-5 (effort high) | deep |
-| `maximum` | maximum | gpt-5.6-sol (xhigh), gemini-2.5-pro (thinking budget 16,000), mistral-medium-3-5 (high), sonar-reasoning-pro, grok-4.6 (high), claude-opus-5 (effort high, searches on fact_check) | max |
+| `economy` | standard | gpt-5.6-luna, gemini-3.5-flash (low), mistral-small-latest, sonar | not set (each provider's default applies) |
+| `wide` | thorough | gpt-5.6-luna, gemini-3.5-flash (low), mistral-small-latest, sonar, grok-4.3, claude-haiku-4-5 | not set (each provider's default applies) |
+| `balanced` | thorough | gpt-5.6-terra (low), gemini-3.5-flash (low), mistral-medium-3-5, sonar-reasoning-pro, grok-4.6 (low), claude-sonnet-5 (effort medium) | light |
+| `thorough` | thorough | gpt-5.6-terra (high), gemini-3.5-flash (medium), mistral-medium-3-5 (high), sonar-reasoning-pro, grok-4.6 (high), claude-sonnet-5 (effort high) | deep |
+| `maximum` | maximum | gpt-5.6-sol (xhigh), gemini-3.5-flash (high), mistral-medium-3-5 (high), sonar-reasoning-pro, grok-4.6 (high), claude-opus-5 (effort high, searches on fact_check) | max |
 
 `standard` was a sixth preset until 2026-09-05. `wide` beat it on every axis measured over three isolated runs each — 33% more strongly corroborated consensus flags, 74% more fact-check claims, and findings that survived a rerun 67% of the time against 50% — so it was retired rather than kept as a tier that costs more for less. An existing `cost_preset: standard` still works: it runs as `wide` and warns on every run, because the change is real (six models over twelve calls where `standard` ran five over seven), not a rename.
 
-**Two of the models these presets run are on retirement schedules.** Perplexity has announced that its Sonar chat-completions API is supported until 2026-09-27; `sonar` and `sonar-reasoning-pro` are the Perplexity models every preset runs. Google Cloud lists `gemini-2.5-flash` and `gemini-2.5-pro` for retirement on Vertex AI on 2026-10-20. `presets.yaml` has not been changed for either yet. Dates and sources are under [Perplexity](PROVIDERS.md#perplexity-ai-optional--recommended) and [Gemini](PROVIDERS.md#google-gemini-required) in PROVIDERS.md.
+**One of the models these presets run is on a retirement schedule.** Perplexity has announced that its Sonar chat-completions API is supported until 2026-09-27; `sonar` and `sonar-reasoning-pro` are the Perplexity models every preset runs. Google Cloud lists the Gemini 2.5 models for retirement on Vertex AI on 2026-10-20, and the presets moved off them to `gemini-3.5-flash` on 2026-09-27. Dates and sources are under [Perplexity](PROVIDERS.md#perplexity-ai-optional--recommended) and [Gemini](PROVIDERS.md#google-gemini-required) in PROVIDERS.md.
+
+**Gemini's search fees now show in the estimate, and they run ahead of the bill.** `gemini-3.5-flash` searches far more than `gemini-2.5-pro` did (103 queries over the five `maximum` domains on a 9,456-character draft, against 16), and the report prices each query at Google's list rate, $14 per 1,000. The first 5,000 queries a month are free and a run cannot see the month's count, so until the allowance is spent the estimate includes fees the bill does not: about $0.28 at `wide` and $1.44 at `maximum` on that draft. The `low` level is what keeps the cheap tiers to 20 queries; see [Gemini — `thinking_level`](#gemini--thinking_level-and-thinking_budget).
 
 **What a run costs.** Cost depends on the draft, so each figure below is tied to the draft it was measured on. Read each as a floor rather than a quote: a retried attempt that the provider billed but reported no usage for is priced at $0.00 (the report's `cost_summary` counts these as `uncosted_calls`), and the figures are token costs only, so per-search and per-request fees come on top.
 
@@ -946,7 +955,7 @@ The tables below show exactly what settings each preset applies to each provider
 | Provider | Model | Reasoning | Notes |
 |---|---|---|---|
 | openai | `gpt-5.6-luna` | not set (OpenAI's default: `medium`) | Cheapest gpt-5.6 tier |
-| gemini | `gemini-2.5-flash` | not set (dynamic thinking) | |
+| gemini | `gemini-3.5-flash` | `thinking_level` `"low"` | The only fact-checker at this tier, so `low`, which still searches (about 20 queries), rather than a Flash-Lite, which did not |
 | mistral | `mistral-small-latest` | none | Small variant; does not support `reasoning_effort` |
 | perplexity | `sonar` | — | Lightweight search-grounded; no CoT |
 | grok | **disabled** | — | Excluded at this cost tier |
@@ -957,7 +966,7 @@ The tables below show exactly what settings each preset applies to each provider
 | Provider | Model | Reasoning | Notes |
 |---|---|---|---|
 | openai | `gpt-5.6-luna` | not set (OpenAI's default: `medium`) | Same model as `economy` |
-| gemini | `gemini-2.5-flash` | not set (dynamic thinking) | |
+| gemini | `gemini-3.5-flash` | `thinking_level` `"low"` | Costs about what `gemini-2.5-flash` did per call, since it thinks a quarter as much |
 | mistral | `mistral-small-latest` | none | |
 | perplexity | `sonar` | — | Lightweight search-grounded; no CoT |
 | grok | `grok-4.3` | not set | Left unset on purpose: grok-4.3 predates `reasoning_effort` |
@@ -974,7 +983,7 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | Provider | Model | Reasoning | Param | Notes |
 |---|---|---|---|---|
 | openai | `gpt-5.6-terra` | `reasoning_effort` | `"low"` | Light CoT, modest latency increase |
-| gemini | `gemini-2.5-flash` | — | not set (dynamic) | Dynamic thinking (model default) |
+| gemini | `gemini-3.5-flash` | `thinking_level` | `"low"` | Light thinking; still searches |
 | mistral | `mistral-medium-3-5` | — | — | Reasoning model; `low`/`medium` not accepted — preset omits effort flag |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding |
 | grok | `grok-4.6` | `reasoning_effort` | `"low"` | Light CoT. Unset would mean `high` |
@@ -985,7 +994,7 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | Provider | Model | Reasoning | Param | Notes |
 |---|---|---|---|---|
 | openai | `gpt-5.6-terra` | `reasoning_effort` | `"high"` | Deep CoT. No `stream_read_timeout` override: the Responses API streams reasoning summaries through the silent phase |
-| gemini | `gemini-2.5-pro` | — | not set (dynamic) | Pro; thinking cannot be turned off on this model |
+| gemini | `gemini-3.5-flash` | `thinking_level` | `"medium"` | Google's default for it, stated so the thought summaries stream. About 80 searches a call |
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted on this model. `stream_read_timeout: 200` |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding. `stream_read_timeout: 500`: its search phase is one long silence before the first byte |
 | grok | `grok-4.6` | `reasoning_effort` | `"high"` | What unset already resolves to, stated so the tier says what it does. `xhigh` exists, unmeasured |
@@ -996,15 +1005,15 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | Provider | Model | Reasoning | Param | Notes |
 |---|---|---|---|---|
 | openai | `gpt-5.6-sol` | `reasoning_effort` | `"xhigh"` | Highest reasoning depth. Slow: a median of about 370s per call over 23 saved calls |
-| gemini | `gemini-2.5-pro` | `thinking_budget` | `16000` | Pro with a 16K thinking budget (2.5 Pro accepts 128–32,768). `stream_read_timeout: 260`: search grounding and thinking each add a silent phase |
+| gemini | `gemini-3.5-flash` | `thinking_level` | `"high"` | The deepest level. About 80 searches per call. `stream_read_timeout: 260`, carried over from the 2.5 Pro setting and not re-measured; the thought summaries a level turns on should feed the socket during thinking |
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted. `stream_read_timeout: 200` |
 | perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding. `stream_read_timeout: 500` |
 | grok | `grok-4.6` | `reasoning_effort` | `"high"` | Full CoT depth. `xhigh` exists, unmeasured |
 | claude | `claude-opus-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Also sets `web_search: [fact_check]`, so it searches on that domain only |
 
 **Notes on the preset tables:**
-- "Not set" means the preset leaves the parameter out and the provider's own default applies. For the gpt-5.6 models that default is `medium`, and `gemini-2.5-flash` thinks dynamically. Neither is off.
-- Gemini's `thinking_budget` is only set at `maximum`, on `gemini-2.5-pro`; everywhere else the model uses its dynamic default. `thinking_budget` under `models:` is not one of the keys a preset preserves, so to change it under a preset use `preset_overrides` (below). `0` turns thinking off on the Flash models only: `thorough` and `maximum` run `gemini-2.5-pro`, where thinking cannot be turned off.
+- "Not set" means the preset leaves the parameter out and the provider's own default applies. For the gpt-5.6 models that default is `medium`. It is not off.
+- Every preset states a `thinking_level` for gemini (`low`, `medium` or `high`, see the tables above). It is not one of the keys a preset preserves from `models:`, so to change it under a preset use `preset_overrides` (below). A `thinking_budget` does nothing on a 3.x model, and config load warns if one is set; the budget is the control for the 2.5 models, which no preset runs.
 - `mistral-medium-3-5` is the reasoning-capable Mistral model (replaces the deprecated `magistral-medium-latest`). It only accepts `reasoning_effort: "high"` or `"none"` — not `"low"` or `"medium"`. The `-latest` suffix variant (`mistral-medium-3-5-latest`) does not exist and returns a 400 error.
 - Claude Opus 5 and Sonnet 5 think by default, at effort `high`; the `effort:` parameter sets the depth, and both reject `thinking_budget:`. Other Claude models differ — see [Claude — adaptive vs extended thinking](#claude--adaptive-vs-extended-thinking).
 - Provider infrastructure settings (Vertex AI, Azure, credentials) are always preserved regardless of preset, and so is the model name on Azure.
@@ -1014,9 +1023,10 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 
 | Provider / model | $/call (list price) | Measured, and what moves it |
 |---|---:|---|
-| gemini-2.5-flash | $0.006 | [Measured](PROVIDERS.md#google-gemini-required); dynamic thinking adds to it |
-| gemini-2.5-pro | $0.025 | [Measured](PROVIDERS.md#google-gemini-required); thinking is always on |
-| gemini-3.5-flash | $0.024 | Not run by any preset |
+| gemini-3.5-flash | $0.024 | [Measured](PROVIDERS.md#google-gemini-required) 2026-09-27: $0.03 at `low`, $0.13 at `medium`, $0.18 at `high` per fact_check call, and its searches bill on top |
+| gemini-3.5-flash-lite | $0.006 | The client's default model and first fallback; no preset runs it |
+| gemini-2.5-flash | $0.006 | Retires on Vertex AI 2026-10-20; no preset runs it |
+| gemini-2.5-pro | $0.025 | Retires on Vertex AI 2026-10-20; no preset runs it |
 | gpt-5.6-luna | $0.003 | [Measured](PROVIDERS.md#openai-required); reasons at `medium` unless an effort is set |
 | gpt-5.6-terra | $0.032 | [Measured](PROVIDERS.md#openai-required) |
 | gpt-5.6-sol | $0.056 | [Measured](PROVIDERS.md#openai-required); $4/$20 is a promotional rate |
@@ -1152,7 +1162,9 @@ pipeline:
 | `reasoning_effort` | openai | `none \| low \| medium \| high \| xhigh` |
 | `reasoning_effort` | grok (`grok-4.6`, `grok-4.5`) | `low \| medium \| high \| xhigh` |
 | `reasoning_effort` | mistral (`mistral-medium-3-5` only) | `"high"` or `"none"` only — `"low"`/`"medium"` return 400 |
-| `thinking_budget` | gemini, claude-haiku | integer (tokens), or `null` to drop the key. On gemini, `0` turns thinking off for the Flash models only |
+| `thinking_budget` | gemini (2.5 only), claude-haiku | integer (tokens), or `null` to drop the key. On gemini, `0` turns thinking off for the 2.5 Flash models only; a 3.x model ignores it |
+| `thinking_level` | gemini (3.x only) | `minimal`, `low`, `medium` or `high`, or `null` to drop the key |
+| `temperature` | gemini | a number, `0` included. Gemini 3.x is sent none unless this is set; 2.5 is sent 0.2 |
 | `effort` | claude (opus, sonnet, fable) | `low \| medium \| high` |
 | `enabled` | all | `true \| false` |
 | `timeout_seconds` | all | integer (seconds) |
@@ -1169,13 +1181,12 @@ pipeline:
       model: gpt-5.6-terra      # maximum uses gpt-5.6-sol
       reasoning_effort: high    # and xhigh
 
-# Use maximum preset but save money by keeping gemini on 2.5-flash:
+# Use maximum preset but search less, by thinking less:
 pipeline:
   cost_preset: maximum
   preset_overrides:
     gemini:
-      model: gemini-2.5-flash   # maximum uses gemini-2.5-pro
-      thinking_budget: 8192     # half of maximum's 16000; 2.5 Flash accepts 1–24,576
+      thinking_level: low       # maximum uses high: about 20 searches a call instead of 80
 
 # Use balanced but turn Mistral's reasoning on:
 pipeline:

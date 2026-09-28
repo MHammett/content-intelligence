@@ -14,7 +14,7 @@ class TestCheckModelCurrency:
     def test_current_models_no_warnings(self):
         models = {
             "openai": {"model": "gpt-5.6-terra", "provider": "openai"},
-            "gemini": {"model": "gemini-2.5-flash", "provider": "ai_studio"},
+            "gemini": {"model": "gemini-3.5-flash-lite", "provider": "ai_studio"},
             "grok": {"model": "grok-4.3", "provider": "grok"},
             "claude": {"model": "claude-opus-5", "provider": "anthropic"},
             "mistral": {"model": "mistral-large-latest", "provider": "mistral"},
@@ -79,6 +79,36 @@ class TestCheckModelCurrency:
         result = check_model_currency({})
         parsed = datetime.date.fromisoformat(result["registry_date"])
         assert parsed == REGISTRY_DATE
+
+    def test_the_gemini_2_5_models_are_warned_with_their_retirement(self):
+        for model, replacement in (
+            ("gemini-2.5-pro", "gemini-3.5-flash"),
+            ("gemini-2.5-flash", "gemini-3.5-flash-lite"),
+            ("gemini-2.5-flash-lite", "gemini-3.5-flash-lite"),
+        ):
+            result = check_model_currency(
+                {"gemini": {"model": model, "provider": "vertex_ai"}}
+            )
+            (warning,) = result["warnings"]
+            assert warning["replacement"] == replacement
+            assert "2026-10-20" in warning["note"]
+
+    def test_no_replacement_is_itself_superseded(self):
+        """A warning that names a model the registry then warns about sends
+        whoever follows it round in a circle."""
+        for model_id, info in _SUPERSEDED.items():
+            assert info["replacement"] not in _SUPERSEDED, (
+                f"{model_id!r} is replaced by {info['replacement']!r}, which is "
+                f"itself superseded"
+            )
+
+    def test_every_gemini_replacement_has_a_price(self):
+        """The report prices the model it recommends moving to."""
+        from ci_core.llm import cost
+
+        for model_id, info in _SUPERSEDED.items():
+            if model_id.startswith("gemini"):
+                assert cost.known_price(info["replacement"]) is not None, model_id
 
     def test_all_superseded_keys_are_strings(self):
         for k in _SUPERSEDED:

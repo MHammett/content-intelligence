@@ -28,7 +28,7 @@ import math
 from pathlib import Path
 
 from ci_core.config_helpers import PackagedConfigError, load_packaged_yaml
-from ci_core.llm import timeout_model
+from ci_core.llm import timeout_model, vertex
 
 #: Providers whose request carries a ceiling taken from the model config. Mirrors
 #: ``client._provider_params``: claude and mistral read ``cfg["max_tokens"]``;
@@ -42,8 +42,9 @@ CAPPED_PROVIDERS = frozenset({"claude", "mistral"})
 #: exactly one: claude's is ``effort``; openai, mistral, grok and perplexity take
 #: ``reasoning_effort``. The other spelling is dropped, not forwarded, so a config
 #: that uses it asks for nothing (``effort_key_warnings``). gemini has no entry:
-#: it thinks by ``thinking_budget`` and is sent no effort at all. Pinned against
-#: the request in tests/test_llm_client.py.
+#: it thinks by ``thinking_budget`` (2.5) or ``thinking_level`` (3 and later) and
+#: is sent no effort key of that name (``gemini_thinking_warnings``). Pinned
+#: against the request in tests/test_llm_client.py.
 _EFFORT_KEY = {
     "claude": "effort",
     "openai": "reasoning_effort",
@@ -274,10 +275,15 @@ def effort_key_warnings(model_configs):
         for stray in strays:
             said = f"{stray}: {cfg[stray]!r}"
             if right is None:
+                if vertex.is_modern(model):
+                    sends = "thinking_level"
+                    fix = "thinking_level (minimal, low, medium or high)"
+                else:
+                    sends = fix = "thinking_budget"
                 warnings.append(
                     f"{provider} model {model} sets {said}, a key the {provider} "
                     f"request does not use: it sends no effort, only "
-                    f"thinking_budget. Remove it, or set thinking_budget to size "
+                    f"{sends}. Remove it, or set {fix} to size "
                     f"its thinking."
                 )
             elif cfg.get(right):
@@ -347,16 +353,77 @@ def effort_spelling_warnings(model_configs):
     ]
 
 
+#: What ``thinking_level`` accepts, in litellm's spelling. Google's Gemini 3.7
+#: and 3.8 Flash take no ``minimal`` (Vertex thinking guide, read 2026-09-19);
+#: litellm 1.96.2 would send it anyway, so that one is Google's to refuse.
+_THINKING_LEVELS = ("minimal", "low", "medium", "high")
+
+
+def gemini_thinking_warnings(model_configs):
+    """A warning for each gemini thinking key that does nothing for its model.
+
+    Gemini 2.5 thinks by ``thinking_budget`` and Gemini 3 and later by
+    ``thinking_level``, and the client sends the one the model takes
+    (``client._provider_params``). The other is inert, and nothing fails:
+
+    * ``thinking_budget`` on a 3.x model. litellm discards the number and sends
+      ``includeThoughts: true`` alone, so the model runs at Google's default
+      level for it while the config reads as a budget. This is the case a move
+      from 2.5 to 3.x creates: ``preset_overrides`` that pinned a budget keep it.
+    * ``thinking_level`` on a 2.5 model, which has no levels. The client sends
+      nothing for it.
+    * A ``thinking_level`` that is not a level, which litellm refuses on every
+      call ("Invalid reasoning effort").
+    """
+    if not isinstance(model_configs, dict):
+        return []
+    cfg = model_configs.get("gemini")
+    if not isinstance(cfg, dict) or cfg.get("enabled", True) is False:
+        return []
+    from ci_core.llm import client  # lazy, as in effort_none_warnings
+
+    model = client._resolve_model("gemini", None, cfg)
+    level = cfg.get("thinking_level")
+    budget = cfg.get("thinking_budget")
+    warnings = []
+    if vertex.is_modern(model):
+        if budget is not None:
+            warnings.append(
+                f"gemini model {model} sets thinking_budget: {budget!r}, which "
+                f"does nothing for a Gemini 3 or later model: litellm drops the "
+                f"number, and the model thinks at Google's default level for it "
+                f"unless thinking_level says otherwise. Set thinking_level to "
+                f"minimal, low, medium or high, and remove the budget."
+            )
+        if level and str(level).strip().lower() not in _THINKING_LEVELS:
+            warnings.append(
+                f"gemini model {model} sets thinking_level: {level!r}, which is "
+                f"not one of {', '.join(_THINKING_LEVELS)}, so litellm refuses "
+                f"every gemini call."
+            )
+    elif level:
+        warnings.append(
+            f"gemini model {model} sets thinking_level: {level!r}, which a "
+            f"Gemini 2.5 model does not take: it thinks by thinking_budget, and "
+            f"no level is sent."
+        )
+    return warnings
+
+
 def effort_warnings(model_configs):
     """Every warning config load has about how the models' effort is written.
 
     The one call both loaders make (ci-review's ``merge_configs`` and
-    ci-style-profile's bootstrap), so a check added here reaches both.
+    ci-style-profile's bootstrap), so a check added here reaches both. Gemini's
+    thinking keys and its Vertex location are judged here too: the location is
+    not an effort, but the same two loaders need to say it.
     """
     return (
         effort_none_warnings(model_configs)
         + effort_key_warnings(model_configs)
         + effort_spelling_warnings(model_configs)
+        + gemini_thinking_warnings(model_configs)
+        + vertex.location_warnings(model_configs)
     )
 
 
