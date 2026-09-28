@@ -21,10 +21,12 @@ everything that would break silently if the shim mapped something wrong:
 import datetime
 import json
 import logging
+import re
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,6 +35,9 @@ import pytest
 
 from ci_core.llm import client
 from ci_core.llm import output_tokens
+
+#: Repo root, from packages/ci-core/tests/this_file.py
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 # ---------------------------------------------------------------------------
@@ -3890,6 +3895,114 @@ class TestRoutes:
             "openai", _azure_openai_config(endpoint=endpoint)
         )
         assert settings["api_base"] == "https://my-resource.openai.azure.com"
+
+
+class TestTheAzureErrorPointsSomewhereReal:
+    """The reading this error sends people to has to exist.
+
+    It ended "See configs/user.example.yaml." — a path with no file at it since
+    the repo became a uv workspace (3ae33d4, 2026-06-24), in an error raised
+    from a state that may have no configs/ directory anywhere. ci-article-review
+    fixed its own copies of this by resolving the packaged example's real path
+    (#251); ci_core cannot import that package to do the same (docs/NAMING.md,
+    "Dependency direction"), so it names the docs, which both packages have.
+
+    Which is only worth doing if the pointer stays true, and these tests are
+    what a hardcoded string could not be checked for: that the file is on disk,
+    and that the section is still in it under that name.
+    """
+
+    #: Every message this class checks, and the section each should send its
+    #: provider to. `model` is set on the openai configs that omit a key so the
+    #: message under test is the missing-key one, not a different complaint.
+    _CASES = [
+        ("openai", _azure_openai_config(endpoint=None), "Azure OpenAI"),
+        ("openai", _azure_openai_config(deployment=""), "Azure OpenAI"),
+        ("openai", {"provider": "azure", "model": "gpt-5.4"}, "Azure OpenAI"),
+        ("mistral", _azure_mistral_config(endpoint=None), "Azure AI (Mistral)"),
+    ]
+
+    @staticmethod
+    def _message(provider, cfg):
+        with pytest.raises(ValueError) as excinfo:
+            client.route(provider, cfg)
+        return str(excinfo.value)
+
+    @staticmethod
+    def _headings(path):
+        """The ATX headings in a markdown file, by text.
+
+        Yaml comments inside fenced blocks look like headings to a line scan —
+        docs/CONFIGURATION.md is full of them — but none of them can collide
+        with a section name here, and the alternative is a markdown parser in
+        ci-core's test dependencies for one assertion. ci-article-review's
+        test_docs_current.py owns the parsed version.
+        """
+        text = path.read_text(encoding="utf-8")
+        return {m.group(1).strip() for m in re.finditer(r"(?m)^#{1,6} +(.+)$", text)}
+
+    @pytest.mark.parametrize("provider,cfg,_section", _CASES)
+    def test_the_file_it_names_is_on_disk(self, provider, cfg, _section):
+        message = self._message(provider, cfg)
+        named = re.findall(r"docs/[A-Za-z0-9_.-]+\.md", message)
+        assert named, f"sends the reader nowhere:\n{message}"
+        for relative in named:
+            assert (_REPO_ROOT / relative).is_file(), f"{relative}:\n{message}"
+
+    @pytest.mark.parametrize("provider,cfg,section", _CASES)
+    def test_it_names_the_section_for_the_provider_that_raised(
+        self, provider, cfg, section
+    ):
+        """The two sections document different key sets — openai's Azure block
+        takes a deployment and mistral's does not — so the wrong one of the two
+        is a wrong answer, not a near miss."""
+        assert f"'{section}'" in self._message(provider, cfg)
+
+    @pytest.mark.parametrize("provider,cfg,_section", _CASES)
+    def test_the_section_it_names_is_still_a_heading_in_that_file(
+        self, provider, cfg, _section
+    ):
+        """A live file and a renamed section is the same dead end one level down.
+
+        Read out of the message rather than compared to the case above, so that
+        a heading renamed in docs/CONFIGURATION.md fails here — which is the way
+        this pointer is most likely to rot, and the one thing no assertion
+        against a value written in this file could notice.
+        """
+        message = self._message(provider, cfg)
+        cited = re.findall(r"(docs/[A-Za-z0-9_.-]+\.md), '([^']+)'", message)
+        assert cited, f"names no file and section:\n{message}"
+        for relative, section in cited:
+            headings = self._headings(_REPO_ROOT / relative)
+            assert section in headings, f"{relative} has no '{section}' heading"
+
+    def test_no_ci_core_source_names_the_path_that_does_not_exist(self):
+        """The whole class of this defect, not just the message above.
+
+        `configs/user.example.yaml` is wrong from ci_core twice over: nothing is
+        at that path, and where the file really is belongs to a package ci_core
+        must not know about. It was here in two places — the Azure error and a
+        `flag_stale_overrides` docstring that also cited a "note on it" the
+        example no longer carries. Both now name docs/, which ships with the
+        repo either way. A comment is cheaper to get wrong than an error
+        message and just as dead to follow, so this covers both.
+        """
+        src = _REPO_ROOT / "packages" / "ci-core" / "src"
+        offenders = sorted(
+            str(p.relative_to(_REPO_ROOT)).replace("\\", "/")
+            for p in src.rglob("*.py")
+            if "configs/user.example.yaml" in p.read_text(encoding="utf-8")
+        )
+        assert not offenders, "names a path that does not exist: " + ", ".join(
+            offenders
+        )
+
+    def test_every_provider_that_can_route_to_azure_has_a_section(self):
+        """The message indexes this table by provider, so a provider that could
+        reach Azure without an entry would raise KeyError from inside the code
+        path that exists to report the config error."""
+        can = {p for p, routes in client.ROUTES.items() if "azure" in routes}
+        assert can == set(client._AZURE_DOC_SECTIONS)
 
 
 def _chat_sse(text='{"flags": []}'):

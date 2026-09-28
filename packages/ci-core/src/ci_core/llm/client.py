@@ -424,6 +424,24 @@ DEFAULT_AZURE_API_VERSION = "preview"
 # it names an API with no /responses route to send to.
 _AZURE_RESPONSES_SINCE = "2025-03-01"
 
+#: Where to read about the keys an Azure block needs, per provider, because
+#: they differ: openai takes a deployment and mistral does not.
+#:
+#: This used to send people to the user config example under a repo-root
+#: configs/ — a directory that has not existed since the repo became a uv
+#: workspace (3ae33d4, 2026-06-24). The examples ship inside ci-article-review
+#: now, and in the state that raises this there may be no configs/ anywhere.
+#: ci-article-review's own copies of that mistake were fixed by resolving the
+#: packaged example's real path (#251), which cannot be borrowed here: ci_core
+#: is the dependency, not the consumer, so it must not reach into an optional
+#: consumer for a path (docs/NAMING.md, "Dependency direction"). These sections
+#: document exactly the endpoint/deployment keys this error is about, and one of
+#: the two describes whichever provider raised it.
+_AZURE_DOC_SECTIONS = {
+    "openai": "Azure OpenAI",
+    "mistral": "Azure AI (Mistral)",
+}
+
 
 def route(provider, provider_config):
     """The endpoint ``provider_config`` names for ``provider``, from ``ROUTES``.
@@ -467,7 +485,7 @@ def _azure_settings(provider, cfg):
         raise ValueError(
             f"models.{provider}.provider is 'azure', which needs "
             f"{' and '.join(missing)} in the same block. See "
-            f"configs/user.example.yaml."
+            f"docs/CONFIGURATION.md, '{_AZURE_DOC_SECTIONS[provider]}'."
         )
     endpoint = str(cfg["endpoint"]).strip()
     version = cfg.get("api_version")

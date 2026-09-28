@@ -192,13 +192,13 @@ def flag_stale_overrides(
     would compute for the model's *current* effort and this draft's size.
 
     This is the failure mode that hit perplexity (fixed 2026-08-16, see
-    configs/user.example.yaml's note on it) and claude (fixed 2026-08-18,
-    losing 3 of 5 domains on a real run): a ``timeout_seconds`` set while a
-    provider ran light gets left behind after that provider's preset moves to
-    a heavier effort or a grounded/reasoning model, and ``compute_all`` treats
-    any explicit value as authoritative — so the formula never gets a chance
-    to say the override is now too tight. This does not run automatically; a
-    caller logs its findings so an operator sees them.
+    docs/CONFIGURATION.md, "Per-model timeout overrides") and claude (fixed
+    2026-08-18, losing 3 of 5 domains on a real run): a ``timeout_seconds`` set
+    while a provider ran light gets left behind after that provider's preset
+    moves to a heavier effort or a grounded/reasoning model, and ``compute_all``
+    treats any explicit value as authoritative — so the formula never gets a
+    chance to say the override is now too tight. This does not run
+    automatically; a caller logs its findings so an operator sees them.
 
     Returns ``[(provider, override_seconds, formula_seconds), ...]`` for every
     enabled model whose override sits below ``ratio`` of the value the model
