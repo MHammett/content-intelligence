@@ -460,7 +460,7 @@ Mirrors the pipeline's `configs/presets.yaml` pattern. A preset bundles corpus b
 **Preset application** in `bootstrap.py`:
 1. Load `configs/presets.yaml` (raise `PackagedConfigError` if missing or malformed; no hardcoded fallback, same as the pipeline)
 2. Apply preset: override `max_input_chars`, `max_styles`, `per_style_min_words`, `synthesis_models`, `detection_models`
-3. For each model in preset's `models:` dict: override `model`, `effort`, `reasoning_effort`, `thinking_budget` while preserving infrastructure keys (`provider`, `api_key`, `endpoint`, `timeout_seconds`, `prompts`)
+3. For each model in preset's `models:` dict: override `model`, `effort`, `reasoning_effort`, `thinking_budget` while preserving infrastructure keys (`provider`, `api_key`, `endpoint`, `timeout_seconds`, `prompts`). On Azure (`provider: azure`) `model` is kept too: the deployment decides what runs
 4. Apply any `sources.yaml` explicit keys on top (same override priority as pipeline's `preset_overrides`)
 5. CLI flags (`--style`, `--max-styles`) override all of the above
 

@@ -158,3 +158,53 @@ class TestApplyPresetModels:
         before = copy.deepcopy(USER)
         bootstrap._apply_preset_models(USER, {"claude": {"model": "haiku"}})
         assert USER == before
+
+
+class TestAzureKeepsItsModel:
+    """On Azure the deployment decides what runs, so a preset's ``model`` is not
+    laid over user.yaml's.
+
+    There ``model`` names what an openai deployment serves, which is what the
+    call is priced as, and it is the deployment name a mistral Foundry endpoint
+    is called by.
+    """
+
+    OPENAI = {
+        "provider": "azure",
+        "model": "gpt-5.4",
+        "endpoint": "https://example.openai.azure.com",
+        "deployment": "prod-gpt",
+    }
+    MISTRAL = {
+        "provider": "azure",
+        "model": "prod-mistral",
+        "endpoint": "https://example.services.ai.azure.com/models",
+        "api_version": "2024-05-01-preview",
+    }
+    TIER = {
+        "openai": {"model": "gpt-5.6-terra", "reasoning_effort": "high"},
+        "mistral": {"model": "mistral-large-latest"},
+    }
+
+    def test_the_users_model_is_kept(self):
+        out = bootstrap._apply_preset_models(
+            {"openai": self.OPENAI, "mistral": self.MISTRAL}, self.TIER
+        )
+        assert out["openai"]["model"] == "gpt-5.4"
+        assert out["mistral"]["model"] == "prod-mistral"
+
+    def test_with_none_in_user_yaml_the_presets_is_not_added(self):
+        """So the client falls back to its own default for Azure, which for
+        openai is the deployment's name."""
+        user = {"openai": {k: v for k, v in self.OPENAI.items() if k != "model"}}
+        out = bootstrap._apply_preset_models(user, self.TIER)
+        assert "model" not in out["openai"]
+
+    def test_the_rest_of_the_tier_still_applies(self):
+        out = bootstrap._apply_preset_models({"openai": self.OPENAI}, self.TIER)
+        assert out["openai"] == {**self.OPENAI, "reasoning_effort": "high"}
+
+    def test_off_azure_the_tiers_model_still_wins(self):
+        user = {"openai": {"provider": "openai", "model": "gpt-5.4"}}
+        out = bootstrap._apply_preset_models(user, self.TIER)
+        assert out["openai"]["model"] == "gpt-5.6-terra"
