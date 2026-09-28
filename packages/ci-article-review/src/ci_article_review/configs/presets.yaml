@@ -119,6 +119,71 @@
 #   * No temperature is sent to them. Google says to keep 1.0 on every Gemini 3
 #     model; see client._temperature.
 #
+# 2026-09-28 Perplexity refresh. Perplexity supported its Sonar chat-completions
+# API until 2026-09-27 and names its Agent API as the successor. Every tier now
+# runs `perplexity/sonar` there, the same Sonar model on the new API: `sonar`
+# (economy, wide) and `sonar-reasoning-pro` (balanced, thorough, maximum) both
+# became it. An id with a "/" goes to the Agent API through Perplexity's own SDK;
+# a bare `sonar*` id still goes to the old API through litellm
+# (client._uses_agent_api; docs/PROVIDERS.md says why not litellm).
+#
+# The Agent API hands the model a web_search tool instead of searching before
+# every call, so the seat now decides when to search. MEASURED 2026-09-28 with
+# `ci-review --only-model perplexity --offline` on this file's `maximum` tier,
+# fact_check only; medians of three runs a draft (two on short-example). "URLs"
+# is the share of the URLs its findings cite that are among the sources it
+# retrieved. perplexity/sonar's cost is Perplexity's own figure (usage.cost),
+# which pricing.yaml reproduces to the cent; the other rows are pricing.yaml's.
+#
+#   draft, chars              model                 sources  URLs  confirmed  seconds   cost
+#   gps-rollover, 31,112      sonar-reasoning-pro        15   53%          8      186  $0.069
+#                             perplexity/sonar           44   89%         16       64  $0.037
+#   dc-environment, 135,514   sonar-reasoning-pro        15   30%          5      116  $0.108
+#                             perplexity/sonar           45   81%         10       34  $0.037
+#   short-example, 9,456      sonar                      15   60%          4       21  $0.013
+#                             perplexity/sonar           44   89%       10.5       30  $0.024
+#
+# All five domains at once on gps-rollover, one run each: sonar-reasoning-pro took
+# 168s and $0.215 for 37 findings (its argument_integrity call returned none, in
+# 14 output tokens); perplexity/sonar took 40s and $0.063 for 114. No call failed
+# in either arm or anywhere above. perplexity/sonar searched on every fact_check
+# call (10 of 10, one to three searches, 15 to 45 sources) and on none of the
+# other domains' calls (0 of 8, over this run and one on short-example); Sonar
+# searched on every call because it could not do otherwise. Those four domains
+# review the draft's own writing, and the seat returned more findings on each
+# than sonar-reasoning-pro did, or as many.
+#
+# Watch: one gps-rollover fact_check returned 163 findings (its repeats 56 and
+# 52), and the five-domain voice_style call raised 35 flags against 1. More
+# findings is not better findings, and nothing here measured whether the extra
+# ones survive consolidation as signal.
+#
+# Screened on gps-rollover and not taken: kimi-k3, glm-5.3 and
+# nemotron-3-ultra-550b-a55b never called web_search (the first two returned
+# nothing, nemotron 30 unsourced findings). deepseek-v4-pro-0813 searched well (69
+# sources) but cost $0.26 and 198s, truncated its output, and on repeat returned
+# malformed JSON and then ran out its time. openai/gpt-5.6-luna retrieved best of
+# all, but it is OpenAI's model, which the openai seat already runs, so the
+# ensemble would lose a model family. `max_steps: 3` on perplexity/sonar sourced
+# no better and returned 140 findings, 79 of them out of scope.
+#
+# No stream_read_timeout override is left for perplexity. sonar-reasoning-pro's
+# search was one silence before its first byte, which is why thorough and maximum
+# carried 500 (see the CONCURRENCY note below); the longest measured above was
+# 264s. The Agent API sends an event at each step of its search and each one
+# restarts the silence clock, so over 19 perplexity/sonar streams the longest
+# silence before output was 58s and the longest gap after it 0.24s, against the
+# grounded default of 160. These runs sent Perplexity at most five calls at once,
+# one per domain, which is what a full run sends it before any backfill or
+# citation re-ask; the other providers' calls were not running alongside.
+#
+# Cost: where the tiers ran sonar-reasoning-pro, the seat's fact_check fell from
+# $0.07-0.11 to about $0.04 a call on the two real drafts, and the five-domain
+# pass from $0.215 to $0.063. Where they ran `sonar` (economy, wide) it rose, from
+# $0.013 to $0.024 a call on short-example, for three times the sources. Search
+# is now billed per search ($0.0025), where Sonar billed a request fee on every
+# call.
+#
 # stream_read_timeout note: the review adapters stream (SSE). There are now TWO
 # streaming knobs, and they do different jobs (see ci_core/llm/streaming.py):
 #
@@ -201,9 +266,11 @@
 # (2026-09-18, 28 streams, raw data in pipeline_history/_experiments/
 # 2026-09-18-stage0-grok-silences/), and grok's entries below are sized from it.
 # The other providers' stages have not, so nothing else here is set from a
-# measurement of these two knobs; this file's perplexity entry is the standing
-# reminder of what guessing costs instead (160 -> 280 -> 350 -> 500, three bumps
-# that each looked marginal within days).
+# measurement of these two knobs; the perplexity entry this file carried until
+# 2026-09-28 is the standing reminder of what guessing costs instead (160 -> 280
+# -> 350 -> 500, three bumps that each looked marginal within days). It went
+# because the model behind it did, not because the experiment ran; see the
+# Perplexity refresh note.
 #
 # OpenAI: originally hit this hard — gpt-5.5 at xhigh failed 5/5 calls at ~121s
 # with 0 output tokens against the default 120s read-gap under Chat Completions,
@@ -244,7 +311,7 @@ economy:
     mistral:
       model: mistral-small-latest
     perplexity:
-      model: sonar
+      model: perplexity/sonar   # was sonar; see the Perplexity refresh note above
     grok:
       enabled: false
     claude:
@@ -265,7 +332,7 @@ wide:
     mistral:
       model: mistral-small-latest
     perplexity:
-      model: sonar
+      model: perplexity/sonar   # was sonar; see the Perplexity refresh note above
     grok:
       model: grok-4.3
     claude:
@@ -323,7 +390,7 @@ balanced:
       model: mistral-medium-3-5
       # No reasoning_effort at balanced — mistral-medium-3-5 only accepts "high" or "none"
     perplexity:
-      model: sonar-reasoning-pro
+      model: perplexity/sonar   # was sonar-reasoning-pro; see the Perplexity refresh note above
     grok:
       model: grok-4.6   # was grok-4.20-0309-reasoning; see the Grok note above
       reasoning_effort: low   # this tier's stated intent. Unset meant the
@@ -349,23 +416,13 @@ thorough:
       reasoning_effort: high
       stream_read_timeout: 200   # not migrated — see the Mistral note above
     perplexity:
-      model: sonar-reasoning-pro
-      stream_read_timeout: 500   # FIRST-BYTE allowance. Reached by three bumps that
-                                  # each looked marginal within days: 160→280→350→500
-                                  # (350 was hit at 352.29s and 354.18s on two domains in
-                                  # the same run, plus the wall-clock budget got hit
-                                  # directly on a third — see timeouts.yaml's sonar
-                                  # model_multiplier).
-                                  #
-                                  # The diagnosis that drove those bumps is now the
-                                  # design: sonar's failures landed at near-exactly
-                                  # whatever the value was set to, meaning one long
-                                  # silent stretch — its search phase — dominates the
-                                  # call rather than any inter-chunk stall. That is a
-                                  # first-byte cost, which is what this knob now means.
-                                  # It no longer doubles as the stall detector, so 500s
-                                  # here costs nothing in dead-connection detection
-                                  # (stream_gap_timeout stays at the 60s default).
+      model: perplexity/sonar   # was sonar-reasoning-pro; see the Perplexity refresh note above
+      # No stream_read_timeout override, where sonar-reasoning-pro had 500. That
+      # was sized for its search: one silent stretch before the first byte, which
+      # took three bumps (160 -> 280 -> 350 -> 500) to outrun. The Agent API sends
+      # an event at each step of its search, and each restarts the silence clock,
+      # so the grounded default of 160s now bounds the longest single silence,
+      # not the whole search. Measured in the refresh note above.
     grok:
       model: grok-4.6   # was grok-4.20-0309-reasoning; see the Grok note above
       reasoning_effort: high   # what unset already resolved to; stated so the
@@ -383,8 +440,9 @@ thorough:
       # 500 and not 360-something, for two reasons. The measurement ran grok
       # alone with at most 5 calls in flight, and these silences track fan-out,
       # which this tier and `maximum` take further. And it is the same value,
-      # reached the same way, as the perplexity entry above, whose worst
-      # observed silence was the same ~354s. It still leaves room for the one
+      # reached the same way, as the sonar-reasoning-pro entry this tier
+      # carried for perplexity until 2026-09-28, whose worst observed silence
+      # was the same ~354s. It still leaves room for the one
       # retry: the slowest healthy grok call measured 447.1s end to end, so a
       # stall at 500 plus the 10s retry delay plus a full retry is ~957s, inside
       # the 1085s wall-clock backstop grok gets at task_timeout_seconds: 1100.
@@ -492,8 +550,8 @@ maximum:
       reasoning_effort: high
       stream_read_timeout: 200   # not migrated — see the Mistral note above
     perplexity:
-      model: sonar-reasoning-pro
-      stream_read_timeout: 500   # see the thorough tier's note above
+      model: perplexity/sonar   # was sonar-reasoning-pro; see the Perplexity refresh note above
+      # No stream_read_timeout override; see the thorough tier's note.
     grok:
       model: grok-4.6   # was grok-4.20-0309-reasoning; see the Grok note above
       reasoning_effort: high   # what unset already resolved to; stated so the

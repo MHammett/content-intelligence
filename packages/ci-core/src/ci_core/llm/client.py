@@ -345,7 +345,9 @@ _PROVIDERS = {
         # _AGENT_FALLBACKS instead; see "Perplexity's Agent API" below.
         "prefix": "perplexity/",
         "surface": "completion",
-        "default_model": "sonar-reasoning-pro",
+        # The Agent API's own Sonar since 2026-09-28: Sonar Chat Completions was
+        # "supported until September 27, 2026", and every preset moved to this.
+        "default_model": "perplexity/sonar",
         "fallbacks": ["sonar-pro", "sonar"],
         "read_timeout": GROUNDED_READ_TIMEOUT,
     },

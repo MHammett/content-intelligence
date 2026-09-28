@@ -174,10 +174,13 @@ model_multipliers:
                              # (5.0 -> 7.0, -> 525s) to sit above the new 500s read-gap
                              # rather than nudge again; see presets.yaml's note.
   perplexity/:        4.0   # Perplexity's Agent API ids (perplexity/sonar, ...), the
-                             # successor to the sonar rows above. It searches on every
-                             # call, so like gemini's it carries the search here.
-                             # gemini's value to start; see presets.yaml for what the
-                             # 2026-09-28 fact_check runs measured.
+                             # successor to the sonar rows above. Measured 2026-09-28:
+                             # perplexity/sonar's longest call of 19 was 69s, against
+                             # the 480-840s this cell gave on drafts of 9,456-135,514
+                             # chars, so it has room. It stays at gemini's value
+                             # because the other models behind this prefix are slower:
+                             # deepseek-v4-pro took 198s, and a repeat ran out a 510s
+                             # budget. See presets.yaml's Perplexity refresh note.
   default:            1.0
 
 # From reasoning_effort / effort in the model config. Calibration showed effort is

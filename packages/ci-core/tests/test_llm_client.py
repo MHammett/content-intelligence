@@ -121,6 +121,16 @@ def _call(provider="mistral", **kwargs):
         retry=False,
         retry_delay=0,
     )
+    if (
+        provider == "perplexity"
+        and "model" not in kwargs
+        and not (kwargs.get("provider_config") or {}).get("model")
+    ):
+        # The tests in this file are about the Sonar path, through litellm.
+        # The client's default perplexity model has been an Agent API id since
+        # 2026-09-28, and that path has its own file:
+        # test_llm_perplexity_agent.py.
+        defaults["model"] = "sonar-reasoning-pro"
     defaults.update(kwargs)
     return client.call(provider, **defaults)
 

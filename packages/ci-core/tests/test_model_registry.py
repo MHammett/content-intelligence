@@ -18,10 +18,19 @@ class TestCheckModelCurrency:
             "grok": {"model": "grok-4.3", "provider": "grok"},
             "claude": {"model": "claude-opus-5", "provider": "anthropic"},
             "mistral": {"model": "mistral-large-latest", "provider": "mistral"},
-            "perplexity": {"model": "sonar-reasoning-pro", "provider": "perplexity"},
+            "perplexity": {"model": "perplexity/sonar", "provider": "perplexity"},
         }
         result = check_model_currency(models)
         assert result["warnings"] == [], f"unexpected warnings: {result['warnings']}"
+
+    def test_every_sonar_id_the_presets_ran_points_at_the_agent_api(self):
+        """Sonar Chat Completions was supported until 2026-09-27. A config
+        still naming one of its ids is told what replaced it, in one step."""
+        for model in ("sonar", "sonar-pro", "sonar-reasoning-pro", "pplx-7b-online"):
+            result = check_model_currency({"perplexity": {"model": model}})
+            (warning,) = result["warnings"]
+            assert warning["replacement"] == "perplexity/sonar", model
+            assert warning["replacement"] not in _SUPERSEDED
 
     def test_superseded_model_triggers_warning(self):
         models = {

@@ -592,7 +592,7 @@ def main():
     perplexity_creds = api_keys.get("perplexity", {})
     if perplexity_creds.get("api_key"):
         perplexity_cfg = models.get("perplexity", {})
-        perplexity_model = perplexity_cfg.get("model", "sonar-pro")
+        perplexity_model = perplexity_cfg.get("model", "perplexity/sonar")
         if perplexity_cfg.get("enabled", True):
             _m = perplexity_model
             results.append(

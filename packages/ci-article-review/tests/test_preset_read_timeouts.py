@@ -1,10 +1,12 @@
 """The stream_read_timeout overrides in presets.yaml must reach the socket.
 
 Every override in that file was written in response to a real production
-timeout — perplexity 500 after three incremental bumps were each exceeded within
-days, gemini 260 after a live Vertex AI call died at 205.78s with grounding and
-a 16k thinking budget stacking their silent phases, mistral 200 after a marginal
-124s failure against the 120s default.
+timeout — gemini 260 after a live Vertex AI call died at 205.78s with grounding
+and a 16k thinking budget stacking their silent phases, mistral 200 after a
+marginal 124s failure against the 120s default. perplexity carried 500 until
+2026-09-28, after three incremental bumps were each exceeded within days; that
+was sonar-reasoning-pro's silent search phase, and its successor on the Agent
+API sends an event at each step of its search, so it runs on the default.
 
 The litellm migration moved the timeout plumbing (``requests``'
 ``timeout=(connect, read)`` tuple became an ``httpx.Timeout``), which is exactly
@@ -63,8 +65,23 @@ def _timeout_handed_to_litellm(provider, model_cfg):
             )
         ]
 
+    def _agent(api_key, timeout, params):
+        # Perplexity's Agent API ids go to Perplexity's SDK, not litellm; the
+        # timeout it is handed is the same object.
+        from types import SimpleNamespace
+
+        seen["timeout"] = timeout
+        return [
+            SimpleNamespace(
+                type="response.output_text.delta", delta='{"a": 1}', output_index=0
+            )
+        ]
+
     target = "responses" if provider == "openai" else "completion"
-    with patch.object(client.litellm, target, side_effect=_capture):
+    with (
+        patch.object(client.litellm, target, side_effect=_capture),
+        patch.object(client, "_perplexity_agent", side_effect=_agent),
+    ):
         client.call(
             provider,
             "sys",
@@ -82,11 +99,9 @@ def _timeout_handed_to_litellm(provider, model_cfg):
 # quietly shrinking its coverage.
 _DECLARED_OVERRIDES = [
     ("thorough", "mistral", 200),
-    ("thorough", "perplexity", 500),
     ("thorough", "grok", 500),
     ("maximum", "gemini", 260),
     ("maximum", "mistral", 200),
-    ("maximum", "perplexity", 500),
     ("maximum", "grok", 500),
 ]
 
@@ -123,6 +138,11 @@ def test_preset_override_reaches_the_socket(preset, provider, expected):
         # Gemini at thorough is grounded but has no thinking budget stacked on
         # top, so the grounded default still covers it.
         ("thorough", "gemini", 160),
+        # Perplexity's Agent API seat, since 2026-09-28: its search is a series
+        # of events, each restarting the clock, not one silence. See the
+        # Perplexity refresh note in presets.yaml for what was measured.
+        ("thorough", "perplexity", 160),
+        ("maximum", "perplexity", 160),
     ],
 )
 def test_providers_without_an_override_get_the_right_default(
