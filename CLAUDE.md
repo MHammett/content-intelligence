@@ -61,7 +61,37 @@ uv run ci-review --draft packages/ci-article-review/src/ci_article_review/handof
 
 `--offline` additionally skips the LanguageTool grammar pass, link validation, Wayback, citation resolution and the two SEO model calls. Note that a replay still prints `Estimated cost:` from the *captured* run's call log — it did not spend that; the "No model calls made" line above it is the true one.
 
-Replay is a real verification for anything in consolidation, scoring, the report, citations or history. It is **not** sufficient for changes to assignment, dispatch, retry, recovery or substitution — those decide which calls get made, and a replay makes none. Verify those live, at `--cost-preset wide` (12 calls, ~$0.12), not at `maximum`.
+Replay is a real verification for anything in consolidation, scoring, the report, citations or history. It is **not** sufficient for changes to assignment, dispatch, retry, recovery or substitution — those decide which calls get made, and a replay makes none. Verify those live, at `--cost-preset wide`, not at `maximum` — after checking whether one of the cheaper checks below covers the change.
+
+**What `wide` costs on that draft** (9,456 chars, ~1,400 words), measured 2026-09-28 as shipped: **$0.40** for the first command above, 44 API calls (12 ensemble, 30 citation verifications and re-asks, 2 SEO); **$0.38** with `--offline` added, which makes only the 12 ensemble calls (two runs, $0.3779 and $0.3811). This section used to say "12 calls, ~$0.12". Two changes more than tripled it, and search fees are now more than half of it (56–67%):
+
+- **PR #252 (2026-09-28) moved every preset to `gemini-3.5-flash`, which bills per search query**, $14 per 1,000, where 2.5 billed a grounded prompt once. Its `fact_check` call made 11–16 queries in those three runs and cost $0.19–$0.26 on its own; Gemini's calls were 68–84% of each run's total.
+- **The report priced no search before PR #230 (2026-09-19)**, so "~$0.12" was tokens only. Search is now $0.22–$0.26 of each run: Gemini's queries plus Perplexity's $0.005 per request.
+
+The report prices every Gemini query at list. The first 5,000 Gemini 3 queries a month are free, and a run cannot see how many are left (`docs/PROVIDERS.md`, Gemini, "Search"), so until they run out the bill is below the report by up to Gemini's share of the fees, $0.18–$0.25 in these runs.
+
+**Cheaper checks, when they cover the change** (each verified 2026-09-28). A worktree has no `configs/` — it is gitignored — so from one, point every command here at the main checkout's with `--config-dir <main checkout>/configs`.
+
+**Assignment: $0.** `_build_assignments` returns the (model, domain) pairs a run will dispatch, with its skip and backfill lines, and calls no model. It printed exactly the 12 pairs, the skip line and the backfill line of the live `wide` run it was checked against:
+
+```bash
+uv run python - <main checkout>/configs <<'EOF'
+import sys
+from ci_article_review.config_loader import load_user_config, load_publication_config, merge_configs
+from ci_article_review.pipeline import _build_assignments
+d = sys.argv[1]
+u = load_user_config(d); u.setdefault("pipeline", {})["cost_preset"] = "wide"
+c = merge_configs(u, load_publication_config("mikehammett", d)); p = c["pipeline"]
+skips, backfills = [], []
+pairs = _build_assignments(p["thoroughness"], c["models"], c["api_keys"], p.get("drafting_model"), skips,
+                           backfill=p.get("backfill_narrowed_domains", True), backfills=backfills)
+print(f"{len(pairs)} calls", *pairs, *skips, *backfills, sep="\n")
+EOF
+```
+
+**One provider's call path — request shape, streaming, parsing: one call.** Copy `configs/` to a scratch dir, add `prompts: [<domain>]` under that model in the copy, and add `--only-model <provider> --offline --config-dir <copy>` to the `wide` command. openai on `argument_integrity`, which does not search, cost $0.0042; on its grounded `fact_check`, $0.07. It takes both: `--only-model` alone keeps all three of openai's `wide` domains, and `prompts:` alone is backfilled rather than saved (narrowing openai that way still planned 12 calls, with perplexity and grok standing in).
+
+**Not backfill or substitution.** `--only-model` and `--only-domain` switch backfill off and substitute only within the domains they kept (`pipeline.py`, "Off under a calibration filter"), so neither can show a change to those two. The $0 check covers backfill; substitution needs the full `wide` run.
 
 Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset on every axis at 55% of the cost, so `wide` is a sound working default and not a degraded one.
 
