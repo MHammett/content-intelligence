@@ -413,8 +413,12 @@ def _validate_publication_keys(config, publication_name):
 #   - Overrides model name and reasoning flags for each configured provider,
 #     except the model name on Azure, where the deployment decides it.
 #   - Preserves user's infrastructure settings: provider, project, location,
-#     credentials_file, endpoint, deployment, api_version, prompts, web_search,
-#     and the two user-tuned limits, timeout_seconds and max_tokens.
+#     credentials_file, endpoint, deployment, api_version, prompts, web_search
+#     and the search controls, a gemini temperature, and the user-tuned
+#     limits: timeout_seconds,
+#     max_tokens, stream_read_timeout and stream_gap_timeout. Where the preset
+#     sets one of these too, the user's value wins; a stream budget below the
+#     preset's is warned about (see _stream_budget_warnings).
 #   - Skips providers the user has not configured (no API key / no models entry).
 #   - Respects enabled: false set by the user.
 #
@@ -444,8 +448,80 @@ _INFRA_KEYS = frozenset(
         # config and dropped it, so `web_search` set alongside any cost_preset —
         # which is every non-default configuration — silently never took effect.
         "web_search",
+        # The two streaming budgets: first-byte allowance and inter-chunk gap.
+        # User-tuned limits like timeout_seconds, and missing from this list the
+        # same way. A live `wide` run on 2026-09-20 recorded gemini's 160s
+        # grounded default against user.yaml's 300, and `maximum` ran its own
+        # 260. Where the preset sets one too, the user's still wins, as for
+        # every key here; one below the preset's is warned about below.
+        "stream_read_timeout",
+        "stream_gap_timeout",
+        # A gemini temperature, where the config names one rather than taking
+        # the model's own default (client._temperature). A generation setting
+        # the user chose, like the ceilings above; no preset sets one. It was
+        # dropped here too, and the docs told users to write it under
+        # preset_overrides to get around that.
+        "temperature",
+        # Search controls: perplexity's three filters, and the context size
+        # claude and grok send with a live search. Which searches a model runs
+        # is the user's call, like web_search. No preset sets these, and every
+        # preset dropped them.
+        "search_mode",
+        "search_recency_filter",
+        "search_domain_filter",
+        "search_context_size",
     }
 )
+
+#: The budgets a preset may set as well as the user. The user's value runs even
+#: when it is the lower of the two, because it is in _INFRA_KEYS; a lower one is
+#: warned about, since it can cut off a call the preset's value would have let
+#: finish.
+_STREAM_BUDGET_KEYS = ("stream_read_timeout", "stream_gap_timeout")
+
+
+def _stream_budget_warnings(provider, preset_name, preset_cfg, user_cfg, overrides):
+    """Warnings for a user stream budget that runs below the preset's own.
+
+    The same kind of check as the stale ``timeout_seconds`` warning in
+    pipeline.py: an explicit value, maybe left over from a lighter tier,
+    undercutting what this tier's models need. Each value presets.yaml sets
+    today was raised after real calls ran past a lower one.
+
+    ``overrides`` is this provider's ``preset_overrides`` block. A key set
+    there is what runs, and it is set for the preset on purpose, so the value
+    under ``models:`` is not warned about.
+    """
+    warnings = []
+    for key in _STREAM_BUDGET_KEYS:
+        if key not in user_cfg or key not in preset_cfg or key in overrides:
+            continue
+        mine, theirs = user_cfg[key], preset_cfg[key]
+        if not mine:
+            # The client reads an empty or zero budget as unset, so the
+            # provider default runs, not the preset's value.
+            said = "empty" if mine in (None, "") else mine
+            warnings.append(
+                f"models.{provider}.{key} is {said} in user.yaml, which the "
+                f"client reads as unset: {provider}'s default runs instead of "
+                f"the {preset_name} preset's {theirs}. Remove the key to run "
+                f"the preset's value."
+            )
+            continue
+        try:
+            lower = float(mine) < float(theirs)
+        except (TypeError, ValueError):
+            continue  # not a number; comparing it is not this check's job
+        if lower:
+            warnings.append(
+                f"models.{provider}.{key} is {mine} in user.yaml, below the "
+                f"{preset_name} preset's {theirs}, and yours is what runs. A "
+                f"lower budget can cut off calls that are slow but alive. "
+                f"Remove it to run the preset's value, raise it to at least "
+                f"{theirs}, or set it under pipeline.preset_overrides if the "
+                f"lower value is deliberate."
+            )
+    return warnings
 
 
 def _load_presets_from_yaml(config_dir=None):
@@ -602,6 +678,11 @@ def _apply_cost_preset(pipeline_cfg, models_raw, user_set=None):
 
     merged_models = dict(models_raw or {})
     preset_models = preset.get("models", {})
+    # Read only to decide which warnings apply; _apply_preset_overrides applies
+    # them, and rejects a block that is not a mapping.
+    all_overrides = pipeline_cfg.get("preset_overrides")
+    if not isinstance(all_overrides, dict):
+        all_overrides = {}
 
     for provider, preset_cfg in preset_models.items():
         user_val = merged_models.get(provider)
@@ -637,6 +718,15 @@ def _apply_cost_preset(pipeline_cfg, models_raw, user_set=None):
             new_cfg.pop("model", None)
             if "model" in user_dict:
                 new_cfg["model"] = user_dict["model"]
+
+        overrides = all_overrides.get(provider)
+        if not isinstance(overrides, dict):
+            overrides = {}
+        if overrides.get("enabled") is not False:
+            for warning in _stream_budget_warnings(
+                provider, preset_name, preset_cfg, user_dict, overrides
+            ):
+                log.warning(warning)
 
         merged_models[provider] = new_cfg
 

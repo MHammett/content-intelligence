@@ -188,7 +188,7 @@ The review adapters stream responses (Server-Sent Events). That splits "the time
 
 | Layer | What it bounds | Typical size | Set by |
 |---|---|---|---|
-| **First-byte allowance** | How long to wait for the stream to *start* (the socket read timeout) | generous and per-model — 120s default; 160s for grounded Gemini/Perplexity (search runs before the first token); 200s/500s where a preset overrides it | `stream_read_timeout` per model, else the provider default, else the `thorough`/`maximum` preset's override |
+| **First-byte allowance** | How long to wait for the stream to *start* (the socket read timeout) | generous and per-model — 120s default; 160s for grounded Gemini/Perplexity (search runs before the first token); 200s/500s where a preset overrides it | `stream_read_timeout` per model, else the `thorough`/`maximum` preset's override, else the provider default |
 | **Inter-chunk stall detector** | Max silence *between* chunks once the stream has started | tight and constant — **60s for every provider** | `stream_gap_timeout` per model, else the 60s default |
 | **Per-task wall-clock backstop** | Total time one model+domain call may run before the pipeline thread kills it | the sliding-scale computed value (below) | `timeout_seconds` per model, else computed |
 | **Global batch ceiling** | Outer bound on the whole parallel batch | slowest backstop + retry + slack | derived (`_global_ceiling()`) |
@@ -245,7 +245,7 @@ models:
 
 Under streaming the adapter passes `timeout=(connect, read_gap)` to the HTTP request, where `read_gap` is the **inter-token** allowance (constant, from `stream_read_timeout` or the adapter default) — **not** `timeout_seconds`. The big `timeout_seconds` value is enforced separately as the pipeline's per-task thread wall-clock backstop. Set `pipeline.task_timeout_seconds` high enough to accommodate your slowest model's genuine total generation time (streaming detects stalls quickly but does not shorten a legitimately long generation).
 
-`timeout_seconds` is an **infrastructure key** — it survives `cost_preset` overrides. If you set it in `models:` for a provider, the preset will not clear it.
+`timeout_seconds` is an **infrastructure key** — it survives `cost_preset` overrides. If you set it in `models:` for a provider, the preset will not clear it. So do `stream_read_timeout` and `stream_gap_timeout`, and where the preset sets one of them as well — Mistral's 200 and Perplexity's 500 at `thorough` and `maximum`, Gemini's 260 at `maximum` — yours is what runs. Config load warns when yours is the lower of the two, because each of those preset values was raised after real calls ran past a lower one; remove the key to run the preset's value, or raise it. An empty value (`stream_read_timeout:` with nothing after it) is warned about too: the client reads it as unset, so the provider default runs rather than the preset's value.
 
 #### Output-token ceiling is automatic too
 
@@ -328,7 +328,7 @@ The two generations take different controls, and the client sends the one the mo
 
 **The level also decides how much the model searches.** Every Gemini call carries the Google Search tool, and 3.5 Flash searched 20 times in one fact_check at `low`, 82 at `medium` and 77 at `high`; 3.5 Flash-Lite searched 0 times at `low` and 8 at `medium` (measured 2026-09-27, one 9,456-character draft; the figures are in `presets.yaml`). Each query is billed after the first 5,000 a month, which is why the presets use `low` below `thorough`.
 
-**Temperature.** The client sends 0.2 to Gemini 2.5 and none to Gemini 3 and later, because Google says to leave theirs at the default, 1.0. To send one, put `temperature: 0.2` under `pipeline.preset_overrides.gemini`; a cost preset rebuilds the model config and would drop it from `models:`.
+**Temperature.** The client sends 0.2 to Gemini 2.5 and none to Gemini 3 and later, because Google says to leave theirs at the default, 1.0. To send one, put `temperature: 0.2` on gemini under `models:` — it survives a cost preset, like the other per-model settings above — or under `pipeline.preset_overrides.gemini`.
 
 #### Grok — `reasoning_effort`
 
@@ -905,6 +905,7 @@ Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article
 **When `cost_preset` is set:**
 - It overrides model names and reasoning flags for all configured providers, except the model name on Azure, where the deployment decides it
 - Provider infrastructure settings (vertex_ai, azure, credentials_file) are preserved
+- So is the per-model tuning you set under `models:`: `prompts`, `web_search` and the Perplexity search controls, `timeout_seconds`, `max_tokens`, `stream_read_timeout`, `stream_gap_timeout` and a gemini `temperature`. Where the preset sets one of these too, yours wins (a lower stream budget is warned about at load)
 - Providers you haven't configured (no API key) are skipped
 - Setting `enabled: false` on a provider still takes precedence
 - Set `thoroughness:` separately to override just that part of the preset

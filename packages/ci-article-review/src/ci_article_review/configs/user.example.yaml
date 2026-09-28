@@ -349,6 +349,9 @@ pipeline:
   # When set, the preset overrides model names and reasoning flags for all configured
   # providers.  Provider infrastructure settings (vertex_ai, azure, credentials) are
   # preserved, and so is the model name on Azure, where the deployment decides it.
+  # Per-model tuning set under models: is preserved too — prompts, web_search and
+  # the search controls, temperature, timeout_seconds, max_tokens, stream_read_timeout and
+  # stream_gap_timeout — and wins where a preset sets the same key.
   # Use thoroughness: below to override just that part of the preset.
   #
   # Preset    Thoroughness  Reasoning     Measured cost (draft size in words)
