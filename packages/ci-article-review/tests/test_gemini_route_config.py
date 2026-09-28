@@ -101,13 +101,18 @@ class TestAVertexUserYamlReachesVertex:
     """user.yaml, config loading, a preset, then the client, as a run chains them.
     Only the transport and litellm's token exchange are replaced."""
 
-    def test_under_the_wide_preset(self, config_dir, monkeypatch):
+    def _run(self, config_dir, monkeypatch, preset="wide", location="europe-west4"):
+        """One gemini call built from a Vertex user.yaml under ``preset``.
+
+        Returns the requests that left, the credentials litellm was asked to
+        exchange, and the service-account file's path.
+        """
         key_file = config_dir / "sa.json"
         key_file.write_text("{}", encoding="utf-8")
         text = (
             _KEYS
-            + _VERTEX.format(credentials=key_file)
-            + "pipeline:\n  cost_preset: wide\n"
+            + _VERTEX.format(credentials=key_file).replace("europe-west4", location)
+            + f"pipeline:\n  cost_preset: {preset}\n"
         )
         gemini = merge_configs(_load(config_dir, text), {})["models"]["gemini"]
 
@@ -153,9 +158,33 @@ class TestAVertexUserYamlReachesVertex:
 
         assert result["failed"] is False, result
         (request,) = sent
+        return request, exchanged, key_file
+
+    def test_under_the_wide_preset(self, config_dir, monkeypatch):
+        """wide runs gemini-3.5-flash. A region outside the US is used as
+        written: Google lists some for the 3.x models, and whoever named one
+        meant it."""
+        request, exchanged, key_file = self._run(config_dir, monkeypatch)
         assert request.url.host == "europe-west4-aiplatform.googleapis.com"
         assert request.url.path == (
             "/v1/projects/test-project/locations/europe-west4/publishers/google/"
-            "models/gemini-2.5-flash:streamGenerateContent"
+            "models/gemini-3.5-flash:streamGenerateContent"
         )
+        assert exchanged == [str(key_file)]
+
+    @pytest.mark.parametrize(
+        "preset", ["economy", "wide", "balanced", "thorough", "maximum"]
+    )
+    def test_a_us_central1_user_yaml_reaches_the_us_multi_region(
+        self, config_dir, monkeypatch, preset
+    ):
+        """The real shape: user.yaml carries us-central1 from the 2.5 days, the
+        preset moves gemini to a 3.x model, and Vertex serves that model at no
+        region. Without the correction every tier's gemini call is a 404."""
+        request, exchanged, key_file = self._run(
+            config_dir, monkeypatch, preset=preset, location="us-central1"
+        )
+        assert request.url.host == "aiplatform.us.rep.googleapis.com"
+        assert request.url.path.startswith("/v1/projects/test-project/locations/us/")
+        assert "gemini-3.5-flash" in request.url.path
         assert exchanged == [str(key_file)]

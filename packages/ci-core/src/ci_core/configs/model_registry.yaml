@@ -46,25 +46,39 @@ superseded:
     replacement: gpt-5.6-luna
     note: "gpt-5.6 family launched 2026-07-09 at matching price tiers"
 
-  # Google Gemini
+  # Google Gemini. The 2.5 models are listed to retire on Vertex AI on 2026-10-20
+  # (Google Cloud's "Model versions and lifecycle" page, read 2026-09-19), with 3.5
+  # Flash named as 2.5 Pro's replacement and 3.5 Flash-Lite as 2.5 Flash's. The
+  # Gemini API lists no shutdown date for them. 3.1 Flash-Lite is not offered as a
+  # replacement: the Gemini API already lists its shutdown, 2027-05-07, with 3.5
+  # Flash-Lite as the replacement.
+  gemini-2.5-pro:
+    replacement: gemini-3.5-flash
+    note: "retires on Vertex AI 2026-10-20 (the Gemini API lists no date); Gemini 3 thinks by thinking_level, not thinking_budget"
+  gemini-2.5-flash:
+    replacement: gemini-3.5-flash-lite
+    note: "retires on Vertex AI 2026-10-20 (the Gemini API lists no date)"
+  gemini-2.5-flash-lite:
+    replacement: gemini-3.5-flash-lite
+    note: "retires on Vertex AI 2026-10-20 (the Gemini API lists no date)"
   gemini-pro:
-    replacement: gemini-2.5-flash
+    replacement: gemini-3.5-flash-lite
   gemini-1.0-pro:
-    replacement: gemini-2.5-flash
+    replacement: gemini-3.5-flash-lite
   gemini-1.5-flash:
-    replacement: gemini-2.5-flash
+    replacement: gemini-3.5-flash-lite
   gemini-1.5-flash-latest:
-    replacement: gemini-2.5-flash
+    replacement: gemini-3.5-flash-lite
   gemini-1.5-pro:
-    replacement: gemini-2.5-pro
+    replacement: gemini-3.5-flash
   gemini-1.5-pro-latest:
-    replacement: gemini-2.5-pro
+    replacement: gemini-3.5-flash
   gemini-2.0-flash:
-    replacement: gemini-2.5-flash
+    replacement: gemini-3.5-flash-lite
   gemini-2.0-flash-exp:
-    replacement: gemini-2.5-flash
+    replacement: gemini-3.5-flash-lite
   gemini-2.0-flash-thinking-exp:
-    replacement: gemini-2.5-flash
+    replacement: gemini-3.5-flash-lite
 
   # xAI Grok
   grok-beta:

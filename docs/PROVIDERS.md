@@ -58,7 +58,7 @@ Gemini's fact-check pass has Google Search grounding attached, so it can check c
 **What you need:**
 - API key: the key you just generated
 
-**Billing:** No credit card is required for the free tier. It covers the Flash models (2.5 Flash, 2.5 Flash-Lite and the 3.x Flash models) but not `gemini-2.5-pro`, which `thorough` and `maximum` run. Google's [pricing page](https://ai.google.dev/gemini-api/docs/pricing) also marks free-tier content as used to improve its products and paid-tier content as not. What this pipeline sends is unpublished drafts, so if that matters to you, use a billing-enabled key or Vertex AI.
+**Billing:** Use a billing-enabled key. The free tier covers the Flash models' tokens, but Google's [pricing page](https://ai.google.dev/gemini-api/docs/pricing) lists Grounding with Google Search as not available on it for the 3.x models, and this pipeline attaches Search to every Gemini call. The same page marks free-tier content as used to improve its products and paid-tier content as not. What this pipeline sends is unpublished drafts, so a billing-enabled key or Vertex AI is the right choice on that ground too.
 
 **Limitation:** AI Studio draws from a shared capacity pool. At peak hours you may get 503 errors. If that happens consistently, use Vertex AI instead.
 
@@ -66,22 +66,26 @@ Gemini's fact-check pass has Google Search grounding attached, so it can check c
 
 | Model | Input | Output | Notes |
 |---|---|---|---|
-| `gemini-2.5-flash` | $0.30/MTok | $2.50/MTok | Best price-performance; **recommended default**; what `economy`, `wide` and `balanced` run |
-| `gemini-2.5-pro` | $1.25/MTok ($2.50 over 200K-token prompts) | $10/MTok ($15 over 200K) | What `thorough` and `maximum` run; no free tier; thinking cannot be turned off |
-| `gemini-3.5-flash` | $1.50/MTok | $9.00/MTok | GA; Google's named replacement for 2.5 Pro on Vertex AI; in no preset |
+| `gemini-3.5-flash` | $1.50/MTok | $9.00/MTok | GA; what every preset runs, at a thinking level: `low` at `economy`, `wide` and `balanced`, `medium` at `thorough`, `high` at `maximum` |
+| `gemini-3.5-flash-lite` | $0.30/MTok | $2.50/MTok | GA; the client's default model and first fallback. At `low` it does not search, and at `medium` it searched 8 times where 3.5 Flash searched 82 (measured; see below) |
+| `gemini-3.1-flash-lite` | $0.25/MTok | $1.50/MTok | The last fallback. The Gemini API lists its shutdown for 2027-05-07, with 3.5 Flash-Lite as the replacement |
+| `gemini-3.6-flash`, `3.7-flash`, `3.8-flash` | $0.75/MTok until 2026-12-31, then $1.50 | $3.75/MTok, then $7.50 | GA, promotional through 2026-12-31; in no preset. 3.8 Flash at `high` returned malformed JSON on two attempts in a measured fact_check |
+| `gemini-2.5-flash`, `2.5-flash-lite`, `2.5-pro` | $0.30, $0.10, $1.25 | $2.50, $0.40, $10 | Listed to retire on Vertex AI on 2026-10-20; no preset runs them, and a config that pins one is warned |
 
-Google's newer Flash models, 3.6, 3.7 and 3.8, are also GA on the Gemini API, at promotional prices that run through 2026-12-31 (see the pricing page). No preset runs them, and `pricing.yaml` has no row for them yet, so the pipeline's cost report would price them at its fallback rate.
+**Retirement.** Google Cloud's [Model versions and lifecycle](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions) page lists `gemini-2.5-pro`, `gemini-2.5-flash` and `gemini-2.5-flash-lite` for retirement on Vertex AI on **2026-10-20**, and names Gemini 3.5 Flash (for 2.5 Pro) and 3.5 Flash-Lite or 3.1 Flash-Lite (for 2.5 Flash) as replacements. Google says listed retirement dates may be extended but will not move earlier. The Gemini API's [deprecations](https://ai.google.dev/gemini-api/docs/deprecations) page listed no shutdown date for the 2.5 models on 2026-09-19. 3.5 Flash is listed to retire "May 19, 2027 or later" on Vertex AI, and 3.5 Flash-Lite "July 21, 2027 or later".
 
-**Retirement.** Google Cloud's [Model versions and lifecycle](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions) page lists `gemini-2.5-pro`, `gemini-2.5-flash` and `gemini-2.5-flash-lite` for retirement on Vertex AI on **2026-10-20**, and names Gemini 3.5 Flash, 3.5 Flash-Lite or 3.1 Flash-Lite as replacements. Google says listed retirement dates may be extended but will not move earlier. The Gemini API's [deprecations](https://ai.google.dev/gemini-api/docs/deprecations) page listed no shutdown date for them on 2026-09-19. Every shipped preset still runs a 2.5 model, and `presets.yaml` has not been changed; Vertex AI (Option B below) is where the date applies. Vertex AI's pricing page lists Gemini 3.5 Flash under "Global", so check that your location serves a model before you switch to it.
+**Thinking.** Gemini 3.x thinks by level: `thinking_level` is `minimal`, `low`, `medium` or `high`, and it is what this pipeline sends for a 3.x model. Each preset states one, and stating one is also what turns on the thought summaries that keep the connection busy while the model thinks. Google's defaults, when none is sent, are `medium` for 3.5 Flash and `minimal` for the Flash-Lites. A `thinking_budget` does nothing on a 3.x model: litellm drops the number, and config load warns about it. Gemini 2.5 thinks by `thinking_budget` (2.5 Flash 1–24,576 tokens, 2.5 Flash-Lite 512–24,576, 2.5 Pro 128–32,768; unset, each thinks dynamically up to 8,192), and takes no level. Details and Google's sources are in [CONFIGURATION.md](CONFIGURATION.md#gemini--thinking_level-and-thinking_budget).
 
-`thinking_budget` controls reasoning token allocation on the 2.5 models, and it is the only Gemini thinking setting this pipeline sends: 2.5 Flash takes 1–24,576 tokens, 2.5 Flash-Lite 512–24,576, 2.5 Pro 128–32,768, and unset each thinks dynamically, up to 8,192. `0` turns thinking off on 2.5 Flash and Flash-Lite. **Thinking cannot be turned off on 2.5 Pro.** Gemini 3.x models use a different parameter, `thinking_level`, which the pipeline does not send. Details and Google's source are in [CONFIGURATION.md](CONFIGURATION.md#gemini--thinking_budget).
+**Temperature.** The pipeline sends 0.2 to the 2.5 models and none to the 3.x models. Google's Gemini 3 guide says to keep the default, 1.0, because a lower value "may lead to unexpected behavior, such as looping or degraded performance". To send one anyway, name `temperature:` under `preset_overrides` for gemini.
 
-**Expected cost:** measured per review call, tokens only, from saved runs and re-priced at the current rates: `gemini-2.5-flash` $0.007–$0.033, median $0.023 (14 calls, drafts of 9,456–73,786 characters); `gemini-2.5-pro` $0.02–$0.15, median $0.05 (177 calls, 2,182–135,514 characters). Across a whole run, Gemini's share was $0.02–$0.07 at `wide` (four runs, a 9,456-character draft), $0.17 at `thorough` (one run, 18,167 characters) and $0.22–$0.49 at `maximum` (four runs, 3,999–27,113 characters). Search grounding is separate: it is attached to every Gemini call here and the model decides whether to use it, and Google's pricing page lists a daily allowance of grounded prompts at no charge (1,500 for the 2.5 Flash models combined, 10,000 for 2.5 Pro on Vertex AI) before per-1,000 charges apply. A run makes up to five Gemini calls, one per domain, before any retries.
+**Search.** Every Gemini call carries the Google Search tool, and the model decides whether to use it. **The 3.x models decide far more often than 2.5 Pro did, and how much depends on the thinking level.** Measured on 2026-09-27, one fact_check call on a 9,456-character draft: 3.5 Flash-Lite at `low` made 0 searches and at `medium` 8; 3.5 Flash made 20 at `low`, 82 at `medium` and 77 at `high`; 3.8 Flash made 89 at `high`; 2.5 Pro made 6. Across the five `maximum` domains 3.5 Flash made 103 searches against 16. On Gemini 3 each search query is billed, $14 per 1,000 after the first 5,000 a month, which are free and shared across all Gemini 3 models; on 2.5 a call that searched is billed once, $35 per 1,000, whatever it searched. The cost report prices every query at list because a run cannot see the month's running count, so its estimate runs ahead of the bill until the allowance is spent (about 48 `maximum` runs at 103 queries). `low` is the level at which 3.5 Flash searches 20 times a call instead of 80.
+
+**Expected cost:** measured on 2026-09-27, one call each, tokens only: 3.5 Flash fact_check $0.03 at `low`, $0.13 at `medium` and $0.18 at `high`, against $0.06 for 2.5 Pro at a 16,000-token budget. A whole `maximum` review of the same draft, Gemini only, cost $0.46 on 2.5 Pro and $2.02 on 3.5 Flash at `high` (list price), of which $1.44 was search and $0.58 tokens. Earlier, from saved runs on the 2.5 models: `gemini-2.5-flash` median $0.023 per call and `gemini-2.5-pro` median $0.05, at drafts of 2,182–135,514 characters. Before any retries, a run makes one or two Gemini calls below `maximum` (fact_check, plus voice_style when a drafting model is excluded from that domain and gemini tops it up, as it does under `drafting_model: claude`) and five at `maximum`, one per domain.
 
 **Config:**
 ```yaml
 models:
-  gemini: gemini-2.5-flash
+  gemini: gemini-3.5-flash
 ```
 
 ---
@@ -128,9 +132,9 @@ This opens a browser to complete sign-in and stores credentials in your user pro
    models:
      gemini:
        provider: vertex_ai
-       model: gemini-2.5-flash
+       model: gemini-3.5-flash
        project: your-gcp-project-id
-       location: us-central1
+       location: us
        credentials_file: C:\Users\your-username\gcp-keys\my-project-vertex.json
    ```
 
@@ -141,20 +145,33 @@ pip install "google-auth>=2.22.0,<3.0"
 
 **What you need:**
 - GCP **project ID** — the unique identifier like `my-project-123`, not the display name. Find it in the project selector dropdown in the GCP console (smaller text below the project name, also visible in the browser URL).
-- Region (e.g. `us-central1`)
+- A location, optional (below): `us` by default for the 3.x models
 - ADC set up, or a service account JSON file
+
+**Location.** The models the presets run are not served everywhere. Google's [Deployments and endpoints](https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/locations) tables list the 3.x models at `global` and at the `us` and `eu` multi-region endpoints, and at no regional endpoint at all; the 2.5 models are the other way about, at every US region and `global`. A 3.x request sent to `us-central1` is a 404 (BerriAI/litellm#37989). So `location` is optional, and the pipeline chooses per model:
+
+| `location` | a 3.x model (every preset) | a 2.5 model |
+|---|---|---|
+| not set | `us` | `us-central1` (litellm's default) |
+| `us` | `us`: the US multi-region, which keeps machine-learning processing in the United States | `us-central1`, since 2.5 has no multi-region |
+| `global` | `global`: no control over where processing happens, and 10% cheaper | `global` |
+| `eu` | `eu` | `eu`, which 2.5 does not serve |
+| a US region, e.g. `us-central1` | `us`, with a warning, so a config written for 2.5 keeps working | as written |
+| any other region | as written (Google lists a few for these models) | as written |
+
+The `VERTEXAI_LOCATION` environment variable stands in for an unset `location`. The fallback models are chosen the same way, one attempt at a time. `ci-check` uses the same rules.
 
 **Config (ADC, no file needed):**
 ```yaml
 models:
   gemini:
     provider: vertex_ai
-    model: gemini-2.5-flash
+    model: gemini-3.5-flash
     project: your-gcp-project-id
-    location: us-central1
+    location: us
 ```
 
-**Billing:** The same per-token list prices as the AI Studio paid tier for 2.5 Pro, 2.5 Flash and 3.5 Flash (Vertex AI's pricing page lists them alike). Search grounding bills at the same rates on both too. The free daily allowance is where they differ: Vertex AI gives Gemini 2.5 Pro, which `thorough` and `maximum` run, 10,000 grounded prompts a day at no charge where AI Studio gives it 1,500, while 2.5 Flash and Flash-Lite share 1,500 a day on either. What a run costs is under **Expected cost** in the Gemini section above: a few cents at `wide`, and tens of cents at `maximum`.
+**Billing:** The `global` endpoint has the same per-token list prices as the AI Studio paid tier for 3.5 Flash, 3.5 Flash-Lite and the 2.5 models (the two pricing pages agree). **A non-global endpoint costs 10% more for Gemini 3 and later**, from 2026-07-01, which includes `us` and `eu`: 3.5 Flash is $1.65/$9.90 per million tokens there. The cost report does not model it, so a Vertex run of a 3.x model on `us` costs about 10% more than the report says. Search grounding bills at the same rates on both surfaces. The free allowance is where they differ for 2.5 Pro: Vertex AI gives it 10,000 grounded prompts a day at no charge where AI Studio gives it 1,500; the 3.x allowance is 5,000 queries a month on either. What a run costs is under **Expected cost** in the Gemini section above.
 
 **Retirement:** the 2.5 models are listed for retirement on Vertex AI on 2026-10-20; see **Retirement** above.
 

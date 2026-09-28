@@ -214,13 +214,20 @@ def _extract_gemini_text(candidate):
     )
 
 
+# Room for a reply on top of whatever the model thinks first. Thinking counts
+# against maxOutputTokens, and _extract_gemini_text raises when no text part
+# arrives, so a cap that a Gemini 3 model's thinking can eat reports a healthy
+# connection as failed. 64 was enough for gemini-2.5-flash on a one-word reply.
+_CHECK_MAX_OUTPUT_TOKENS = 512
+
+
 def check_gemini(api_key, model):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     resp = requests.post(
         url,
         json={
             "contents": [{"parts": [{"text": "Reply with the single word: ok"}]}],
-            "generationConfig": {"maxOutputTokens": 64},
+            "generationConfig": {"maxOutputTokens": _CHECK_MAX_OUTPUT_TOKENS},
         },
         timeout=30,
     )
@@ -231,6 +238,28 @@ def check_gemini(api_key, model):
         raise Exception("No candidates returned")
     reply = _extract_gemini_text(candidates[0])
     return f"model={model}, replied: {reply!r}"
+
+
+def _vertex_target(cfg):
+    """``(project, location, model, url)`` for a Vertex gemini config.
+
+    The location is the model's to choose, exactly as the client chooses it
+    (``ci_core.llm.vertex``): the 3.x models are served at `global` and the `us`
+    and `eu` multi-regions and at no region, the 2.5 models the other way about.
+    Building ``{location}-aiplatform.googleapis.com`` from the config's location
+    alone, as this did, made a 3.x model a 404 wherever user.yaml said
+    us-central1, and could not name the host of `global` or `us` at all.
+    """
+    from ci_core.llm import client, vertex
+
+    project = cfg.get("project", "")
+    model = client._resolve_model("gemini", None, cfg)
+    location = vertex.location_for(model, cfg.get("location")) or "us-central1"
+    url = (
+        f"https://{vertex.host(location)}/v1/projects/{project}"
+        f"/locations/{location}/publishers/google/models/{model}:generateContent"
+    )
+    return project, location, model, url
 
 
 def check_gemini_vertex(cfg):
@@ -244,9 +273,7 @@ def check_gemini_vertex(cfg):
             "Run: pip install 'google-auth>=2.22.0,<3.0'"
         )
 
-    project = cfg.get("project", "")
-    location = cfg.get("location", "us-central1")
-    model = cfg.get("model", "gemini-2.5-flash")
+    project, location, model, url = _vertex_target(cfg)
 
     if not project:
         raise Exception(
@@ -269,10 +296,6 @@ def check_gemini_vertex(cfg):
     auth_req = google.auth.transport.requests.Request()
     creds.refresh(auth_req)
 
-    url = (
-        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}"
-        f"/locations/{location}/publishers/google/models/{model}:generateContent"
-    )
     resp = requests.post(
         url,
         headers={
@@ -283,7 +306,7 @@ def check_gemini_vertex(cfg):
             "contents": [
                 {"role": "user", "parts": [{"text": "Reply with the single word: ok"}]}
             ],
-            "generationConfig": {"maxOutputTokens": 64},
+            "generationConfig": {"maxOutputTokens": _CHECK_MAX_OUTPUT_TOKENS},
         },
         timeout=30,
     )
@@ -511,7 +534,9 @@ def main():
 
     # Gemini — dispatch by provider
     gemini_cfg = models.get("gemini", {})
-    gemini_model = gemini_cfg.get("model", "gemini-2.5-flash")
+    from ci_core.llm import client
+
+    gemini_model = client._resolve_model("gemini", None, gemini_cfg)
     gemini_provider = gemini_cfg.get("provider", "ai_studio")
 
     if gemini_provider == "vertex_ai":

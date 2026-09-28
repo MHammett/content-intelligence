@@ -5292,6 +5292,136 @@ def run_publish_pipeline(
         sys.exit(1)
 
 
+def run_archive_only(
+    draft_path, publication_name, config_dir="configs", api_key_overrides=None
+):
+    """``--archive-only``: submit/verify Wayback snapshots for a draft's cited
+    URLs, with zero model-provider calls.
+
+    Every other way to touch the archiving machinery goes through a fact-check
+    claim first: ``--replay`` still runs Pass 3's citation *relevance*
+    checking (model calls) on the way to the archiving it does for free, and
+    there is no flag to isolate one pipeline pass the way ``--only-domain``
+    isolates one ensemble domain. This calls the same archiving primitives
+    directly instead of reimplementing pacing, dedupe-by-URL, staleness or the
+    outcome bookkeeping — ``wayback.check`` and
+    ``adapters.citation.resolver._submit_missing_archives`` are exactly what
+    Pass 3 calls, just fed synthetic per-URL entries instead of resolved
+    claims, and rendered with ``report_markdown``'s own archive-outcome prose
+    so the wording matches Section 9 exactly rather than a second copy of it.
+
+    URLs come from ``adapters.citation.draft_citations.DraftCitations``, read
+    directly off the whole file — the same citation-block parser Pass 3 uses
+    to find a claim's citation, just consulted for every URL in the block
+    instead of only the ones a claim cites.
+    """
+    text = _read_handoff_file(draft_path)
+    citations = draft_citations.DraftCitations(text)
+    if not citations:
+        print(
+            f"No citation block found in {draft_path} (looked for a heading like "
+            f"'## Sources' / '## Citations' / '## References'). Nothing to archive."
+        )
+        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+        return
+
+    targets = [
+        (marker, url)
+        for marker, entry in citations.entries.items()
+        for url in entry["urls"]
+    ]
+    if not targets:
+        print(
+            f"The citation block in {draft_path} has {citations.marker_count} "
+            f"entrie(s) but no URLs. Nothing to archive."
+        )
+        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+        return
+
+    unique_urls = {url for _, url in targets}
+    log.info(
+        "Archive-only: %d citation URL(s) found in %s (%d unique)",
+        len(targets),
+        draft_path,
+        len(unique_urls),
+    )
+
+    user_config = load_user_config(config_dir)
+    pub_config_raw = load_publication_config(publication_name, config_dir)
+    config = merge_configs(user_config, pub_config_raw)
+    if api_key_overrides:
+        config = apply_api_key_overrides(config, api_key_overrides)
+    api_keys = config["api_keys"]
+    capture_settings = config["pipeline"].get("wayback_capture")
+
+    # One check() per unique URL, not per marker — a source cited under two
+    # markers (or twice in one entry) gets checked once and each entry below
+    # gets its own copy of the result, never a shared dict two mutations could
+    # step on.
+    checked = {url: wayback.check(url) for url in unique_urls}
+    results = [
+        {"resolved": True, "url": url, "marker": marker, "wayback": dict(checked[url])}
+        for marker, url in targets
+    ]
+
+    from .adapters.citation.resolver import _submit_missing_archives
+
+    _submit_missing_archives(
+        results, api_keys.get("archive_org"), HISTORY_ROOT, capture_settings
+    )
+
+    from .report_markdown import _render_archive_pair
+
+    fresh = stale = missing = unchecked = 0
+    for entry in results:
+        print(f"\n[{entry['marker']}]")
+        for line in _render_archive_pair(entry):
+            print(line)
+
+        wb = entry.get("wayback") or {}
+        outcome = wb.get("archive_outcome")
+        if wb.get("snapshot_url"):
+            if wb.get("snapshot_stale"):
+                stale += 1
+            else:
+                fresh += 1
+            # _render_archive_pair shows a snapshot that exists and stops, so a
+            # stale one whose re-capture this run requested and did not get
+            # rendered exactly like one nobody asked about. For a mode whose whole
+            # job is that request, the outcome is the point. Seen in the first
+            # live run: one source printed only its 2024 snapshot flagged STALE,
+            # with no trace of what happened to the re-archive.
+            if outcome not in (None, wayback.ARCHIVE_ARCHIVED):
+                label = wayback.ARCHIVE_OUTCOME_LABELS.get(outcome, outcome)
+                detail = wb.get("archive_outcome_detail")
+                print(
+                    f"  - Re-archive attempt: {label}"
+                    f"{f' — {detail}' if detail else ''}. "
+                    f"The snapshot above is the one that exists."
+                )
+        elif wb.get("archived") is None:
+            # The lookup itself did not complete (breaker tripped, archive.org
+            # refused it). That establishes nothing about the page, and the
+            # second live run showed what counting it as "none" does: both
+            # sources printed "NOT CHECKED" above and the summary called them
+            # "0 with a snapshot, 2 with none".
+            unchecked += 1
+        else:
+            missing += 1
+
+    not_checked = (
+        f", {unchecked} not checked (the archive.org lookup did not complete, "
+        f"which says nothing about whether they are archived)"
+        if unchecked
+        else ""
+    )
+    print(
+        f"\n{len(results)} citation URL(s): {fresh} with a fresh Wayback snapshot, "
+        f"{stale} with only a stale one, {missing} with none{not_checked}."
+    )
+    print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -5451,6 +5581,17 @@ def build_parser():
         "with --replay for a run that makes no network calls at all.",
     )
     parser.add_argument(
+        "--archive-only",
+        action="store_true",
+        help="Submit/verify Wayback Machine snapshots for every URL in the draft's "
+        "own citation block ('## Sources' / '## Citations' / etc.), then exit. "
+        "Makes zero model-provider calls — only HTTP to archive.org, the same "
+        "check-then-submit-if-missing-or-stale machinery Pass 3 uses for a full "
+        "review, just run directly against the draft's URLs instead of behind "
+        "fact-check claim resolution. Costs nothing in provider terms. Requires "
+        "--draft or --raw-draft; mutually exclusive with --offline.",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable DEBUG logging"
     )
     return parser
@@ -5476,6 +5617,14 @@ def main():
         )
     if args.retry_failed and args.publish:
         parser.error("--retry-failed only applies to draft review runs, not --publish")
+
+    if args.archive_only and not (args.draft or args.raw_draft):
+        parser.error("--archive-only requires --draft or --raw-draft")
+    if args.archive_only and args.offline:
+        parser.error(
+            "--archive-only and --offline are mutually exclusive — archive-only's "
+            "entire job is the archive.org network calls --offline turns off."
+        )
 
     try:
         api_key_overrides = parse_api_key_overrides(args.api_key)
@@ -5511,7 +5660,14 @@ def main():
         sys.exit(1)
 
     try:
-        if args.draft:
+        if args.archive_only:
+            run_archive_only(
+                args.draft or args.raw_draft,
+                args.publication,
+                config_dir=args.config_dir,
+                api_key_overrides=api_key_overrides,
+            )
+        elif args.draft:
             run_draft_pipeline(
                 args.draft,
                 args.publication,

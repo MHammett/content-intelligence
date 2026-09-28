@@ -119,6 +119,74 @@ class TestProviderChecks:
         assert isinstance(msg, str) and msg
 
 
+class TestGeminiChecks:
+    """ci-check builds Vertex's request itself, so it has to choose the location
+    the way the client does (ci_core.llm.vertex): the 3.x models are served at
+    `global` and the `us` and `eu` multi-regions and at no region."""
+
+    @staticmethod
+    def _cfg(**overrides):
+        return {
+            "provider": "vertex_ai",
+            "project": "p",
+            "model": "gemini-3.5-flash",
+            **overrides,
+        }
+
+    def test_a_3x_model_with_no_location_is_checked_at_the_us_multi_region(self):
+        project, location, model, url = check_mod._vertex_target(self._cfg())
+        assert (project, location, model) == ("p", "us", "gemini-3.5-flash")
+        assert url == (
+            "https://aiplatform.us.rep.googleapis.com/v1/projects/p/locations/us/"
+            "publishers/google/models/gemini-3.5-flash:generateContent"
+        )
+
+    def test_a_us_region_is_corrected_as_the_client_corrects_it(self):
+        _, location, _, url = check_mod._vertex_target(
+            self._cfg(location="us-central1")
+        )
+        assert location == "us"
+        assert url.startswith("https://aiplatform.us.rep.googleapis.com/")
+
+    def test_global_has_a_host_of_its_own(self):
+        _, location, _, url = check_mod._vertex_target(self._cfg(location="global"))
+        assert location == "global"
+        assert url.startswith(
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/"
+        )
+
+    def test_a_2_5_model_keeps_its_region(self):
+        _, location, _, url = check_mod._vertex_target(
+            self._cfg(model="gemini-2.5-flash", location="europe-west4")
+        )
+        assert location == "europe-west4"
+        assert url.startswith("https://europe-west4-aiplatform.googleapis.com/")
+
+    def test_a_2_5_model_with_no_location_is_checked_at_us_central1(self):
+        _, location, _, url = check_mod._vertex_target(
+            self._cfg(model="gemini-2.5-flash")
+        )
+        assert location == "us-central1"
+        assert url.startswith("https://us-central1-aiplatform.googleapis.com/")
+
+    def test_a_config_with_no_model_checks_the_clients_default(self):
+        from ci_core.llm import client
+
+        cfg = self._cfg()
+        del cfg["model"]
+        _, _, model, _ = check_mod._vertex_target(cfg)
+        assert model == client._PROVIDERS["gemini"]["default_model"]
+
+    def test_the_reply_cap_leaves_room_for_a_3x_model_to_think(self):
+        """Thinking counts against maxOutputTokens, and a cap it eats leaves no
+        text part, which _extract_gemini_text reports as a failure."""
+        resp = _resp(200, {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]})
+        with patch.object(check_mod.requests, "post", return_value=resp) as post:
+            check_mod.check_gemini("k", "gemini-3.5-flash")
+        cap = post.call_args.kwargs["json"]["generationConfig"]["maxOutputTokens"]
+        assert cap >= 256
+
+
 class TestWordPressCheck:
     """The publishing credential — the one with real consequences."""
 

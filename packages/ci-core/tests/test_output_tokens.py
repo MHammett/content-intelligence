@@ -469,6 +469,13 @@ class TestAnEffortUnderTheWrongKeyIsWarned:
         assert f"gemini model gemini-2.5-pro sets {stray}: 'high'" in warning
         assert "it sends no effort, only thinking_budget" in warning
 
+    @pytest.mark.parametrize("stray", ["effort", "reasoning_effort"])
+    def test_a_gemini_3_model_is_pointed_at_thinking_level(self, stray):
+        (warning,) = self._warned("gemini", model="gemini-3.5-flash", **{stray: "high"})
+        assert f"gemini model gemini-3.5-flash sets {stray}: 'high'" in warning
+        assert "it sends no effort, only thinking_level" in warning
+        assert "minimal, low, medium or high" in warning
+
     def test_both_spellings_in_one_config_names_the_inert_one(self):
         """The ordinary way to meet it: a preset's `effort` beside a
         `reasoning_effort` left in user.yaml, or in preset_overrides."""
@@ -685,7 +692,9 @@ class TestASpellingLitellmRejectsIsWarned:
 class TestEveryEffortWarningComesThroughOneCall:
     """The call both loaders make, so a check added to it reaches both."""
 
-    def test_it_is_the_three_checks_in_order(self):
+    def test_it_is_every_check_in_order(self):
+        from ci_core.llm import vertex
+
         configs = {
             "claude": {
                 "model": "claude-opus-4-8",
@@ -693,14 +702,28 @@ class TestEveryEffortWarningComesThroughOneCall:
                 "reasoning_effort": "low",
             },
             "openai": {"model": "gpt-5.6-terra", "effort": "high"},
+            "gemini": {
+                "provider": "vertex_ai",
+                "model": "gemini-3.5-flash",
+                "location": "us-central1",
+                "thinking_budget": 16000,
+            },
         }
         got = ot.effort_warnings(configs)
         assert got == (
             ot.effort_none_warnings(configs)
             + ot.effort_key_warnings(configs)
             + ot.effort_spelling_warnings(configs)
+            + ot.gemini_thinking_warnings(configs)
+            + vertex.location_warnings(configs)
         )
-        assert [w.split(" model ")[0] for w in got] == ["claude", "openai", "claude"]
+        assert [w.split(" model ")[0].split(" ")[0] for w in got] == [
+            "claude",
+            "openai",
+            "claude",
+            "gemini",
+            "models.gemini.location",
+        ]
         assert "sets both effort: 'High'" in got[0]
         assert "is set to effort: 'High'" in got[2]
 
@@ -711,6 +734,78 @@ class TestEveryEffortWarningComesThroughOneCall:
             "gemini": {"model": "gemini-2.5-pro", "thinking_budget": 8192},
         }
         assert ot.effort_warnings(configs) == []
+
+    def test_a_gemini_3_config_that_runs_as_written_is_quiet(self):
+        configs = {
+            "gemini": {
+                "provider": "vertex_ai",
+                "model": "gemini-3.5-flash",
+                "location": "us",
+                "thinking_level": "high",
+            },
+        }
+        assert ot.effort_warnings(configs) == []
+
+
+class TestGeminiThinkingWarnings:
+    """Gemini 2.5 thinks by a budget and Gemini 3 by a level; the client sends
+    the one the model takes and drops the other. That it does is pinned in
+    test_llm_client.py; these cover who is warned."""
+
+    @staticmethod
+    def _warned(**cfg):
+        return ot.gemini_thinking_warnings({"gemini": cfg})
+
+    def test_a_budget_on_a_3x_model_is_named_as_dropped(self):
+        (warning,) = self._warned(model="gemini-3.5-flash", thinking_budget=16000)
+        assert "gemini model gemini-3.5-flash sets thinking_budget: 16000" in warning
+        assert "litellm drops the number" in warning
+        assert "thinking_level" in warning
+
+    @pytest.mark.parametrize("model", ["gemini-3.5-flash-lite", "gemini-3.8-flash"])
+    def test_every_3x_model_is_judged_alike(self, model):
+        assert len(self._warned(model=model, thinking_budget=2000)) == 1
+
+    def test_a_level_on_a_2_5_model_is_named_as_unsent(self):
+        (warning,) = self._warned(model="gemini-2.5-pro", thinking_level="high")
+        assert "gemini model gemini-2.5-pro sets thinking_level: 'high'" in warning
+        assert "thinking_budget" in warning
+
+    def test_a_level_that_is_not_one_is_named(self):
+        (warning,) = self._warned(model="gemini-3.5-flash", thinking_level="extreme")
+        assert "thinking_level: 'extreme'" in warning
+        assert "minimal, low, medium, high" in warning
+
+    @pytest.mark.parametrize("level", ["minimal", "low", "medium", "high", "HIGH"])
+    def test_a_level_on_a_3x_model_is_quiet(self, level):
+        assert self._warned(model="gemini-3.5-flash", thinking_level=level) == []
+
+    def test_a_budget_on_a_2_5_model_is_quiet(self):
+        assert self._warned(model="gemini-2.5-pro", thinking_budget=16000) == []
+
+    def test_the_model_a_config_leaves_out_is_the_clients_default(self):
+        """A config with no `model` calls the default, which is a 3.x model now,
+        so a budget on it is dropped."""
+        assert len(self._warned(thinking_budget=16000)) == 1
+
+    @pytest.mark.parametrize(
+        "configs",
+        [
+            None,
+            {},
+            {"gemini": "gemini-3.5-flash"},
+            {
+                "gemini": {
+                    "model": "gemini-3.5-flash",
+                    "thinking_budget": 1,
+                    "enabled": False,
+                }
+            },
+            {"openai": {"model": "gpt-5.6-terra", "thinking_budget": 1}},
+        ],
+    )
+    def test_a_config_it_cannot_judge_is_not_an_error(self, configs):
+        assert ot.gemini_thinking_warnings(configs) == []
 
 
 class TestTheModelsOwnLimit:

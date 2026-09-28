@@ -99,14 +99,41 @@ def _get_nested(d, *keys):
     return d
 
 
+#: Where the example configs actually live. They ship inside the package, and a
+#: checkout has no configs/ directory at all until something creates one, so the
+#: instruction these messages used to give -- "Copy configs/user.example.yaml to
+#: configs/user.yaml" -- named a path that has not existed since the repo became
+#: a uv workspace (3ae33d4, 2026-06-24). `ci-setup` is the remedy; the resolved
+#: path is printed alongside it for anyone who would rather copy the file by
+#: hand, and because in an installed wheel it is the only way to find these.
+_PACKAGED_CONFIGS = Path(__file__).parent / "configs"
+
+
+def _setup_command(config_dir, publication_name=None):
+    """The `ci-setup` invocation that scaffolds into *this* config directory."""
+    command = "uv run ci-setup"
+    if publication_name:
+        command += f" --publication {publication_name}"
+    if str(config_dir) != "configs":
+        command += f' --config-dir "{config_dir}"'
+    return command
+
+
+def _missing_user_config_message(path, config_dir):
+    return (
+        f"User config not found at {path}.\n"
+        f"Run `{_setup_command(config_dir)}` to create it from the shipped "
+        f"example and print what to fill in.\n"
+        f"To copy it by hand, the example is at\n"
+        f"  {_PACKAGED_CONFIGS / 'user.example.yaml'}\n"
+        "API keys can also be set as environment variables — see .env.example."
+    )
+
+
 def load_user_config(config_dir="configs"):
     path = Path(config_dir) / "user.yaml"
     if not path.exists():
-        raise FileNotFoundError(
-            f"User config not found at {path}.\n"
-            "Copy configs/user.example.yaml to configs/user.yaml and fill in your API keys.\n"
-            "API keys can also be set as environment variables — see .env.example."
-        )
+        raise FileNotFoundError(_missing_user_config_message(path, config_dir))
     config = _load_yaml(path)
     if not isinstance(config, dict):
         raise ValueError(f"{path} is empty or not a valid YAML mapping.")
@@ -153,11 +180,7 @@ def describe_api_key_sources(config_dir="configs", env_snapshot=None):
     snap = _ENV_SNAPSHOT if env_snapshot is None else env_snapshot
     path = Path(config_dir) / "user.yaml"
     if not path.exists():
-        raise FileNotFoundError(
-            f"User config not found at {path}.\n"
-            "Copy configs/user.example.yaml to configs/user.yaml and fill in your API keys.\n"
-            "API keys can also be set as environment variables — see .env.example."
-        )
+        raise FileNotFoundError(_missing_user_config_message(path, config_dir))
     raw = _load_yaml(path)
     if not isinstance(raw, dict):
         raise ValueError(f"{path} is empty or not a valid YAML mapping.")
@@ -207,8 +230,11 @@ def load_publication_config(publication_name, config_dir="configs"):
     if not path.exists():
         raise FileNotFoundError(
             f"Publication config not found at {path}.\n"
-            f"Create configs/{publication_name}.yaml based on configs/publication.example.yaml.\n"
-            "Example configs are in configs/examples/."
+            f"Run `{_setup_command(config_dir, publication_name)}` to create it "
+            f"from the shipped example and print what to fill in.\n"
+            f"To copy it by hand, the example is at\n"
+            f"  {_PACKAGED_CONFIGS / 'publication.example.yaml'}\n"
+            f"and filled-in ones are in\n  {_PACKAGED_CONFIGS / 'examples'}"
         )
     config = _load_yaml(path)
     if not isinstance(config, dict):
@@ -236,8 +262,8 @@ def _validate_routes(config):
             client.route(provider, model_cfg)
         except ValueError as e:
             raise ValueError(
-                f"User config: {e}\nSee configs/user.example.yaml, which shows "
-                f"each provider's endpoints."
+                f"User config: {e}\nSee {_PACKAGED_CONFIGS / 'user.example.yaml'}, "
+                f"which shows each provider's endpoints."
             ) from None
 
 
@@ -261,7 +287,8 @@ def _validate_user_config(config):
         raise ValueError(
             "User config is missing required fields:\n"
             + "\n".join(f"  {m}" for m in missing)
-            + "\nSee configs/user.example.yaml for the expected structure."
+            + f"\nSee {_PACKAGED_CONFIGS / 'user.example.yaml'} for the expected "
+            "structure."
         )
 
 
@@ -647,7 +674,8 @@ def _apply_preset_overrides(pipeline_cfg, models_raw):
     if not isinstance(overrides, dict):
         raise ValueError(
             "pipeline.preset_overrides must be a mapping of provider names to "
-            "their override settings.  See configs/user.example.yaml for examples."
+            f"their override settings.  See {_PACKAGED_CONFIGS / 'user.example.yaml'} "
+            "for examples."
         )
 
     merged = dict(models_raw or {})

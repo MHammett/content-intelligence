@@ -66,7 +66,10 @@ upstream: the credit-exhaustion classification above; litellm's per-provider
 parameter allowlist rejecting ``reasoning_effort`` for Mistral even though the
 model accepts it (see :func:`_provider_params`); and ``responses()`` faking the
 stream for any model its map does not list, as almost every Azure deployment is
-(see :func:`_stream_azure_deployment` and UPSTREAM.md #9).
+(see :func:`_stream_azure_deployment` and UPSTREAM.md #9). An Azure deployment
+is registered so it streams; a model on openai.com is refused before the request
+goes out instead, because there the map is the only account of whether the model
+streams at all (see :func:`_refuse_fake_stream`).
 
 Importing litellm
 -----------------
@@ -121,6 +124,7 @@ from .. import text_repair
 from . import cache as cache_mod
 from . import output_tokens
 from . import schema as schema_mod
+from . import vertex
 from .json_utils import extract_json_with_salvage
 from .tokens import normalize_tokens
 
@@ -226,6 +230,8 @@ _RETRYABLE_STATUS = (429, 500, 502, 503, 504)
 # would hide the next parameter mismatch instead of surfacing it.
 _SENDS_TEMPERATURE = frozenset({"gemini", "mistral", "grok", "perplexity"})
 _TEMPERATURE = 0.2
+# Gemini 3 and later are the exception, see _temperature: Google says to leave
+# theirs at the default, 1.0.
 
 # Providers that accept `response_format: {"type": "json_object"}`, i.e. the
 # provider itself guarantees parseable JSON rather than the prompt merely asking
@@ -294,8 +300,15 @@ _PROVIDERS = {
     "gemini": {
         "prefix": "gemini/",
         "surface": "completion",
-        "default_model": "gemini-2.5-flash",
-        "fallbacks": ["gemini-2.5-flash-lite"],
+        # Google's named replacement for gemini-2.5-flash. All three 2.5 models
+        # are listed to retire on Vertex AI on 2026-10-20 (Google Cloud's model
+        # lifecycle page, read 2026-09-19); the Gemini API lists no date.
+        "default_model": "gemini-3.5-flash-lite",
+        # The chain skips the requested model, so each tier's primary leaves
+        # the other one. 3.1 Flash-Lite is already scheduled to shut down on the
+        # Gemini API on 2027-05-07, with 3.5 Flash-Lite as its replacement, so
+        # it is a last resort and this list wants revisiting by then.
+        "fallbacks": ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
         "read_timeout": GROUNDED_READ_TIMEOUT,
     },
     "mistral": {
@@ -355,12 +368,17 @@ PROVIDERS = tuple(_PROVIDERS)
 # opens itself. Whatever is left unset falls through to litellm's own defaults:
 # the VERTEXAI_PROJECT, VERTEXAI_LOCATION and VERTEXAI_CREDENTIALS variables,
 # then the project named in the credentials, us-central1, and Application
-# Default Credentials (the old adapter's fallback too). A location that is set
-# is sent as given unless litellm's model map lists supported_regions for the
-# model, in which case litellm quietly swaps it for the first of those; neither
-# litellm 1.96.2's bundled map nor its live one (checked 2026-09-20) lists any
-# for a gemini model. The request body, grounding tool included, is built by
-# the same transformation as AI Studio's.
+# Default Credentials (the old adapter's fallback too). The request body,
+# grounding tool included, is built by the same transformation as AI Studio's.
+#
+# The location is the model's to choose, see ci_core.llm.vertex: the 3.x models
+# are served at `global` and the `us` and `eu` multi-regions and at no regional
+# endpoint, the 2.5 models the other way about. litellm sends a location as
+# given and swaps it only for a model whose map entry lists supported_regions,
+# which no gemini entry does (checked 2026-09-19 against 1.96.2's bundled map and
+# the live one), so an unset location on a 3.x model would be litellm's
+# us-central1 and a 404. `location_for` supplies `us`, per attempt, so a
+# fallback that is a different generation goes where it is served.
 #
 # Azure, for openai: litellm's azure/ route on responses(), the surface openai
 # must stay on (see the module docstring). Azure routes on the deployment, not
@@ -520,7 +538,123 @@ def _stream_azure_deployment(deployment, model):
         _azure_streaming.add(key)
 
 
-def _route_kwargs(provider, api_key, cfg):
+class FakeStreamRefused(Exception):
+    """A ``responses()`` call never sent, because litellm's map cannot support it.
+
+    Raised for both answers that map gives: a model whose stream litellm would
+    fake, and a bare name it cannot route at all — one remedy away from the
+    other, since the prefix litellm's routing error recommends is what turns the
+    second into the first.
+
+    No HTTP status, deliberately: this is a misconfigured model, not a provider
+    fault, so ``_with_retry`` does not retry it and ``call`` does not walk the
+    fallback chain over it. It reaches the pipeline as a failed call whose
+    ``error`` says what to change.
+    """
+
+
+def _model_map_source():
+    """Which model map litellm loaded, in words an error message can use.
+
+    Worth naming, because it is decided per process and not by this repo:
+    litellm fetches the live map at import and falls back to the copy in its
+    wheel when that 5s fetch fails. ``get_model_cost_map_source_info`` is
+    litellm's own record of which happened — an internal, so a message never
+    depends on it being there.
+    """
+    try:
+        from litellm.litellm_core_utils.get_model_cost_map import (
+            get_model_cost_map_source_info,
+        )
+
+        info = get_model_cost_map_source_info()
+    except Exception:  # pragma: no cover - litellm internals moved
+        return "litellm's model map"
+    if info.get("source") == "remote":
+        return "the model map litellm fetched at import"
+    reason = info.get("fallback_reason")
+    if reason:
+        return f"litellm's bundled model map (the live one failed: {reason})"
+    return "litellm's bundled model map"
+
+
+def _refuse_fake_stream(name):
+    """Raise before sending a ``responses()`` call litellm would not stream.
+
+    ``name`` is the model as litellm receives it (see :func:`_qualified`).
+    litellm streams natively only when its model map says the model does;
+    otherwise ``responses(stream=True)`` sends ONE non-streaming request and
+    replays the finished answer through ``MockResponsesAPIStreamingIterator``
+    (UPSTREAM.md #9). Nothing arrives while the model works, so the first-byte
+    allowance cuts the call off and reports a timeout — which reads as "the
+    provider got slow" and sends the operator to raise ``stream_read_timeout``,
+    the one change that hides the stall detector instead of fixing anything.
+
+    Measured 2026-09-27 on litellm 1.96.2, ``httpx.Client.send`` recorded,
+    nothing sent to a provider:
+
+      * ``gpt-5.6-luna`` and ``gpt-5.6-sol`` -> ``"stream": true`` in the body
+        and ``send(stream=True)``. Every model presets.yaml names, and both
+        fallbacks, answer that they stream natively; the test named below is
+        what holds them to it;
+      * ``gpt-5-pro`` -> no ``"stream"`` in the body, from a bare name, under
+        both maps. It and ``o1-pro`` (with their dated ids) are the only openai
+        models either map marks ``supports_native_streaming: false``;
+      * ``openai/gpt-5.7-nova``, listed by neither -> faked under the bundled
+        map, streamed under the live one, whose
+        ``openai-reasoning-family-baseline`` rule answers for gpt-5..9 names the
+        map itself has not caught up with. Same config, different behaviour,
+        decided by whether one HTTP GET succeeded at import;
+      * bare ``gpt-5.7-nova`` -> nothing sent at all. litellm cannot route a
+        name its map does not list, and the error it raises ("LLM Provider NOT
+        provided ... Pass model as E.g. ...") advises exactly the ``openai/``
+        prefix that makes it fake the stream instead.
+
+    So this asks litellm, per call, the question ``responses()`` is about to ask
+    it, and refuses before anything is sent. What presets.yaml ships is checked
+    against the bundled map in CI too — ci-article-review's
+    ``test_preset_native_streaming.py`` — but no test can settle a map that is
+    fetched at runtime, or a model named in user.yaml.
+
+    Refusing, rather than registering the model as
+    :func:`_stream_azure_deployment` does: a deployment name is never in the
+    map, so registering is the only way an Azure call can stream at all, while
+    for a model on openai.com the map is the only account there is of whether it
+    streams — and for ``gpt-5-pro`` it says no. Not a workaround to delete when
+    UPSTREAM.md #9 lands: the fix proposed there leaves those models faked, and
+    leaves a bare unlisted name unroutable.
+    """
+    litellm = _litellm()
+    try:
+        model, provider, _, _ = litellm.get_llm_provider(model=name)
+    except Exception as exc:
+        raise FakeStreamRefused(
+            f"litellm cannot route model {name!r}: {_model_map_source()} does not "
+            f"list it, and that map is where litellm learns which models are "
+            f"openai's. Nothing was sent. Name a model the map lists, or upgrade "
+            f"litellm. Do not prefix this one with 'openai/' to get past it: "
+            f"litellm would route it and then fake its stream (UPSTREAM.md #9)."
+        ) from exc
+    if litellm.utils.supports_native_streaming(
+        model=model, custom_llm_provider=provider
+    ):
+        return
+    try:
+        litellm.get_model_info(model=model, custom_llm_provider=provider)
+        verdict = "marks it as not streaming natively"
+    except Exception:  # litellm raises a bare Exception for an unmapped model
+        verdict = "does not list it"
+    raise FakeStreamRefused(
+        f"litellm would fake the stream for model {name!r}: "
+        f"{_model_map_source()} {verdict}. It would send one non-streaming "
+        f"request and replay the answer once the model had finished, so nothing "
+        f"would arrive while it worked and stream_read_timeout would cut the call "
+        f"off. Nothing was sent. Name a model litellm streams natively "
+        f"(UPSTREAM.md #9)."
+    )
+
+
+def _route_kwargs(provider, api_key, cfg, model=None):
     """Where one request goes and how it authenticates, as litellm keyword
     arguments.
 
@@ -529,6 +663,9 @@ def _route_kwargs(provider, api_key, cfg):
     1.96.2 ignores a key on that route and sends its own Bearer token, but a key
     that never reaches litellm cannot turn up in a Vertex request whatever a
     later release does with one. Azure adds the endpoint and an API version.
+
+    ``model`` is the model this attempt calls, which is a fallback's once the
+    chain has moved on: on Vertex the location depends on it (``vertex.location_for``).
 
     Raises ``FileNotFoundError`` when ``credentials_file`` names no file. litellm
     would read the path as inline JSON instead and report "Unable to load vertex
@@ -544,8 +681,9 @@ def _route_kwargs(provider, api_key, cfg):
     kwargs = {"api_key": None}
     if cfg.get("project"):
         kwargs["vertex_project"] = cfg["project"]
-    if cfg.get("location"):
-        kwargs["vertex_location"] = cfg["location"]
+    location = vertex.location_for(model, cfg.get("location"))
+    if location:
+        kwargs["vertex_location"] = location
     path = cfg.get("credentials_file")
     if path:
         if not os.path.isfile(path):
@@ -917,6 +1055,34 @@ def _thinks_adaptively(effort, model):
     return output_tokens.effort_when_unset("claude", model) is not None
 
 
+def _temperature(provider, model, cfg):
+    """The temperature this request sends, or None to send none.
+
+    ``_TEMPERATURE`` for the providers in ``_SENDS_TEMPERATURE``, except Gemini 3
+    and later, which send none: Google's Gemini 3 guide says "we strongly
+    recommend keeping the temperature parameter at its default value of 1.0"
+    and that a lower one "may lead to unexpected behavior, such as looping or
+    degraded performance, particularly in complex mathematical or reasoning
+    tasks". litellm supplies 1.0 when none is sent, and logs a warning on every
+    call that sends less. What 0.2 bought on 2.5 was repeatability, and this
+    pipeline's runs repeat little at any temperature (about a quarter of a run's
+    findings come back on a rerun), so the model's own setting is the default.
+
+    A gemini config may name one, for either generation (``temperature``). A
+    cost preset rebuilds the model config and keeps only the infrastructure keys,
+    so it is written under ``pipeline.preset_overrides`` to survive one.
+    """
+    if provider not in _SENDS_TEMPERATURE:
+        return None
+    cfg = cfg or {}
+    if provider == "gemini":
+        if cfg.get("temperature") is not None:
+            return float(cfg["temperature"])
+        if vertex.is_modern(_resolve_model(provider, model, cfg)):
+            return None
+    return _TEMPERATURE
+
+
 def _provider_params(provider, cfg, response_schema=None, model=None):
     """Per-provider request parameters drawn from the model config.
 
@@ -936,9 +1102,27 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
         # Search grounding. This is the entire reason gemini is in the fact_check
         # ensemble; without it the model is answering from training recall.
         params["tools"] = [{"googleSearch": {}}]
-        budget = cfg.get("thinking_budget")
-        if budget is not None:
-            params["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
+        if vertex.is_modern(_resolve_model(provider, model, cfg)):
+            # Gemini 3 and later think by level, not by budget. litellm turns
+            # `reasoning_effort` into thinkingConfig {thinkingLevel,
+            # includeThoughts}, and includeThoughts is what streams the model's
+            # thought summaries while it thinks, so the wait is not silent.
+            #
+            # `thinking_budget` is never sent to these. litellm discards the
+            # number for a gemini-3 model and sends {includeThoughts: true}
+            # alone, so the model would think at Google's default level while
+            # the config read as a budget; and sent beside a level, litellm
+            # refuses the request itself (Google's guide says it would answer
+            # 400). Checked on the wire against litellm 1.96.2, 2026-09-19; the
+            # source reads the same through 1.103-dev. Config load warns about
+            # the key (output_tokens.gemini_thinking_warnings).
+            level = cfg.get("thinking_level")
+            if level:
+                params["reasoning_effort"] = str(level).strip().lower()
+        else:
+            budget = cfg.get("thinking_budget")
+            if budget is not None:
+                params["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
 
     elif provider == "claude":
         budget = cfg.get("thinking_budget")
@@ -1922,10 +2106,13 @@ def _attempt(
     streams = []
 
     def _invoke():
-        # Ahead of the timing record, so a missing service-account file fails
-        # before any request is made, and is not recorded as a stream that
-        # died. It carries no status, so it is not retried either.
-        routing = _route_kwargs(provider, api_key, cfg)
+        # Ahead of the timing record, so a missing service-account file — or a
+        # model litellm would answer with a fake stream — fails before any
+        # request is made, and is not recorded as a stream that died. Neither
+        # carries a status, so neither is retried.
+        routing = _route_kwargs(provider, api_key, cfg, model)
+        if spec["surface"] == "responses":
+            _refuse_fake_stream(_qualified(provider, model, cfg))
         # Started before litellm is called, so no wait for the provider goes
         # unmeasured — including the one inside completion() itself, which is
         # bounded by the socket timeout rather than by _iter_with_gap.
@@ -2005,8 +2192,9 @@ def _attempt(
                 _litellm().responses(**kwargs), first_byte, gap, timing
             )
 
-        if provider in _SENDS_TEMPERATURE:
-            params.setdefault("temperature", _TEMPERATURE)
+        temperature = _temperature(provider, model, cfg)
+        if temperature is not None:
+            params.setdefault("temperature", temperature)
 
         # A cacheable prefix, where the provider needs telling where it ends.
         # Anthropic caches nothing without this; the rest either cache

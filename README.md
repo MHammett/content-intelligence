@@ -500,6 +500,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--expand` | Add the **expansion pass**: a sixth review domain that proposes additional sources, topics, angles and data fitting the draft's existing primary claim, instead of judging what is already there. Its output is SECTION 10, and every URL it proposes is fetched and marked resolved or not. Off by default — it costs extra model calls, and it earns them early in a draft rather than on a final revision. See [Expansion pass](#expansion-pass). |
 | `--no-seo-suggestions` | Skip both SEO model calls for this run — the [metadata suggestions](docs/CONFIGURATION.md#seo-suggestions) (focus keyword candidates, meta description, OG title, OG description, schema type) and the [structure review](docs/CONFIGURATION.md#seo-structure-review). Deterministic on-page checks still run. Permanent off: `seo_rules.suggestions` / `seo_rules.content_review`. |
 | `--retry-failed RESULTS_JSON` | Fill in the gaps from a prior run: make model calls only for the (model, domain) pairs marked failed in a `run_N_results.json`, merging the new attempts onto everything that already succeeded. Requires the same draft-loading flags (`--draft`/`--url`/`--raw-draft`) as the original run. Mutually exclusive with `--replay`, which makes no model calls at all. |
+| `--archive-only` | Submit/verify Wayback snapshots for every URL in the draft's own citation block, then exit — zero model-provider calls, only HTTP to archive.org. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`. See [Archiving citations without the rest of the pipeline](#archiving-citations-without-the-rest-of-the-pipeline). |
 | `--verbose`, `-v` | DEBUG logging |
 
 **Calibration flags** (for measuring/tuning timeouts — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#wall-clock-backstop-is-automatic-sliding-scale)):
@@ -531,6 +532,16 @@ uv run ci-review --draft handoff.md --publication mypub --cost-preset maximum --
 ```
 
 > On Windows `cmd.exe`, keep the whole command on one line — backslash line-continuation is a bash feature and will split the command.
+
+### Archiving citations without the rest of the pipeline
+
+Every other way to reach the Wayback archiving machinery runs it behind fact-check claim resolution: `--replay` on its own still resolves citations and checks links on the way to archiving them (adding `--offline` skips citation resolution entirely instead, so Section 9 comes back empty), and `--only-domain` only isolates an ensemble domain, not a pipeline pass. `--archive-only` calls the archiving primitives directly instead — no ensemble, no SEO calls, no citation *relevance* checking, so it makes zero model-provider calls and costs nothing in provider terms:
+
+```powershell
+uv run ci-review --raw-draft handoff.md --publication mypub --archive-only
+```
+
+It reads every URL out of the draft's own citation block (`## Sources` / `## Citations` / etc. — whatever heading [docs/CITATIONS.md](docs/CITATIONS.md) documents), checks each one's current Wayback status, and submits the ones that are missing or stale — the same dedupe-by-URL, pacing and outcome bookkeeping a normal run's Pass 3 uses, just run directly against the draft's URLs instead of only the ones a resolved fact-check claim cites. Each URL's outcome prints in the same wording Section 9 uses, ending with `Estimated cost: $0.0000 (no model calls)` so it's never mistaken for a real spend line. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`, which turns off the very network calls this flag exists to make.
 
 ---
 
@@ -856,6 +867,9 @@ content-intelligence/
 │   │   │   │   │                      completion(), OpenAI through responses(),
 │   │   │   │   │                      all streaming under a first-byte allowance
 │   │   │   │   │                      plus an independent stall detector
+│   │   │   │   ├── vertex.py          where a Gemini model is served on Vertex AI:
+│   │   │   │   │                      3.x at `global` and the `us`/`eu` multi-regions
+│   │   │   │   │                      only, 2.5 at the US regions; defaults to `us`
 │   │   │   │   ├── cache.py           marks the cacheable prefix in each provider's
 │   │   │   │   │                      own terms (Anthropic caches nothing without it)
 │   │   │   │   ├── schema.py          puts a caller's JSON schema on the wire in each

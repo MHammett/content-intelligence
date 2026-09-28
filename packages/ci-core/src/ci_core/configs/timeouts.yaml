@@ -125,7 +125,7 @@ size_multipliers:
 # is large and variable by domain, and isn't captured by a reasoning-effort knob.
 #
 # WHY SOME OF THESE LOOK ABSURD (gemini 4.0, sonar 7.0, grok 2.0): those three
-# providers have no reasoning_effort parameter at all — gemini uses thinking_budget,
+# providers have no reasoning_effort parameter at all — gemini uses thinking_level (3.x) or thinking_budget (2.5),
 # grok selects reasoning by model name, perplexity has no knob — so they fall through
 # to effort_multipliers.default (1.0) and their model multiplier ends up carrying the
 # reasoning cost as well as the model cost. The number is doing two jobs. Don't
@@ -177,7 +177,7 @@ model_multipliers:
 
 # From reasoning_effort / effort in the model config. Calibration showed effort is
 # the steep, dominant axis: same model, none→high was ~5×. Models with no reasoning
-# param (grok reasoning variant, gemini thinking_budget, perplexity) use 'default'.
+# param (grok reasoning variant, gemini thinking_level/thinking_budget, perplexity) use 'default'.
 # A claude model that thinks with no effort set (claude-opus-5, claude-sonnet-5)
 # does not: it runs at high, the API default, and is sized as high — see
 # _EFFORT_WHEN_UNSET in ci_core/llm/output_tokens.py.
