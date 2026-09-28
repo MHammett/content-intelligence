@@ -52,8 +52,11 @@ def dotenv_file(tmp_path):
 
 class TestDescribeApiKeySources:
     def test_missing_user_yaml_raises_with_setup_instructions(self, tmp_path):
-        with pytest.raises(FileNotFoundError, match="user.example.yaml"):
+        with pytest.raises(FileNotFoundError, match="ci-setup") as excinfo:
             describe_api_key_sources(str(tmp_path), env_snapshot=snapshot(None))
+        # The example ships in the package; the message names its real path.
+        # test_config_data.py asserts that path exists.
+        assert "user.example.yaml" in str(excinfo.value)
 
     def test_non_mapping_yaml_raises(self, tmp_path):
         (tmp_path / "user.yaml").write_text("- just\n- a\n- list\n", encoding="utf-8")

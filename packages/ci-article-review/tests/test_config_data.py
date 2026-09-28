@@ -601,3 +601,80 @@ class TestAuthorNameIsADeclaredPublicationKey:
 # deliberately reversed rather than moved — an unrelated custom key such as
 # `author_bio` used to be explicitly allowed and is now rejected, with `x_` as
 # the way to keep one on purpose. See tests/test_publication_config_strictness.py.
+
+
+class TestMissingConfigMessagesNameRealPaths:
+    """The errors a first run hits have to name paths that are actually there.
+
+    They used to say "Copy configs/user.example.yaml to configs/user.yaml" and
+    "based on configs/publication.example.yaml". The examples moved into the
+    package when the repo became a uv workspace (3ae33d4, 2026-06-24) and no
+    repo-root `configs/` has shipped since, so those instructions named files
+    that do not exist — in the one state that raises them, where there is no
+    `configs/` directory either. The paths are resolved from the package now,
+    which is what these tests can check and a hardcoded string could not.
+    """
+
+    @staticmethod
+    def _raised(call):
+        with pytest.raises(FileNotFoundError) as excinfo:
+            call()
+        return str(excinfo.value)
+
+    @staticmethod
+    def _named_paths(message):
+        """Every path the message prints, one per indented continuation line."""
+        from pathlib import Path
+
+        return [
+            Path(line.strip())
+            for line in message.splitlines()
+            if line.startswith("  ") and line.strip()
+        ]
+
+    def test_the_user_config_message_names_the_packaged_example(self, tmp_path):
+        from ci_article_review.config_loader import load_user_config
+
+        message = self._raised(lambda: load_user_config(str(tmp_path)))
+        named = self._named_paths(message)
+        assert named, f"names no path to copy:\n{message}"
+        assert all(p.is_file() for p in named), message
+        assert "uv run ci-setup" in message
+
+    def test_the_key_source_diagnostic_gives_the_same_instructions(self, tmp_path):
+        """`ci-check --show-keys` reads user.yaml itself, so it raises its own."""
+        from ci_article_review.config_loader import describe_api_key_sources
+        from ci_core.env_provenance import snapshot
+
+        message = self._raised(
+            lambda: describe_api_key_sources(str(tmp_path), env_snapshot=snapshot(None))
+        )
+        named = self._named_paths(message)
+        assert named, f"names no path to copy:\n{message}"
+        assert all(p.is_file() for p in named), message
+        assert "uv run ci-setup" in message
+
+    def test_the_publication_config_message_names_the_packaged_example(self, tmp_path):
+        from ci_article_review.config_loader import load_publication_config
+
+        message = self._raised(lambda: load_publication_config("mypub", str(tmp_path)))
+        named = self._named_paths(message)
+        assert named, f"names no path to copy:\n{message}"
+        assert all(p.exists() for p in named), message
+        assert "uv run ci-setup --publication mypub" in message
+
+    def test_the_printed_command_scaffolds_where_the_config_was_looked_for(
+        self, tmp_path, monkeypatch
+    ):
+        """`ci-setup` writes into configs/ unless told otherwise, so a custom
+        config dir has to reach the command the message prints — and the default
+        one has to leave the flag off."""
+        from ci_article_review.config_loader import load_user_config
+
+        custom = self._raised(lambda: load_user_config(str(tmp_path)))
+        assert f'--config-dir "{tmp_path}"' in custom, custom
+
+        monkeypatch.chdir(tmp_path)
+        default = self._raised(load_user_config)
+        assert "--config-dir" not in default, default
+        assert "`uv run ci-setup`" in default, default
