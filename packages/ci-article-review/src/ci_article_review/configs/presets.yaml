@@ -197,10 +197,13 @@
 # a stall written as a lower bound (`>120.02s`), never as the budget. The same
 # values, with the budgets in force, are in each report's
 # api_call_log[].stream_timing, including the streams of calls the recovery
-# pass later got back. The experiment itself has not been run. Nothing here is
-# changed until it has — this file's perplexity entry is the standing reminder
-# of what guessing costs (160 -> 280 -> 350 -> 500, three bumps that each looked
-# marginal within days).
+# pass later got back. Stage 0 of that experiment — grok alone — HAS been run
+# (2026-09-18, 28 streams, raw data in pipeline_history/_experiments/
+# 2026-09-18-stage0-grok-silences/), and grok's entries below are sized from it.
+# The other providers' stages have not, so nothing else here is set from a
+# measurement of these two knobs; this file's perplexity entry is the standing
+# reminder of what guessing costs instead (160 -> 280 -> 350 -> 500, three bumps
+# that each looked marginal within days).
 #
 # OpenAI: originally hit this hard — gpt-5.5 at xhigh failed 5/5 calls at ~121s
 # with 0 output tokens against the default 120s read-gap under Chat Completions,
@@ -368,6 +371,29 @@ thorough:
       reasoning_effort: high   # what unset already resolved to; stated so the
                                # tier says what it does. xhigh exists and is
                                # unmeasured, so it is not reached for here.
+      # FIRST-BYTE, measured rather than guessed: stage 0 of the concurrency
+      # experiment described at the top of this file (2026-09-18) ran 28 grok
+      # streams on a 28,746-char draft with 900s budgets, so no silence was cut
+      # off by a budget. Nine ran past the stock 120s default before any output
+      # and every one of them then completed — slow, not dead. The worst was
+      # 354.1s on argument_integrity, with red_team at 348.1s and fact_check at
+      # 303.9s; voice_style and completeness never passed 76s. Under the default
+      # all nine would have been killed.
+      #
+      # 500 and not 360-something, for two reasons. The measurement ran grok
+      # alone with at most 5 calls in flight, and these silences track fan-out,
+      # which this tier and `maximum` take further. And it is the same value,
+      # reached the same way, as the perplexity entry above, whose worst
+      # observed silence was the same ~354s. It still leaves room for the one
+      # retry: the slowest healthy grok call measured 447.1s end to end, so a
+      # stall at 500 plus the 10s retry delay plus a full retry is ~957s, inside
+      # the 1085s wall-clock backstop grok gets at task_timeout_seconds: 1100.
+      #
+      # stream_gap_timeout is deliberately NOT set: once grok starts emitting it
+      # does not pause — the worst inter-chunk gap over all 28 streams was 0.4s.
+      # `balanced` runs grok at effort low, which was not measured, so it keeps
+      # the default as well.
+      stream_read_timeout: 500
     claude:
       model: claude-sonnet-5   # was claude-opus-5 until 2026-09-08 — see note below
       effort: high
@@ -473,6 +499,11 @@ maximum:
       reasoning_effort: high   # what unset already resolved to; stated so the
                                # tier says what it does. xhigh exists and is
                                # unmeasured, so it is not reached for here.
+      stream_read_timeout: 500   # the same measurement as the thorough tier's
+                                  # grok entry above, which carries the numbers.
+                                  # This tier fans out furthest — 29 calls — and
+                                  # fan-out is the axis those silences track, so
+                                  # if either tier needs it, this one does.
       # xAI Live Search is real and works — asked for the newest litellm release
       # on PyPI, grok said "I do not know" without it and answered with a cited
       # version with it. NOT enabled here because litellm cannot currently send

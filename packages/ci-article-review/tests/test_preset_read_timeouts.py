@@ -83,9 +83,11 @@ def _timeout_handed_to_litellm(provider, model_cfg):
 _DECLARED_OVERRIDES = [
     ("thorough", "mistral", 200),
     ("thorough", "perplexity", 500),
+    ("thorough", "grok", 500),
     ("maximum", "gemini", 260),
     ("maximum", "mistral", 200),
     ("maximum", "perplexity", 500),
+    ("maximum", "grok", 500),
 ]
 
 
@@ -111,8 +113,11 @@ def test_preset_override_reaches_the_socket(preset, provider, expected):
         # phase, live-verified against xhigh with a worst gap of ~8s.
         ("thorough", "openai", 120),
         ("maximum", "openai", 120),
-        # Grok has never needed one.
-        ("maximum", "grok", 120),
+        # Grok carries one at thorough and maximum, where it runs at effort
+        # high — 354.1s of silence measured before output, and the call then
+        # completed. `balanced` runs it at low, which that experiment did not
+        # measure, so that tier is left on the default deliberately.
+        ("balanced", "grok", 120),
         # Claude has never needed one.
         ("maximum", "claude", 120),
         # Gemini at thorough is grounded but has no thinking budget stacked on
