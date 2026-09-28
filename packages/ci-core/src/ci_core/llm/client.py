@@ -66,7 +66,10 @@ upstream: the credit-exhaustion classification above; litellm's per-provider
 parameter allowlist rejecting ``reasoning_effort`` for Mistral even though the
 model accepts it (see :func:`_provider_params`); and ``responses()`` faking the
 stream for any model its map does not list, as almost every Azure deployment is
-(see :func:`_stream_azure_deployment` and UPSTREAM.md #9).
+(see :func:`_stream_azure_deployment` and UPSTREAM.md #9). An Azure deployment
+is registered so it streams; a model on openai.com is refused before the request
+goes out instead, because there the map is the only account of whether the model
+streams at all (see :func:`_refuse_fake_stream`).
 
 Importing litellm
 -----------------
@@ -533,6 +536,122 @@ def _stream_azure_deployment(deployment, model):
             served.setdefault("supports_native_streaming", True)
             litellm.register_model({key: served})
         _azure_streaming.add(key)
+
+
+class FakeStreamRefused(Exception):
+    """A ``responses()`` call never sent, because litellm's map cannot support it.
+
+    Raised for both answers that map gives: a model whose stream litellm would
+    fake, and a bare name it cannot route at all — one remedy away from the
+    other, since the prefix litellm's routing error recommends is what turns the
+    second into the first.
+
+    No HTTP status, deliberately: this is a misconfigured model, not a provider
+    fault, so ``_with_retry`` does not retry it and ``call`` does not walk the
+    fallback chain over it. It reaches the pipeline as a failed call whose
+    ``error`` says what to change.
+    """
+
+
+def _model_map_source():
+    """Which model map litellm loaded, in words an error message can use.
+
+    Worth naming, because it is decided per process and not by this repo:
+    litellm fetches the live map at import and falls back to the copy in its
+    wheel when that 5s fetch fails. ``get_model_cost_map_source_info`` is
+    litellm's own record of which happened — an internal, so a message never
+    depends on it being there.
+    """
+    try:
+        from litellm.litellm_core_utils.get_model_cost_map import (
+            get_model_cost_map_source_info,
+        )
+
+        info = get_model_cost_map_source_info()
+    except Exception:  # pragma: no cover - litellm internals moved
+        return "litellm's model map"
+    if info.get("source") == "remote":
+        return "the model map litellm fetched at import"
+    reason = info.get("fallback_reason")
+    if reason:
+        return f"litellm's bundled model map (the live one failed: {reason})"
+    return "litellm's bundled model map"
+
+
+def _refuse_fake_stream(name):
+    """Raise before sending a ``responses()`` call litellm would not stream.
+
+    ``name`` is the model as litellm receives it (see :func:`_qualified`).
+    litellm streams natively only when its model map says the model does;
+    otherwise ``responses(stream=True)`` sends ONE non-streaming request and
+    replays the finished answer through ``MockResponsesAPIStreamingIterator``
+    (UPSTREAM.md #9). Nothing arrives while the model works, so the first-byte
+    allowance cuts the call off and reports a timeout — which reads as "the
+    provider got slow" and sends the operator to raise ``stream_read_timeout``,
+    the one change that hides the stall detector instead of fixing anything.
+
+    Measured 2026-09-27 on litellm 1.96.2, ``httpx.Client.send`` recorded,
+    nothing sent to a provider:
+
+      * ``gpt-5.6-luna`` and ``gpt-5.6-sol`` -> ``"stream": true`` in the body
+        and ``send(stream=True)``. Every model presets.yaml names, and both
+        fallbacks, answer that they stream natively; the test named below is
+        what holds them to it;
+      * ``gpt-5-pro`` -> no ``"stream"`` in the body, from a bare name, under
+        both maps. It and ``o1-pro`` (with their dated ids) are the only openai
+        models either map marks ``supports_native_streaming: false``;
+      * ``openai/gpt-5.7-nova``, listed by neither -> faked under the bundled
+        map, streamed under the live one, whose
+        ``openai-reasoning-family-baseline`` rule answers for gpt-5..9 names the
+        map itself has not caught up with. Same config, different behaviour,
+        decided by whether one HTTP GET succeeded at import;
+      * bare ``gpt-5.7-nova`` -> nothing sent at all. litellm cannot route a
+        name its map does not list, and the error it raises ("LLM Provider NOT
+        provided ... Pass model as E.g. ...") advises exactly the ``openai/``
+        prefix that makes it fake the stream instead.
+
+    So this asks litellm, per call, the question ``responses()`` is about to ask
+    it, and refuses before anything is sent. What presets.yaml ships is checked
+    against the bundled map in CI too — ci-article-review's
+    ``test_preset_native_streaming.py`` — but no test can settle a map that is
+    fetched at runtime, or a model named in user.yaml.
+
+    Refusing, rather than registering the model as
+    :func:`_stream_azure_deployment` does: a deployment name is never in the
+    map, so registering is the only way an Azure call can stream at all, while
+    for a model on openai.com the map is the only account there is of whether it
+    streams — and for ``gpt-5-pro`` it says no. Not a workaround to delete when
+    UPSTREAM.md #9 lands: the fix proposed there leaves those models faked, and
+    leaves a bare unlisted name unroutable.
+    """
+    litellm = _litellm()
+    try:
+        model, provider, _, _ = litellm.get_llm_provider(model=name)
+    except Exception as exc:
+        raise FakeStreamRefused(
+            f"litellm cannot route model {name!r}: {_model_map_source()} does not "
+            f"list it, and that map is where litellm learns which models are "
+            f"openai's. Nothing was sent. Name a model the map lists, or upgrade "
+            f"litellm. Do not prefix this one with 'openai/' to get past it: "
+            f"litellm would route it and then fake its stream (UPSTREAM.md #9)."
+        ) from exc
+    if litellm.utils.supports_native_streaming(
+        model=model, custom_llm_provider=provider
+    ):
+        return
+    try:
+        litellm.get_model_info(model=model, custom_llm_provider=provider)
+        verdict = "marks it as not streaming natively"
+    except Exception:  # litellm raises a bare Exception for an unmapped model
+        verdict = "does not list it"
+    raise FakeStreamRefused(
+        f"litellm would fake the stream for model {name!r}: "
+        f"{_model_map_source()} {verdict}. It would send one non-streaming "
+        f"request and replay the answer once the model had finished, so nothing "
+        f"would arrive while it worked and stream_read_timeout would cut the call "
+        f"off. Nothing was sent. Name a model litellm streams natively "
+        f"(UPSTREAM.md #9)."
+    )
 
 
 def _route_kwargs(provider, api_key, cfg, model=None):
@@ -1987,10 +2106,13 @@ def _attempt(
     streams = []
 
     def _invoke():
-        # Ahead of the timing record, so a missing service-account file fails
-        # before any request is made, and is not recorded as a stream that
-        # died. It carries no status, so it is not retried either.
+        # Ahead of the timing record, so a missing service-account file — or a
+        # model litellm would answer with a fake stream — fails before any
+        # request is made, and is not recorded as a stream that died. Neither
+        # carries a status, so neither is retried.
         routing = _route_kwargs(provider, api_key, cfg, model)
+        if spec["surface"] == "responses":
+            _refuse_fake_stream(_qualified(provider, model, cfg))
         # Started before litellm is called, so no wait for the provider goes
         # unmeasured — including the one inside completion() itself, which is
         # bounded by the socket timeout rather than by _iter_with_gap.
