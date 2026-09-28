@@ -189,22 +189,133 @@ class TestOutputReusesReportMarkdownVocabulary:
         *_, out = _run_archive_only(draft)
         assert "Estimated cost: $0.0000 (no model calls)" in out
 
-    def test_summary_counts_snapshots_that_exist_after_the_run(self, tmp_path):
+    def test_summary_separates_fresh_stale_and_missing(self, tmp_path):
+        """ "Have a snapshot" is not one fact: a stale copy predates the page as
+        it reads now, and the first version of this summary counted it as done."""
         draft = _write(
             tmp_path,
             "draft.md",
             "## Sources\n\n"
-            "[1] Already archived. https://a.example/archived\n\n"
-            "[2] Still missing. https://a.example/missing\n",
+            "[1] Fresh. https://a.example/fresh\n\n"
+            "[2] Stale. https://a.example/stale\n\n"
+            "[3] Missing. https://a.example/missing\n",
         )
 
         def fake_check(url):
-            if url.endswith("archived"):
-                return {"archived": True, "snapshot_url": "https://web.archive.org/x"}
+            if url.endswith("fresh"):
+                return {
+                    "archived": True,
+                    "snapshot_url": "https://web.archive.org/web/2/fresh",
+                    "snapshot_stale": False,
+                }
+            if url.endswith("stale"):
+                return {
+                    "archived": True,
+                    "snapshot_url": "https://web.archive.org/web/1/stale",
+                    "snapshot_stale": True,
+                }
             return {"archived": False, "snapshot_url": None}
 
         *_, out = _run_archive_only(draft, wayback_check=fake_check)
-        assert "1/2 citation URL(s) now have a Wayback snapshot." in out
+        assert (
+            "3 citation URL(s): 1 with a fresh Wayback snapshot, "
+            "1 with only a stale one, 1 with none." in out
+        )
+
+
+class TestALookupThatDidNotCompleteIsNotCountedAsNoSnapshot:
+    """The second live run: archive.org refused both lookups, each source printed
+    "NOT CHECKED", and the summary still said "0 with a snapshot, 2 with none"."""
+
+    def test_unchecked_urls_are_reported_as_such_not_as_missing(self, tmp_path):
+        draft = _write(
+            tmp_path,
+            "draft.md",
+            "## Sources\n\n"
+            "[1] Refused lookup. https://a.example/one\n\n"
+            "[2] Confirmed absent. https://a.example/two\n",
+        )
+
+        def fake_check(url):
+            if url.endswith("one"):
+                return {"archived": None, "error": "archive.org refused the lookup"}
+            return {"archived": False, "snapshot_url": None}
+
+        *_, out = _run_archive_only(draft, wayback_check=fake_check)
+        assert "1 with none, 1 not checked" in out
+        assert "says nothing about whether they are archived" in out
+
+    def test_no_unchecked_clause_when_every_lookup_completed(self, tmp_path):
+        draft = _write(
+            tmp_path, "draft.md", "## Sources\n\n[1] One. https://a.example/one\n"
+        )
+        *_, out = _run_archive_only(draft)
+        assert "not checked" not in out
+
+
+class TestAStaleSnapshotDoesNotHideTheReArchiveOutcome:
+    """The bug the first live run exposed. ``_render_archive_pair`` shows a
+    snapshot that exists and stops, so a stale one whose re-capture was
+    requested and refused printed only the old snapshot flagged STALE, and the
+    outcome the mode exists to report went unsaid."""
+
+    _STALE = {
+        "archived": True,
+        "snapshot_url": "https://web.archive.org/web/20240812234508/https://a.example/x",
+        "snapshot_stale": True,
+    }
+
+    def _submit_that_records(self, outcome, detail):
+        def submit(results, *args, **kwargs):
+            for entry in results:
+                entry["wayback"]["archive_outcome"] = outcome
+                entry["wayback"]["archive_outcome_detail"] = detail
+
+        return submit
+
+    def test_a_refused_recapture_is_reported_beside_the_stale_snapshot(self, tmp_path):
+        draft = _write(
+            tmp_path, "draft.md", "## Sources\n\n[1] Old. https://a.example/x\n"
+        )
+        *_, out = _run_archive_only(
+            draft,
+            wayback_check=lambda url: dict(self._STALE),
+            submit=self._submit_that_records(
+                "submit_failed", "archive.org refused the request: try tomorrow"
+            ),
+        )
+        assert (
+            "Re-archive attempt: submission failed — archive.org refused the "
+            "request: try tomorrow." in out
+        )
+        assert "1 with only a stale one" in out
+
+    def test_a_successful_recapture_adds_no_extra_line(self, tmp_path):
+        draft = _write(
+            tmp_path, "draft.md", "## Sources\n\n[1] Old. https://a.example/x\n"
+        )
+
+        def recaptured(results, *args, **kwargs):
+            wb = results[0]["wayback"]
+            wb["archive_outcome"] = "archived"
+            wb["snapshot_url"] = (
+                "https://web.archive.org/web/20260927/https://a.example/x"
+            )
+            wb["snapshot_stale"] = False
+
+        *_, out = _run_archive_only(
+            draft, wayback_check=lambda url: dict(self._STALE), submit=recaptured
+        )
+        assert "Re-archive attempt" not in out
+        assert "1 with a fresh Wayback snapshot" in out
+
+    def test_a_fresh_snapshot_nobody_resubmitted_adds_no_line(self, tmp_path):
+        draft = _write(
+            tmp_path, "draft.md", "## Sources\n\n[1] Fine. https://a.example/x\n"
+        )
+        fresh = {**self._STALE, "snapshot_stale": False}
+        *_, out = _run_archive_only(draft, wayback_check=lambda url: dict(fresh))
+        assert "Re-archive attempt" not in out
 
 
 class TestArchiveOnlyTouchesNoModelProvider:

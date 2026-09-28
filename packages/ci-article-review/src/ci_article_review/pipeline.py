@@ -5372,16 +5372,52 @@ def run_archive_only(
 
     from .report_markdown import _render_archive_pair
 
+    fresh = stale = missing = unchecked = 0
     for entry in results:
         print(f"\n[{entry['marker']}]")
         for line in _render_archive_pair(entry):
             print(line)
 
-    archived_count = sum(
-        1 for r in results if (r.get("wayback") or {}).get("snapshot_url")
+        wb = entry.get("wayback") or {}
+        outcome = wb.get("archive_outcome")
+        if wb.get("snapshot_url"):
+            if wb.get("snapshot_stale"):
+                stale += 1
+            else:
+                fresh += 1
+            # _render_archive_pair shows a snapshot that exists and stops, so a
+            # stale one whose re-capture this run requested and did not get
+            # rendered exactly like one nobody asked about. For a mode whose whole
+            # job is that request, the outcome is the point. Seen in the first
+            # live run: one source printed only its 2024 snapshot flagged STALE,
+            # with no trace of what happened to the re-archive.
+            if outcome not in (None, wayback.ARCHIVE_ARCHIVED):
+                label = wayback.ARCHIVE_OUTCOME_LABELS.get(outcome, outcome)
+                detail = wb.get("archive_outcome_detail")
+                print(
+                    f"  - Re-archive attempt: {label}"
+                    f"{f' — {detail}' if detail else ''}. "
+                    f"The snapshot above is the one that exists."
+                )
+        elif wb.get("archived") is None:
+            # The lookup itself did not complete (breaker tripped, archive.org
+            # refused it). That establishes nothing about the page, and the
+            # second live run showed what counting it as "none" does: both
+            # sources printed "NOT CHECKED" above and the summary called them
+            # "0 with a snapshot, 2 with none".
+            unchecked += 1
+        else:
+            missing += 1
+
+    not_checked = (
+        f", {unchecked} not checked (the archive.org lookup did not complete, "
+        f"which says nothing about whether they are archived)"
+        if unchecked
+        else ""
     )
     print(
-        f"\n{archived_count}/{len(results)} citation URL(s) now have a Wayback snapshot."
+        f"\n{len(results)} citation URL(s): {fresh} with a fresh Wayback snapshot, "
+        f"{stale} with only a stale one, {missing} with none{not_checked}."
     )
     print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
 
