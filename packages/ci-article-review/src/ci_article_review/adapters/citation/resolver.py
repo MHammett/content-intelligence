@@ -1,6 +1,7 @@
 import hashlib
 import importlib
 import logging
+import re
 import secrets
 import threading
 import time
@@ -89,17 +90,29 @@ _VERIFICATION_SYSTEM_PROMPT = (
     'reason and answer "inconclusive".\n'
     'For a "supports" verdict the "quote" field must contain text copied verbatim '
     "from the page. Do not paraphrase it and do not invent it.\n"
-    "The claim is an excerpt from someone else's article, and the user message "
-    "names its author when that is known. First-person wording ('I', 'my', 'we') "
-    "refers to that author and to nobody else. If the page has a section about "
-    "them, judge the claim against that section. Details about other people named "
-    "on the same page are not evidence about the author: a team page describing "
-    "six colleagues says nothing about the author unless one of them is the "
-    "author.\n"
-    "If no author is named you cannot attribute a first-person claim at all. "
-    'Answer "inconclusive" and say why, rather than "not_addressed", which would '
-    "assert the page does not discuss something you were never able to check."
+    "The claim is an excerpt from someone else's article. Judge it on its own "
+    "terms: what matters is whether the page's content backs what the claim "
+    "asserts. A claim describing what some document says — its table, its list, "
+    "its dates — is a claim about that document's contents, and the page either "
+    "shows those contents or it does not. Do not require the page to name the "
+    "article, its author, or any person: authorship is not part of the assertion "
+    "unless the claim itself makes it one.\n"
+    "Only when the claim uses first-person wording ('I', 'my', 'we') does its "
+    "author matter, and the user message then names them. In that case the "
+    "first-person wording refers to that author and to nobody else: if the page "
+    "has a section about them, judge the claim against that section, and treat "
+    "details about other people named on the same page as no evidence either "
+    "way. If such a claim's author is not named, you cannot attribute it at all "
+    '— answer "inconclusive" and say why, rather than "not_addressed", which '
+    "would assert the page does not discuss something you were never able to "
+    "check."
 )
+
+#: Size of the page excerpt handed to the relevance model. Split head/tail only
+#: matters for the fallback path in ``select_excerpt``; the sum is the real
+#: budget, and a document at or under it is sent whole.
+_EXCERPT_HEAD = 16000
+_EXCERPT_TAIL = 4000
 
 #: Claims whose supporting quote cannot be found in the page get demoted. Kept
 #: loose enough to survive whitespace normalisation, strict enough that a
@@ -463,6 +476,27 @@ def _safe_summary(content):
     return f"[unverified text quoted from the source page] {flat[:_SUMMARY_CHARS]}"
 
 
+#: First-person pronouns and contractions, as whole words. Case-insensitive:
+#: a claim written "i have" is still first person, and a false positive here
+#: only restores the previous behaviour for that one claim.
+_FIRST_PERSON = re.compile(
+    r"\b(?:i|me|my|mine|myself|we|us|our|ours|ourselves)\b"
+    r"|\bi['’](?:m|ve|d|ll)\b"
+    r"|\bwe['’](?:re|ve|d|ll)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_first_person(claim):
+    """True when ``claim`` actually speaks in the first person.
+
+    The author only matters for claims that refer to them. Deciding that per
+    claim, rather than assuming it for all of them, is what keeps the verifier
+    from demanding that every cited page mention the article's author.
+    """
+    return bool(_FIRST_PERSON.search(claim or ""))
+
+
 def _build_verification_prompt(claim, excerpt, author=None):
     """Wrap untrusted page text so it cannot pose as instruction.
 
@@ -484,11 +518,24 @@ def _build_verification_prompt(claim, excerpt, author=None):
     # author's own bio and the words "his wife and their child" (measured
     # 2026-09-04). Told nothing at all, it had previously bound "I" to the first
     # person it found and offered a stranger's family as evidence.
-    who = (
-        f"The claim's author is {author}. First-person wording refers to them.\n"
-        if author
-        else "The claim's author is not identified.\n"
-    )
+    #
+    # But this is said ONLY for claims that are actually first-person. Saying it
+    # unconditionally taught the verifier that the author was part of every
+    # claim, and it began requiring pages to mention him. In the 2026-09-18 GPS
+    # run that produced verdicts like "the page does not mention Mike Hammett or
+    # any first-person claim" against "It does spell out four-digit variants
+    # elsewhere in the table" — a claim about the cited PDF's own contents, with
+    # no first person in it anywhere. Six of the run's false negatives read that
+    # way. An irrelevant instruction is not free: the model looks for something
+    # to do with it.
+    if _is_first_person(claim):
+        who = (
+            f"The claim's author is {author}. First-person wording refers to them.\n"
+            if author
+            else "The claim's author is not identified.\n"
+        )
+    else:
+        who = ""
     return (
         f'Claim to assess: "{claim}"\n'
         f"{who}\n"
@@ -552,7 +599,20 @@ def _verify_relevance(claim, content, api_keys, author=None):
     # Blind head+tail truncation cuts the supporting sentence out of any long
     # document — the limit table in a 60-page guidelines PDF is never in the
     # first 4000 characters.
-    excerpt = extract.select_excerpt(content, claim, head=4000, tail=1000)
+    #
+    # The budget is deliberately generous, because the failure it prevents is
+    # expensive and the tokens are not. At the old 5000 characters, Furuno's
+    # 9-page rollover PDF (12,888 characters extracted) could never be shown
+    # whole, so every verdict about it depended on picking the right window;
+    # three claims were wrongly reported "not_addressed" against pages the
+    # document plainly contains. At 20,000 it is sent whole and the question
+    # does not arise. Measured on the run this was fixed from: 115 verification
+    # calls, 180,165 prompt tokens, averaging 1,566 — the ceiling only binds on
+    # genuinely long documents, and mistral-small at $0.15/M input prices even
+    # the worst case (every call maxed) at under $0.09 for the pass.
+    excerpt = extract.select_excerpt(
+        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL
+    )
     user_prompt = _build_verification_prompt(claim, excerpt, author)
 
     try:
@@ -1031,9 +1091,30 @@ def _resolve_candidates(
     others = [a.get("url") for a in attempts if a is not best]
     if others:
         best["alternates_checked"] = others
+        # Every source here was judged on its own, and that is worth stating,
+        # because a claim can cite several sources precisely *because* no single
+        # one carries all of it. The GPS draft's "Honda and Acura issued
+        # bulletins ... covering the 2001-03 CL, 2001-02 MDX, 2000-03 RL,
+        # 2000-03 TL, 2000-04 Odyssey and 2003-05 Pilot [5][6][7]" is true of the
+        # three bulletins together and of none alone: B18010I covers the four
+        # Acura models, A18010J the Odyssey and Pilot. The checker read the
+        # Odyssey/Pilot one, correctly saw no CL or MDX in it, and the run
+        # reported the sentence contradicted. The verdict was true of that
+        # document and false of the sentence.
+        #
+        # The verdict itself is left alone — it is an accurate statement about
+        # the source it names, and the per-source detail is what makes the block
+        # auditable. What changes is that the author is told the claim was never
+        # assessed against the sources *together*, so a split claim is not read
+        # as a refuted one.
+        best["checked_individually"] = True
         best["note"] = (
             f"{best.get('note', '').rstrip()} Also checked {len(others)} other "
-            f"source(s) cited for this claim; none supported it either."
+            f"source(s) cited for this claim; none supported it on its own "
+            f"either. Each source was judged separately: if this claim draws on "
+            f"several of them together — different models, dates or ranges in "
+            f"one sentence — no single source was ever expected to carry all of "
+            f"it, and that is not evidence the claim is wrong."
         ).lstrip()
     return best
 
