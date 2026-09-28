@@ -11,15 +11,26 @@
 #   - Skips providers with no API key or no models: entry in user.yaml.
 #   - Respects enabled: false set by the user — disabled models stay disabled.
 #
-# Estimated per-article costs assume a 1,500-word article (~4,000 in / ~2,000 out
-# tokens per call). Reasoning adds latency and token overhead.
+# Per-article cost is MEASURED, not estimated, and every figure belongs to the
+# draft it was measured on. The table lives beside `cost_preset:` in
+# user.example.yaml, in this directory; docs/CONFIGURATION.md, "Cost presets",
+# carries the same figures with their run counts and each draft's size in
+# characters. They are deliberately not copied here a third time: this list held
+# unsized estimates from a 1,500-word model of per-call tokens, and kept them
+# after both of those moved to measured figures (8e4de54, 2026-09-19).
 #
-#   economy  : ~$0.04 – $0.10   (sanity check, no reasoning)
-#   standard : ~$0.10 – $0.40   (solid, no reasoning overhead)
-#   balanced : ~$0.50 – $1.50   (light reasoning on key models, thorough coverage)
-#   thorough : ~$0.65 – $1.65   (deep reasoning, thorough coverage; scaled down 2026-09-08
-#                                 after the claude-sonnet-5 swap below — see that entry)
-#   maximum  : ~$2.50 – $5.00   (all flagship models, all domains, max reasoning)
+# Read every figure there as a floor, not a quote: token costs only — per-search
+# and per-request fees come on top — and a retried attempt the provider billed
+# without reporting usage is priced at $0.00. For scale, on one ~19,500-word
+# draft `wide` averaged $0.38 over three runs and one `maximum` run came to about
+# $9.6, roughly 25x as much. Cost grows far more slowly than the draft does — at
+# `maximum`, 7.5x the characters cost about 1.6x the money — so a figure without
+# its draft size says nothing.
+#
+# The tiers, cheapest first, are economy, wide (the shipped default in
+# user.example.yaml), balanced, thorough and maximum. `standard` was retired
+# 2026-09-05: it still runs, as `wide`, with a warning — see the note under
+# `wide:`, which is also where the wide-against-standard cost comparison lives.
 #
 # Mistral note: mistral-medium-3-5 only accepts reasoning_effort "high" or "none".
 #   "low" and "medium" return 400. Standard models do not support reasoning_effort at all.
@@ -309,15 +320,23 @@ thorough:
 #   wide        $0.38          6.8%              0.0%
 #   thorough+sonnet-5  $1.74   16.9%             22.1%
 #   thorough (opus-5)  $2.64   [not repro-scored; single run only]
-#   maximum     $10.27        20.0%             29.6%
+#   maximum     $10.27 †      20.0%             29.6%
+#
+# † $10.27 was priced at a stale gpt-5.6-sol rate, corrected 2026-09-17. This
+#   average has not been re-derived, but a later single `maximum` run on the same
+#   draft comes to about $9.6 at current rates, which makes the multiple below
+#   about 25x rather than 27x. Only `maximum` runs sol -- `thorough`/`balanced`
+#   run terra, `wide` runs luna -- so the other three rows are unaffected and the
+#   comparison this table was built for still holds.
 #
 # The sonnet-5 swap captures 84% of `maximum`'s overall reproducibility and 75% of
 # its fact-check reproducibility at 17% of the cost -- a far better marginal trade
 # than `maximum` itself represents over `wide` (which buys +13.2 points of repro at
-# 27x cost, vs this swap's +10.1 points at 4.6x cost). Stock opus-5 `thorough` was
-# scouted at n=1 ($2.64, no clear edge over the sonnet-5 swap's findings) and was
-# not taken to a full 3-run study once the swap's numbers came back this strong --
-# see pipeline_history and the session that ran this for the n=1 comparison.
+# about 25x cost, see † above, vs this swap's +10.1 points at 4.6x cost). Stock
+# opus-5 `thorough` was scouted at n=1 ($2.64, no clear edge over the sonnet-5
+# swap's findings) and was not taken to a full 3-run study once the swap's numbers
+# came back this strong -- see pipeline_history and the session that ran this for
+# the n=1 comparison.
 #
 # `balanced` was measured in the same round and is NOT a good value: 6.4% overall
 # repro, statistically indistinguishable from `wide`'s 6.8%, at 3.4x the cost. It

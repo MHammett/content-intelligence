@@ -13,7 +13,7 @@ It makes one minimal call to each configured service and tells you exactly what'
 ## Configuration errors
 
 **`User config not found`**  
-You haven't created `configs/user.yaml` yet. Copy `configs/user.example.yaml` to `configs/user.yaml` and fill in your API keys.
+You haven't created `configs/user.yaml` yet. Run `uv run ci-setup`: it creates `configs/`, copies the packaged `user.example.yaml` into it, and prints what to fill in. There is no `configs/user.example.yaml` in a checkout — the examples ship inside the package, under `packages/ci-article-review/src/ci_article_review/configs/` — and the error message names that full path for anyone who would rather copy the file by hand.
 
 **`Environment variable X is not set`**  
 You used `${VAR_NAME}` syntax in a config but the variable isn't in your `.env` file or shell environment. Copy `.env.example` to `.env` and add the missing variable.
