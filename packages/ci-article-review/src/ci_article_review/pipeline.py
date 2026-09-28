@@ -5256,9 +5256,20 @@ def run_publish_pipeline(
 
     from .adapters.cms import wordpress as wp
 
+    # Images are refused here with the other bad handoffs: before the SEO
+    # suggestion call is paid for, and before the checklist asks for a yes that
+    # would come to nothing. A relative path is relative to the handoff file, not
+    # to wherever this was run from, so the same handoff finds the same files.
+    image_base_dir = Path(handoff_path).resolve().parent
+    image_plan = wp.plan_images(pub_handoff["final_draft"], image_base_dir)
+    if image_plan.problems:
+        log.error(wp.describe_problems(image_plan))
+        sys.exit(1)
+
     if seo_suggestions is not False:
         _suggest_seo_for_publish(pub_handoff, pub_config, config["api_keys"])
 
+    wp.print_image_plan(image_plan)
     confirmed = wp.print_checklist_and_confirm()
     if not confirmed:
         sys.exit(0)
@@ -5304,7 +5315,12 @@ def run_publish_pipeline(
         "publish" if publish_live else "draft",
     )
     result = wp.push(
-        content, pub_params, wp_config, rank_math_config, publish_live=publish_live
+        content,
+        pub_params,
+        wp_config,
+        rank_math_config,
+        publish_live=publish_live,
+        image_base_dir=image_base_dir,
     )
 
     if result["success"]:
@@ -5312,6 +5328,7 @@ def run_publish_pipeline(
         print(f"Type:     {result.get('post_type', 'post')}")
         print(f"Post URL: {result['post_url']}")
         print(f"Post ID:  {result['post_id']}")
+        wp.print_image_result(result)
         if result.get("ignored_terms"):
             # A page cannot carry them. Said plainly, because the handoff named
             # them and the author would otherwise assume they applied.

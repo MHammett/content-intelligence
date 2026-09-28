@@ -1,13 +1,21 @@
 import base64
+import html
 import logging
+import os
+from dataclasses import dataclass, field
 
 import requests
 
 from ci_core import redact
 
-from . import blocks
+from . import blocks, images
 
 log = logging.getLogger(__name__)
+
+#: Read timeout for one image upload. The post itself gets 60s; a photograph over
+#: a slow uplink is a bigger body than any post, and a timeout here fails the
+#: publish over an upload that was merely slow.
+_UPLOAD_TIMEOUT = 120
 
 CHECKLIST = """
 PRE-PUBLICATION CHECKLIST
@@ -22,7 +30,7 @@ TECHNICAL
 [ ] All embedded components tested (charts, maps, interactive elements)
 [ ] Data in visualizations matches claims in prose
 [ ] Structured data schema validates (https://validator.schema.org)
-[ ] All images have alt text
+[ ] All images have alt text (any the script found without are listed under IMAGES above)
 [ ] Internal links reviewed and functional
 [ ] Canonical URL set correctly in WordPress
 
@@ -279,6 +287,344 @@ def _apply_rank_math_meta(site_url, headers, post_id, meta):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Images
+#
+# An image alone on a line of the draft becomes a core/image block. One with an
+# http(s) source is already hosted, and the block points at it. One with a path
+# is a file on the author's disk, and is uploaded to the media library first,
+# because the block has to point at where the image now lives. All of it that
+# can be checked without a request is checked first (plan_images), so a mistyped
+# path fails before anything has been sent rather than after an earlier image
+# has already gone up.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ImagePlan:
+    """What the draft's images need, worked out without a single request."""
+
+    #: Every image the draft contains, in document order.
+    refs: list = field(default_factory=list)
+    #: Source as written -> the file on disk, for each local image that becomes
+    #: a block.
+    uploads: dict = field(default_factory=dict)
+    #: What stops the publish: one entry per image, each naming it.
+    problems: list = field(default_factory=list)
+    #: What does not stop it, but the author should see.
+    warnings: list = field(default_factory=list)
+
+    @property
+    def block_images(self):
+        """The images that will become image blocks."""
+        return [r for r in self.refs if r.placement == images.BLOCK]
+
+    @property
+    def linked(self):
+        """Those already hosted, which are pointed at and never uploaded."""
+        return [r for r in self.block_images if r.kind == images.URL]
+
+
+def plan_images(content, base_dir=None):
+    """Find the draft's images and check every local file, sending nothing.
+
+    ``base_dir`` is what a relative path is relative to: the directory of the
+    handoff file, so the same handoff resolves the same way wherever the command
+    is run from. Left unset it is the working directory.
+    """
+    plan = ImagePlan(refs=blocks.find_images(content))
+    structural = blocks.image_problems(plan.refs)
+    for i, ref in enumerate(plan.refs):
+        label = images.describe(ref, i + 1, len(plan.refs))
+        if i in structural:
+            plan.problems.append(f"{label}: {structural[i]}")
+            continue
+        if ref.placement != images.BLOCK:
+            continue
+        if ref.kind == images.LOCAL:
+            try:
+                plan.uploads[ref.src] = images.resolve_local_image(ref.src, base_dir)
+            except images.ImageError as e:
+                plan.problems.append(f"{label}: {e}")
+                continue
+        if not ref.alt.strip():
+            plan.warnings.append(
+                f"{label}: no alt text. It goes between the square brackets: "
+                "![alt text](...)."
+            )
+    return plan
+
+
+def describe_problems(plan):
+    return (
+        "The FINAL DRAFT has image(s) that cannot be published, so nothing was "
+        "sent:\n  - "
+        + "\n  - ".join(plan.problems)
+        + "\nFix the image line(s) in the handoff and re-run."
+    )
+
+
+#: What each status an upload commonly fails with usually means, since the
+#: server's own message for these says what happened and not what to do.
+_UPLOAD_HINTS = {
+    401: (
+        "Check wordpress.username and wordpress.application_password: "
+        "WordPress answers a wrong username exactly as it answers no "
+        "credentials at all."
+    ),
+    403: (
+        "This WordPress user may not be allowed to upload files (the "
+        "upload_files capability, which Author and above have)."
+    ),
+    413: (
+        "The file is larger than the server accepts. Shrink it, or raise "
+        "upload_max_filesize and post_max_size on the server."
+    ),
+}
+
+
+def _upload_error(exc):
+    """A WordPress REST error as one line: status, message, code, and what to do."""
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    message = code = None
+    try:
+        body = resp.json()
+    except Exception:  # no response, or a body that is not JSON
+        body = None
+    if isinstance(body, dict):
+        message, code = body.get("message"), body.get("code")
+    if isinstance(message, str) and message:
+        detail = f"{message} ({code})" if code else message
+    else:
+        detail = redact.capture_error_body(exc) or redact.redact_url_keys(str(exc))
+    line = f"HTTP {status}: {detail}" if status else str(detail)
+    hint = _UPLOAD_HINTS.get(status)
+    return f"{line} {hint}" if hint else line
+
+
+def _plain(text):
+    """Alt text as WordPress will have kept it: unescaped, whitespace collapsed.
+
+    WordPress runs alt text through ``sanitize_text_field``, which turns a bare
+    ``<`` into ``&lt;`` and collapses runs of whitespace. Comparing raw strings
+    would report a difference for an alt text that arrived exactly as written.
+    """
+    return " ".join(html.unescape(text or "").split())
+
+
+def _set_alt_text(api_base, headers, attachment_id, alt, stored):
+    """Second chance for the media item's own alt text. A warning, or None if it landed.
+
+    Never fails the publish. The block carries the alt text that matters for
+    accessibility whatever happens here; this is the copy on the media-library
+    item, which is what the next post that reuses the image will offer.
+    """
+    if stored:
+        # WordPress kept something, so the field works and it edited what it
+        # was given (it strips tags). A second attempt would be refused the same way.
+        return (
+            f"WordPress stored the media-library alt text as {stored!r}, not "
+            f"{alt!r}. The block has it as written."
+        )
+    try:
+        resp = requests.post(
+            f"{api_base}/media/{attachment_id}",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"alt_text": alt},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        stored = resp.json().get("alt_text")
+    except Exception as e:
+        return (
+            f"the media-library alt text could not be set ({redact.redact_url_keys(str(e))}). "
+            "The block has it."
+        )
+    if _plain(stored) != _plain(alt):
+        return (
+            "WordPress did not keep the alt text on the media-library item, "
+            "although the block has it."
+        )
+    return None
+
+
+def _upload_one(api_base, headers, path, alt):
+    """Upload one file to the media library: ``(UploadedImage, warning or None)``.
+
+    Multipart, so the alt text travels in the same request as the file. A
+    raw-body upload carries only the file, and naming it would take a second
+    request. Its landing is checked all the same, in the response: this
+    repo's last WordPress field that vanished (Rank Math's) came back
+    ``200`` with nothing set.
+    """
+    try:
+        with path.open("rb") as fh:
+            resp = requests.post(
+                f"{api_base}/media",
+                headers=headers,
+                files={"file": (path.name, fh, images.mime_for(path))},
+                data={"alt_text": alt} if alt else None,
+                timeout=_UPLOAD_TIMEOUT,
+            )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        raise images.ImageError(
+            f"WordPress refused the upload. {_upload_error(e)}"
+        ) from e
+    except requests.RequestException as e:  # timeout, refused connection, DNS
+        raise images.ImageError(
+            f"the upload did not complete: {redact.redact_url_keys(str(e))}"
+        ) from e
+    except OSError as e:
+        raise images.ImageError(f"the file could not be read: {e.strerror or e}") from e
+
+    try:
+        body = resp.json()
+        attachment_id = int(body["id"])
+        source_url = body["source_url"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise images.ImageError(
+            "WordPress accepted the upload, but its answer did not name the new "
+            "attachment (no id or source_url), so there is nothing to point the "
+            "block at."
+        ) from e
+
+    # The size the block editor picks by default: "large" when WordPress made
+    # one, which it does only for an image wider than that size, else the file
+    # as uploaded.
+    large = ((body.get("media_details") or {}).get("sizes") or {}).get("large") or {}
+    if large.get("source_url"):
+        url, size_slug = large["source_url"], "large"
+    else:
+        url, size_slug = source_url, "full"
+
+    warning = None
+    if alt and _plain(body.get("alt_text")) != _plain(alt):
+        warning = _set_alt_text(
+            api_base, headers, attachment_id, alt, body.get("alt_text")
+        )
+    return images.UploadedImage(attachment_id, url, size_slug), warning
+
+
+def _file_key(path):
+    """One identity for a file however it was spelled (case, ``./``, symlinks)."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _left_behind(uploads):
+    """A note on what is already in the media library when a later step fails."""
+    if not uploads:
+        return ""
+    listing = ", ".join(f"ID {u['id']} ({u['src']})" for u in uploads)
+    return (
+        "\nUploaded before this failed, and still in the media library (nothing "
+        f"was deleted): {listing}. Remove them under Media > Library if you do "
+        "not want them."
+    )
+
+
+def upload_images(plan, api_base, headers):
+    """Upload each distinct local file once: ``(resolved, uploads, warnings)``.
+
+    ``resolved`` is what ``blocks.to_blocks`` takes, source -> ``UploadedImage``.
+    ``uploads`` and ``warnings`` are for the result.
+
+    A file the draft uses twice is uploaded once and both blocks point at the
+    one attachment. Each block keeps its own alt text; the attachment can hold
+    only one, so it gets the first that is not empty.
+
+    Raises ``ImageError`` naming the image, and what was already uploaded.
+    """
+    first_alt = {}
+    for ref in plan.refs:
+        path = plan.uploads.get(ref.src)
+        if path is not None and ref.alt.strip():
+            first_alt.setdefault(_file_key(path), ref.alt)
+
+    by_file, resolved, uploads, warnings = {}, {}, [], []
+    for i, ref in enumerate(plan.refs):
+        path = plan.uploads.get(ref.src)
+        if path is None:
+            continue
+        key = _file_key(path)
+        if key not in by_file:
+            label = images.describe(ref, i + 1, len(plan.refs))
+            try:
+                by_file[key], warning = _upload_one(
+                    api_base, headers, path, first_alt.get(key, "")
+                )
+            except images.ImageError as e:
+                raise images.ImageError(f"{label}: {e}{_left_behind(uploads)}") from e
+            log.info(
+                f"Uploaded {path.name}: media ID {by_file[key].attachment_id}, "
+                f"{by_file[key].size_slug} size"
+            )
+            uploads.append(
+                {
+                    "src": ref.src,
+                    "id": by_file[key].attachment_id,
+                    "url": by_file[key].url,
+                }
+            )
+            if warning:
+                warnings.append(f"{label}: {warning}")
+        resolved[ref.src] = by_file[key]
+    return resolved, uploads, warnings
+
+
+def _size(path):
+    try:
+        return f"{path.stat().st_size / 1024:.0f} KB"
+    except OSError:
+        return "size unknown"
+
+
+def print_image_plan(plan):
+    """List the draft's images before the checklist asks for a yes.
+
+    It shows the resolved path of every file that will be uploaded, which is the
+    one thing on this page the author has not already read in the draft: a
+    handoff can name any file the machine can read, and this is the last point
+    at which someone can see which.
+    """
+    if not plan.block_images:
+        return
+    print("\nIMAGES")
+    print("======")
+    for i, ref in enumerate(plan.refs, 1):
+        if ref.placement != images.BLOCK:
+            continue
+        if ref.src in plan.uploads:
+            path = plan.uploads[ref.src]
+            print(f"{i}. UPLOAD  {path}  ({_size(path)})")
+        else:
+            print(f"{i}. LINK    {ref.src}  (already hosted; not uploaded)")
+        print(f"     alt:     {ref.alt.strip() or '(none)'}")
+        if ref.caption.strip():
+            print(f"     caption: {ref.caption.strip()}")
+    for warning in plan.warnings:
+        print(f"  ! {warning}")
+    if plan.uploads:
+        print(
+            "Uploaded files are public from the moment they are uploaded, even "
+            "though the post stays a draft."
+        )
+
+
+def print_image_result(result):
+    """Say what the images did, next to the post URL, the way terms are."""
+    if "images_uploaded" in result:
+        print(
+            f"Images:   {result['images_uploaded']} uploaded to the media "
+            f"library, {result['images_linked']} linked from an existing URL"
+        )
+        for up in result["image_uploads"]:
+            print(f"  - {up['src']} -> media ID {up['id']}")
+    for warning in result.get("image_warnings", []):
+        print(f"WARNING: {warning}")
+
+
 def push(
     content,
     pub_params,
@@ -286,11 +632,19 @@ def push(
     rank_math_config,
     publish_live=False,
     allow_missing_terms=False,
+    image_base_dir=None,
 ):
     """Push article to WordPress.  Always saves as draft unless publish_live=True.
 
     Resolves category and tag slugs to integer IDs via the WP REST API before
     creating the post.
+
+    An image alone on a line of the draft becomes a native image block. A local
+    file (a path relative to ``image_base_dir``, or absolute) is uploaded to the
+    media library first; an http(s) URL is pointed at and never uploaded. Every
+    local file is checked before the first request, and if an upload fails the
+    post is not created. Uploads are not undone when a later step fails: they are
+    named in the error, since a media-library item is public the moment it exists.
 
     ``pub_params["post_type"]`` selects the REST route: ``post`` (default) or
     ``page``. A page carries no categories or tags, so for that type the term
@@ -316,6 +670,14 @@ def push(
     headers = _auth_header(username, app_password)
     headers["Content-Type"] = "application/json"
     auth_headers = _auth_header(username, app_password)  # without Content-Type for GETs
+
+    # Every local image is checked here, before the first request of any kind. A
+    # mistyped path costs nothing now; found after an earlier image had gone up,
+    # it would cost an orphaned upload as well.
+    image_plan = plan_images(content, image_base_dir)
+    if image_plan.problems:
+        log.error(describe_problems(image_plan))
+        return {"success": False, "error": describe_problems(image_plan)}
 
     # Resolve slugs → IDs before building the post payload. Pages are not in
     # either taxonomy, so the two GETs are skipped rather than issued and
@@ -361,8 +723,26 @@ def push(
         }
 
     # WordPress stores HTML; the pipeline carries Markdown. Converting here
-    # rather than at the call site means every publish path gets it.
-    content = blocks.to_blocks(content)
+    # rather than at the call site means every publish path gets it. The images
+    # go up first, after the term check above so that a publish refused for its
+    # terms uploads nothing, because each block has to point at where its image
+    # now lives. Either step failing means the post is never created.
+    try:
+        hosted, image_uploads, image_warnings = upload_images(
+            image_plan, api_base, auth_headers
+        )
+    except images.ImageError as e:  # names the image, and what already went up
+        log.error(f"WordPress image upload failed: {e}")
+        return {"success": False, "error": str(e)}
+    try:
+        content = blocks.to_blocks(content, resolved=hosted)
+    except images.ImageError as e:
+        # Not reachable while the plan and the converter read the draft the same
+        # way, which they do by sharing find_images. Handled anyway, because the
+        # images are already up by now and this is the one place that says so.
+        error = f"{e}{_left_behind(image_uploads)}"
+        log.error(f"WordPress image conversion failed: {error}")
+        return {"success": False, "error": error}
 
     payload = _build_post_payload(
         pub_params,
@@ -409,6 +789,12 @@ def push(
             # Surfaced on the result, not just in a log line, so the caller can
             # print it next to the success message instead of it scrolling past.
             result["unresolved_terms"] = sorted(unresolved)
+        if image_plan.block_images:
+            result["images_uploaded"] = len(image_uploads)
+            result["images_linked"] = len(image_plan.linked)
+            result["image_uploads"] = image_uploads
+        if image_warnings:
+            result["image_warnings"] = image_warnings
         return result
     except requests.HTTPError as e:
         # Redacted and bounded like every other adapter's error path. A WordPress
@@ -416,10 +802,13 @@ def push(
         # and returned to the caller for display.
         error_body = redact.capture_error_body(e) or redact.redact_url_keys(str(e))
         log.error(f"WordPress push failed: {error_body}")
-        return {"success": False, "error": str(error_body)}
+        return {
+            "success": False,
+            "error": str(error_body) + _left_behind(image_uploads),
+        }
     except Exception as e:
         log.error(f"WordPress push failed: {e}")
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": str(e) + _left_behind(image_uploads)}
 
 
 def print_checklist_and_confirm():

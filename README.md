@@ -170,6 +170,12 @@ uv run ci-review --publish path/to/publication_handoff.md --publication your_pub
 
 Always saves as a WordPress draft unless you add `--publish-live`.
 
+Images in the FINAL DRAFT are ordinary Markdown,
+`![alt text](path/to/file.png "optional caption")`, alone on a line. A file on
+disk is uploaded to the WordPress media library and becomes a native Image
+block you can edit in the block editor; an `https://` URL is linked and not
+uploaded. See [Images in the FINAL DRAFT](docs/CONFIGURATION.md#images-in-the-final-draft).
+
 **Analyze an existing web page:**
 
 ```powershell
@@ -839,6 +845,7 @@ content-intelligence/
 │   │   │   │   ├── grammar/languagetool.py   grammar correction (Pass 1)
 │   │   │   │   ├── cms/wordpress.py          WordPress REST API publisher
 │   │   │   │   ├── cms/blocks.py             Markdown -> WordPress block markup
+│   │   │   │   ├── cms/images.py             image sources, and the checks on local image files
 │   │   │   │   └── citation/
 │   │   │   │       ├── resolver.py           primary source resolution, checksums, confidence tiers
 │   │   │   │       ├── disposition.py        the one vocabulary for what happened to a citation

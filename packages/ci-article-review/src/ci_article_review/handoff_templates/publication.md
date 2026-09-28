@@ -33,6 +33,31 @@ Titles & Meta > Local SEO.]
 EMBEDS AND SPECIAL ELEMENTS
 [List any shortcodes, React components, charts, iframes, or interactive elements]
 [Note: these are preserved verbatim -- the script does not modify embedded content]
+[Images are NOT embeds. Do not list them here: see IMAGES AND ALT TEXT below.]
+
+IMAGES AND ALT TEXT
+[A note, not a form: write each image in FINAL DRAFT as ordinary Markdown,
+alone on its own line, with a blank line above and below it:
+
+![Alt text: what the image shows](images/grid-map.png "Optional caption")
+
+Alt text is the text in the square brackets. A screen reader reads it in place
+of the image, so describe what the image shows, not what the file is called.
+It is set on the image block and on the media-library item.
+Caption is the optional text in quotes after the path. It shows under the
+image. Leave the quotes out for no caption. Plain text only.
+Source is what is between the parentheses:
+  - A file on your disk: a path relative to THIS handoff file, or an absolute
+    path. It is uploaded to the WordPress media library when you publish and
+    becomes an Image block you can edit in the block editor.
+  - An https:// URL of an image that is already hosted. The block points at it;
+    nothing is uploaded.
+Use forward slashes in paths (C:/photos/map.png). Markdown treats a backslash
+as an escape, so C:\photos\_map.png reaches the script as C:\photos_map.png.
+Wrap a path that has spaces in angle brackets: ![alt](<my photo.png>)
+If a file is missing or is not an image, or an image is inside a sentence or a
+list, publishing stops before anything is sent and names the image. Uploaded
+files are public as soon as they are uploaded, even though the post stays a draft.]
 
 DISPOSITION LOG
 Consensus flags addressed: [count]
