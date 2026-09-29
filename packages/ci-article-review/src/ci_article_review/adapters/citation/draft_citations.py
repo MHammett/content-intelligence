@@ -140,6 +140,26 @@ def _tokens(text):
     return words
 
 
+def claim_tokens(text):
+    """The similarity key for comparing one claim against another.
+
+    Public because the resolver compares claims to each other — two fact-check
+    models routinely return the same draft sentence in different words — and
+    that needs the same tokenizer this module already uses for claim-to-span
+    matching.
+
+    Deliberately not ``ci_core.extract.claim_terms``, which looks like the
+    obvious shared choice and is the wrong one. That function keeps words of
+    five characters or more because it is locating a passage inside a long
+    document, where short words carry no signal. Claim-to-claim similarity is
+    the opposite problem: the short words are most of what two phrasings of one
+    sentence have in common. Measured on the 2026-09-18 GPS run, the same pair
+    of claims scored 0.455 here and 0.182 under ``claim_terms``, and a threshold
+    loose enough to catch it there would have merged unrelated claims.
+    """
+    return _tokens(text or "")
+
+
 def _numbers(text):
     return {n.rstrip(".,").replace(",", "") for n in _NUMBER.findall(text)}
 
