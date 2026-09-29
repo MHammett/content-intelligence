@@ -2,7 +2,7 @@
 
 import pytest
 
-from ci_core.llm import cost
+from ci_core.llm import cost, model_registry
 from ci_core.llm.cost import calculate, _price_for_model
 
 
@@ -92,6 +92,123 @@ class TestGeminiRates:
     )
     def test_the_search_fee_follows_the_generation(self, model, fee):
         assert cost.known_search_fee(model) == fee
+
+
+class TestClaudeRates:
+    """Every Claude id this repo can configure has a row of its own.
+
+    Verified 2026-09-29 on platform.claude.com/docs/en/about-claude/pricing
+    (pricing.yaml has the source note). Same point TestGeminiRates makes, and
+    this is the family where it bit: lookup takes the longest prefix, and every
+    Claude id is a prefix of its own successor. "claude-opus-5-5" starts with
+    "claude-opus-5", so with no row of its own it priced at opus-5's
+    $5.00/$25.00 and still reported pricing_known True -- 25% over, silently.
+    """
+
+    @pytest.mark.parametrize(
+        "model,rates",
+        [
+            ("claude-fable-5-1", (10.00, 50.00, 0.25)),
+            ("claude-fable-5", (10.00, 50.00, 1.00)),
+            ("claude-opus-5-5", (4.00, 20.00, 0.20)),
+            ("claude-opus-5", (5.00, 25.00, 0.50)),
+            ("claude-sonnet-5-5", (2.00, 10.00, 0.20)),
+            ("claude-sonnet-5", (2.00, 10.00, 0.20)),
+            ("claude-opus-4-8", (5.00, 25.00, 0.50)),
+            ("claude-sonnet-4-6", (3.00, 15.00, 0.30)),
+            ("claude-haiku-4-5-20251001", (1.00, 5.00, 0.10)),
+        ],
+    )
+    def test_the_rate_is_the_providers(self, model, rates):
+        assert cost.known_price(model) == rates
+
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"],
+    )
+    def test_a_successor_never_prices_at_its_predecessors_row(self, model):
+        """claude-sonnet-5-5's borrowed rate happened to be correct. That is
+        luck; an exact row is what keeps it correct when either price moves."""
+        assert model in cost._PRICING
+
+    def test_opus_5_5_is_not_billed_as_opus_5(self):
+        entry = {
+            "pass": "claude:fact_check",
+            "model": "claude-opus-5-5",
+            "tokens": {"prompt": 100_000, "completion": 20_000},
+        }
+        summary = calculate([entry])
+        assert summary["pricing_known"] is True
+        # 100k in at $4.00 and 20k out at $20.00, per million. Borrowing
+        # opus-5's row read this same call as $1.00.
+        assert summary["total_usd"] == pytest.approx(0.80, abs=0.0001)
+
+    def test_fable_5_1_cache_reads_are_not_billed_at_fable_5s_rate(self):
+        entry = {
+            "pass": "claude:fact_check",
+            "model": "claude-fable-5-1",
+            "tokens": {"prompt": 100_000, "completion": 20_000, "cached": 90_000},
+        }
+        summary = calculate([entry])
+        # 10k uncached at $10, 90k cached at $0.25, 20k out at $50. Borrowing
+        # fable-5's $1.00 cached read made this $1.19.
+        assert summary["total_usd"] == pytest.approx(1.1225, abs=0.0001)
+
+    @pytest.mark.parametrize(
+        "model,multiplier",
+        [
+            ("claude-fable-5-1", 0.025),
+            ("claude-opus-5-5", 0.05),
+            ("claude-fable-5", 0.1),
+            ("claude-opus-5", 0.1),
+            ("claude-sonnet-5-5", 0.1),
+            ("claude-sonnet-5", 0.1),
+            ("claude-haiku-4-5-20251001", 0.1),
+        ],
+    )
+    def test_the_cache_read_multiplier_is_the_published_one(self, model, multiplier):
+        """0.1x is the rule, not a law. Anthropic publishes 0.025x on Fable 5.1
+        and Mythos 5.1, and 0.05x on Opus 5.5, so copying the row above a new
+        model gets its cached rate 4x or 2x too high."""
+        in_rate, _out, cached = cost.known_price(model)
+        assert cached == pytest.approx(in_rate * multiplier)
+
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"],
+    )
+    def test_the_search_fee_still_reaches_the_new_rows(self, model):
+        """search_fees keys on "claude-" alone, so an id added to `models`
+        inherits the fee. Adding rows must not disturb that."""
+        assert cost.known_search_fee(model) == (10.00, "search")
+
+
+class TestEveryRegistryTargetIsPriced:
+    """A model the registry recommends must have a price of its own.
+
+    model_registry.yaml is where a stale id hides, because its notes quote a
+    price: the pointer can go a generation out of date while the price beside
+    it stays right, so nothing looks wrong. What follows is a run on the
+    recommended model reporting a borrowed or fallback rate.
+    """
+
+    def _targets(self):
+        targets = set()
+        for entry in model_registry.SUPERSEDED.values():
+            if entry.get("replacement"):
+                targets.add(entry["replacement"])
+        for entry in model_registry.NEWER_AVAILABLE.values():
+            if entry.get("newer"):
+                targets.add(entry["newer"])
+        return targets
+
+    def test_the_registry_actually_names_targets(self):
+        """Guards the assertion below against an empty set passing vacuously."""
+        assert len(self._targets()) > 5
+
+    def test_each_target_has_an_exact_row_not_a_prefix_match(self):
+        unpriced = sorted(t for t in self._targets() if t not in cost._PRICING)
+        assert unpriced == []
 
 
 class TestCalculate:
