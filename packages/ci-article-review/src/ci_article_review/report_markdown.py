@@ -1964,6 +1964,19 @@ def _render_mismatch_entry(citation):
     if reason:
         lines.append(f"  - Relevance reason: {reason}")
 
+    # Directly under the verdict, because it is the fastest way to dismiss an
+    # entry: the same run confirmed the same point under another phrasing, so
+    # the disagreement is between two restatements of one sentence rather than
+    # between the draft and the document. It cannot ride along in ``note`` —
+    # that field is suppressed below whenever it repeats the relevance reason,
+    # which for a mismatch entry it always does.
+    for sibling in c.get("confirmed_elsewhere") or ():
+        lines.append(
+            "  - ⚠ This run ALSO confirmed a closely-worded version of this "
+            f"claim, against {sibling.get('url')}"
+        )
+        lines.append(f'      Confirmed wording: "{sibling.get("claim", "")}"')
+
     lines.extend(_render_reask(c.get("reask")))
     lines.extend(_render_archive_pair(c))
 
@@ -1975,6 +1988,7 @@ def _render_mismatch_entry(citation):
         "final_url",
         "relevance_verdict",
         "relevance_reason",
+        "confirmed_elsewhere",
         *_PAIR_RENDERED_FIELDS,
     ]
     if reason and reason in (c.get("note") or ""):

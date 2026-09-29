@@ -23,6 +23,7 @@ from ci_core import llm
 
 from ci_article_review import history_analytics
 
+from . import draft_citations
 from . import wayback
 from ci_core.llm import cost
 
@@ -2107,6 +2108,79 @@ def _normalize_claim_entry(entry):
     )
 
 
+#: How much two claims must overlap before one is treated as covering the same
+#: point as the other.
+#:
+#: Measured on the 2026-09-18 GPS run, whose 30 refutations included several
+#: sentences the same run had already confirmed under a different phrasing. The
+#: four pairs verified by hand against the sources scored 0.455, 0.462, 0.571
+#: and 1.000, so 0.45 catches all of them; it annotates 7 of the 30. Loosening
+#: to 0.40 adds two more and starts pairing merely adjacent claims, so the
+#: threshold sits at the bottom of the verified range rather than below it.
+_SIBLING_OVERLAP = 0.45
+
+
+def _claim_overlap(first, second):
+    """Jaccard overlap of two claims' content words, 0.0 when either is empty."""
+    left = draft_citations.claim_tokens(first)
+    right = draft_citations.claim_tokens(second)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _note_confirmed_siblings(results):
+    """Tell a refuted entry when the same run confirmed the same point.
+
+    The ensemble returns one draft sentence as several differently-worded
+    claims, and each is resolved independently — often against a different URL,
+    because the URL comes from whichever fact-check model raised that phrasing.
+    They can therefore disagree. On the 2026-09-18 GPS run one sentence produced
+    four entries reading ``supports``, ``supports``, ``contradicts`` and
+    ``not_addressed``; only the failures reach "Read, and does NOT support the
+    claim", so the block asserted the source failed a sentence the same run had
+    already confirmed against a source the draft cites.
+
+    This does not suppress or re-rank anything — the verdict stands and the
+    entry stays in the block. It attaches the confirming sibling so the author
+    can see the disagreement is between two phrasings of their sentence rather
+    than between their draft and the document, which is usually a few seconds'
+    work to dismiss instead of a trip to the PDF.
+    """
+    confirmed = [r for r in results if r.get("verification") == "checksum"]
+    if not confirmed:
+        return
+    for result in results:
+        if result.get("verification") != "content_mismatch":
+            continue
+        claim = result.get("claim") or ""
+        matches = [
+            (_claim_overlap(claim, other.get("claim") or ""), other)
+            for other in confirmed
+        ]
+        siblings = [
+            {"claim": other.get("claim"), "url": other.get("url")}
+            for score, other in sorted(matches, key=lambda row: -row[0])
+            if score >= _SIBLING_OVERLAP
+        ]
+        if not siblings:
+            continue
+        result["confirmed_elsewhere"] = siblings
+        same_url = siblings[0].get("url") == result.get("url")
+        where = (
+            "the same source"
+            if same_url
+            else f"a different source ({siblings[0]['url']})"
+        )
+        result["note"] = (
+            f"{result.get('note', '').rstrip()} Note that this run also checked a "
+            f"closely-worded version of this claim and found it supported, against "
+            f"{where}. Two phrasings of one sentence can be resolved against "
+            f"different sources and disagree; compare them before treating this as "
+            f"a finding about the draft."
+        ).lstrip()
+
+
 def resolve_citations(
     claims,
     citation_sources,
@@ -2214,4 +2288,7 @@ def resolve_citations(
     # whole point is that the pairing the report offers has been verified,
     # whether the snapshot is new or was already there.
     _verify_archive_matches(resolved_results)
+    # Last, because it reads every other entry's outcome: a refutation is much
+    # less alarming when the same run confirmed the same point elsewhere.
+    _note_confirmed_siblings(resolved_results)
     return resolved_results
