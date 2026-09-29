@@ -346,6 +346,8 @@ Two things it does deliberately:
 
 6. Repeat until the findings are ones you're content to ship, then publish with `--publish`.
 
+**Drafting in a separate chat project?** When the article changes hands between that project and a Code session, write the hand-off from `handoff_templates/close_out.md` (Template D) instead of free-hand: settled edits as exact find-and-replace text, decisions kept apart from edits, and a check that the Drive folder and the pipeline's `History key` name the same article. See [docs/CLOSE-OUT.md](docs/CLOSE-OUT.md).
+
 `--raw-draft` on its own works too — it just uses the whole file as the article body and skips the metadata context, which means the review models lose the author-supplied framing. Pair it with `--metadata` whenever you have that context to give.
 
 ---
@@ -861,7 +863,8 @@ content-intelligence/
 │   │   │   ├── configs/               committed defaults: presets.yaml + *.example.yaml
 │   │   │   │                          (real user.yaml + publication.yaml are gitignored;
 │   │   │   │                          pricing/timeouts/model_registry live in ci-core)
-│   │   │   └── handoff_templates/     fill these out to submit drafts and publish
+│   │   │   └── handoff_templates/     fill these out to submit drafts, publish, and
+│   │   │                              hand an article between sessions
 │   │   └── tests/                     pipeline test suite, all external calls mocked
 │   │
 │   ├── ci-core/                  the shared foundation both applications import
@@ -936,6 +939,7 @@ content-intelligence/
     ├── PROVIDERS.md              account setup for every service
     ├── CONFIGURATION.md          full config reference, thoroughness, ensemble weights
     ├── CITATIONS.md              Section 9 confidence tiers and archiving behavior
+    ├── CLOSE-OUT.md              handing an article between Code and the drafting chat
     ├── NAMING.md                 package/module naming convention
     ├── TERMINOLOGY.md            "voice" vs. "style" and other term definitions
     └── TROUBLESHOOTING.md        error messages and fixes
@@ -954,6 +958,8 @@ content-intelligence/
 - **[docs/CITATIONS.md](docs/CITATIONS.md)** — How Section 9 resolves claims to primary sources: the three confidence tiers (verified / pointer-only / unresolved), what each one does and doesn't prove, and the Wayback Machine archiving behavior.
 
 - **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — Error messages and fixes for every service, plus pipeline behavior edge cases.
+
+- **[docs/CLOSE-OUT.md](docs/CLOSE-OUT.md)** — How an article is handed between a Code session and the claude.ai drafting project: the close-out template, where its files live and how they are named, the check that the Drive folder and the pipeline's `History key` name the same article, and how a note's exact-text edits are applied all-or-nothing.
 
 - **[docs/AI-DETECTORS.md](docs/AI-DETECTORS.md)** — Why this pipeline does not call a commercial AI-text detector (GPTZero, Originality.ai, Pangram, Turnitin). Evidence on detector accuracy for LLM-assisted-then-edited prose, false positives on technical writing, API cost against this repo's own per-run numbers, and the specific findings that would reverse the decision.
 
