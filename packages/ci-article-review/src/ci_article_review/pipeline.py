@@ -684,10 +684,25 @@ def _build_assignments(
                     break
                 # Fewest domains already carried first, so the width bought here
                 # is distinct-model coverage rather than a third and fourth
-                # domain piled onto whichever model happens to sort first. The
-                # sort is stable, so ties keep _substitute_candidates' ordering
-                # — which puts a search-grounded model first for fact_check.
-                pool.sort(key=lambda m: load.get(m, 0))
+                # domain piled onto whichever model happens to sort first.
+                #
+                # Except on fact_check, where a search-grounded candidate comes
+                # first whatever it already carries. Load used to decide there
+                # too, with grounding only breaking ties, so the least-loaded
+                # model won even when it could not search: measured 2026-09-28,
+                # with perplexity unavailable at wide, balanced and thorough the
+                # seat went to grok, which has no working search, while openai
+                # sat configured `web_search: [fact_check]`. A fact_check voter
+                # checking claims from training recall is the weakness the
+                # grounded pair exists to avoid. With no grounded candidate
+                # left, load decides as before.
+                pool.sort(
+                    key=lambda m: (
+                        domain == "fact_check"
+                        and not _is_grounded_for(m, domain, model_configs.get(m, {})),
+                        load.get(m, 0),
+                    )
+                )
                 chosen = pool[0]
                 # Named before the pick is recorded, so the line says which of
                 # the preset's own models is being stood in for.
@@ -2038,8 +2053,8 @@ def _run_reviews_in_parallel(runners, pipeline_cfg, model_configs, task_timeout)
     """
 
     def _per_model_timeout(runner_name):
-        m = runner_name.split(":")[0]
-        return model_configs.get(m, {}).get("timeout_seconds", task_timeout)
+        m, _, domain = runner_name.partition(":")
+        return _call_budget(m, domain, model_configs.get(m, {}), task_timeout)
 
     def _configured_model_id(runner_name):
         m = runner_name.split(":")[0]
@@ -2429,6 +2444,22 @@ def _is_grounded_for(model_name: str, domain: str, cfg: dict) -> bool:
     if not isinstance(cfg, dict):
         return False
     return _web_search_enabled(cfg.get("web_search"), domain)
+
+
+def _call_budget(model_name: str, domain: str, cfg, default=None):
+    """The wall-clock budget one (model, domain) call runs under.
+
+    The model's ``timeout_seconds``, except where this domain searches because
+    the model's ``web_search`` covers it: then ``search_timeout_seconds``, which
+    the run sizes alongside it (``timeout_model.search_budget``). Read here, in
+    one place, by both the task that enforces the budget and the call log that
+    reports it, so the two cannot disagree about which one a call ran under.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    searching = cfg.get("search_timeout_seconds")
+    if searching is not None and _web_search_enabled(cfg.get("web_search"), domain):
+        return searching
+    return cfg.get("timeout_seconds", default)
 
 
 def _domains_with_nothing_usable(raw_results, expected_domains=None):
@@ -3055,17 +3086,41 @@ def run_draft_pipeline(
                 _formula,
             )
 
+        # An explicit timeout_seconds is the user's budget for every call the
+        # model makes, searching or not, so it gets no search budget beside it.
+        _explicit = {
+            _prov
+            for _prov, _cfg in model_configs.items()
+            if isinstance(_cfg, dict) and _cfg.get("timeout_seconds") is not None
+        }
         computed_timeouts = timeout_model.compute_all(
             char_count, model_configs, task_timeout
         )
+        _searching = {}
         for _prov, _t in computed_timeouts.items():
-            if isinstance(model_configs.get(_prov), dict):
-                model_configs[_prov]["timeout_seconds"] = _t
+            _cfg = model_configs.get(_prov)
+            if not isinstance(_cfg, dict):
+                continue
+            _cfg["timeout_seconds"] = _t
+            # gemini and perplexity search on every call, and their model
+            # multipliers already carry it (configs/timeouts.yaml).
+            if (
+                _prov not in _explicit
+                and _prov not in _SEARCH_GROUNDED_MODELS
+                and _cfg.get("web_search")
+            ):
+                _cfg["search_timeout_seconds"] = _searching[_prov] = (
+                    timeout_model.search_budget(_t, task_timeout)
+                )
         if computed_timeouts:
             log.info(
                 "Timeouts (%d chars): %s",
                 char_count,
-                ", ".join(f"{p}={t}s" for p, t in sorted(computed_timeouts.items())),
+                ", ".join(
+                    f"{p}={t}s"
+                    + (f" ({_searching[p]}s when searching)" if p in _searching else "")
+                    for p, t in sorted(computed_timeouts.items())
+                ),
             )
 
     # Pre-load all prompt files before spawning threads (warms the cache)
@@ -3403,7 +3458,7 @@ def run_draft_pipeline(
             )
             or "none"
         )
-        budget = (mcfg or {}).get("timeout_seconds")
+        budget = _call_budget(model_name, domain, mcfg)
         elapsed = result.get("elapsed_seconds")
         out_tokens = (result.get("tokens") or {}).get("completion")
         timed_out = "timed out" in str(result.get("error", "")).lower()

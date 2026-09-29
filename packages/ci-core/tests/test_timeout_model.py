@@ -194,6 +194,34 @@ class TestComputeAll:
         )
 
 
+class TestSearchBudget:
+    """A call that searches because ``web_search`` asked it to gets room for
+    the search. Measured 2026-09-28: a grounded gpt-5.6-luna fact_check spent
+    ~40s searching and was killed at the 120s its model was sized for."""
+
+    def test_multiplies_the_budget_by_the_configured_factor(self):
+        mult = float(tm._CONFIG["search_multiplier"])
+        assert mult > 1
+        assert tm.search_budget(120, CEILING) == int(120 * mult)
+
+    def test_is_clamped_to_the_task_ceiling_like_every_budget(self):
+        assert tm.search_budget(1000, CEILING) == CEILING - 15
+
+    def test_never_lowers_a_budget(self):
+        import copy
+
+        cfg = copy.deepcopy(tm._CONFIG)
+        cfg["search_multiplier"] = 0.5
+        assert tm.search_budget(120, CEILING, config=cfg) == 120
+
+    def test_a_config_without_the_key_leaves_the_budget_alone(self):
+        import copy
+
+        cfg = copy.deepcopy(tm._CONFIG)
+        del cfg["search_multiplier"]
+        assert tm.search_budget(120, CEILING, config=cfg) == 120
+
+
 class TestFlagStaleOverrides:
     """Catches the perplexity/claude failure mode: an explicit timeout_seconds
     left over from a lighter preset, silently undercutting what the formula

@@ -674,9 +674,14 @@ The rules are deliberately tight:
 - Candidates are ordered by which model is carrying the fewest domains already,
   so the width bought is distinct-model coverage rather than a third and fourth
   domain piled onto whichever model sorts first.
+- On `fact_check`, a search-grounded candidate comes first whatever it already
+  carries: gemini and perplexity, plus any model whose `web_search` covers
+  `fact_check`. Before 2026-09-28 grounding only broke ties, so with perplexity
+  unavailable at `wide`, `balanced` or `thorough` the seat went to grok, which
+  cannot search, even where openai was configured to. Load decides only when no
+  grounded candidate is left.
 - Credential checks, `enabled: false`, `prompts:` overrides and the
-  drafting-model exclusion all apply exactly as in a normal assignment, and
-  `fact_check` still prefers a search-grounded model.
+  drafting-model exclusion all apply exactly as in a normal assignment.
 
 Every backfilled assignment is logged (`Backfilled: ...`) and listed in the
 report's *Ensemble Width* section, naming the preset entry it stands in for.

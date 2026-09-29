@@ -210,6 +210,54 @@ class TestBackfillPrefersDistinctCoverage:
         assert set(by_domain["fact_check"]) <= set(pipeline._SEARCH_GROUNDED_MODELS)
 
 
+class TestFactCheckBackfillPrefersGrounding:
+    """Measured 2026-09-28: with perplexity unavailable at wide, balanced or
+    thorough (all run the `thorough` map), backfill gave fact_check's second
+    seat to grok -- the least-loaded candidate, and one with no working search
+    -- although openai was configured `web_search: [fact_check]`."""
+
+    def _thorough(self, **overrides):
+        configs = {m: {} for m in _ALL_MODELS}
+        configs["perplexity"] = {"enabled": False}
+        configs.update(overrides)
+        backfills = []
+        pairs = pipeline._build_assignments(
+            "thorough", configs, _ALL_KEYS, backfills=backfills
+        )
+        return _by_domain(pairs), backfills
+
+    def test_a_grounded_candidate_beats_a_less_loaded_one(self):
+        by_domain, backfills = self._thorough(openai={"web_search": ["fact_check"]})
+
+        # openai already carries three domains and grok one; grounding wins.
+        assert by_domain["fact_check"] == ["gemini", "openai"]
+        assert any(line.startswith("openai → fact_check") for line in backfills)
+
+    def test_with_no_grounded_candidate_load_still_decides(self):
+        by_domain, _ = self._thorough()
+
+        assert by_domain["fact_check"] == ["gemini", "grok"]
+
+    def test_the_preference_is_scoped_to_fact_check(self):
+        """Elsewhere a grounded model buys nothing a less-loaded one does not,
+        so distinct coverage still decides. Two models would tie on every real
+        preset, so a two-domain preset isolates the rule: openai is grounded
+        for red_team and carries one domain, grok is not and carries none."""
+        tiny = {"voice_style": ["openai"], "red_team": ["mistral", "claude"]}
+        configs = {
+            "openai": {"web_search": ["red_team"]},
+            "mistral": {},
+            "grok": {},
+            "gemini": {"enabled": False},
+            "perplexity": {"enabled": False},
+            "claude": {"enabled": False},
+        }
+        with patch.dict(pipeline._THOROUGHNESS_PRESETS, {"tiny": tiny}):
+            pairs = pipeline._build_assignments("tiny", configs, _ALL_KEYS)
+
+        assert _by_domain(pairs)["red_team"] == ["mistral", "grok"]
+
+
 class TestExpectedDomainsComeFromThePreset:
     """The gap in the substitution pass: a domain nobody was assigned to."""
 
