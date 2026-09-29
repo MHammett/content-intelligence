@@ -642,9 +642,10 @@ def _refuse_fake_stream(name):
 
     So this asks litellm, per call, the question ``responses()`` is about to ask
     it, and refuses before anything is sent. What presets.yaml ships is checked
-    against the bundled map in CI too — ci-article-review's
-    ``test_preset_native_streaming.py`` — but no test can settle a map that is
-    fetched at runtime, or a model named in user.yaml.
+    against the bundled map in CI too — ci-article-review's and
+    ci-style-profile's ``test_preset_native_streaming.py``, one per package that
+    ships a presets.yaml naming openai models — but no test can settle a map that
+    is fetched at runtime, or a model named in user.yaml.
 
     Refusing, rather than registering the model as
     :func:`_stream_azure_deployment` does: a deployment name is never in the
