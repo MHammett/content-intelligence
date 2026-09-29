@@ -153,9 +153,14 @@ a similarly short fixture deliberately engineered to touch more of the
 pipeline's edges in one pass: a mix of resolving, dead, and mismatched
 citations, a claim that needs a live web search, an AI-speak passage several
 models should flag in consensus, and a vague SEO heading. A `--cost-preset
-wide` run against it costs about $0.13, live-verified end to end (2026-09-08:
-all 12 ensemble calls completed, one transient malformed-JSON retry recovered
-cleanly, process exited without hanging).
+wide` run against it costs about $0.40 as the report prices it, live-verified
+end to end (2026-09-28: 44 API calls, all 12 ensemble calls completed after
+three transient OpenAI HTTP 500s were retried, process exited cleanly in five
+minutes); with `--offline` it makes only the 12 ensemble calls, about $0.38.
+More than half of either figure is search fees at list price, most of them
+Gemini's queries, which Google's free monthly allowance covers until it is
+spent — see "What a run costs" in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#cost-presets).
 
 **6. Publish an approved draft:**
 

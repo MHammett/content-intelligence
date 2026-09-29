@@ -357,14 +357,17 @@ pipeline:
   # Preset    Thoroughness  Reasoning     Measured cost (draft size in words)
   # --------  ------------  ------------  --------------------------------------------------
   # economy   standard      not set       not measured on a sized draft; costs less than wide
-  # wide      thorough      not set       $0.10-$0.15 (~1,400); $0.38 (~19,500)       ← default
+  # wide      thorough      not set       $0.40† (~1,400); $0.38 (~19,500)            ← default
   # balanced  thorough      light (low)   $1.28 (~19,500)
   # thorough  thorough      deep          $1.33 (~2,900); $1.74 (~19,500)
   # maximum   maximum       max           $6.15 (~2,900); about $9.6 (~19,500)
   #
-  # Each figure is a floor, not a quote: token costs only, and a retried attempt the
-  # provider billed without reporting usage is priced at $0.00.  docs/CONFIGURATION.md,
-  # "Cost presets", has the run counts and what was measured.
+  # Each figure is a floor, not a quote: a retried attempt the provider billed without
+  # reporting usage is priced at $0.00.  † was measured 2026-09-28 with search fees
+  # included, $0.23 of it, mostly Gemini's queries at list price.  Every other figure
+  # is token costs only and predates the move of every preset to gemini-3.5-flash,
+  # so its query fees come on top.  docs/CONFIGURATION.md, "Cost presets", has the
+  # run counts and what was measured.
   #
   # `standard` was retired 2026-09-05 in favour of `wide`, which beat it on every
   # measured axis at lower cost (first measured at 55% of it; the saving has since
