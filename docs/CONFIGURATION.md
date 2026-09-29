@@ -1363,6 +1363,73 @@ seo_rules:
 
 ---
 
+### Images in the FINAL DRAFT
+
+Write each image as ordinary Markdown, alone on its own line, with a blank line
+above and below:
+
+```markdown
+![Grid load by county, August peak](images/grid-load.png "Figure 1: Grid load by county")
+```
+
+| Part | What it does |
+|---|---|
+| Alt text, in the square brackets | What a screen reader reads in place of the image. It is set on the image block **and** on the media-library item. An empty one is allowed (a purely decorative image), and is listed before the confirmation prompt so it is a choice rather than an oversight. |
+| Source, in the parentheses | A path to a file on disk, or an `http(s)` URL. |
+| Caption, the optional quoted text after the source | Shown under the image. Markdown calls it the title. Plain text only; leave it out for no caption. |
+
+A **file on disk** is uploaded to the WordPress media library when you publish,
+and the post gets a native Image block that points at the attachment, so the
+block editor's replace, resize and alt-text controls work on it. The path is
+relative to the directory of the handoff file you pass to `--publish`, wherever
+you run the command from, or absolute. Use forward slashes on Windows
+(`C:/photos/grid-load.png`): Markdown reads a backslash as an escape, so
+`C:\photos\_grid.png` reaches the script as `C:\photos_grid.png`. A path with
+spaces is written `<my photo.png>` or `my%20photo.png`. WordPress decides which
+types it accepts (`.svg` needs a plugin); the script itself only checks that the
+extension is an image type, so a PDF is refused before anything is uploaded.
+
+An **`https://` URL** is for an image that is already hosted. The block points
+at it and nothing is uploaded. It is not in this site's media library, so it has
+no attachment, and its alt text lives on the block alone. Its reachability is
+not checked.
+
+**What stops a publish.** All of it is checked before the SEO suggestion call
+is paid for and before the checklist asks for a yes, everything wrong is
+reported at once, and each line names the image:
+
+- a file that is missing, is a folder, is not an image type, is empty or cannot
+  be read;
+- a local image inside a sentence, list, quote, table or link, which cannot
+  become an image block. Put it on a line of its own. (A URL image there is left
+  as it always was, since it still renders);
+- an image with no source, or one that is neither a path nor an `http(s)` URL
+  (`data:`, `file:`);
+- a local image in a draft whose HTML could not be parsed at all, which would
+  otherwise publish its path as if it were a URL.
+
+An upload WordPress refuses (credentials, file type, size) stops the publish
+too, and the post is not created. The error names the image, the HTTP status
+and WordPress's own reason, and says what to check.
+
+**What it does not do.** Uploaded files are public from the moment they are
+uploaded, even though the post stays a draft: WordPress serves media by URL.
+Nothing is deleted if a later step fails, so an image already uploaded stays in
+the media library, and the error lists which by ID. Nothing is remembered
+between runs: publishing the same handoff twice uploads its images twice, and
+WordPress names the second copy `grid-load-1.png`. Within one publish a file
+used twice is uploaded once. The uploads are made before the post exists, so the
+Media Library lists them as unattached; they are still the images the post uses. A linked image (`[![alt](x.png)](url)`), an
+alignment or a width is not supported; an attribute list such as
+`{: width=300 }` is dropped, with a warning.
+
+**What you see.** Before the checklist, an `IMAGES` list: each image's
+resolved path or link, its alt text and caption, and any image with no alt
+text. After the push, next to the post URL: how many were uploaded and how many
+linked, with the media IDs.
+
+---
+
 ### SEO suggestions
 
 The pre-analysis SEO pass reports what's missing. The suggestion pass proposes
