@@ -301,7 +301,8 @@ def _validate_publication_config(config, publication_name):
         raise ValueError(
             f"Publication config '{publication_name}' is missing required fields:\n"
             + "\n".join(f"  {m}" for m in missing)
-            + "\nSee configs/publication.example.yaml for the expected structure."
+            + f"\nSee {_PACKAGED_CONFIGS / 'publication.example.yaml'} for the "
+            "expected structure."
         )
 
 

@@ -12,7 +12,7 @@ Three more are provider/model reference data rather than review settings, so the
 - `model_registry.yaml` — model deprecation tracking; edit to add superseded entries and bump the date
 - `timeouts.yaml` — sliding-scale timeout model (size × model × effort multipliers)
 
-The first two are gitignored and have example templates you copy (`user.example.yaml`, `publication.example.yaml`, plus worked examples in `configs/examples/`). The rest are committed defaults — they ship with the repo and *are* their own reference; edit them in place, no copy step.
+The first two are gitignored and have example templates you copy (`user.example.yaml`, `publication.example.yaml`, plus worked examples in `examples/`). Those templates ship inside the package, under `packages/ci-article-review/src/ci_article_review/configs/` — a checkout has no `configs/` at all until `uv run ci-setup` creates one. The rest are committed defaults — they ship with the repo and *are* their own reference; edit them in place, no copy step.
 
 ---
 
@@ -1513,7 +1513,7 @@ wordpress:
   application_password: ${WP_APPLICATION_PASSWORD}
 ```
 
-See `configs/examples/` for complete worked examples.
+See `packages/ci-article-review/src/ci_article_review/configs/examples/` for complete worked examples.
 
 ---
 
