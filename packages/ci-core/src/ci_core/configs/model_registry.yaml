@@ -179,6 +179,13 @@ newer_available:
   gpt-5.6-luna:
     newer: gpt-5.6-terra
     note: "gpt-5.6-terra ($2.00/$12.00 MTok) available for heavier tasks; luna remains the right choice for fast/cheap everyday work"
+  # 2026-09-29: repointed from claude-sonnet-5 to claude-sonnet-5-5, which ships
+  # at the same $2.00/$10.00 and whose retirement floor is 15 months later
+  # (platform.claude.com/docs/en/about-claude/model-deprecations, read that
+  # day). The price in the note was still right, so nothing flagged the model id
+  # going a generation stale. The preset names were wrong too: `standard` was
+  # retired 2026-09-05, and `economy` disables claude entirely -- `wide` is the
+  # only tier that configures haiku.
   claude-haiku-4-5-20251001:
-    newer: claude-sonnet-5
-    note: "claude-sonnet-5 ($2.00/$10.00 MTok) available; haiku remains better value for economy/standard presets"
+    newer: claude-sonnet-5-5
+    note: "claude-sonnet-5-5 ($2.00/$10.00 MTok) available; haiku remains better value for `wide`, the only preset that runs it"
