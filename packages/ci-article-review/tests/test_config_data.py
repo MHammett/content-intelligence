@@ -678,3 +678,60 @@ class TestMissingConfigMessagesNameRealPaths:
         default = self._raised(load_user_config)
         assert "--config-dir" not in default, default
         assert "`uv run ci-setup`" in default, default
+
+    def test_no_source_names_an_example_config_path_that_is_not_there(self):
+        """The other half of this class, and the half that keeps catching misses.
+
+        The tests above call a loader and check the paths it *resolved*. They
+        cannot see a path that was never resolved -- a literal written into a
+        message by hand. Every one of those found so far was wrong, because the
+        examples have not been at a repo-root `configs/` since 3ae33d4
+        (2026-06-24), and three passes each left one behind:
+
+          * #251 fixed six, and said ci_core/llm/client.py's was left for a
+            separate change;
+          * #253 fixed that one, with a ci_core-scoped version of this guard;
+          * `_validate_publication_config` was still naming a repo-root
+            publication example after both -- directly below the
+            `_validate_user_config` that #251 had fixed.
+
+        So this asserts the property rather than the instances: an example config
+        ships, so any *path* naming one has to resolve. A bare filename is exempt
+        -- `_PACKAGED_CONFIGS / 'user.example.yaml'` is how the fixed messages are
+        built, and whether that resolves is what the tests above check. So are the
+        configs a user creates (`configs/user.yaml`, `configs/<pub>.yaml`), which
+        are *supposed* not to exist where these errors are raised.
+
+        Strings, not comments. A `#:` block quoting the old wrong instruction to
+        explain the fix -- config_loader.py's own `_PACKAGED_CONFIGS` comment does
+        exactly that -- is history, not a pointer, and rewording it to satisfy a
+        grep would make the record harder to read. What reaches a user is a string
+        literal, so that is what this reads, via ast rather than text.
+
+        Source only, deliberately. docs/TROUBLESHOOTING.md has to name the dead
+        path in order to explain that it is dead, and prose saying "there is no
+        `configs/user.example.yaml` in a checkout" is correct writing that this
+        rule would call a defect. Real markdown links are already covered by
+        test_docs_current.py's `test_all_relative_markdown_links_resolve`.
+        """
+        import ast
+        import re
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[3]
+        # Requires a directory part: a string that says *where* the file is can
+        # be wrong about it, where a bare filename makes no such claim.
+        pattern = re.compile(r"[\w./-]*/(?:[\w.-]+\.example\.yaml|examples/?)")
+        offenders = []
+        for source in sorted((repo_root / "packages").rglob("*/src/**/*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                    continue
+                for match in pattern.findall(node.value):
+                    if not (repo_root / match).exists():
+                        rel = source.relative_to(repo_root).as_posix()
+                        offenders.append(f"{rel}:{node.lineno}: {match}")
+        assert not offenders, "names an example config path that is not there:\n" + (
+            "\n".join(f"  {o}" for o in sorted(set(offenders)))
+        )
