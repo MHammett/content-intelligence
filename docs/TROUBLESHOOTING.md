@@ -69,7 +69,15 @@ The Responses API with `web_search_preview` falls back silently to standard chat
 **Perplexity (or Gemini) returns non-JSON / Malformed JSON**  
 Reasoning and grounded models (sonar-reasoning-pro, gemini-2.5-pro) sometimes wrap responses in markdown fences, prepend a chain-of-thought / `<think>` block, or surround the JSON with prose. All review adapters share a robust extractor (`ci_core.llm.json_utils`) that tries a direct parse, then a fenced block, then the outermost `{…}` span. If none parse, the run continues with that pass marked failed and the other models' results stand.
 
+**Perplexity calls fail with a bare `sonar*` model**  
+Perplexity supported Sonar chat completions, where the bare ids (`sonar`, `sonar-pro`, `sonar-reasoning-pro`) go, until 2026-09-27. Set the model to `perplexity/sonar`, the same model on its Agent API, which every preset has run since 2026-09-28. A run with a bare id configured flags it as superseded. See [PROVIDERS.md](PROVIDERS.md#perplexity-ai-optional--recommended).
+
+**"models.perplexity.search_mode is ..., which Perplexity's Agent API has no equivalent for"**  
+`search_mode` (`academic`, `sec`) was a Sonar option. The Agent API has none, so it is not sent, and the warning appears once per run. Remove it, or steer sources with `search_domain_filter`, which the Agent API does take.
+
 **sonar-reasoning-pro timing out even with a generous `stream_read_timeout` / wall-clock budget**  
+Historical: no preset has run `sonar-reasoning-pro` since 2026-09-28, and its successor runs on the 160s default (see `presets.yaml`'s Perplexity refresh note). Kept for the method.
+
 Investigated 2026-08-07 after PRs #19/#20/#23/#26 each raised Perplexity's timeouts and each got outrun within days (calibration 59-141s → 233.93s → 240s ceiling hit → 162s vs 160s read-gap → 282s vs 280s → 352s/354s vs 350s, wall-clock hit directly at 375s for the first time). The pattern — failures landing within a few seconds of whatever the current ceiling happened to be — raised the question of whether something in this codebase was leaking the configured timeout back into the request (e.g. inflating `max_tokens` or reasoning depth), rather than the calls genuinely getting slower.
 
 Findings:
@@ -177,7 +185,7 @@ One of your configured model IDs has been superseded by a newer model. The old m
 The built-in model registry hasn't been updated in 60+ days. Provider APIs change frequently. Re-check [PROVIDERS.md](PROVIDERS.md) against current provider documentation, update `superseded:` / `newer_available:` in [`ci-core`'s `model_registry.yaml`](../packages/ci-core/src/ci_core/configs/model_registry.yaml), and bump `registry_date:` to today. This resets the staleness clock. No code change is needed — the pipeline reloads the YAML each run.
 
 **Model discovery shows no models for a provider**  
-Check that the provider's API key is valid (run the check command first). For Gemini configured via Vertex AI, model listing is not supported — check https://ai.google.dev/models manually. For Perplexity, model listing isn't available from their API; the script shows a static documented list.
+Check that the provider's API key is valid (run the check command first). For Gemini configured via Vertex AI, model listing is not supported — check https://ai.google.dev/models manually. Perplexity's list comes from its Agent API (`GET /v1/models`) and carries no dates, so nothing on it shows as NEW.
 
 **Model discovery shows NEW models but the check command fails with 404 on the new model**  
 The new model exists in the provider's catalog but may require a different API access tier, may be in preview, or the model ID in the discovery list may not match exactly what the API accepts for inference. Check the provider's documentation for the exact model ID and any access requirements.

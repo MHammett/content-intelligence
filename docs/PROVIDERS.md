@@ -223,9 +223,25 @@ models:
 
 ## Perplexity AI (optional — recommended)
 
-Perplexity's sonar models run every response through live web search by default. Adding a Perplexity key gives you a second independent search-grounded fact-checker alongside Gemini. Both get the `grounding_bonus` (1.5×) on `fact_check` when the call actually consulted live sources; see [Ensemble weighting](CONFIGURATION.md#ensemble-weighting).
+Perplexity's models search the live web as they answer. Adding a Perplexity key gives you a second independent search-grounded fact-checker alongside Gemini. Both get the `grounding_bonus` (1.5×) on `fact_check` when the call actually consulted live sources; see [Ensemble weighting](CONFIGURATION.md#ensemble-weighting).
 
-> **Sonar is being retired.** Perplexity's documentation says Sonar "will be supported until September 27, 2026", and recommends moving existing Sonar Chat Completions usage to its [Agent API](https://docs.perplexity.ai/docs/agent-api/migrate-from-sonar/overview). Its [forum announcement](https://community.perplexity.ai/t/sonar-is-moving-to-the-agent-api/5802) of 2026-08-13 says the Sonar endpoints retire on that date. This pipeline calls Sonar through litellm's `perplexity/` chat-completions route, and every cost preset runs a Sonar model, so plan for those calls to fail after the date unless the adapter moves to the Agent API. Setting `enabled: false` on `perplexity` (see [Disabling a model](CONFIGURATION.md#disabling-a-model)) runs the pipeline without it. `presets.yaml` has not been changed.
+Perplexity has two APIs, and the model id decides which one a call goes to:
+
+- **Agent API** — any id with a vendor prefix, as Perplexity's own model list writes them: `perplexity/sonar`, `perplexity/deepseek-v4-pro-0813`, `openai/gpt-5.6-luna`. This is the current API. It is called through Perplexity's own SDK (`perplexityai`), with the `web_search` tool attached to every call.
+- **Sonar Chat Completions** — the bare `sonar*` ids (`sonar`, `sonar-pro`, `sonar-reasoning-pro`), through litellm as before.
+
+> **Sonar is being retired.** Perplexity's documentation says Sonar "will be supported until September 27, 2026", and recommends moving to its [Agent API](https://docs.perplexity.ai/docs/agent-api/migrate-from-sonar/overview); its [forum announcement](https://community.perplexity.ai/t/sonar-is-moving-to-the-agent-api/5802) says the Sonar endpoints retire that day. On 2026-09-28 a Sonar request was still answered and billed, so the date was not a hard shutoff, but nothing says for how long. The Agent API is the successor either way, and every cost preset has run `perplexity/sonar` on it since 2026-09-28. That is the Sonar model itself on the new API. At every draft size tried it retrieved about three times the sources of either Sonar model the presets ran, cited more of them and confirmed more claims; it costs less than `sonar-reasoning-pro` and more than `sonar` (table below).
+
+**How the Agent API seat differs from Sonar.** The model decides whether to call `web_search`; Sonar searched on every request whether it needed to or not. So whether a call actually searched is read off the response, and a call that did not search gets no grounding bonus. Measured, `perplexity/sonar` searched on every fact-check call (10 of 10) and on none of the other four domains' calls (0 of 8). Those review the draft's own writing, and on each it returned as many findings as `sonar-reasoning-pro`, or more. The model can also take more than one step, searching again after reading results, up to `max_steps` (Perplexity's default for a named model is 1). Everything else the pipeline reads comes back as it did from Sonar: the JSON schema is enforced, sources arrive as `citations` and `search_results`, and the search count and token usage are exact. Perplexity also reports what it billed for each call, which the run records as `provider_cost_usd` beside the pipeline's own estimate.
+
+What is sent, and what is not:
+
+- `store: false`, so Perplexity does not keep the draft for later retrieval.
+- No `temperature` unless you set one. The Agent API applies it per model, and ignores it for GPT-5 models.
+- `search_domain_filter` and `search_recency_filter` go into the `web_search` tool's filters, and `search_context_size` onto the tool. `search_mode` (`academic`, `sec`) has no Agent API equivalent; it is not sent, and the first call that has one logs a warning.
+- `reasoning_effort` becomes `reasoning.effort`, `max_tokens` becomes `max_output_tokens`, and `max_steps` is sent as is. An `anthropic/*` model must have an output ceiling, so one gets 16,000 if you set none.
+
+Why Perplexity's SDK rather than litellm: litellm's route for this API drops `response_format` without a word, fakes the stream for any model its map does not list (today that includes every one of Perplexity's own presets, `perplexity/preset/medium` and the rest), and in the 1.96.2 this repo pins, crashes at the last event of a real response. See UPSTREAM.md entries 6, 9 and 10.
 
 **Where:** https://www.perplexity.ai/settings/api
 
@@ -240,18 +256,41 @@ Perplexity's sonar models run every response through live web search by default.
 
 **Current models (September 2026):**
 
-| Model | Input | Output | Request fee, per 1,000 (low / medium / high search context) | Notes |
+On the Agent API, tokens plus a fee for each `web_search` call ($2.50 per 1,000). There is no per-request fee:
+
+| Model | Input | Output | Cache read | Notes |
 |---|---|---|---|---|
-| `sonar-reasoning-pro` | $2/MTok | $8/MTok | $6 / $10 / $14 | CoT reasoning + web search; **recommended default**; what `balanced`, `thorough` and `maximum` run |
-| `sonar-pro` | $3/MTok | $15/MTok | $6 / $10 / $14 | Web search, no CoT trace; good for standard tier; in no preset |
-| `sonar` | $1/MTok | $1/MTok | $5 / $8 / $12 | Lightweight; economy option; what `economy` and `wide` run |
-| `sonar-deep-research` | $2/MTok | $8/MTok | none | Extended research; highest cost and latency. Also bills citation tokens ($2/MTok), reasoning tokens ($3/MTok) and $5 per 1,000 searches |
+| `perplexity/sonar` | $0.25/MTok | $2.50/MTok | $0.0625/MTok | Perplexity's own model; what **every preset** runs |
+| `perplexity/deepseek-v4-pro-0813` | $1.32/MTok | $3.96/MTok | $0.044/MTok | Searched well when measured, but truncated its output on a 31k-character draft, and a repeat returned malformed JSON; see below |
+| `perplexity/kimi-k3`, `perplexity/glm-5.3`, `perplexity/nemotron-3-ultra-550b-a55b` | see pricing.yaml | | | Did not call `web_search` at all on a fact-check when measured; see below |
 
-Prices are from Perplexity's [pricing page](https://docs.perplexity.ai/docs/getting-started/pricing), checked 2026-09-19. The request fee is charged per request on top of the tokens. For `sonar` it is about as large as the tokens themselves: $0.005–$0.012 a request against roughly $0.009 of tokens a call in saved runs.
+Third-party models are on the Agent API too (`openai/…`, `anthropic/…`, `google/…`, `xai/…`); `ci-discover` lists them. pricing.yaml does not price them, so a run using one estimates its cost at the table's fallback rate ($2.50/$10 per MTok) and marks the pricing unknown, while `provider_cost_usd` still records what Perplexity billed. For `openai/gpt-5.6-luna` the fallback came to 13 times the bill. Running a model family the ensemble already has (a GPT model here, beside the openai seat) gives consensus two voters that share one model's mistakes.
 
-Perplexity's reasoning is model-selection based — use `sonar-reasoning-pro` for CoT, `sonar-pro` for standard search grounding. There is no separate reasoning parameter.
+On Sonar Chat Completions, being retired, tokens plus a fee per request by search context size, per 1,000 requests (low / medium / high):
 
-**Expected cost:** measured per review call, tokens only, from saved runs: `sonar-reasoning-pro` $0.006–$0.13, median $0.063 (160 calls, drafts of 2,182–135,514 characters; the reasoning trace makes the token count vary widely); `sonar` $0.008–$0.010 (4 calls, a 9,456-character draft), priced at Perplexity's $1/$1 rate. The request fee above comes on top of both.
+| Model | Input | Output | Request fee | Notes |
+|---|---|---|---|---|
+| `sonar-reasoning-pro` | $2/MTok | $8/MTok | $6 / $10 / $14 | What `balanced`, `thorough` and `maximum` ran until 2026-09-28 |
+| `sonar-pro` | $3/MTok | $15/MTok | $6 / $10 / $14 | In no preset |
+| `sonar` | $1/MTok | $1/MTok | $5 / $8 / $12 | What `economy` and `wide` ran until 2026-09-28 |
+| `sonar-deep-research` | $2/MTok | $8/MTok | none | Also bills citation tokens ($2/MTok), reasoning tokens ($3/MTok) and $5 per 1,000 searches |
+
+Prices are from Perplexity's [pricing page](https://docs.perplexity.ai/docs/getting-started/pricing) and [models page](https://docs.perplexity.ai/docs/agent-api/models), checked 2026-09-28; the API's own `GET /v1/models` returned the same rates.
+
+**Measured, 2026-09-28.** The fact-check call only, on the `maximum` config with just Perplexity's model swapped, `--offline`. Three runs per model on each of two real drafts; the smoke-test draft had two. A single run reproduces only about a quarter of its findings, so read medians, not rows:
+
+| draft | model | sources retrieved | finding URLs among them | confirmed claims | seconds | $ per call |
+|---|---|---:|---:|---:|---:|---:|
+| 31,112 chars | `sonar-reasoning-pro` | 15 | 53% | 8 | 186 | $0.069 |
+| 31,112 chars | `perplexity/sonar` | 44 | 89% | 16 | 64 | $0.037 |
+| 135,514 chars | `sonar-reasoning-pro` | 15 | 30% | 5 | 116 | $0.108 |
+| 135,514 chars | `perplexity/sonar` | 45 | 81% | 10 | 34 | $0.037 |
+| 9,456 chars | `sonar` | 15 | 60% | 4 | 21 | $0.013 |
+| 9,456 chars | `perplexity/sonar` | 44 | 89% | 10.5 | 30 | $0.024 |
+
+Every run of either model searched, and none failed. "Finding URLs among them" is how many of the URLs the model wrote into its findings were among the sources its search actually returned; the rest it typed from memory. One `perplexity/sonar` run on the 31,112-character draft listed 163 findings, 145 of them unverifiable or out of scope, where no other run in the table listed more than 56. A screening run with `max_steps: 3` did the same (140, 79 out of scope). So it happens, and it is worth watching: it lengthens Section 2 and gives citation resolution more to do.
+
+All five domains once, on the 31,112-character draft: `sonar-reasoning-pro` took 168s and $0.215, and `perplexity/sonar` 40s and $0.063. Every call in both runs returned. See presets.yaml's "Perplexity refresh" note for the models tried and not taken, and why.
 
 **What it adds:** At `standard` thoroughness, Perplexity only runs if you explicitly add it to a model's `prompts:` list. At `thorough` thoroughness, it runs fact_check automatically alongside Gemini. Two independently grounded models flagging the same claim is very strong signal.
 
@@ -262,7 +301,18 @@ api_keys:
     api_key: your_key_here
 
 models:
-  perplexity: sonar-reasoning-pro
+  perplexity: perplexity/sonar
+```
+
+To tune the Agent API seat under a cost preset, use `pipeline.preset_overrides` (the preset owns `model`, `reasoning_effort` and `max_steps`):
+
+```yaml
+pipeline:
+  cost_preset: maximum
+  preset_overrides:
+    perplexity:
+      max_steps: 3          # search again after reading results; the default is 1.
+                            # Measured once: fewer sources, 79 of 140 findings out of scope
 ```
 
 ---

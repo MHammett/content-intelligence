@@ -121,15 +121,30 @@ superseded:
     replacement: claude-sonnet-5
     note: "claude-sonnet-5 available 2026-06-29, price dropped to $2/$10 MTok from $3/$15"
 
-  # Perplexity
+  # Perplexity. Sonar Chat Completions was "supported until September 27, 2026"
+  # (Perplexity's docs), replaced by the Agent API, which serves the same Sonar
+  # model as `perplexity/sonar`. Measured 2026-09-28 against the Sonar models the
+  # presets ran; see presets.yaml's Perplexity refresh note. The older ids point
+  # straight at the end of the chain rather than at a Sonar id that is itself
+  # superseded. sonar-deep-research is not listed: no preset ran it, and nothing
+  # here measured a successor for it.
+  sonar:
+    replacement: perplexity/sonar
+    note: "Sonar Chat Completions retired 2026-09-27; the same model on Perplexity's Agent API"
+  sonar-pro:
+    replacement: perplexity/sonar
+    note: "Sonar Chat Completions retired 2026-09-27; see presets.yaml's Perplexity refresh note"
+  sonar-reasoning-pro:
+    replacement: perplexity/sonar
+    note: "Sonar Chat Completions retired 2026-09-27; measured 2026-09-28, see presets.yaml"
   pplx-7b-online:
-    replacement: sonar
+    replacement: perplexity/sonar
   pplx-70b-online:
-    replacement: sonar-pro
+    replacement: perplexity/sonar
   sonar-small-online:
-    replacement: sonar
+    replacement: perplexity/sonar
   sonar-medium-online:
-    replacement: sonar-pro
+    replacement: perplexity/sonar
 
   # Mistral
   mistral-small:

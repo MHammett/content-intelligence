@@ -42,6 +42,9 @@ _PRESET_OWNED = frozenset(
         # by every tier — a reasoning flag, so the preset owns it as it owns
         # the budget it replaced.
         "thinking_level",
+        # How many search-and-reason rounds Perplexity's Agent API may take:
+        # how hard the seat works, set per tier like reasoning_effort.
+        "max_steps",
         "enabled",
     }
 )
@@ -68,8 +71,18 @@ def _merge(caplog, preset, models, overrides=None):
         return merge_configs(user, {})["models"]
 
 
-def _stream_for(provider):
+def _stream_for(provider, model=None):
     """A minimal well-formed stream in the shape ``provider``'s surface reads."""
+    if client._uses_agent_api(provider, model):
+        return [
+            SimpleNamespace(
+                type="response.output_text.delta", delta='{"a": 1}', output_index=0
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response={"status": "completed", "output": [], "usage": None},
+            ),
+        ]
     if provider == "openai":
         return [
             SimpleNamespace(type="response.output_text.delta", delta='{"a": 1}'),
@@ -95,15 +108,23 @@ def _stream_for(provider):
 
 
 def _call(provider, model_cfg):
-    """Run ``client.call`` against a stubbed litellm: (result, timeout it got)."""
+    """Run ``client.call`` against a stubbed litellm, and a stubbed Perplexity
+    Agent API for the ids that go there: (result, timeout it got)."""
     seen = {}
 
     def _capture(**kwargs):
         seen.update(kwargs)
         return _stream_for(provider)
 
+    def _agent(api_key, timeout, params):
+        seen.update(params, timeout=timeout)
+        return _stream_for(provider, params["model"])
+
     target = "responses" if provider == "openai" else "completion"
-    with patch.object(client.litellm, target, side_effect=_capture):
+    with (
+        patch.object(client.litellm, target, side_effect=_capture),
+        patch.object(client, "_perplexity_agent", side_effect=_agent),
+    ):
         result = client.call(
             provider,
             "sys",

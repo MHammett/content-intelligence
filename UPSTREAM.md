@@ -556,6 +556,15 @@ PRs are about 3% of litellm's merges (see entry 1), and entry 5 landed the other
 way, with their bot reimplementing the fix from the issue. So #37125 is as likely
 a route to a fix as the PR, and both carry the same diagnosis.
 
+**It drops Perplexity's schema too (2026-09-28, not yet added upstream).**
+Perplexity's Agent API takes `response_format` in exactly this shape; it is the
+one spelling that API documents. `litellm.responses(model="perplexity/perplexity/sonar",
+response_format={...}, stream=True)` sends a body without it, on 1.96.2 and on
+1.103.0 alike, with `httpx.Client.send` recorded; `extra_body` is the only way
+through. A second provider on the same silent drop is worth a comment on
+#37125. This project calls that API through Perplexity's own SDK instead (see
+entry 10), so nothing here waits on it.
+
 ---
 
 ## 7. pytest-socket — fixture teardown runs after the guard is lifted
@@ -781,3 +790,60 @@ are unaffected. An unmapped model that really cannot stream then gets an error
 from its server, instead of a slowdown nothing reports. The workaround here uses
 `litellm.register_model`, the call litellm's own Router makes per deployment,
 to describe each Azure deployment as the model it serves.
+
+**On Perplexity's Agent API too (2026-09-28, not yet added upstream).** Every
+current preset name (`perplexity/preset/medium` and the rest) is faked on both
+1.96.2 and 1.103.0, since no map lists the renamed presets; routed third-party
+ids such as `perplexity/openai/gpt-5.6-luna` are faked under 1.96.2's bundled
+map and streamed under 1.103.0's. `perplexity/perplexity/sonar` streams on both.
+Measured with `httpx.Client.send` recorded, as above.
+
+---
+
+## 10. litellm — Perplexity's Agent API stream crashes on its last event
+
+**Status:** landed — fixed upstream by 1.103.0 (released 2026-09-28), before it
+was filed. Kept because this repo pins 1.96.2, where it is live, and because it
+is one of the reasons Perplexity's Agent API is called through Perplexity's own
+SDK (`_perplexity_agent` in `ci_core/llm/client.py`). If that route is ever
+moved onto litellm, the floor is 1.103.0, and entries 6 and 9 still apply.
+**Repo:** BerriAI/litellm (1.96.2)
+
+The real `response.completed` from Perplexity's Agent API carries
+`"truncation": ""`. litellm types that field `Literal["auto", "disabled"]`, so
+`ResponsesAPIResponse` fails to validate, the event's `response` stays a dict,
+and litellm's own logging hook (`_get_assembled_streaming_response`) raises
+`AttributeError: 'dict' object has no attribute 'usage'` from inside the
+iterator. The answer has streamed by then, and has been billed. Found by
+replaying a stream captured from the live API on 2026-09-19; Perplexity's own
+documentation examples show `"truncation": "disabled"`, so a stream built from
+the docs does not reproduce it. That capture is
+`packages/ci-core/tests/fixtures/perplexity_agent/stream_2026-09-19.sse`.
+
+**Reproduction** (`httpx.Client.send` replaced, nothing leaves the machine):
+
+```python
+import json
+import httpx
+import litellm
+
+response = {"id": "r", "object": "response", "created_at": 1, "model": "perplexity/sonar",
+            "status": "completed", "truncation": "", "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
+events = [
+    {"type": "response.created", "sequence_number": 0, "response": {**response, "status": "in_progress"}},
+    {"type": "response.output_text.delta", "sequence_number": 1, "item_id": "m",
+     "output_index": 0, "content_index": 0, "delta": "ok"},
+    {"type": "response.completed", "sequence_number": 2, "response": response},
+]
+body = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+httpx.Client.send = lambda client, request, *a, **k: httpx.Response(
+    200, request=request, headers={"content-type": "text/event-stream"}, content=body)
+for event in litellm.responses(model="perplexity/perplexity/sonar", input="hi",
+                               stream=True, api_key="k", num_retries=0):
+    print(event.type)
+```
+
+**Measured 2026-09-28:** 1.96.2 prints two events and raises the AttributeError
+at the third; 1.103.0 prints all three. The real capture behaves the same way:
+it crashes 1.96.2 at the last of its 67 events and streams cleanly on 1.103.0.

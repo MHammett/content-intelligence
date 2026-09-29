@@ -137,7 +137,7 @@ models:
   openai: gpt-5.6-terra       # gpt-5.6-sol for max quality, gpt-5.6-luna for economy
   gemini: gemini-3.5-flash    # what every preset runs; the 2.5 models retire on Vertex AI 2026-10-20 (PROVIDERS.md)
   mistral: mistral-large-latest
-  perplexity: sonar-reasoning-pro   # Sonar retires 2026-09-27; see PROVIDERS.md
+  perplexity: perplexity/sonar      # Perplexity's Agent API; what every preset runs (PROVIDERS.md)
   grok: grok-4.3              # what `wide` runs; grok-4.6 adds reasoning_effort (low to xhigh)
   claude: claude-sonnet-5     # claude-opus-5 for more depth, claude-haiku-4-5-20251001 for least cost
 ```
@@ -172,7 +172,7 @@ Use `prompts:` to override the thoroughness preset for a specific model. This mo
 ```yaml
 models:
   perplexity:
-    model: sonar-pro
+    model: perplexity/sonar
     prompts: [fact_check]   # only run fact-check; skip voice, argument, etc.
 ```
 
@@ -188,7 +188,7 @@ The review adapters stream responses (Server-Sent Events). That splits "the time
 
 | Layer | What it bounds | Typical size | Set by |
 |---|---|---|---|
-| **First-byte allowance** | How long to wait for the stream to *start* (the socket read timeout) | generous and per-model — 120s default; 160s for grounded Gemini/Perplexity (search runs before the first token); 200s/500s where a preset overrides it | `stream_read_timeout` per model, else the `thorough`/`maximum` preset's override, else the provider default |
+| **First-byte allowance** | How long to wait for the stream to *start* (the socket read timeout) | generous and per-model — 120s default; 160s for grounded Gemini/Perplexity (search runs before the first token); 200s, 260s or 500s where a preset overrides it | `stream_read_timeout` per model, else the `thorough`/`maximum` preset's override, else the provider default |
 | **Inter-chunk stall detector** | Max silence *between* chunks once the stream has started | tight and constant — **60s for every provider** | `stream_gap_timeout` per model, else the 60s default |
 | **Per-task wall-clock backstop** | Total time one model+domain call may run before the pipeline thread kills it | the sliding-scale computed value (below) | `timeout_seconds` per model, else computed |
 | **Global batch ceiling** | Outer bound on the whole parallel batch | slowest backstop + retry + slack | derived (`_global_ceiling()`) |
@@ -197,13 +197,13 @@ The review adapters stream responses (Server-Sent Events). That splits "the time
 
 Streaming does **not** make a long generation finish faster — that gpt-5.5 xhigh call still emits tokens for ~800s. So the **wall-clock backstop still must cover the genuine total generation time**; it just no longer has to absorb "model sent nothing for 800s, is it hung?" — the read-gap layer answers that.
 
-**Why the first two layers are separate knobs.** They were one value until 2026-08-15, and that single value had to be large enough to survive a grounded model's search phase — which is how Perplexity's reached 500s, in four bumps (160 → 280 → 350 → 500), each one chasing a slow-but-alive call. The side effect was that a genuinely *dead* Sonar connection also took over eight minutes to notice, which removes the one thing a stall detector is for. Splitting them lets the first-byte allowance stay generous per model while the stall detector goes back to a tight 60s for everyone: once a stream has started emitting, a healthy provider keeps emitting (the worst gap ever observed here is ~8s, from gpt-5.5's xhigh reasoning-summary deltas), so a minute of silence means dead, not slow.
+**Why the first two layers are separate knobs.** They were one value until 2026-08-15, and that single value had to be large enough to survive a grounded model's search phase — which is how Perplexity's reached 500s, in four bumps (160 → 280 → 350 → 500), each one chasing a slow-but-alive call. (It stood until 2026-09-28, when the presets moved to Perplexity's Agent API, which reports each step of its search and runs on the 160s default.) The side effect was that a genuinely *dead* Sonar connection also took over eight minutes to notice, which removes the one thing a stall detector is for. Splitting them lets the first-byte allowance stay generous per model while the stall detector goes back to a tight 60s for everyone: once a stream has started emitting, a healthy provider keeps emitting (the worst gap ever observed here is ~8s, from gpt-5.5's xhigh reasoning-summary deltas), so a minute of silence means dead, not slow.
 
 The stall detector is enforced outside the socket, because iterating a stream blocks *inside* a socket read and cannot be interrupted by a clock check in the consuming loop. If you raise `stream_read_timeout` for a slow-starting model, you do **not** need to touch `stream_gap_timeout` — that is the whole point of them being separate.
 
 **Measuring them.** Every `[CALIBRATION]` log line ends with `first_byte=` and `max_gap=`: the longest the call went without receiving anything before real output began, and after — the numbers `stream_read_timeout` and `stream_gap_timeout` have to exceed. Both budgets restart on every chunk, so every chunk ends a silence, but only real output (the stall detector's own test) moves a stream from the first phase to the second. There is one value per stream, oldest first, so a call whose first attempt stalled shows two. A stream cut short in a phase can only give a lower bound for it, written `>120.02s`; `-` means the phase never began. The report's `api_call_log` has the same values under `stream_timing`, with the budgets in force and `first_output_s` (request to first real output). Do not size either knob from a single-call run: stalls track concurrency, and an isolated call reproduces the healthy case by construction — see the CONCURRENCY note in `presets.yaml`.
 
-**Caveat found in production:** the 120s default read gap assumed only *grounded* (search) calls have a long silent period before the first token. In practice, `high`/`xhigh` reasoning effort also produces a long silent stretch — the model "thinks" with zero bytes on the wire, not even a keep-alive — before it starts streaming visible output. Observed directly: `gpt-5.5` at `xhigh` failed 5/5 calls at ~121s with 0 output tokens against the 120s default. The presets ship a `stream_read_timeout` override wherever a model has needed one: 200s for Mistral at `high` (`thorough` and `maximum`), 260s for Gemini at `maximum`, where grounding and a thinking budget stack (below), and 500s for Grok at `thorough` and `maximum`, where 28 measured streams put nine silences past the 120s default — worst 354.1s — every one of which then completed. OpenAI needs none, because its Responses API streams reasoning summaries through the silent phase, and Perplexity's 500s covers its search phase rather than reasoning (the notes in `presets.yaml` have the measurements). If you define a custom preset or override `reasoning_effort` to `high`/`xhigh` on a provider the built-in presets don't cover, set `stream_read_timeout` yourself — don't rely on the 120s default.
+**Caveat found in production:** the 120s default read gap assumed only *grounded* (search) calls have a long silent period before the first token. In practice, `high`/`xhigh` reasoning effort also produces a long silent stretch — the model "thinks" with zero bytes on the wire, not even a keep-alive — before it starts streaming visible output. Observed directly: `gpt-5.5` at `xhigh` failed 5/5 calls at ~121s with 0 output tokens against the 120s default. The presets ship a `stream_read_timeout` override wherever a model has needed one: 200s for Mistral at `high` (`thorough` and `maximum`), 260s for Gemini at `maximum`, where grounding and a thinking budget stack (below), and 500s for Grok at `thorough` and `maximum`, where 28 measured streams put nine silences past the 120s default — worst 354.1s — every one of which then completed. OpenAI needs none, because its Responses API streams reasoning summaries through the silent phase, and Perplexity's Agent API reports each step of its search, so it runs on the grounded 160s default (the notes in `presets.yaml` have the measurements). If you define a custom preset or override `reasoning_effort` to `high`/`xhigh` on a provider the built-in presets don't cover, set `stream_read_timeout` yourself — don't rely on the 120s default.
 
 The two silent-period causes **stack** when a model does both at once. The `maximum` preset's Gemini entry sets `thinking_budget: 16000` on top of the model's default 160s grounded read gap; a live Vertex AI run timed out at 205.78s (search + extended thinking, both silent, ahead of the 160s default). Gemini's `maximum` entry now carries its own `stream_read_timeout: 260` for this reason — grounding and reasoning-effort overrides aren't mutually exclusive, so check whether both apply when tuning a custom config.
 
@@ -245,7 +245,7 @@ models:
 
 Under streaming the adapter passes `timeout=(connect, read_gap)` to the HTTP request, where `read_gap` is the **inter-token** allowance (constant, from `stream_read_timeout` or the adapter default) — **not** `timeout_seconds`. The big `timeout_seconds` value is enforced separately as the pipeline's per-task thread wall-clock backstop. Set `pipeline.task_timeout_seconds` high enough to accommodate your slowest model's genuine total generation time (streaming detects stalls quickly but does not shorten a legitimately long generation).
 
-`timeout_seconds` is an **infrastructure key** — it survives `cost_preset` overrides. If you set it in `models:` for a provider, the preset will not clear it. So do `stream_read_timeout` and `stream_gap_timeout`, and where the preset sets one of them as well — Mistral's 200 and Perplexity's 500 at `thorough` and `maximum`, Gemini's 260 at `maximum` — yours is what runs. Config load warns when yours is the lower of the two, because each of those preset values was raised after real calls ran past a lower one; remove the key to run the preset's value, or raise it. An empty value (`stream_read_timeout:` with nothing after it) is warned about too: the client reads it as unset, so the provider default runs rather than the preset's value.
+`timeout_seconds` is an **infrastructure key** — it survives `cost_preset` overrides. If you set it in `models:` for a provider, the preset will not clear it. So do `stream_read_timeout` and `stream_gap_timeout`, and where the preset sets one of them as well — Mistral's 200 and Grok's 500 at `thorough` and `maximum`, Gemini's 260 at `maximum` — yours is what runs. Config load warns when yours is the lower of the two, because each of those preset values was raised after real calls ran past a lower one; remove the key to run the preset's value, or raise it. An empty value (`stream_read_timeout:` with nothing after it) is warned about too: the client reads it as unset, so the provider default runs rather than the preset's value.
 
 #### Output-token ceiling is automatic too
 
@@ -405,7 +405,7 @@ models:
     web_search: [fact_check, expansion]
 ```
 
-Perplexity needs nothing here — `sonar` models search natively. Gemini and OpenAI do. The pipeline fetches every URL the pass returns either way and reports how many resolved, so you can see directly what search bought you.
+Perplexity needs nothing here: its `web_search` tool is attached to every call, and the model decides whether to use it. Gemini and OpenAI do. The pipeline fetches every URL the pass returns either way and reports how many resolved, so you can see directly what search bought you.
 
 If the Responses API is unavailable it falls back to standard chat completions silently.
 
@@ -919,15 +919,15 @@ Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article
 
 | Preset | Thoroughness | Models used | Reasoning |
 |---|---|---|---|
-| `economy` | standard | gpt-5.6-luna, gemini-3.5-flash (low), mistral-small-latest, sonar | not set (each provider's default applies) |
-| `wide` | thorough | gpt-5.6-luna, gemini-3.5-flash (low), mistral-small-latest, sonar, grok-4.3, claude-haiku-4-5 | not set (each provider's default applies) |
-| `balanced` | thorough | gpt-5.6-terra (low), gemini-3.5-flash (low), mistral-medium-3-5, sonar-reasoning-pro, grok-4.6 (low), claude-sonnet-5 (effort medium) | light |
-| `thorough` | thorough | gpt-5.6-terra (high), gemini-3.5-flash (medium), mistral-medium-3-5 (high), sonar-reasoning-pro, grok-4.6 (high), claude-sonnet-5 (effort high) | deep |
-| `maximum` | maximum | gpt-5.6-sol (xhigh), gemini-3.5-flash (high), mistral-medium-3-5 (high), sonar-reasoning-pro, grok-4.6 (high), claude-opus-5 (effort high, searches on fact_check) | max |
+| `economy` | standard | gpt-5.6-luna, gemini-3.5-flash (low), mistral-small-latest, perplexity/sonar | not set (each provider's default applies) |
+| `wide` | thorough | gpt-5.6-luna, gemini-3.5-flash (low), mistral-small-latest, perplexity/sonar, grok-4.3, claude-haiku-4-5 | not set (each provider's default applies) |
+| `balanced` | thorough | gpt-5.6-terra (low), gemini-3.5-flash (low), mistral-medium-3-5, perplexity/sonar, grok-4.6 (low), claude-sonnet-5 (effort medium) | light |
+| `thorough` | thorough | gpt-5.6-terra (high), gemini-3.5-flash (medium), mistral-medium-3-5 (high), perplexity/sonar, grok-4.6 (high), claude-sonnet-5 (effort high) | deep |
+| `maximum` | maximum | gpt-5.6-sol (xhigh), gemini-3.5-flash (high), mistral-medium-3-5 (high), perplexity/sonar, grok-4.6 (high), claude-opus-5 (effort high, searches on fact_check) | max |
 
 `standard` was a sixth preset until 2026-09-05. `wide` beat it on every axis measured over three isolated runs each — 33% more strongly corroborated consensus flags, 74% more fact-check claims, and findings that survived a rerun 67% of the time against 50% — so it was retired rather than kept as a tier that costs more for less. An existing `cost_preset: standard` still works: it runs as `wide` and warns on every run, because the change is real (six models over twelve calls where `standard` ran five over seven), not a rename.
 
-**One of the models these presets run is on a retirement schedule.** Perplexity has announced that its Sonar chat-completions API is supported until 2026-09-27; `sonar` and `sonar-reasoning-pro` are the Perplexity models every preset runs. Google Cloud lists the Gemini 2.5 models for retirement on Vertex AI on 2026-10-20, and the presets moved off them to `gemini-3.5-flash` on 2026-09-27. Dates and sources are under [Perplexity](PROVIDERS.md#perplexity-ai-optional--recommended) and [Gemini](PROVIDERS.md#google-gemini-required) in PROVIDERS.md.
+**Two retirements, both handled.** Perplexity supported its Sonar chat-completions API until 2026-09-27; every preset moved from `sonar` and `sonar-reasoning-pro` to `perplexity/sonar` on its Agent API on 2026-09-28, the same Sonar model, which found more when measured; it costs less than `sonar-reasoning-pro` did and more than `sonar`. Google Cloud lists the Gemini 2.5 models for retirement on Vertex AI on 2026-10-20, and the presets moved off them to `gemini-3.5-flash` on 2026-09-27. Dates and sources are under [Perplexity](PROVIDERS.md#perplexity-ai-optional--recommended) and [Gemini](PROVIDERS.md#google-gemini-required) in PROVIDERS.md.
 
 **Gemini's search fees now show in the estimate, and they run ahead of the bill.** `gemini-3.5-flash` searches far more than `gemini-2.5-pro` did (103 queries over the five `maximum` domains on a 9,456-character draft, against 16), and the report prices each query at Google's list rate, $14 per 1,000. The first 5,000 queries a month are free and a run cannot see the month's count, so until the allowance is spent the estimate includes fees the bill does not: $0.18–$0.25 of a `wide` run's total (three runs, 2026-09-28) and $1.44 at `maximum` on that draft. The `low` level is what keeps the cheap tiers down, to 13–18 queries a `wide` run; see [Gemini — `thinking_level`](#gemini--thinking_level-and-thinking_budget).
 
@@ -963,7 +963,7 @@ The tables below show exactly what settings each preset applies to each provider
 | openai | `gpt-5.6-luna` | not set (OpenAI's default: `medium`) | Cheapest gpt-5.6 tier |
 | gemini | `gemini-3.5-flash` | `thinking_level` `"low"` | The only fact-checker at this tier, so `low`, which still searches (about 20 queries), rather than a Flash-Lite, which did not |
 | mistral | `mistral-small-latest` | none | Small variant; does not support `reasoning_effort` |
-| perplexity | `sonar` | — | Lightweight search-grounded; no CoT |
+| perplexity | `perplexity/sonar` | — | Searches when it judges a claim needs it: on every fact_check call measured, on no other domain's. Was `sonar` until 2026-09-28 |
 | grok | **disabled** | — | Excluded at this cost tier |
 | claude | **disabled** | — | Excluded at this cost tier |
 
@@ -974,7 +974,7 @@ The tables below show exactly what settings each preset applies to each provider
 | openai | `gpt-5.6-luna` | not set (OpenAI's default: `medium`) | Same model as `economy` |
 | gemini | `gemini-3.5-flash` | `thinking_level` `"low"` | Costs about what `gemini-2.5-flash` did per call, since it thinks a quarter as much |
 | mistral | `mistral-small-latest` | none | |
-| perplexity | `sonar` | — | Lightweight search-grounded; no CoT |
+| perplexity | `perplexity/sonar` | — | Searches when it judges a claim needs it: on every fact_check call measured, on no other domain's. Was `sonar` until 2026-09-28 |
 | grok | `grok-4.3` | not set | Left unset on purpose: grok-4.3 predates `reasoning_effort` |
 | claude | `claude-haiku-4-5-20251001` | none | Does not think unless `thinking_budget` is set |
 
@@ -991,7 +991,7 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | openai | `gpt-5.6-terra` | `reasoning_effort` | `"low"` | Light CoT, modest latency increase |
 | gemini | `gemini-3.5-flash` | `thinking_level` | `"low"` | Light thinking; still searches |
 | mistral | `mistral-medium-3-5` | — | — | Reasoning model; `low`/`medium` not accepted — preset omits effort flag |
-| perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding |
+| perplexity | `perplexity/sonar` | — | — | Same model as `wide`. Was `sonar-reasoning-pro` until 2026-09-28, which it beat on sources and confirmed claims at a half to a third of the cost |
 | grok | `grok-4.6` | `reasoning_effort` | `"low"` | Light CoT. Unset would mean `high` |
 | claude | `claude-sonnet-5` | `effort` | `"medium"` | Adaptive thinking, on by default; `medium` spends less than the `high` default |
 
@@ -1002,7 +1002,7 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | openai | `gpt-5.6-terra` | `reasoning_effort` | `"high"` | Deep CoT. No `stream_read_timeout` override: the Responses API streams reasoning summaries through the silent phase |
 | gemini | `gemini-3.5-flash` | `thinking_level` | `"medium"` | Google's default for it, stated so the thought summaries stream. About 80 searches a call |
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted on this model. `stream_read_timeout: 200` |
-| perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding. `stream_read_timeout: 500`: its search phase is one long silence before the first byte |
+| perplexity | `perplexity/sonar` | — | — | Same model as `wide`. No `stream_read_timeout` override: the Agent API reports each step of its search, so the 160s default holds where `sonar-reasoning-pro` needed 500 |
 | grok | `grok-4.6` | `reasoning_effort` | `"high"` | What unset already resolves to, stated so the tier says what it does. `xhigh` exists, unmeasured. `stream_read_timeout: 500`: 354.1s of silence measured before its first output, and the call then completed |
 | claude | `claude-sonnet-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Was `claude-opus-5` until 2026-09-08 — see the note above `maximum:` in `presets.yaml` |
 
@@ -1013,7 +1013,7 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | openai | `gpt-5.6-sol` | `reasoning_effort` | `"xhigh"` | Highest reasoning depth. Slow: a median of about 370s per call over 23 saved calls |
 | gemini | `gemini-3.5-flash` | `thinking_level` | `"high"` | The deepest level. About 80 searches per call. `stream_read_timeout: 260`, carried over from the 2.5 Pro setting and not re-measured; the thought summaries a level turns on should feed the socket during thinking |
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted. `stream_read_timeout: 200` |
-| perplexity | `sonar-reasoning-pro` | — | — | CoT+search grounding. `stream_read_timeout: 500` |
+| perplexity | `perplexity/sonar` | — | — | Same model as every other tier; see `thorough` |
 | grok | `grok-4.6` | `reasoning_effort` | `"high"` | Full CoT depth. `xhigh` exists, unmeasured. `stream_read_timeout: 500`, same measurement as at `thorough` |
 | claude | `claude-opus-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Also sets `web_search: [fact_check]`, so it searches on that domain only |
 
@@ -1044,9 +1044,8 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | claude-haiku-4-5 | $0.014 | +$0.02+ (extended thinking) |
 | claude-sonnet-5 | $0.028 | Thinks by default, at `high` — [measured per-call cost](PROVIDERS.md#anthropic-claude-optional) |
 | claude-opus-5 | $0.070 | Thinks by default, at `high` — [measured per-call cost](PROVIDERS.md#anthropic-claude-optional) |
-| perplexity sonar | $0.006 | Plus a $5–$12 per 1,000 requests fee, by search-context size; [measured](PROVIDERS.md#perplexity-ai-optional--recommended) |
-| perplexity sonar-pro | $0.042 | Plus $6–$14 per 1,000 requests; not run by any preset |
-| perplexity sonar-reasoning-pro | $0.024 | Plus $6–$14 per 1,000 requests; the reasoning trace makes tokens vary widely — [measured](PROVIDERS.md#perplexity-ai-optional--recommended) |
+| perplexity/sonar | $0.006 | Plus $2.50 per 1,000 searches. [Measured](PROVIDERS.md#perplexity-ai-optional--recommended) 2026-09-28: about $0.04 per fact_check call on 31k- and 135k-character drafts, searches included; $0.004–0.014 on the other domains, which did not search |
+| sonar, sonar-reasoning-pro | $0.006, $0.024 | The retired Sonar API, plus a request fee; no preset runs them since 2026-09-28 |
 ---
 
 ### Thoroughness
@@ -1201,12 +1200,12 @@ pipeline:
     mistral:
       reasoning_effort: high    # balanced sends no effort; "high" and "none" are the only values accepted
 
-# Use wide but add Perplexity reasoning (normally wide uses sonar):
+# Use wide but let Perplexity search again after reading its results:
 pipeline:
   cost_preset: wide
   preset_overrides:
     perplexity:
-      model: sonar-reasoning-pro
+      max_steps: 3              # the default is 1; measured once and no better (PROVIDERS.md)
 ```
 
 ---
@@ -1261,12 +1260,16 @@ Grok / xAI  (configured: grok-4.6)
     ⚠  grok-4.20-0309-reasoning  2026-03-09  (6mo ago)  ⚠ superseded → grok-4.6
         ...
 
-Perplexity  (configured: sonar-reasoning-pro)
-  (No models endpoint — showing documented set from June 2026)
-        sonar-deep-research  (no date)
-    ✓  sonar-reasoning-pro  (no date)  ← configured
-        sonar-pro  (no date)
-        sonar  (no date)
+Perplexity  (configured: perplexity/sonar)
+        anthropic/claude-haiku-4-5  (no date)
+        ...
+        openai/gpt-5.6-luna  (no date)
+        ...
+        perplexity/kimi-k3  (no date)
+        perplexity/nemotron-3-ultra-550b-a55b  (no date)
+    ✓  perplexity/sonar  (no date)  ← configured
+        xai/grok-4.6  (no date)
+        ...
 ```
 
 **What each marker means:**
@@ -1277,7 +1280,7 @@ Perplexity  (configured: sonar-reasoning-pro)
 
 **Notes on Vertex AI:** Gemini via Vertex AI cannot be queried for model lists without the gcloud SDK. The script notes this and skips. Check [Google AI for Developers](https://ai.google.dev/models) for what exists, and Google Cloud's [Model versions and lifecycle](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions) page for what is being retired: the two disagree. On 2026-09-19 the Vertex AI page listed `gemini-2.5-pro`, `gemini-2.5-flash` and `gemini-2.5-flash-lite` for retirement on 2026-10-20, while the Gemini API's [deprecations](https://ai.google.dev/gemini-api/docs/deprecations) page listed no shutdown date for them.
 
-**Notes on Perplexity:** Perplexity does not publish a models list API. The script shows the documented set as a static fallback. That set is from June 2026 and does not reflect Perplexity's announced end of Sonar chat-completions support on 2026-09-27 (see [PROVIDERS.md](PROVIDERS.md#perplexity-ai-optional--recommended)).
+**Notes on Perplexity:** the script reads the Agent API's live model list (`GET /v1/models`). It carries no creation dates, so nothing on it is ever marked `NEW`, and it lists only Agent API ids: the retired Sonar API's bare `sonar*` models are not on it. Ids with another company's prefix (`openai/`, `anthropic/`, `google/`, `xai/`) are that company's models, run through Perplexity's API; see [PROVIDERS.md](PROVIDERS.md#perplexity-ai-optional--recommended).
 
 **After discovery, to update your configured model:**
 1. Edit `models:` in `configs/user.yaml` (or update the `cost_preset` which sets models automatically)

@@ -41,6 +41,17 @@ dependencies = [
     # Green Book county tables) where the fallback returns menus. The fallback
     # stays as a safety net.
     "trafilatura>=1.6",
+    # Perplexity's own SDK, for its Agent API (ci_core.llm.client's "agent"
+    # surface). Perplexity retired Sonar Chat Completions ("supported until
+    # 2026-09-27") in favour of it. litellm has a route for it, with defects
+    # checked 2026-09-28: on the pinned 1.96.2 the real stream crashes litellm
+    # at its last event ("truncation": ""; fixed by 1.103.0), and on both
+    # versions a model its map does not list is fake-streamed and
+    # response_format is silently dropped. See the client for the detail. This
+    # SDK parses the captured real stream unchanged. Every dependency of it was
+    # already in uv.lock.
+    # Pinned to a minor: 0.x releases are generated and may break anywhere.
+    "perplexityai>=0.43.6,<0.44",
 ]
 
 [project.optional-dependencies]

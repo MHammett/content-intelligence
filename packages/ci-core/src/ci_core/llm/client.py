@@ -17,6 +17,12 @@ instead — TTFB 0.8s, 1318 summary deltas. Since the read-gap timeout below is
 the only thing standing between a slow call and a hung one, a surface that goes
 silent for 79s is unusable. Do not "simplify" OpenAI onto ``completion()``.
 
+A third surface is not litellm's at all: Perplexity's Agent API, which replaced
+Sonar Chat Completions, is called through Perplexity's own SDK. A perplexity
+model id with a vendor prefix (``perplexity/sonar``) goes there, and a bare
+``sonar*`` id still goes to Sonar through litellm. See "Perplexity's Agent API"
+below for why litellm's route for it is not used.
+
 Three timeout layers, not one
 -----------------------------
 Every call streams, and the waiting splits into three jobs that need opposite
@@ -102,7 +108,8 @@ report generator all read it:
 
 plus per-provider extras: ``citations`` / ``search_results`` (Perplexity),
 ``grounding_chunks`` / ``grounding_available`` (Gemini), ``truncated``,
-``fallback_from``, ``misconfiguration_warning``.
+``fallback_from``, ``misconfiguration_warning``, and ``provider_cost_usd``
+(Perplexity's Agent API, which prices its own calls).
 
 And ``stream_timing``: one record per stream the call opened, retries
 included — the longest the stream went without receiving anything before and
@@ -333,9 +340,14 @@ _PROVIDERS = {
         "read_timeout": DEFAULT_READ_TIMEOUT,
     },
     "perplexity": {
+        # The surface and fallbacks of the Sonar ids. An Agent API id
+        # (``perplexity/sonar``) takes the "agent" surface and
+        # _AGENT_FALLBACKS instead; see "Perplexity's Agent API" below.
         "prefix": "perplexity/",
         "surface": "completion",
-        "default_model": "sonar-reasoning-pro",
+        # The Agent API's own Sonar since 2026-09-28: Sonar Chat Completions was
+        # "supported until September 27, 2026", and every preset moved to this.
+        "default_model": "perplexity/sonar",
         "fallbacks": ["sonar-pro", "sonar"],
         "read_timeout": GROUNDED_READ_TIMEOUT,
     },
@@ -1759,23 +1771,27 @@ def _read_searches(provider, assembled, model=""):
       optional per call, and the old adapter's ``grounding_available`` meant
       only "tool attached", so its 153 of 153 is no baseline for 0 of 37 since
       the move to litellm.
-    * perplexity: 1. The fee is per request, and this response is one.
+    * perplexity, Sonar: 1. The fee is per request, and this response is one.
       Perplexity also prices it in ``usage.cost.request_cost``, but litellm does
       not carry that through a stream. sonar-deep-research is the exception:
       it has no request fee and bills each search query instead, and its count
       (``usage.num_search_queries``) does not survive the stream either, so it
       is unknown.
+    * perplexity, Agent API: the web_search invocations in
+      ``usage.tool_calls_details``, which Perplexity bills one by one; see
+      :func:`_consume_agent_stream`.
     * grok: unknown. xAI reports ``num_sources_used`` and litellm maps it only
       on a response that was not streamed. Grok's search is off in every preset
       until the litellm fix in UPSTREAM.md lands.
 
-    For gemini and openai a zero is inferred from absence (no queries, no
-    search items), so it is only taken from a response that reported tokens.
+    For gemini, openai and the Agent API a zero is inferred from absence (no
+    queries, no search items, no invocations), so it is only taken from a
+    response that reported tokens.
     An empty one is not a report of no searches. On 2026-09-19 a live
     gemini:fact_check came back empty four times running, 0+0 tokens and no
     text, and those counts are unknown, like its tokens.
     """
-    if provider == "perplexity":
+    if provider == "perplexity" and not _uses_agent_api(provider, model):
         return None if "sonar-deep-research" in str(model) else 1
     if provider == "gemini":
         queries = assembled.get("web_search_queries")
@@ -1790,7 +1806,7 @@ def _read_searches(provider, assembled, model=""):
             return None
         else:
             count = 0
-    elif provider == "openai":
+    elif provider in ("openai", "perplexity"):
         count = assembled.get("web_search_calls")
     elif provider == "claude":
         server = _usage_as_dict(assembled.get("usage")).get("server_tool_use")
@@ -1833,6 +1849,379 @@ def _grounding_chunks(metadata):
         if isinstance(web, dict) and web.get("uri"):
             out.append({"uri": web["uri"], "title": web.get("title", "")})
     return out
+
+
+# ---------------------------------------------------------------------------
+# Perplexity's Agent API
+# ---------------------------------------------------------------------------
+#
+# Perplexity replaced Sonar Chat Completions with its Agent API: "Sonar will be
+# supported until September 27, 2026" (docs.perplexity.ai, read 2026-09-19; it
+# was still answering on 2026-09-28). A perplexity model id with a vendor prefix
+# goes to the Agent API — ``perplexity/sonar``, ``perplexity/kimi-k3``, the form
+# Perplexity's own model list uses — and a bare ``sonar*`` id goes to Sonar
+# through litellm as before. The two cannot collide: no Sonar id has a slash.
+#
+# Called through Perplexity's own SDK, not litellm. litellm has a route for this
+# API with three defects, each of which fails late or quietly. Checked on
+# 2026-09-28 against a captured real stream, on the 1.96.2 this repo pins and on
+# 1.103.0, released that day:
+#
+#   * the real ``response.completed`` carries ``"truncation": ""``, outside
+#     litellm's Literal["auto", "disabled"]. On 1.96.2 the response stays a dict
+#     and litellm's logging hook raises AttributeError on it at the last event
+#     of every stream, after the answer has streamed and been billed. 1.103.0
+#     streams it cleanly (UPSTREAM.md #10);
+#   * a model id litellm's map does not list is fake-streamed — one
+#     non-streaming request, replayed. Still so on 1.103.0 for every current
+#     preset name; the bundled 1.96.2 map fakes the gpt-5.6 ids too. The same bug
+#     as UPSTREAM.md #9;
+#   * ``response_format`` passed as a parameter is dropped without a word, on
+#     both. The same bug as UPSTREAM.md #6 (BerriAI/litellm#37125).
+#
+# So moving onto litellm would take a repo-wide upgrade from 1.96.2 and still
+# leave two of the three, and the stream reading below would be needed anyway:
+# the existing Responses consumer reads none of Perplexity's sources or search
+# counts. The SDK parses the captured stream unchanged, and every dependency it
+# has was already in uv.lock.
+#
+# What the pipeline reads, and where each comes from here:
+#
+#   * grounding: the web_search tool is attached to every call. Unlike Sonar,
+#     the model decides whether to call it — the API has no tool_choice — so
+#     whether a call searched is read off the response, never assumed;
+#   * the schema: ``response_format``, in the shape Sonar took;
+#   * sources: ``citations`` and ``search_results``, from the response's
+#     search_results items and in Sonar's shape;
+#   * searches: the web_search invocations Perplexity reports it billed;
+#   * tokens: ``usage``, which normalize_tokens reads as it reads OpenAI's
+#     Responses usage — input_tokens inclusive, cached tokens in the details;
+#   * search controls: search_domain_filter and search_recency_filter move into
+#     the tool's ``filters``, search_context_size onto the tool. search_mode
+#     has no equivalent and is not sent; the first call that has one says so.
+
+#: Tried in order when an Agent API model is at capacity (503): Perplexity's own
+#: model, which searches as the seat did under Sonar. No Sonar id is a fallback
+#: here — those are the API being retired.
+_AGENT_FALLBACKS = ("perplexity/sonar",)
+
+#: Events that mean the model has begun its answer. The search and reasoning
+#: events before one are signs of life, and each restarts the silence clock, but
+#: they are not output: an agent can search for minutes before it writes a word,
+#: and that is what the first-byte allowance is for.
+_AGENT_PROGRESS_EVENTS = ("response.output_text.delta",)
+
+_agent_warnings_given: set = set()
+
+
+def _uses_agent_api(provider, model):
+    """Whether ``model`` goes to Perplexity's Agent API rather than to Sonar."""
+    return provider == "perplexity" and "/" in str(model or "")
+
+
+def _field(obj, key, default=None):
+    """``key`` read from an SDK object or a plain dict alike.
+
+    Read by field and dispatched on ``type``, never on class: the SDK builds an
+    event or output item it does not recognise as whichever of its models fits
+    first. Measured on 0.43.6: an unknown output item came back as a
+    ``MessageOutputItemOutput`` carrying its real ``type``, and
+    ``response.completed`` as a ``ResponseCreatedEventOutput``.
+    """
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _plain(obj):
+    """``obj`` as plain dicts and lists, however the SDK built it."""
+    dump = getattr(obj, "model_dump", None)
+    return dump() if callable(dump) else obj
+
+
+def _agent_params(model, system_prompt, user_prompt, cfg, response_schema, reasoning):
+    """The Agent API request for one call, as keyword arguments to the SDK.
+
+    ``reasoning`` is False on the retry ``call`` makes after a model rejects its
+    reasoning effort. Only the effort is dropped then: search and the schema are
+    what the seat is for, and neither is a reasoning parameter.
+    """
+    cfg = cfg or {}
+    tool: dict = {"type": "web_search"}
+    filters = {
+        key: cfg[key]
+        for key in ("search_domain_filter", "search_recency_filter")
+        if cfg.get(key) is not None
+    }
+    if filters:
+        tool["filters"] = filters
+    if cfg.get("search_context_size"):
+        tool["search_context_size"] = cfg["search_context_size"]
+    if (
+        cfg.get("search_mode") is not None
+        and "search_mode" not in _agent_warnings_given
+    ):
+        _agent_warnings_given.add("search_mode")
+        log.warning(
+            "models.perplexity.search_mode is %r, which Perplexity's Agent API "
+            "has no equivalent for, so it is not sent. Its migration guide "
+            "suggests search_domain_filter in its place.",
+            cfg["search_mode"],
+        )
+    params = {
+        "model": model,
+        "instructions": system_prompt,
+        "input": user_prompt,
+        "stream": True,
+        # Not kept for retrieval: the draft is the author's unpublished work,
+        # and nothing here ever fetches a response back by id.
+        "store": False,
+        "tools": [tool],
+    }
+    # No temperature unless the config names one. The API applies it per model
+    # and ignores it outright for GPT-5; the reasoning models it serves run at
+    # their own defaults; and what 0.2 bought Sonar was repeatability, which this
+    # pipeline's runs have little of at any temperature (see _temperature).
+    if cfg.get("temperature") is not None:
+        params["temperature"] = float(cfg["temperature"])
+    effort = cfg.get("reasoning_effort")
+    if reasoning and effort:
+        params["reasoning"] = {"effort": effort}
+    if cfg.get("max_steps"):
+        params["max_steps"] = int(cfg["max_steps"])
+    if cfg.get("max_tokens"):
+        params["max_output_tokens"] = int(cfg["max_tokens"])
+    elif str(model).startswith("anthropic/"):
+        # Required for these, and only these: without it the API answers 400
+        # "max_output_tokens is required when using Anthropic models".
+        params["max_output_tokens"] = 16000
+    if response_schema:
+        params.update(
+            schema_mod.as_request_params(
+                "perplexity", response_schema["name"], response_schema["schema"]
+            )
+        )
+    return params
+
+
+class AgentTransportError(Exception):
+    """The Agent API connection failed, before or during the stream.
+
+    Given a status so ``_with_retry`` treats it as litellm's own transport
+    errors are treated: 500 retries once, as a dropped keepalive does; 504 for
+    a response that never began, as a stall does. Never 503, which would walk
+    the fallback chain over a network blip (see ``_is_capacity_error``).
+    """
+
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class AgentResponseFailed(Exception):
+    """An Agent API stream that ended in ``response.failed``.
+
+    The SDK yields that as an ordinary event, not an exception — it raises only
+    for an SSE event named ``error`` — so without this a failed call would read
+    as one that finished with nothing to say. The status is inferred from
+    Perplexity's error code only as far as the retry logic needs: a rate limit
+    retries, a capacity error walks the fallback chain, a server error retries
+    once, and anything else is reported as it stands.
+    """
+
+    def __init__(self, error):
+        self.code = str(_field(error, "code") or "")
+        self.kind = str(_field(error, "type") or "")
+        self.message = str(_field(error, "message") or "") or "no message given"
+        super().__init__(
+            f"Perplexity Agent API response failed "
+            f"({self.code or self.kind or 'no code'}): {self.message}"
+        )
+        said = f"{self.code} {self.kind}".lower()
+        if "rate" in said:
+            self.status_code = 429
+        elif any(word in said for word in ("overload", "capacity", "unavailable")):
+            self.status_code = 503
+        elif any(word in said for word in ("server", "internal", "timeout")):
+            self.status_code = 500
+        else:
+            self.status_code = None
+
+
+class _AgentStream:
+    """The SDK's stream, as ``_iter_with_gap`` reads it and ``_close_stream``
+    closes it.
+
+    ``http_response`` is what ``_close_stream`` closes to unblock a reader
+    stalled in a socket read. Transport errors raised while iterating — which
+    the SDK passes through as httpx's own — become ``AgentTransportError``, so
+    they retry once as litellm's do. The SDK client is closed whichever way the
+    stream ends.
+    """
+
+    def __init__(self, sdk, stream):
+        self._sdk = sdk
+        self._stream = stream
+        self.http_response = getattr(stream, "response", None)
+
+    def __iter__(self):
+        try:
+            yield from self._stream
+        except httpx.TransportError as exc:
+            raise AgentTransportError(
+                f"Perplexity Agent API stream broke: {exc!r}", 500
+            ) from exc
+        finally:
+            self._sdk.close()
+
+
+def _perplexity_agent(api_key, timeout, params):
+    """Open one streamed Agent API response: the one place the SDK is called.
+
+    Tests patch this, as they patch ``client.litellm``. Imported on first use,
+    like litellm (see :func:`_litellm`). ``max_retries=0`` because retries are
+    ours: the SDK's default of two would bill attempts our accounting never saw.
+    """
+    import perplexity
+
+    sdk = perplexity.Perplexity(api_key=api_key, max_retries=0, timeout=timeout)
+    try:
+        stream = sdk.responses.create(**params)
+    except perplexity.APITimeoutError as exc:
+        sdk.close()
+        raise AgentTransportError(
+            f"Perplexity Agent API did not answer in time: {exc}", 504
+        ) from exc
+    except perplexity.APIConnectionError as exc:
+        sdk.close()
+        raise AgentTransportError(
+            f"Perplexity Agent API connection failed: {exc}", 500
+        ) from exc
+    except BaseException:
+        sdk.close()
+        raise
+    return _AgentStream(sdk, stream)
+
+
+def _agent_is_progress(event):
+    return _field(event, "type") in _AGENT_PROGRESS_EVENTS
+
+
+def _consume_agent_stream(stream, first_byte, gap, timing=None):
+    """Drain a streamed Agent API response into the shape the other surfaces
+    return.
+
+    The answer is the last ``message`` item of the final response, which is the
+    whole text, rather than the streamed deltas: an agent's output is one item
+    per step, so a model that wrote before searching again would otherwise have
+    that note spliced in front of its JSON. The deltas are the fallback, for a
+    stream cut off before the final response arrived; so are the search events,
+    for the sources.
+    """
+    if timing is None:
+        timing = _StreamTiming(first_byte, gap)
+    texts: dict = {}
+    order: list = []
+    streamed_results: list = []
+    streamed_queries: list = []
+    final = None
+    for event in _iter_with_gap(stream, first_byte, gap, _agent_is_progress, timing):
+        kind = _field(event, "type")
+        if kind == "response.output_text.delta":
+            index = _field(event, "output_index")
+            if index not in texts:
+                texts[index] = []
+                order.append(index)
+            texts[index].append(_field(event, "delta") or "")
+        elif kind == "response.reasoning.search_results":
+            streamed_results.extend(_field(event, "results") or [])
+        elif kind == "response.reasoning.search_queries":
+            streamed_queries.extend(_field(event, "queries") or [])
+        elif kind in ("response.completed", "response.incomplete"):
+            final = _field(event, "response")
+        elif kind == "response.failed":
+            failure = AgentResponseFailed(_field(event, "error"))
+            timing.cut_short(failure)
+            _close_stream(stream)
+            raise failure
+
+    output = list(_field(final, "output") or []) if final is not None else []
+    messages = [item for item in output if _field(item, "type") == "message"]
+    content = ""
+    if messages:
+        if len(messages) > 1:
+            log.debug(
+                "Perplexity answered in %d message items; reading the last",
+                len(messages),
+            )
+        content = "".join(
+            _field(part, "text") or ""
+            for part in _field(messages[-1], "content") or []
+            if _field(part, "type", "output_text") == "output_text"
+        )
+    if not content and order:
+        content = "".join(texts[order[-1]])
+
+    results: list = []
+    queries: list = []
+    for item in output:
+        kind = _field(item, "type")
+        if kind == "search_results":
+            results.extend(_field(item, "results") or [])
+            queries.extend(_field(item, "queries") or [])
+        elif kind == "fetch_url_results":
+            # Pages the model read in full. Sources as much as a search hit.
+            results.extend(_field(item, "contents") or [])
+    if final is None:
+        results, queries = streamed_results, streamed_queries
+
+    citations: list = []
+    search_results: list = []
+    for source in results:
+        url = _field(source, "url")
+        if not url or url in citations:
+            continue
+        citations.append(url)
+        search_results.append(
+            {
+                key: _field(source, key)
+                for key in ("title", "url", "date", "last_updated", "snippet", "source")
+                if _field(source, key) is not None
+            }
+        )
+
+    usage = _plain(_field(final, "usage")) if final is not None else None
+    usage = usage if isinstance(usage, dict) else None
+    searches = None
+    provider_cost = None
+    if usage:
+        # Perplexity's key is "search_web", measured on a live call on
+        # 2026-09-19; matched loosely in case it becomes "web_search".
+        calls = usage.get("tool_calls_details") or {}
+        searches = sum(
+            int(_field(detail, "invocation") or 0)
+            for name, detail in calls.items()
+            if "search" in str(name) and "web" in str(name)
+        )
+        cost = usage.get("cost")
+        total = cost.get("total_cost") if isinstance(cost, dict) else None
+        provider_cost = float(total) if total is not None else None
+
+    status = _field(final, "status") if final is not None else None
+    return text_repair.repair_tree(
+        {
+            "content": content,
+            "usage": usage,
+            "finish_reason": "length" if status == "incomplete" else status,
+            "citations": citations,
+            "search_results": search_results,
+            "web_search_used": bool(results) or bool(searches),
+            "grounding_metadata": {},
+            "web_search_queries": queries,
+            "web_search_calls": searches,
+            "provider_cost_usd": provider_cost,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1977,10 +2366,23 @@ def _ceiling_field(params):
 
     Read off the request rather than recomputed, so it is the value the provider
     actually enforced. Absent for the providers that send none — openai, grok,
-    gemini and perplexity run to the model's own limit.
+    gemini and perplexity run to the model's own limit. The Agent API spells it
+    ``max_output_tokens``.
     """
-    ceiling = (params or {}).get("max_tokens")
+    params = params or {}
+    ceiling = params.get("max_tokens") or params.get("max_output_tokens")
     return {"max_tokens": int(ceiling)} if ceiling else {}
+
+
+def _provider_cost_field(assembled):
+    """``{"provider_cost_usd": x}`` where the provider priced the call itself.
+
+    Only Perplexity's Agent API does, in ``usage.cost.total_cost``. Recorded
+    beside the tokens, not in place of cost.calculate's figure, so the two can
+    be compared: a pricing.yaml row that has drifted shows up as a difference.
+    """
+    cost = assembled.get("provider_cost_usd")
+    return {"provider_cost_usd": cost} if cost is not None else {}
 
 
 def _summarise_discarded(discarded):
@@ -2102,11 +2504,15 @@ def _attempt(
 ):
     """One model call, start to finish, as a result dict. Never raises."""
     spec = _PROVIDERS[provider]
-    params = (
-        _provider_params(provider, cfg, response_schema, model=model)
-        if with_reasoning
-        else {}
-    )
+    agent = _uses_agent_api(provider, model)
+    if agent:
+        params = _agent_params(
+            model, system_prompt, user_prompt, cfg, response_schema, with_reasoning
+        )
+    elif with_reasoning:
+        params = _provider_params(provider, cfg, response_schema, model=model)
+    else:
+        params = {}
     label = f"{provider} {model}"
     searchable = _search_enabled(provider, cfg, params)
     # Two budgets, two jobs: the socket read timeout is the first-byte
@@ -2151,6 +2557,13 @@ def _attempt(
         return assembled
 
     def _request(timing, routing):
+        if agent:
+            return _consume_agent_stream(
+                _perplexity_agent(routing["api_key"], timeout, params),
+                first_byte,
+                gap,
+                timing,
+            )
         if spec["surface"] == "responses":
             kwargs = {
                 "model": _qualified(provider, model, cfg),
@@ -2309,6 +2722,7 @@ def _attempt(
             "elapsed_seconds": elapsed,
             **_extras_from(assembled),
             **_ceiling_field(params),
+            **_provider_cost_field(assembled),
             # A call that failed, retried and failed again was billed twice.
             # Attaching this only to the success path would have left the
             # most expensive outcome — two full attempts, no usable result —
@@ -2354,7 +2768,7 @@ def _attempt(
         # The ceiling named, not just the count: a grounded claude call reports
         # the SUM of its search iterations' output, so "20,215 tokens" alone
         # read as though a 16,000 ceiling had never been the cause.
-        ceiling = params.get("max_tokens")
+        ceiling = params.get("max_tokens") or params.get("max_output_tokens")
         against = f" against a {ceiling}-token ceiling" if ceiling else ""
         log.warning(
             f"{label} response was truncated (hit the output-token ceiling at "
@@ -2374,6 +2788,7 @@ def _attempt(
         "elapsed_seconds": elapsed,
         **extras,
         **_ceiling_field(params),
+        **_provider_cost_field(assembled),
     }
     if truncated:
         result["truncated"] = True
@@ -2436,6 +2851,8 @@ def call(
         chain = [requested]
         if provider == "openai":
             _stream_azure_deployment(cfg["deployment"], requested)
+    elif _uses_agent_api(provider, requested):
+        chain = [requested] + [m for m in _AGENT_FALLBACKS if m != requested]
     else:
         chain = [requested] + [
             m for m in _PROVIDERS[provider]["fallbacks"] if m != requested
