@@ -43,7 +43,7 @@ Reasoning is controlled via `reasoning_effort: none | low | medium | high | xhig
 
 ## Google Gemini (required)
 
-Gemini's fact-check pass has Google Search grounding attached, so it can check claims against live sources. Whether it searches on a given call is the model's decision, not the pipeline's, and the report marks the calls where it did with `[grounded]`. There are two access paths. Start with AI Studio; move to Vertex AI if you hit consistent 503 capacity errors.
+Gemini's fact-check pass has Google Search grounding attached, so it can check claims against live sources. Whether it searches on a given call is the model's decision, not the pipeline's, and the report marks the calls where it did with `[grounded]`. A call counts as having searched when Google lists any search query, whether or not it also names sources. There are two access paths. Start with AI Studio; move to Vertex AI if you hit consistent 503 capacity errors.
 
 ### Option A — AI Studio (quick start, free tier available)
 

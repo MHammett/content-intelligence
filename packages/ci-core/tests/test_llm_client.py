@@ -3602,6 +3602,73 @@ def _captured_gemini_sse(*chunks):
     return "".join(f"data: {json.dumps(e)}\r\n\r\n" for e in events).encode()
 
 
+# A gemini-3.5-flash stream as Vertex really sent it (location `us`,
+# thinking_level low, the smoke draft's fact_check), captured 2026-09-28 through
+# this client with httpx's iter_lines teed. 83 events; trimmed here to two thought
+# events, the answer's text, and the last event, whose keys and usageMetadata are
+# the captured ones. What differs from the 2.5 streams above:
+#   * groundingMetadata is ABSENT from 82 events, not `{}`; only the last has it
+#   * the last event has no answer text: one empty part holding a thoughtSignature
+#   * that metadata named 21 webSearchQueries, a searchEntryPoint and an empty
+#     retrievalMetadata, and no groundingChunks or groundingSupports anywhere in
+#     the stream, although the answer cited an article dated after the model's
+#     training, so the searches did feed it
+_CAPTURED_GEMINI_3X_USAGE = {
+    "promptTokenCount": 6580,
+    "candidatesTokenCount": 1916,
+    "totalTokenCount": 10425,
+    "cachedContentTokenCount": 5949,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 6580}],
+    "cacheTokensDetails": [{"modality": "TEXT", "tokenCount": 5949}],
+    "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 1916}],
+    "thoughtsTokenCount": 1929,
+}
+_CAPTURED_GEMINI_3X_SEARCH = {
+    "webSearchQueries": [
+        "Illinois BEAD Final Proposal NTIA approved",
+        "Illinois BEAD Final Proposal status 2026",
+        "GoNetspeed pole attachment FCC July 2026 Illinois",
+    ],
+    "searchEntryPoint": {"renderedContent": '<div class="container"></div>'},
+    "retrievalMetadata": {},
+}
+
+
+def _captured_gemini_3x_sse(grounding=None):
+    """The captured gemini-3.5-flash shape; ``grounding`` is the last event's
+    groundingMetadata, or None for a stream that carries none."""
+
+    def event(parts, candidate=None, usage=None):
+        return {
+            "candidates": [
+                {"content": {"role": "model", "parts": parts}, **(candidate or {})}
+            ],
+            "usageMetadata": usage or {"trafficType": "ON_DEMAND"},
+            "modelVersion": "gemini-3.5-flash",
+            "createTime": "2026-09-28T12:26:27.427345Z",
+            "responseId": "81y6atGKGoGo8sYP2-776Ac",
+        }
+
+    last = {"finishReason": "STOP"}
+    if grounding is not None:
+        last["groundingMetadata"] = grounding
+    events = [
+        event(
+            [{"text": "**Checking the claims**\n\nReading the draft.", "thought": True}]
+        ),
+        event([{"text": "**Looking up dates**\n\nSearching.", "thought": True}]),
+        event([{"text": '```json\n{"confirmed": []}\n'}]),
+        event([{"text": "```"}]),
+        event(
+            [{"text": "", "thoughtSignature": "c2lnbmF0dXJl"}],
+            last,
+            _CAPTURED_GEMINI_3X_USAGE,
+        ),
+    ]
+    return "".join(f"data: {json.dumps(e)}\r\n\r\n" for e in events).encode()
+
+
 class TestGeminiCapturedStreams:
     """What the client makes of Gemini streams shaped like the real ones.
 
@@ -3609,8 +3676,10 @@ class TestGeminiCapturedStreams:
     against real streams: metadata reached the caller every time Google sent it
     (2 of 2), and on a production-shaped fact_check call Gemini did not search at
     all, so ``grounding_available`` False was the right answer. These pin both.
-    The shape litellm does drop, a final chunk with no text and no supports, is
-    in TestSearchCountsOnTheWire and has not been seen on a real stream.
+    The shape litellm does drop on a built stream, a final chunk with no text
+    and no supports, is in TestSearchCountsOnTheWire. A real text-less last
+    event did arrive on 2026-09-28, from gemini-3.5-flash, and litellm kept it:
+    TestGemini3xCapturedStream.
     """
 
     @pytest.fixture
@@ -3693,6 +3762,87 @@ class TestGeminiCapturedStreams:
         assert "Analyzing the Claims" not in result["raw"]
 
 
+class TestGemini3xCapturedStream:
+    """gemini-3.5-flash as Vertex really streamed it on 2026-09-28.
+
+    Google ran 21 searches and named none of their sources: the metadata on the
+    last event holds queries, a searchEntryPoint and an empty retrievalMetadata,
+    and the stream has no groundingChunks or groundingSupports at all. The
+    client read that as ungrounded, so consolidation withheld the fact-check
+    bonus from a call whose answer plainly came from the live web. The flag now
+    follows the search, as it already did for every other provider.
+    """
+
+    @pytest.fixture
+    def wire(self, monkeypatch):
+        reply = {"sse": b""}
+
+        def _send(http_client, request, *args, **kwargs):
+            return httpx.Response(
+                200,
+                request=request,
+                headers={"content-type": "text/event-stream"},
+                content=reply["sse"],
+            )
+
+        monkeypatch.setattr(httpx.Client, "send", _send)
+        return reply
+
+    def _ask(self):
+        return _call("gemini", provider_config={"model": "gemini-3.5-flash"})
+
+    def test_searches_that_name_no_sources_still_read_as_grounded(self, wire):
+        wire["sse"] = _captured_gemini_3x_sse(_CAPTURED_GEMINI_3X_SEARCH)
+        result = self._ask()
+        assert result["failed"] is False, result
+        # Counted from the queries themselves: had litellm dropped this text-less
+        # last event, there would be no queries and the count would be 0.
+        assert result["searches"] == 3
+        assert result["grounding_chunks"] == []
+        assert result["grounding_available"] is True
+
+    def test_sources_are_still_kept_when_google_does_name_them(self, wire):
+        named = dict(
+            _CAPTURED_GEMINI_3X_SEARCH,
+            groundingChunks=[
+                {
+                    "web": {
+                        "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZ1",
+                        "title": "fierce-network.com",
+                    }
+                }
+            ],
+        )
+        wire["sse"] = _captured_gemini_3x_sse(named)
+        result = self._ask()
+        assert result["grounding_available"] is True
+        assert [c["title"] for c in result["grounding_chunks"]] == [
+            "fierce-network.com"
+        ]
+        assert result["searches"] == 3
+
+    def test_a_call_that_did_not_search_still_reads_as_ungrounded(self, wire):
+        """No groundingMetadata anywhere in the stream: nothing was searched, and
+        the count is a real 0 because the response reported tokens."""
+        wire["sse"] = _captured_gemini_3x_sse(None)
+        result = self._ask()
+        assert result["failed"] is False, result
+        assert result["searches"] == 0
+        assert result["grounding_chunks"] == []
+        assert result["grounding_available"] is False
+
+    def test_metadata_that_names_no_queries_is_not_a_search(self, wire):
+        """Only the search itself counts. Google has not sent a searchEntryPoint
+        with no query behind it, so this pins the rule (read the queries, not
+        the entry point), not an observed shape."""
+        wire["sse"] = _captured_gemini_3x_sse(
+            {"searchEntryPoint": {"renderedContent": "<div></div>"}}
+        )
+        result = self._ask()
+        assert result["failed"] is False, result
+        assert result["grounding_available"] is False
+
+
 class TestSearchCountsOnTheWire:
     """The same counts, read through litellm's own stream parsing.
 
@@ -3746,20 +3896,25 @@ class TestSearchCountsOnTheWire:
 
     def test_geminis_count_survives_litellm_dropping_the_metadata(self, wire):
         """The final chunk carries no text and no groundingSupports, so litellm
-        drops its grounding metadata: the call reads as ungrounded. The search
-        still ran and billed, and litellm's usage still counts it. The shape
-        is built from Google's documented format: no real stream has shown it,
-        so this pins the count's fallback, not an observed production loss."""
+        drops its grounding metadata. The search still ran and billed, and
+        litellm's usage still counts it, so the call still reads as grounded.
+        The shape is built from Google's documented format. A real text-less
+        last event whose empty part held a thoughtSignature (Vertex,
+        gemini-3.5-flash, 2026-09-28) kept its metadata, see
+        TestGemini3xCapturedStream, so this pins the count's fallback, not an
+        observed production loss."""
         wire["sse"] = _gemini_sse(["q one", "q two"], texts=('{"flags": []}', ""))
         result = _call("gemini", provider_config={"model": "gemini-2.5-pro"})
         assert result["failed"] is False, result
-        # The drop itself, so this test notices if a litellm upgrade fixes it.
-        assert result["grounding_available"] is False, (
+        # The drop itself, so this test notices if a litellm upgrade fixes it:
+        # the one source the built stream names would then arrive.
+        assert result["grounding_chunks"] == [], (
             "litellm now keeps Gemini's grounding metadata on this shape, so "
             "BerriAI/litellm#41492 may be fixed for it. The count below is "
             "right either way; update this."
         )
         assert result["searches"] == 2
+        assert result["grounding_available"] is True
 
     def test_openais_search_calls_survive_the_stream(self, wire):
         wire["sse"] = _openai_responses_sse(["search", "open_page", "search"])

@@ -1770,7 +1770,9 @@ def _read_searches(provider, assembled, model=""):
       ``searches`` 0 and ``grounding_available`` False were right. The tool is
       optional per call, and the old adapter's ``grounding_available`` meant
       only "tool attached", so its 153 of 153 is no baseline for 0 of 37 since
-      the move to litellm.
+      the move to litellm. ``grounding_available`` follows this count as well
+      as the source list (``_extras_from``): on 2026-09-28 gemini-3.5-flash ran
+      21 searches and named no source at all.
     * perplexity, Sonar: 1. The fee is per request, and this response is one.
       Perplexity also prices it in ``usage.cost.request_cost``, but litellm does
       not carry that through a stream. sonar-deep-research is the exception:
@@ -2662,7 +2664,21 @@ def _attempt(
         extras = {}
         if provider == "gemini":
             extras["grounding_chunks"] = grounding
-            extras["grounding_available"] = bool(grounding)
+            # Sources OR a search, because Google names sources only when it
+            # chooses to. Measured 2026-09-28 (Vertex `us`, gemini-3.5-flash, the
+            # smoke draft's fact_check): 83 events, groundingMetadata on the last
+            # one alone, holding 21 webSearchQueries and a searchEntryPoint and no
+            # groundingChunks or groundingSupports anywhere in the stream, while
+            # the answer cited an article dated after the model's training.
+            # Reading the source list alone called that call ungrounded and cost
+            # it the fact-check bonus. This is the rule the branch below states,
+            # true when a search ran even if the provider named no sources.
+            # ``searches`` is Google's own query list, else litellm's count of
+            # them, which outlives the metadata drop of BerriAI/litellm#41492.
+            # 0 and None (unknown) stay False.
+            extras["grounding_available"] = bool(grounding) or bool(
+                assembled.get("searches")
+            )
         elif (
             provider == "perplexity"
             or citations
