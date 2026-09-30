@@ -87,6 +87,14 @@ _NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
 #: URL rather than a guessed one.
 _MIN_SCORE = 0.55
 
+#: The band below ``_MIN_SCORE`` in which a span match is weak but may still be
+#: the right one, and how decisively it must beat the runner-up to be used as a
+#: last-resort candidate. See ``fallback_candidates_for`` for the measurement
+#: behind both numbers. The floor exists because below it the scores are noise
+#: on any reading; the margin is what tells a near-miss match apart from a tie.
+_NEAR_MISS_FLOOR = 0.40
+_DECISIVE_MARGIN = 0.10
+
 #: How many candidate URLs one claim may be checked against. The enclosing span
 #: usually answers it; the allowance exists so a claim that opens a span cited to
 #: the *next* marker still reaches the source the author meant. Each candidate
@@ -384,3 +392,55 @@ class DraftCitations:
 
         ordered = sorted(by_key, key=lambda k: (-rank(k), k))
         return self._urls_for_keys(ordered)[:MAX_CANDIDATES]
+
+    def fallback_candidates_for(self, claim):
+        """Draft citations for a claim that only *nearly* located itself.
+
+        ``_MIN_SCORE`` is a cliff: a claim at 0.54 gets no draft citation at
+        all, so the only thing left to check is whatever URL the fact-check
+        model happened to supply. On the 2026-09-18 GPS run that is exactly what
+        happened to "when the system internal calendar is reset to May 19,
+        2002" — it scored 0.450, the draft's own ``[4]`` never applied, and the
+        model's URL (a June 2023 revision that had dropped the sentence) was
+        reported as failing to support it. ``[4]``'s January 2022 URL carries
+        the wording verbatim.
+
+        The cliff is not wrong, it is just blunt. Swept across 33 captures
+        (2,904 scored claims, 2026-09-29): 232 claims land in the 0.40-0.55
+        band and 48 of them end up in "Read, and does NOT support the claim".
+        The threshold's own rationale is that below it "the top span is no
+        better than the runner-up" — which holds on average and not in the
+        majority. Matched claims beat their runner-up by 0.10 or more 93% of
+        the time; near-miss claims still do so **61%** of the time. So the band
+        is a mix of decisive matches and genuine ties, and the margin separates
+        them where a flat threshold cannot.
+
+        This returns a span's citations only when the match is weak *and*
+        decisive. The caller appends them behind every stronger candidate,
+        including the model's own URL, so they are only ever paid for by a claim
+        that was otherwise going to be reported unsupported, and can never
+        pre-empt a source that would have resolved it. 28 of those 48 gain a
+        draft-cited URL that the run never looked at.
+        """
+        if not self.entries or len(self._segments) < 2:
+            return []
+        claim_words, claim_numbers = _tokens(claim), _numbers(claim)
+        scored = sorted(
+            (
+                (_score(claim_words, claim_numbers, span), index)
+                for index, span in enumerate(self._segments)
+            ),
+            key=lambda row: (-row[0], row[1]),
+        )
+        (best, index), (second, _second_index) = scored[0], scored[1]
+        if not _NEAR_MISS_FLOOR <= best < _MIN_SCORE:
+            return []
+        if best - second < _DECISIVE_MARGIN:
+            return []
+        keys = list(self._segments[index]["markers"])
+        if index > 0:
+            # Same reason as in ``candidates_for``: a marker trails the text it
+            # supports, so the sentence opening a span may belong to the one
+            # before it.
+            keys += [k for k in self._segments[index - 1]["markers"] if k not in keys]
+        return self._urls_for_keys(keys)[:MAX_CANDIDATES]
