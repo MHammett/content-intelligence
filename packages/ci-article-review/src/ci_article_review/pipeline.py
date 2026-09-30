@@ -1320,6 +1320,7 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
             seen_keys.append(key)
             source_field = item.get(url_key, "") if url_key else ""
             known_urls = cited.candidates_for(claim, source_field)
+            anchored_this_claim = bool(known_urls)
             if known_urls:
                 anchored += 1
             # ``source_url`` is a dedicated field the prompt asks for outright;
@@ -1350,10 +1351,30 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
                 if extra not in known_urls:
                     known_urls = known_urls + [extra]
 
+            # Last of all, and only for a claim the draft's citation block could
+            # not place: a span it *nearly* matched, when that span beats its
+            # runner-up decisively. See ``fallback_candidates_for``.
+            #
+            # Appended behind everything above rather than returned by
+            # ``candidates_for``, which is the whole safety property: a weak
+            # match can never displace a source that would have resolved the
+            # claim, and is only fetched once every better candidate has already
+            # failed — i.e. only for claims that were going to be reported
+            # unsupported anyway.
+            weak_urls = []
+            if not anchored_this_claim:
+                for weak in cited.fallback_candidates_for(claim):
+                    if weak not in known_urls:
+                        known_urls = known_urls + [weak]
+                        weak_urls.append(weak)
+
             claims.append(
                 {
                     "claim": claim,
                     "known_urls": known_urls,
+                    # Which of those URLs got in only on a weak span match, so
+                    # a resolution that ends up resting on one can say so.
+                    "weak_source_urls": weak_urls,
                     "fact_check_bucket": bucket,
                     # Which model asserted this. `_build_fact_check` tags every
                     # merged item with it; it was being dropped here, which is
