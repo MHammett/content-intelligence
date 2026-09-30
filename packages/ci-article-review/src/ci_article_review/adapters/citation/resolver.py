@@ -2108,6 +2108,40 @@ def _normalize_claim_entry(entry):
     )
 
 
+def _note_weak_span_sources(results, claims):
+    """Say so when a resolution rests on a weakly-matched draft citation.
+
+    ``fallback_candidates_for`` lets a claim reach the citations of a span it
+    only nearly matched. That rescues claims whose source the draft really does
+    cite nearby, and it can also land on a citation the author attached to a
+    different sentence. The difference is not something the pipeline can settle,
+    so it is reported rather than hidden: a source that got in this way is named
+    as such, whether it supported the claim or not.
+
+    Without this the tier would quietly overstate itself — "checksum-verified"
+    reads as "the source you cited for this sentence backs it", and for these
+    entries the first half of that is exactly what is uncertain.
+    """
+    weak_by_claim = {}
+    for entry in claims or ():
+        if isinstance(entry, dict) and entry.get("weak_source_urls"):
+            weak_by_claim[entry.get("claim") or ""] = set(entry["weak_source_urls"])
+    if not weak_by_claim:
+        return
+    for result in results:
+        weak = weak_by_claim.get(result.get("claim") or "")
+        if not weak or result.get("url") not in weak:
+            continue
+        result["weak_span_match"] = True
+        result["note"] = (
+            f"{result.get('note', '').rstrip()} This source was not the one the "
+            f"draft cites for this sentence — the sentence could not be placed in "
+            f"the draft confidently, so the citations of the passage it most "
+            f"resembles were checked as a last resort. Confirm the citation is "
+            f"the one intended before relying on this entry either way."
+        ).lstrip()
+
+
 #: How much two claims must overlap before one is treated as covering the same
 #: point as the other.
 #:
@@ -2288,6 +2322,7 @@ def resolve_citations(
     # whole point is that the pairing the report offers has been verified,
     # whether the snapshot is new or was already there.
     _verify_archive_matches(resolved_results)
+    _note_weak_span_sources(resolved_results, claims)
     # Last, because it reads every other entry's outcome: a refutation is much
     # less alarming when the same run confirmed the same point elsewhere.
     _note_confirmed_siblings(resolved_results)
