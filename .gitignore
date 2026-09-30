@@ -1,12 +1,25 @@
-configs/user.yaml
-configs/*.yaml
-!configs/user.example.yaml
-!configs/publication.example.yaml
-!configs/examples/
-!configs/pricing.yaml
-!configs/model_registry.yaml
-!configs/presets.yaml
-!configs/timeouts.yaml
+# A user's own configs/ — scaffolded by ci-setup, holds real API keys. The whole
+# directory, with a leading slash:
+#
+# * Anchored. A bare `configs/` matches a directory of that name at any depth,
+#   so git would ignore every packaged config under packages/*/src/*/configs/,
+#   and hatchling — which matches these lines relative to each package
+#   directory (pypa/hatch#304) — would drop them from the wheel and the sdist.
+#   Measured 2026-09-30 with hatchling's own build: a bare `configs/` empties
+#   configs/ in all three wheels and all three sdists, and git then ignores
+#   all 12 tracked files under packages/*/src/*/configs/.
+# * The directory, not the old `configs/*.yaml`, which reached only its top
+#   level. A second copy of a filled-in config one level down,
+#   configs/backup/user.yaml, was not ignored; nor was configs/examples/*.yaml.
+#
+# Seven `!configs/<name>` negations sat here until 2026-09-30, from when these
+# files lived in a repo-root configs/ and had to be un-ignored to be tracked.
+# 3ae33d4 (2026-06-24) moved them into the packages, which an anchored line
+# never reaches, so each named a path nothing creates: ci-setup and
+# docs/CONFIGURATION.md both copy an example and rename it. `!configs/examples/`
+# never un-ignored anything even then, since `configs/*.yaml` does not cross a
+# slash. test_gitignore_configs.py holds both halves.
+/configs/
 pipeline_history/
 pipeline_out.txt
 # Cached provider model listings (live_model_check / ci-discover). Derived data
