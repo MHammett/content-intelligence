@@ -316,7 +316,7 @@ class TestRetiredPresets:
         assert "retired" in caplog.text
         assert "wide" in caplog.text
         # The models really are wide's, not a no-op pass-through.
-        assert resolved["openai"]["model"] == "gpt-5.6-luna"
+        assert resolved["openai"]["model"] == "gpt-6-luna"
         assert pipe["thoroughness"] == "thorough"
 
     def test_the_report_names_the_preset_that_actually_ran(self):

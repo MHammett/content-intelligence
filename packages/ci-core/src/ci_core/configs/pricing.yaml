@@ -92,6 +92,18 @@ unknown_price: [2.50, 10.00]   # fallback for unrecognized model IDs (conservati
 
 models:
   # ── OpenAI ──────────────────────────────────────────────────────────────────
+  # gpt-6: Astra 2026-09-03, Sol and Luna 2026-09-22, 6.1 Sol 2026-09-29. There
+  # is no gpt-6 Terra: 6-sol and 6.1-sol sit at 5.6-terra's input price with a
+  # lower output price, and 6-luna at half of 5.6-luna. Verified against
+  # developers.openai.com/api/docs/pricing and each model page 2026-09-30. Same
+  # tiering as below — cache writes 1.25x input, 2x input / 1.5x output past
+  # 272k prompt tokens, neither modelled. 6.1-sol's cache read is 5% of input,
+  # not 10%: the one rate that differs from 6-sol.
+  gpt-6-astra:           [10.00, 50.00, 1.00]
+  gpt-6.1-sol:           [2.00, 10.00,  0.10]
+  gpt-6-sol:             [2.00, 10.00,  0.20]
+  gpt-6-luna:            [0.10,  0.50,  0.01]
+  #
   # gpt-5.6 (Sol/Terra/Luna) launched 2026-07-09, replacing 5.5/5.4/5.4-mini at
   # matching price points; Terra and Luna then got price cuts on 2026-07-30
   # (20% and 80% respectively). Terra and Luna re-confirmed unchanged 2026-09-17.

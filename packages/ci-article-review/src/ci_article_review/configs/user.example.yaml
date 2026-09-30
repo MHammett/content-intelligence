@@ -56,10 +56,10 @@ api_keys:
 #     you can mix forms.
 #
 # Current model IDs (September 2026):
-#   OpenAI:      gpt-5.6-sol ($4/$20 /MTok, promotional through at least 2026-11-21), gpt-5.6-terra ($2/$12), gpt-5.6-luna ($0.20/$1.20)
-#              Sol/Terra/Luna replaced 5.5/5.4/5.4-mini on 2026-07-09 at matching tiers;
-#              Terra and Luna then got price cuts on 2026-07-30, and Sol is on a promotional
-#              rate (all rates above are current).
+#   OpenAI:      gpt-6.1-sol ($2/$10 /MTok), gpt-6-luna ($0.10/$0.50), gpt-6-astra ($10/$50)
+#              gpt-6 (2026-09-22) and 6.1 Sol (2026-09-29) undercut the 5.6 family they
+#              replace; there is no gpt-6 Terra, so 6.1-sol takes Terra's place too.
+#              gpt-5.6-sol/terra/luna still work and are still priced.
 #   Gemini:      gemini-3.5-flash ($1.50/$9.00; what every preset runs), gemini-3.5-flash-lite ($0.30/$2.50)
 #              The 2.5 family (2.5 Pro, Flash, Flash-Lite) is listed for retirement on Vertex AI on
 #              2026-10-20 (Google Cloud's model lifecycle page; dates may be extended but will not
@@ -86,7 +86,7 @@ api_keys:
 #
 # Simple form (default):
 models:
-  openai: gpt-5.6-terra
+  openai: gpt-6.1-sol
   gemini: gemini-3.5-flash
   mistral: mistral-large-latest
   perplexity: perplexity/sonar
@@ -116,13 +116,14 @@ models:
 # model in configs/timeouts.yaml — you do NOT need to set timeout_seconds.
 # Set timeout_seconds on a model only to OVERRIDE the formula for that model.
 #
-# OpenAI — reasoning.effort: none | low | medium | high | xhigh
-# Supported on gpt-5.x models.  Default is "medium" on all three gpt-5.6 models, and
-# leaving it out sends nothing, so it runs at medium; "none" is what turns reasoning off.
+# OpenAI — reasoning.effort: none | low | medium | high | xhigh | max
+# Supported on gpt-5.x and gpt-6 models.  Default is "medium", and leaving it out sends
+# nothing, so it runs at medium; "none" turns reasoning off on gpt-6-luna and gpt-5.6,
+# but gpt-6.1-sol refuses it (low is its floor). "max" is gpt-6 only.
 #
 #  openai:
-#    model: gpt-5.6-terra
-#    reasoning_effort: medium   # "none" | "low" | "medium" | "high" | "xhigh"
+#    model: gpt-6.1-sol
+#    reasoning_effort: medium   # "low" | "medium" | "high" | "xhigh" | "max"
 #    timeout_seconds: 300
 #
 # Claude — thinking mode depends on the model.  This follows Anthropic's per-model table
@@ -215,7 +216,7 @@ models:
 # OpenAI with live web search (OpenAI Responses API):
 #
 #  openai:
-#    model: gpt-5.6-terra
+#    model: gpt-6.1-sol
 #    web_search: [fact_check]   # only these domains search; `true` means all five
 #                               # (search bills per search, and only fact_check
 #                               #  has any use for a live-fetched source)
@@ -383,13 +384,13 @@ pipeline:
   #
   # Reasoning presets (balanced+) automatically switch to reasoning-capable models.
   # The exact model/effort per preset lives in configs/presets.yaml; current bundle:
-  #   OpenAI  → gpt-5.6-terra low/high (balanced/thorough), gpt-5.6-sol xhigh (maximum)
+  #   OpenAI  → gpt-6.1-sol low/high/xhigh (balanced/thorough/maximum)
   #   Mistral → mistral-medium-3-5 (reasoning_effort "high" at thorough+; "high"/"none" only)
   #   Grok    → grok-4.6 with reasoning_effort low/high/high (balanced/thorough/maximum)
   #   Gemini  → gemini-3.5-flash at every preset, thinking_level low/low/low/medium/high
   #             (economy/wide/balanced/thorough/maximum)
-  # economy and wide run gpt-5.6-luna and mistral-small-latest with no effort set, so each
-  # provider's own default applies (gpt-5.6-luna reasons at medium, not none).
+  # economy and wide run gpt-6-luna and mistral-small-latest with no effort set, so each
+  # provider's own default applies (gpt-6-luna reasons at medium, not none).
   #
   # Two retirements, both handled: the presets moved from Perplexity's Sonar chat completions
   # (supported until 2026-09-27) to perplexity/sonar on its Agent API on 2026-09-28, and off
