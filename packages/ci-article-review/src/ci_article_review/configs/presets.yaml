@@ -419,7 +419,9 @@ wide:
 # less" as a statement about the 2026-09-05 line-up at 2.5-Flash prices, and
 # settle today's with a live A/B rather than arithmetic: the retired preset
 # rebuilt from `git show 3a16fd4^:<this file>`, three runs each on the smoke
-# draft, roughly $1 at current rates. Not run.
+# draft, roughly $1 at current rates. Not run; tracked in issue #285, which
+# also carries where the captures behind every figure here live, since
+# pipeline_history is gitignored and archiving a worktree deletes its runs.
 #
 # The six original runs are not among the saved runs, so none of this can be
 # checked against them, and only one draft length was ever compared: read every
