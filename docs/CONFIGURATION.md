@@ -42,7 +42,7 @@ cp packages/ci-article-review/src/ci_article_review/configs/user.example.yaml co
 cp packages/ci-article-review/src/ci_article_review/configs/publication.example.yaml configs/your_publication_name.yaml
 ```
 
-The `.gitignore` excludes `configs/user.yaml` and all `configs/*.yaml` files that aren't examples or committed defaults. Your keys will not be committed.
+The `.gitignore` excludes the whole `configs/` directory — everything in it, at any depth, not just the `*.yaml` at its top level. Nothing under it is tracked, so your keys will not be committed, and neither will a backup copy you leave beside them.
 
 ---
 
