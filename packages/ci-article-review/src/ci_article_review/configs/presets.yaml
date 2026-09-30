@@ -340,42 +340,93 @@ wide:
 
 # `standard` was retired 2026-09-05. `wide` above dominated it on every axis
 # measured -- more corroborated consensus, more claims, more findings that
-# survive a rerun -- at lower cost, and a tier that costs more for less is not a
-# rung on a cost/benefit ladder. An existing `cost_preset: standard` still runs
-# (as `wide`) and warns; see _RETIRED_PRESETS in config_loader.py.
+# survive a rerun -- at lower cost on the one draft they were compared on; a
+# tier that costs more for less is not a rung on a cost/benefit ladder. An
+# existing `cost_preset: standard` still runs (as `wide`) and warns; see
+# _RETIRED_PRESETS in config_loader.py. The retirement is settled; what it cost
+# is what keeps going stale, so every figure below carries its basis, the draft
+# length, and the date of the price table it was priced against.
 #
-# How much lower depends on what is counted, and the first figure overstated it.
-# The comparison measured `wide` at 55% of `standard`'s cost ($0.119 against
-# $0.215, three isolated runs each, one 1,392-word draft), but it counted tokens
-# only and priced mistral-large 6x too high and mistral-small too low. Both rows
-# were verified 2026-09-18 and corrected in #216; #230 (2026-09-19) then began
-# billing search and grounding fees. Re-derived 2026-09-19 for that draft length,
-# `wide`'s cost as a share of `standard`'s is:
-#   - Tokens only, at the corrected Mistral rates: 72-86%, by two routes.
-#       * Reconstruct `standard` from each `wide` smoke-test run's own calls: the
-#         same 9,456-char draft, with mistral-small's and gpt-5.6-luna's tokens
-#         standing in for mistral-large's and gpt-5.6-terra's on the same
-#         domains. At the old rates this gives 57% against the measured 55%, so
-#         the method is calibrated; at the new ones, 72-77% (three complete
-#         runs).
-#       * Re-price the two complete `standard` runs on record and apply their
-#         change to the measured $0.215, as #216 did: 76-86%. Neither is the
-#         comparison's length (2,182 and ~74,000 chars), and both saved more
-#         (25% and 34%) than the reconstruction does at 9,456 chars (19-24%).
-#   - With search fees, using the reconstruction: 80-84% if gemini's fact_check
-#     searched (one grounded prompt billed), perplexity's fact_check and citation
-#     re-ask were billed a request each, and gemini's other calls did not search
-#     (as #230's live run saw of voice_style; its fact_check came back empty);
-#     80-89% if gemini's citation re-asks searched too, which both presets pay;
-#     and about 95-101% if the gemini voice_style call only `wide` makes (it
-#     stands in for claude, which drafted these runs) searched as well. The saved
-#     captures predate #230 and carry no search counts, so these fees are
-#     injected, not measured.
+# The first figure overstated the saving. The comparison measured `wide` at 55%
+# of `standard`'s cost ($0.119 against $0.215, three isolated runs each, one
+# 1,392-word draft), but it counted tokens only and priced mistral-large 6x too
+# high and mistral-small too low. Both rows were verified 2026-09-18 and
+# corrected in #216; #230 (2026-09-19) then began billing search and grounding
+# fees; #235 (2026-09-20) re-priced sonar; #252 (2026-09-28) moved every preset
+# off gemini-2.5-flash.
+#
+# CURRENT, tokens only, priced 2026-09-30 against ci-core's pricing.yaml of that
+# date, on the 9,456-char (~1,400-word) smoke draft, over the three complete
+# saved `wide` captures:
+#
+#     `wide` costs 73-79% of `standard`.
+#
+# 73.1 / 78.1 / 74.7% per run as #233 built the rebuild, and 74.1 / 78.5 / 77.0%
+# with the perplexity citation re-asks charged to `wide` alone -- which is what
+# the code does: reask_refuted hands a refuted claim back to its own
+# `source_model` and the pipeline passes no fallback_provider, so a preset that
+# gave perplexity no ensemble domain can have no perplexity claim to re-ask. The
+# rest of the citation pass still differs between the presets in ways a rebuild
+# cannot model, which is why this is a band and not a number.
+#
+# Method, unchanged from #233: rebuild `standard` out of each captured `wide`
+# run's own api_call_log -- drop the five calls only `wide` makes, re-point
+# openai voice_style/completeness from gpt-5.6-luna to gpt-5.6-terra and mistral
+# argument_integrity/red_team from mistral-small to mistral-large, every call
+# keeping its reported tokens -- then price through ci_core.llm.cost.calculate.
+# Prompts are model-independent; completions are a proxy. The seven ensemble
+# calls this leaves match, pass for pass and model for model, three real
+# `standard` runs still on disk. pipeline_history is per-checkout and
+# gitignored, and all three are in the content-intelligence-audit-fixes
+# worktree, not the main one: pipeline-and-verification-update run_1 and run_2
+# (2026-09-04) and data-centers-dont-have-an-environmental... run_20
+# (2026-09-05). None of the three got far enough into the citation pass to show
+# what it would have cost there.
+#
+# Calibrated twice, and neither check may be skipped: at the pre-#216 rates the
+# rebuild gives 56.6 / 57.1 / 57.5% against the 55.3% actually measured, and at
+# #233's own table (c5a4acf, pre-#235) it reproduces #233's published
+# 72.1 / 76.9 / 73.7% exactly. Of the rows the rebuild touches, only #235's
+# sonar has moved since #233 -- claude-haiku-4-5 gained a cached-input rate, and
+# these captures report no cached tokens -- so #235 is the whole of the change.
+# 73.5 / 78.3 / 75.7% is NOT that change, though the arithmetic is tempting:
+# that is `wide` at the new sonar rate over `standard` at the old one, crediting
+# `wide` alone for an increase both presets pay on their citation re-asks.
+#
+# NOT re-derived. Do not quote these as current:
+#   - #216's scaling of two complete `standard` runs onto the measured $0.215,
+#     which gave 76-86%. Pre-#235, and #235 also moved sonar-pro
+#     ([1.00, 8.00] -> [3.00, 15.00]), the perplexity model `standard` named.
+#   - The fee bases, 80-84% / 80-89% / about 95-101%. They injected search
+#     counts into captures that predate #230 and carry none, and they assumed
+#     Gemini 2.5's flat $35 per 1,000 grounded prompts. #252 put every preset on
+#     gemini-3.5-flash, which bills $14 per 1,000 QUERIES instead -- 11-16 of
+#     them on a single fact_check in the 2026-09-28 `wide` runs recorded in
+#     CLAUDE.md. They are kept as a record of the reasoning about a fee model
+#     that no longer applies, not as figures.
+#
+# #252 may have reversed the sign, and not only through fees: gemini-3.5-flash
+# is [1.50, 9.00] against 2.5-flash's [0.30, 2.50]. `wide` makes two gemini
+# calls with 8-12K-token completions (the shared fact_check, plus the
+# voice_style only it makes, standing in for claude, which drafted these runs)
+# where `standard` makes one, so the rise lands hardest on `wide`. Carry the
+# same captured token counts onto today's models (gemini-3.5-flash,
+# perplexity/sonar) on both sides and the rebuild gives 105.2 / 110.1 / 103.6%
+# -- `wide` costing MORE on tokens alone, before any fee -- or 97.0-108.7% if
+# `standard`'s re-asks run sonar-pro. That is a bound, not a measurement: it
+# prices 2.5-Flash's output lengths at 3.5-Flash's rate, and 3.5-Flash's own
+# output lengths on these prompts have never been measured. Read "`wide` cost
+# less" as a statement about the 2026-09-05 line-up at 2.5-Flash prices, and
+# settle today's with a live A/B rather than arithmetic: the retired preset
+# rebuilt from `git show 3a16fd4^:<this file>`, three runs each on the smoke
+# draft, roughly $1 at current rates. Not run; tracked in issue #285, which
+# also carries where the captures behind every figure here live, since
+# pipeline_history is gitignored and archiving a worktree deletes its runs.
+#
 # The six original runs are not among the saved runs, so none of this can be
-# checked against them, and only one draft length was ever compared: read it as
-# belonging to a ~1,400-word draft. On that draft `wide` cost less on every basis
-# above but the last, where it cost about the same, and it still wins every other
-# axis measured. Nothing user-facing quotes a percentage, for that reason.
+# checked against them, and only one draft length was ever compared: read every
+# figure above as belonging to a ~1,400-word draft. Nothing user-facing quotes a
+# percentage, for that reason.
 
 balanced:
   thoroughness: thorough

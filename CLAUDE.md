@@ -93,7 +93,7 @@ EOF
 
 **Not backfill or substitution.** `--only-model` and `--only-domain` switch backfill off and substitute only within the domains they kept (`pipeline.py`, "Off under a calibration filter"), so neither can show a change to those two. The $0 check covers backfill; substitution needs the full `wide` run.
 
-Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset on every axis at lower cost — first measured at 55% of it, tokens only at that day's Mistral rates; re-priced, the saving is smaller and depends on what is counted, and `standard` never ran on `gemini-3.5-flash` (the note under `wide:` in `configs/presets.yaml` has the dated figures) — so `wide` is a sound working default and not a degraded one.
+Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset on every axis, and cost less at that day's model line-up and prices — first measured at 55% of it, tokens only at that day's Mistral rates; re-priced, the saving is smaller and depends on what is counted, and on today's models it may be gone altogether, since `standard` never ran on `gemini-3.5-flash` (the note under `wide:` in `configs/presets.yaml` has the dated figures and that bound) — so `wide` is a sound working default and not a degraded one: the quality axes are what settle that, not the cost gap.
 
 Measured 2026-09-08 on a 19,457-word real article (dc-environment-v26), 3 isolated runs per condition, cross-run reproducibility scored against `wide` and `maximum` as anchors — the first measurement of anything above `wide`:
 
