@@ -11,8 +11,11 @@ dependencies = [
     # logic) can depend on it too, instead of each maintaining a copy.
     # 0.2.1 (not just 0.1.0) matters here: it paces/breaker-protects submit()
     # at archive.org's own documented capture-endpoint limits, which 0.1.0
-    # did not do at all.
-    "spn-client>=0.3.0,<0.4",
+    # did not do at all. 0.4.0 matters for --archive-only: check(cdx_fallback=)
+    # and the refusal fields on submit() (error_code, retry_category), which
+    # run_archive_only and _record_submission use. A test reads the installed
+    # signature, so an older client fails the suite rather than the CLI.
+    "spn-client>=0.4.0,<0.5",
     "requests>=2.31.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "python-dotenv>=1.0.0,<2.0",
