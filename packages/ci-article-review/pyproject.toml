@@ -21,6 +21,21 @@ dependencies = [
     # Python-Markdown does the parsing; the block wrapping in adapters/cms/
     # blocks.py uses the stdlib, which is why beautifulsoup4 is not here too.
     "markdown>=3.4,<4.0",
+    # Strips EXIF/XMP/IPTC from an image before it is uploaded to a media
+    # library, where it would be public immediately (issue #288). Required and
+    # not an extra on purpose: a privacy default that silently does not apply
+    # because an optional dependency is absent is the same bug with a quieter
+    # failure, and this repo has already been bitten by exactly that (see the
+    # ci-core[unblock] note in the root pyproject).
+    #
+    # The floor is what the module names: ExifTags.IFD arrived in Pillow 9.4.0
+    # (2023-01-02; Base and GPS one release earlier, 9.3.0), and 10.0 is the next
+    # round release above that. The behaviour it depends on -- that none of
+    # Pillow's JPEG, PNG or WebP writers copies EXIF out of ``im.info`` -- is
+    # asserted by tests/test_wordpress_images.py against whichever version
+    # uv.lock pins, so a release that changed it would fail the suite rather
+    # than quietly publish a GPS block.
+    "pillow>=10.0,<13",
 ]
 
 [project.optional-dependencies]

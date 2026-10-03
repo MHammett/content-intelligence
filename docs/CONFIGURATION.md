@@ -1440,6 +1440,37 @@ at it and nothing is uploaded. It is not in this site's media library, so it has
 no attachment, and its alt text lives on the block alone. Its reachability is
 not checked.
 
+**Metadata is stripped before upload.** A phone photo carries EXIF: the GPS
+position it was taken at, the device make and model, the capture time. A
+media-library file is public from the moment it is uploaded, so uploading the
+original would publish all of that before anyone had chosen to publish the post.
+A `.jpg`, `.jpeg`, `.png` or `.webp` therefore goes up as a scrubbed copy — EXIF,
+XMP, IPTC and any embedded comment removed, the EXIF orientation applied to the
+pixels so a rotated photo is not sideways, the ICC colour profile kept because it
+describes colour and not a person. **The file on your disk is never modified.**
+
+A JPEG is re-encoded with its own quantisation tables and chroma subsampling, so
+it keeps the quality level it already had. A lossless WebP stays lossless; a lossy
+one is re-saved at quality 95, which can make the file bigger, because nothing in
+the format records what quality it was written at. PNG is lossless either way.
+
+Any other type — `.heic`, `.heif`, `.tif`, `.tiff`, `.gif`, `.avif`, `.bmp`,
+`.svg` — is uploaded as it is, and so is an animation (APNG, animated WebP),
+because re-encoding one would mean rebuilding every frame's timing. When a file in
+that group records a location, the `IMAGES` list says so before the checklist asks
+for a yes.
+
+`--keep-image-metadata` turns the stripping off and uploads every file exactly as
+it is. If a file of a stripped type cannot be opened as an image at all, the
+publish stops and names it rather than sending the original: a scrubber that
+quietly gives up is worse than none, because the publish still looks like it
+worked.
+
+None of this makes a photo anonymous. A photo *of a screen* can show a location in
+plain text — a navigation unit's coordinates, a map, a dashboard, a hostname in a
+terminal — and no metadata strip touches pixels. Look at each photo at full size
+first.
+
 **What stops a publish.** All of it is checked before the SEO suggestion call
 is paid for and before the checklist asks for a yes, everything wrong is
 reported at once, and each line names the image:
@@ -1470,9 +1501,10 @@ alignment or a width is not supported; an attribute list such as
 `{: width=300 }` is dropped, with a warning.
 
 **What you see.** Before the checklist, an `IMAGES` list: each image's
-resolved path or link, its alt text and caption, and any image with no alt
-text. After the push, next to the post URL: how many were uploaded and how many
-linked, with the media IDs.
+resolved path or link, its alt text and caption, what metadata the file carries
+and what will happen to it, and any image with no alt text. After the push, next
+to the post URL: how many were uploaded and how many linked, with the media IDs,
+and a note on any whose metadata was not stripped.
 
 ---
 

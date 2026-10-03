@@ -5185,6 +5185,7 @@ def run_publish_pipeline(
     api_key_overrides=None,
     wp_user=None,
     wp_password=None,
+    strip_image_metadata=True,
 ):
     log.info(f"Loading configs (publication={publication_name})")
     user_config = load_user_config(config_dir)
@@ -5295,7 +5296,9 @@ def run_publish_pipeline(
     # would come to nothing. A relative path is relative to the handoff file, not
     # to wherever this was run from, so the same handoff finds the same files.
     image_base_dir = Path(handoff_path).resolve().parent
-    image_plan = wp.plan_images(pub_handoff["final_draft"], image_base_dir)
+    image_plan = wp.plan_images(
+        pub_handoff["final_draft"], image_base_dir, strip_image_metadata
+    )
     if image_plan.problems:
         log.error(wp.describe_problems(image_plan))
         sys.exit(1)
@@ -5355,6 +5358,7 @@ def run_publish_pipeline(
         rank_math_config,
         publish_live=publish_live,
         image_base_dir=image_base_dir,
+        strip_image_metadata=strip_image_metadata,
     )
 
     if result["success"]:
@@ -5620,6 +5624,16 @@ def build_parser():
         "archive_org.access_key, archive_org.secret_key.",
     )
     parser.add_argument(
+        "--keep-image-metadata",
+        action="store_true",
+        help="Upload each local image exactly as it is (--publish mode). By "
+        "default a JPEG, PNG or WebP is uploaded as a scrubbed copy: EXIF "
+        "(including the GPS position a phone writes), XMP, IPTC and any comment "
+        "removed, the EXIF orientation applied to the pixels, the ICC colour "
+        "profile kept. A media-library file is public the moment it is "
+        "uploaded, so this publishes whatever the camera recorded.",
+    )
+    parser.add_argument(
         "--wp-user",
         metavar="USERNAME",
         help="Override the WordPress username for this run only (--publish "
@@ -5850,6 +5864,7 @@ def main():
                 api_key_overrides=api_key_overrides,
                 wp_user=args.wp_user,
                 wp_password=args.wp_password,
+                strip_image_metadata=not args.keep_image_metadata,
             )
     except (FileNotFoundError, ValueError) as e:
         log.error(str(e))

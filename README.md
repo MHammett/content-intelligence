@@ -174,7 +174,11 @@ Images in the FINAL DRAFT are ordinary Markdown,
 `![alt text](path/to/file.png "optional caption")`, alone on a line. A file on
 disk is uploaded to the WordPress media library and becomes a native Image
 block you can edit in the block editor; an `https://` URL is linked and not
-uploaded. See [Images in the FINAL DRAFT](docs/CONFIGURATION.md#images-in-the-final-draft).
+uploaded. A `.jpg`, `.png` or `.webp` is uploaded as a scrubbed copy — EXIF
+(including the GPS position a phone writes), XMP, IPTC and any comment removed,
+the orientation applied to the pixels, the ICC profile kept — and your own file
+is not modified; `--keep-image-metadata` turns that off. See
+[Images in the FINAL DRAFT](docs/CONFIGURATION.md#images-in-the-final-draft).
 
 **Analyze an existing web page:**
 
@@ -508,6 +512,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--config-dir DIR` | Config directory (default `configs`) |
 | `--cost-preset PRESET` | Override `cost_preset` for this run: `economy` / `wide` / `balanced` / `thorough` / `maximum`. Doesn't modify `user.yaml`. (`standard` was retired 2026-09-05; it still runs, as `wide`, with a warning.) |
 | `--api-key PROVIDER[.FIELD]=VALUE` | Override one credential field for this run only — highest tier of the credential precedence (CLI > publication config > `.env`/`user.yaml` > OS environment variable). Repeatable. `PROVIDER=VALUE` is shorthand for `api_key` (`openai`, `gemini`, `mistral`, `grok`, `perplexity`, `claude`); multi-field credentials need `PROVIDER.FIELD` (`languagetool.username`, `archive_org.secret_key`, etc.). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#api-key-precedence). |
+| `--keep-image-metadata` | Upload each local image exactly as it is (`--publish` mode). By default a `.jpg`/`.png`/`.webp` is uploaded as a scrubbed copy: EXIF (including the GPS position a phone writes), XMP, IPTC and any comment removed, the EXIF orientation applied to the pixels, the ICC colour profile kept. A media-library file is public the moment it is uploaded, so this publishes whatever the camera recorded. |
 | `--wp-user USERNAME` | Override the WordPress username for this run only (`--publish` mode) — same precedence idea as `--api-key`, applied to `publication.wordpress`. |
 | `--wp-password APPLICATION_PASSWORD` | Override the WordPress application password for this run only (`--publish` mode). |
 | `--expand` | Add the **expansion pass**: a sixth review domain that proposes additional sources, topics, angles and data fitting the draft's existing primary claim, instead of judging what is already there. Its output is SECTION 10, and every URL it proposes is fetched and marked resolved or not. Off by default — it costs extra model calls, and it earns them early in a draft rather than on a final revision. See [Expansion pass](#expansion-pass). |
