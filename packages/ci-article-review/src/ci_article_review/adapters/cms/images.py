@@ -246,13 +246,42 @@ def mime_for(path):
 # re-encode, and _jpeg_options and _webp_options below are where it is held down.
 # ---------------------------------------------------------------------------
 
-#: The types the strip handles. Everything else in ``IMAGE_TYPES`` is uploaded
-#: as it is: a TIFF or a HEIC off a phone carries EXIF too, but re-encoding a
-#: multi-page TIFF, an animation, or a format Pillow needs a plugin to open at
-#: all would risk the image itself to remove metadata that is reported either
-#: way. One of those types carrying a location is warned about instead, where
-#: the images are listed and before anything is sent.
-STRIPPABLE = (".jpg", ".jpeg", ".png", ".webp")
+#: The types the strip handles. AVIF is here because Pillow 11.3 brought the
+#: codec in-tree, so it needs nothing extra and behaves like the other three.
+STRIPPABLE = (".jpg", ".jpeg", ".png", ".webp", ".avif")
+
+#: Types that are refused while stripping is on rather than uploaded.
+#:
+#: The rule that separates these from the types that go up as they are is not
+#: "can it be stripped" but **"can it be read"**. A TIFF cannot be stripped
+#: either — re-encoding a multi-page or non-RGB one would risk the image to
+#: protect its metadata — but Pillow reads its EXIF, so its GPS block is named
+#: in the listing and the author chooses with the facts in front of them. A
+#: HEIC cannot even be opened, so there is no informed choice to offer: the
+#: honest options are to refuse it or to upload it blind, and uploading the
+#: format an iPhone writes by default, blind, is how issue #288 happened.
+#:
+#: Stripping a HEIC was investigated (issue #299) and is not worth it:
+#:
+#:   * pillow-heif 1.8.0 (BSD-3, Windows and manylinux wheels, bundles libheif
+#:     1.23.4) registers an opener and can read and write HEIC, so it would
+#:     work. Measured 2026-10-03, it is still the wrong trade.
+#:   * There is no lossless path. Neither ``lossless=True`` nor ``quality=-1``
+#:     nor ``chroma=444`` round-trips a HEIC pixel-for-pixel — ``lossless=True``
+#:     is accepted and ignored, byte count unchanged. So every strip is a lossy
+#:     re-encode of someone's photograph.
+#:   * At a quality that does not visibly degrade it, the format's whole point
+#:     is gone: a 300x200 test image was 11,437 B as written and 43,574 B at
+#:     ``quality=95``, against 40,088 B for a JPEG of the same picture at 95.
+#:     Paying 4x the size for no advantage over a JPEG is not a strip, it is a
+#:     bad conversion.
+#:   * And a HEIC does not display on the web anyway. HEVC is patent-encumbered,
+#:     so Safari renders one and Chrome, Firefox and Edge do not. Publishing one
+#:     gives most visitors a broken image whatever its metadata says.
+#:
+#: So the advice the refusal gives — export a JPEG — is what the photo needed
+#: regardless, and the dependency (and libheif's C parser) is not taken.
+REFUSED = (".heic", ".heif")
 
 #: EXIF tags that name a person or a device rather than describing the picture.
 #: By name, not number, so this reads as what it is and does not depend on which
@@ -443,6 +472,26 @@ def strippable(path):
     return Path(path).suffix.lower() in STRIPPABLE
 
 
+def refusal(path):
+    """Why this file cannot be published with stripping on, or ``None``.
+
+    A clause, not a sentence: the caller puts the image's name in front of it.
+    """
+    ext = Path(path).suffix.lower()
+    if ext not in REFUSED:
+        return None
+    return (
+        f"{Path(path).name} is a {ext} file. Its metadata cannot be removed "
+        "(there is no lossless way to re-save one, and re-encoding it at a "
+        "quality that does not degrade the photo makes it larger than a JPEG "
+        "of the same picture), and it cannot be read either, so whether it "
+        "records where it was taken is unknown. Export it as a JPEG and point "
+        "the draft at that -- which it needs anyway, because Chrome, Firefox "
+        "and Edge do not display a .heic at all. To upload this file exactly "
+        "as it is, pass --keep-image-metadata."
+    )
+
+
 def _jpeg_options(im):
     """Save options that re-encode a JPEG at the quality it already is.
 
@@ -486,6 +535,19 @@ def _webp_options(raw):
     return {"lossless": True} if b"VP8L" in raw[:64] else {"quality": 95, "method": 6}
 
 
+def _avif_options():
+    """Save options for an AVIF: 95, for the reason a lossy WebP gets 95.
+
+    Nothing in the file records the quality it was written at, and AVIF has no
+    working lossless re-save either (``lossless=True`` is accepted and ignored,
+    and ``quality=-1`` is rejected outright), so the choice is the same one:
+    grow the file rather than degrade the picture. Measured 2026-10-03 at about
+    1.9x on a 600x400 photo-shaped image, against 3.8x for the same move on a
+    HEIC -- which is part of why a HEIC is refused instead (see ``REFUSED``).
+    """
+    return {"quality": 95}
+
+
 def strip_metadata(path, out_dir):
     """Write a copy of ``path`` into ``out_dir`` with its metadata removed.
 
@@ -515,6 +577,8 @@ def strip_metadata(path, out_dir):
                 options = _jpeg_options(im)
             elif fmt == "WEBP":
                 options = _webp_options(raw)
+            elif fmt == "AVIF":
+                options = _avif_options()
             else:
                 options = {}
             out = ImageOps.exif_transpose(im)

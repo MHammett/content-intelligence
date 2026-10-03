@@ -602,7 +602,7 @@ requires-dist = [
     { name = "google-auth", marker = "extra == 'all'", specifier = ">=2.0" },
     { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0" },
     { name = "markdown", specifier = ">=3.4,<4.0" },
-    { name = "pillow", specifier = ">=10.0,<13" },
+    { name = "pillow", specifier = ">=11.3,<13" },
     { name = "python-dotenv", specifier = ">=1.0.0,<2.0" },
     { name = "pyyaml", specifier = ">=6.0,<7.0" },
     { name = "requests", specifier = ">=2.31.0,<3.0" },

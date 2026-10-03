@@ -382,6 +382,12 @@ def _read_metadata(plan, src, path, label):
     lookups and after the author said yes, and the one answer that is never
     right is to send the original anyway.
     """
+    if plan.strip_metadata:
+        refusal = images.refusal(path)
+        if refusal:
+            # Before inspect_metadata, which cannot open one of these and would
+            # report "could not be read" as if the file were damaged.
+            return f"{label}: {refusal}"
     try:
         meta = plan.metadata[src] = images.inspect_metadata(path)
     except images.ImageError as e:  # Pillow missing from the environment
@@ -412,7 +418,21 @@ def _will_strip(plan, src):
 
 
 def _location_warning(plan, src, label):
-    """A warning when a file that records where it was taken will keep it."""
+    """A warning when a file that records where it was taken will keep it.
+
+    Also when that cannot be established: a kept ``.heic`` gets the warning on
+    the strength of what the format usually carries, because nothing here can
+    open one to check, and silence would read as "nothing found".
+    """
+    path = plan.uploads.get(src)
+    if path is not None and path.suffix.lower() in images.REFUSED:
+        return (
+            f"{label}: this is a {path.suffix.lower()} file being uploaded as "
+            "it is, and nothing here can read it. A phone writes a GPS "
+            "position into this format by default, so assume it records WHERE "
+            "IT WAS TAKEN. A media-library file is public the moment it is "
+            "uploaded."
+        )
     meta = plan.metadata.get(src)
     if not meta or not meta.location or _will_strip(plan, src):
         return None
@@ -749,6 +769,11 @@ def _metadata_line(plan, src):
         if found == "none":
             return f"none found; stripped anyway before upload{tail}"
         return f"{found} -> stripped before upload{tail}"
+    if path.suffix.lower() in images.REFUSED:
+        return (
+            f"NOT stripped, and NOT readable either ({path.suffix.lower()}): "
+            "whether this file records where it was taken is unknown"
+        )
     if not images.strippable(path):
         return f"NOT stripped ({path.suffix.lower()} is uploaded as it is)"
     if meta.animated:
