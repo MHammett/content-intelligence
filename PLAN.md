@@ -697,6 +697,107 @@ around its output. 239 lines is not where the pain is.
    separately, since `wide` is fact-check-blind (0.0% repro) for the entire
    length of an active revision cycle otherwise.
 
+   ### 5.6.1 Superseded by the late-September 2026 model refresh (2026-10-03)
+
+   **Everything above was measured on a line-up that no longer ships, and the
+   repro numbers cannot simply be carried forward.** Three of the six models in
+   the ensemble changed inside one week:
+
+   | slot | measured on | ships today | PR |
+   |------|-------------|-------------|----|
+   | gemini | `gemini-2.5-pro` | `gemini-3.5-flash` | #252, 2026-09-27 |
+   | perplexity | `sonar-reasoning-pro` | `sonar` | #258, 2026-09-28 |
+   | openai | `gpt-5.6-sol` / `gpt-5.6-terra` | `gpt-6.1-sol` | #286, 2026-09-30 |
+
+   `reproducibility.py`'s `ensemble_signature` carries the model set as its last
+   component, so a run made today lands in a different comparability group and
+   **nothing above can be re-scored against it**. Worse, the 12 run captures the
+   study was computed from are gone: they lived in a worktree-scoped,
+   gitignored `pipeline_history/`, and went with the session. Only the recorded
+   numbers survive. Any future study must copy its captures into the main
+   checkout as each run lands.
+
+   **Costs re-derived, free, from captures that do survive.** Two real
+   `maximum` captures of dc-environment-v26 and one `thorough` capture remain in
+   the main checkout's `pipeline_history/`. Re-pricing their `api_call_log`
+   call by call through `ci_core.llm.cost` under today's `pricing.yaml` and
+   today's preset line-ups, tokens only:
+
+   | capture | as reported then | re-priced today | on GPT-6 line-up |
+   |---------|-----------------:|----------------:|-----------------:|
+   | `thorough`, run_21 (opus-5 scout, n=1) | $2.57 | $2.57 | **$1.84** |
+   | `maximum`, run_22 | $10.96 | $9.60 | **$7.79** |
+   | `maximum`, run_22 + `gpt-6-astra` | — | — | **$13.96** |
+
+   The `thorough` capture is the opus-5 **scout** run, not the shipped tier: the
+   3-run sonnet-5 mean the table above reports is $1.74, and its captures are
+   among the twelve that are gone. The GPT-6 column for that row therefore swaps
+   in what `thorough` ships today — `claude-sonnet-5` as well as `gpt-6.1-sol`,
+   `gemini-3.5-flash` and `sonar` — so $1.84 is the shipped tier's price on a
+   single run's token profile, not a re-price of a shipped-tier run.
+
+   These are **derived, not measured** — no GPT-6 run of this draft exists at
+   either tier — and **tokens only, which makes the `maximum` row misleading on
+   its own.** The same week's refresh moved Gemini from $35 per 1,000 grounded
+   *prompts* (2.5 Pro: 13 calls in this run, ~$0.49 with perplexity and openai)
+   to $14 per 1,000 search *queries* (3.5 Flash), and 3.5 Flash searches far
+   more. All-in on this draft: **~$10.09** on the 5.6 line-up against
+   **~$9.3–10.6** on GPT-6. The $1.81 of OpenAI tokens GPT-6 saves is largely
+   or wholly returned as Gemini search fees, so `maximum` has not got cheaper —
+   its cost moved between providers. The query count is the weak link: the only
+   `maximum` search figure on record is 103 queries / $1.44 on a 9,456-char
+   draft (`docs/CONFIGURATION.md`, PR #252), whose capture is also gone, used
+   here as a floor on a draft 14x larger; and Gemini's first 5,000 queries a
+   month are free, invisible to a run, so the true bill sits below the estimate
+   by Gemini's share. Measuring this properly is part of #287, not separable
+   from it.
+
+   The $9.60 also settles a small inconsistency: CLAUDE.md carried $9.56 where
+   `presets.yaml` and `docs/CONFIGURATION.md` said "about $9.6". The re-price
+   agrees with the latter two and CLAUDE.md was corrected. What moved between
+   the 2026-09-17 figure and today is **not** fully accounted for: rolling the
+   Mistral (#207/#216) and Perplexity (#235) rates back to their pre-correction
+   values gives $9.17, not $9.56, so those corrections alone do not explain the
+   gap. It was not chased further at four cents, and the hypothesis is recorded
+   here as tested-and-rejected rather than left to be re-guessed.
+
+   **`gpt-6-astra` decided against, without a quality measurement (issue #287).**
+   The bar #286 set was that only a measured repro or fact-check gain justifies
+   5x the OpenAI line. That measurement was priced and not bought, so the bar is
+   unmet and Astra is not adopted — the burden sits on Astra, and declining to
+   spend is a decision, not a deferral. The cost half *is* now measured:
+   **+$6.17 a run**, nearly 80% of an entire `maximum` run, for one of six
+   providers. Three things stack against it before any quality test: OpenAI
+   itself markets 6.1-sol as "near-Astra"; `maximum` on 6.1-sol already buys
+   only +13.2 points of overall repro over `wide` at ~25x the cost, so the
+   marginal return at this end of the curve is already poor; and `openai:fact_check`
+   at xhigh used 786s of its 1085s budget on this draft, so a deeper model risks
+   stalls whose retries the provider bills while reporting zero usage
+   (`uncosted_calls`) — making the quoted price a floor with a fat tail.
+   Revisit cost on record: **$44–45** for a full-ensemble 3-run study, or **~$12**
+   for an openai-only head-to-head on `fact_check` alone, which is where this
+   section found nearly the entire quality gap lives.
+
+   **Still open in #287, priced and unbought:** `thorough` x3 ($6–7) and
+   `maximum` x3 ($25–27) on dc-environment-v26 to re-measure the repro columns;
+   and the `max` reasoning effort new in GPT-6, which `timeouts.yaml` sizes at
+   xhigh's 10.5x multiplier with the comment "UNMEASURED" and which no preset
+   sets — a `--no-timeout` probe costs $1–3. Shrinking the draft does not rescue
+   the budget: `maximum` re-prices to $4.62 on an 18,167-char draft against $7.79
+   on this one, a 40% saving for 7.5x less article, and it forfeits comparability
+   with the table it would be updating.
+
+   **Also fixed here (2026-10-03), found while pricing the above:** `pricing.yaml`
+   had a `gpt-5:` row under `search_fees:` and no `gpt-6:` row, so from #286
+   onward every grounded GPT-6 call billed **$0.00** for web search —
+   `maximum` runs openai on `fact_check`, which is grounded. OpenAI's pricing page,
+   re-read 2026-10-03, now leads with "Web search (all models) $10.00 / 1k calls",
+   so the rate no longer turns on the model being a reasoning one. Row added.
+   The same read confirmed GPT-6 token prices match `pricing.yaml` exactly and
+   pinned the long-context threshold at **>272K input tokens** (a hover tooltip,
+   not page text) — OpenAI's largest prompt on this draft is 157K, so the 2x-input
+   tier `pricing.yaml` does not model never engages here.
+
 ---
 
 ## Known open items, not addressed here

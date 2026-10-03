@@ -735,3 +735,59 @@ class TestMissingConfigMessagesNameRealPaths:
         assert not offenders, "names an example config path that is not there:\n" + (
             "\n".join(f"  {o}" for o in sorted(set(offenders)))
         )
+
+
+class TestEveryGroundedPresetModelHasASearchFeeRow:
+    """A model move must not leave its ``search_fees:`` row behind.
+
+    PR #286 (2026-09-30) moved every preset's OpenAI model from the gpt-5.6
+    family to GPT-6. pricing.yaml's ``search_fees:`` had a ``gpt-5:`` row and
+    gained no ``gpt-6:`` one, so from that merge until 2026-10-03 every grounded
+    GPT-6 call billed $0.00 for web search while reporting ``pricing_known``
+    true -- ``maximum`` runs openai on ``fact_check``, which is grounded. The
+    dollars were small (one call, $0.01) but nothing failed and nothing warned.
+
+    Scoped to the four providers whose responses actually report a billable
+    search count -- see ``ci_core.llm.client._read_searches``. grok is excluded
+    deliberately: ``_read_searches`` returns None for it and its search is off
+    in every preset, so it has a row that prices nothing yet. mistral is
+    excluded because this repo never grounds it.
+    """
+
+    SEARCH_REPORTING_PROVIDERS = ("openai", "gemini", "claude", "perplexity")
+
+    def test_each_grounded_providers_preset_models_resolve_to_a_fee_row(self):
+        from ci_core.llm import cost
+
+        from ci_article_review.config_loader import _load_presets_from_yaml
+
+        missing = []
+        for tier, body in sorted(_load_presets_from_yaml().items()):
+            for provider in self.SEARCH_REPORTING_PROVIDERS:
+                model = ((body.get("models") or {}).get(provider) or {}).get("model")
+                if not model:
+                    continue
+                # Perplexity ids carry a "perplexity/" route prefix in presets;
+                # cost.py prefix-matches the id as logged, which keeps it.
+                if cost.known_search_fee(model) is None:
+                    missing.append(f"{tier}: {provider} -> {model}")
+        assert not missing, (
+            "named in presets.yaml with no pricing.yaml search_fees row, so a "
+            "grounded call bills $0.00 for search:\n"
+            + "\n".join(f"  {m}" for m in missing)
+            + "\nAdd a row (prefix-matched, longest first) with a dated source."
+        )
+
+    def test_the_guard_would_have_caught_the_gpt_6_miss(self):
+        """Red-proof: with only the gpt-5 row, a gpt-6 model resolves to None."""
+        from ci_core.llm import cost
+
+        assert cost.known_search_fee("gpt-6.1-sol") == (10.00, "call")
+        saved = dict(cost._SEARCH_FEES)
+        try:
+            cost._SEARCH_FEES.pop("gpt-6", None)
+            assert cost.known_search_fee("gpt-6.1-sol") is None
+        finally:
+            cost._SEARCH_FEES.clear()
+            cost._SEARCH_FEES.update(saved)
+        assert cost.known_search_fee("gpt-6.1-sol") == (10.00, "call")
