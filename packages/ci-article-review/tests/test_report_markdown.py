@@ -2525,6 +2525,125 @@ class TestArchiveOutcomeWording:
         assert "SUBMISSION FAILED" in out
         assert "429 Too Many Requests" in out
         assert "NOT archived" in out
+        assert "Archive it by hand, or re-run." in out
+
+    CAP = (
+        "archive.org refused the request: This URL has been already captured 1 "
+        "times today, which is a daily limit we have set for that Resource type. "
+        "Please try again tomorrow."
+    )
+
+    def _refusal(self, code, category, detail="archive.org refused the request"):
+        wayback = {
+            "archived": False,
+            "submitted": False,
+            "archive_outcome": "submit_failed",
+            "archive_outcome_detail": detail,
+        }
+        if code:
+            wayback["submission_error_code"] = code
+        if category:
+            wayback["submission_retry_category"] = category
+        return self._text(self._cit(**wayback))
+
+    def test_a_daily_cap_refusal_does_not_say_the_url_is_not_archived(self):
+        """archive.org says it has already captured this URL today, so "It is NOT
+        archived" is untrue: a capture exists and the lookup has not listed it."""
+        out = self._refusal(
+            "error:too-many-daily-captures", "transient", detail=self.CAP
+        )
+        assert "NOT RE-SUBMITTED TODAY" in out
+        assert "already captured 1 times today" in out
+        assert "A capture from today therefore exists" in out
+        assert "retry tomorrow" in out
+        assert "NOT archived" not in out
+        assert "SUBMISSION FAILED" not in out
+
+    def test_a_permanent_refusal_does_not_tell_the_author_to_rerun(self):
+        out = self._refusal("error:blocked-url", "permanent")
+        assert "SUBMISSION FAILED" in out
+        assert "code error:blocked-url" in out
+        assert "will refuse it the same way every time" in out
+        assert "re-source the claim" in out
+        assert "or re-run." not in out
+
+    def test_a_transient_refusal_says_the_next_run_retries(self):
+        out = self._refusal("error:bad-gateway", "transient")
+        assert "the refusal looks temporary" in out
+        assert "the next run will try again on its own" in out
+        assert "or re-run." not in out
+
+    def test_a_quota_refusal_says_to_retry_later(self):
+        out = self._refusal("error:too-many-requests", "quota_exhausted")
+        assert "a limit that covers the account, this address or the target host" in out
+        assert "Retry later." in out
+
+    def test_a_refusal_with_a_code_but_no_category_is_unknown_not_permanent(self):
+        out = self._refusal("error:brand-new-2027", None)
+        assert "code error:brand-new-2027" in out
+        assert "Archive it by hand, or re-run." in out
+        assert "same way every time" not in out
+
+    def test_a_refusal_with_no_code_reads_as_it_always_did(self):
+        out = self._refusal(None, None, detail="could not reach archive.org")
+        assert "SUBMISSION FAILED" in out
+        assert "could not reach archive.org" in out
+        assert "code error" not in out
+        assert "It is NOT archived. Archive it by hand, or re-run." in out
+
+    def test_a_revisit_snapshot_says_what_the_date_means(self):
+        """The date is the day archive.org confirmed the page unchanged, not the
+        day it stored new bytes."""
+        out = self._text(
+            self._cit(
+                archived=True,
+                snapshot_url=self.SNAP,
+                snapshot_age_days=6,
+                snapshot_stale=False,
+                snapshot_is_revisit=True,
+                found_via="cdx",
+            )
+        )
+        assert f"Archive: {self.SNAP}" in out
+        assert "a revisit record" in out
+        assert "confirmed the page unchanged on that date" in out
+        assert "STALE" not in out
+        assert "Cite both" in out
+
+    def test_an_ordinary_snapshot_says_nothing_about_revisits(self):
+        out = self._text(
+            self._cit(
+                archived=True,
+                snapshot_url=self.SNAP,
+                snapshot_age_days=0,
+                archive_outcome="archived",
+            )
+        )
+        assert "revisit" not in out
+
+    def test_a_failed_second_opinion_is_named_beside_a_stale_snapshot(self):
+        out = self._text(
+            self._cit(
+                archived=True,
+                snapshot_url=self.SNAP,
+                snapshot_stale=True,
+                cdx_error="archive.org did not answer within the timeout",
+            )
+        )
+        assert "STALE" in out
+        assert "Archive lookup note" in out
+        assert "archive.org did not answer within the timeout" in out
+        assert "does not prove the page is unarchived" in out
+
+    def test_a_failed_second_opinion_is_named_beside_no_snapshot(self):
+        out = self._text(
+            self._cit(archived=False, cdx_error="skipped: rate limit tripped")
+        )
+        assert "Archive lookup note" in out
+        assert "skipped: rate limit tripped" in out
+
+    def test_no_lookup_note_when_the_second_opinion_never_failed(self):
+        assert "Archive lookup note" not in self._text(self._cit(archived=False))
 
     def test_a_repeated_capture_failure_is_visible_as_a_pattern(self):
         """One report at a time a URL that never archives looks like bad luck.
@@ -2582,6 +2701,18 @@ def test_the_archive_outcome_vocabulary_matches_the_adapters():
     assert report_markdown._ARCHIVE_CAPTURE_FAILED == wb.ARCHIVE_CAPTURE_FAILED
     assert report_markdown._ARCHIVE_SUBMIT_FAILED == wb.ARCHIVE_SUBMIT_FAILED
     assert report_markdown._ARCHIVE_NOT_ATTEMPTED == wb.ARCHIVE_NOT_ATTEMPTED
+
+
+def test_the_daily_cap_code_is_one_spn_client_knows():
+    """The renderer gives the cap its own wording by comparing against this
+    string, duplicated for the same reason as the outcome constants. A typo, or
+    spn-client dropping the code, would silently send every cap refusal back
+    through the generic branch, which says "NOT archived" for a URL archive.org
+    has just said it captured."""
+    from ci_article_review.adapters.citation import wayback as wb
+
+    assert report_markdown._ERROR_DAILY_CAP == "error:too-many-daily-captures"
+    assert wb.categorize_job_error(report_markdown._ERROR_DAILY_CAP) is not None
 
 
 class TestArchiveMatchRendering:

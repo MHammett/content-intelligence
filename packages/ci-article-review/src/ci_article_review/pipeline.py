@@ -5472,7 +5472,15 @@ def run_archive_only(
     # markers (or twice in one entry) gets checked once and each entry below
     # gets its own copy of the result, never a shared dict two mutations could
     # step on.
-    checked = {url: wayback.check(url) for url in unique_urls}
+    #
+    # cdx_fallback=True because this mode's whole job is to decide, from this
+    # answer, whether to spend a capture request. The availability API alone
+    # never lists a warc/revisit record, so a page that has not changed reads
+    # stale on every run and would be re-submitted every time (measured
+    # 2026-09-28 on one NHTSA PDF). The fallback is slow, up to cdx_timeout per
+    # stale or unarchived URL, which is why the full review's own lookups do not
+    # use it; see content-intelligence#289 for measuring that before widening it.
+    checked = {url: wayback.check(url, cdx_fallback=True) for url in unique_urls}
     results = [
         {"resolved": True, "url": url, "marker": marker, "wayback": dict(checked[url])}
         for marker, url in targets

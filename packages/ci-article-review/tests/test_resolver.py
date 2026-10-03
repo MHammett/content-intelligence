@@ -4014,3 +4014,86 @@ class TestCaptureDiagnosticsAreKept:
             },
         )
         assert entry["wayback"]["capture_retry_category"] == "transient"
+
+
+class TestARefusedSubmissionIsRecordedWithItsCode:
+    """A refusal is archive.org answering a capture request with HTTP 200 and an
+    error body, which is how it reports a URL at its per-day cap. spn-client hands
+    back ``error_code`` and ``retry_category``; the report keys on them, so the
+    recorder has to keep them, as ``_record_job_status`` does for a failed
+    capture job."""
+
+    REFUSAL = {
+        "submitted": False,
+        "job_id": None,
+        "archived": False,
+        "error": "This URL has been already captured 1 times today",
+        "error_summary": (
+            "archive.org refused the request: "
+            "This URL has been already captured 1 times today"
+        ),
+        "error_code": "error:too-many-daily-captures",
+        "retry_category": "transient",
+    }
+
+    def test_the_code_and_category_are_recorded(self):
+        entry = {}
+        resolver._record_submission(entry, dict(self.REFUSAL))
+        wb = entry["wayback"]
+        assert wb["archive_outcome"] == wayback.ARCHIVE_SUBMIT_FAILED
+        assert wb["submission_error_code"] == "error:too-many-daily-captures"
+        assert wb["submission_retry_category"] == "transient"
+        assert "already captured 1 times today" in wb["archive_outcome_detail"]
+
+    def test_a_missing_category_is_looked_up_from_the_code(self):
+        sub = {k: v for k, v in self.REFUSAL.items() if k != "retry_category"}
+        sub["error_code"] = "error:blocked-url"
+        entry = {}
+        resolver._record_submission(entry, sub)
+        assert entry["wayback"]["submission_retry_category"] == "permanent"
+
+    def test_a_code_spn_client_does_not_know_has_no_category(self):
+        """Not "permanent": a code archive.org adds tomorrow is unknown, and a
+        caller that stopped retrying on it would give up on something new."""
+        sub = {k: v for k, v in self.REFUSAL.items() if k != "retry_category"}
+        sub["error_code"] = "error:brand-new-2027"
+        entry = {}
+        resolver._record_submission(entry, sub)
+        wb = entry["wayback"]
+        assert wb["submission_error_code"] == "error:brand-new-2027"
+        assert "submission_retry_category" not in wb
+
+    def test_a_transport_failure_records_neither(self):
+        entry = {}
+        resolver._record_submission(
+            entry,
+            {
+                "submitted": False,
+                "error": "connection refused",
+                "error_summary": "could not reach archive.org",
+            },
+        )
+        wb = entry["wayback"]
+        assert wb["archive_outcome"] == wayback.ARCHIVE_SUBMIT_FAILED
+        assert "submission_error_code" not in wb
+        assert "submission_retry_category" not in wb
+
+    def test_an_accepted_submission_records_neither(self):
+        entry = {}
+        resolver._record_submission(
+            entry, {"submitted": True, "job_id": "spn2-abc", "archived": False}
+        )
+        wb = entry["wayback"]
+        assert wb["archive_outcome"] == wayback.ARCHIVE_PENDING
+        assert "submission_error_code" not in wb
+        assert "submission_retry_category" not in wb
+
+    def test_a_timeout_is_not_a_refusal(self):
+        entry = {}
+        resolver._record_submission(
+            entry,
+            {"submitted": False, "outcome_unknown": True, "error": "Read timed out"},
+        )
+        wb = entry["wayback"]
+        assert wb["archive_outcome"] == wayback.ARCHIVE_SUBMITTED
+        assert "submission_error_code" not in wb

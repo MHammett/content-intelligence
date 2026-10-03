@@ -561,6 +561,8 @@ uv run ci-review --raw-draft handoff.md --publication mypub --archive-only
 
 It reads every URL out of the draft's own citation block (`## Sources` / `## Citations` / etc. — whatever heading [docs/CITATIONS.md](docs/CITATIONS.md) documents), checks each one's current Wayback status, and submits the ones that are missing or stale — the same dedupe-by-URL, pacing and outcome bookkeeping a normal run's Pass 3 uses, just run directly against the draft's URLs instead of only the ones a resolved fact-check claim cites. Each URL's outcome prints in the same wording Section 9 uses, ending with `Estimated cost: $0.0000 (no model calls)` so it's never mistaken for a real spend line. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`, which turns off the very network calls this flag exists to make.
 
+**A page that has not changed is not re-submitted.** archive.org's availability API never lists a `warc/revisit` record (its pointer for an unchanged page), so an unchanged page reads stale on every run however often it is captured. For a URL that API calls stale or missing, this mode also asks archive.org's CDX index, which does list them, and trusts a revisit only after finding a `200` capture with the same content digest. That second lookup is slow, roughly 10 to 50 seconds per URL when it answers, so a draft with many stale sources takes minutes; a URL the first lookup already shows as fresh costs one request. The full review's own lookups do not use it. A CDX lookup that fails is printed as an `Archive lookup note`, because the answer then rests on the weaker source alone.
+
 ---
 
 ## Running the tests

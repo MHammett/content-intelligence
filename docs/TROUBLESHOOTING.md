@@ -235,6 +235,15 @@ archive.org accepted the capture and then could not complete it, and the reason 
 **Section 9 — a citation reads `NOT SUBMITTED`**  
 Nothing tried to archive it, and the entry says which of the two reasons applied. A non-public address is a deliberate, permanent refusal — an internal hostname is never handed to archive.org — so re-running will not change it. A host that did not resolve is transient; the next run will try again.
 
+**Section 9 — a citation reads `SUBMISSION FAILED`**  
+archive.org did not accept the capture request. When the entry names a code, what to do depends on it: a *permanent* refusal (an excluded or blocked URL, say) will repeat every time, so archive it by hand or re-source the claim; a *temporary* one is retried by the next run; a *quota* refusal means a limit covering the account, this address or the target host, so retry later. With no code it was a transport failure, and re-running is the right move.
+
+**Section 9 — a citation reads `NOT RE-SUBMITTED TODAY`**  
+archive.org refused the request because it has already captured this URL the maximum number of times today. Its limit is not fixed (1, 5 and 10 have been seen, and it depends on the kind of file), but the message itself establishes that a capture from today exists, even when the lookup lists none yet: the lookup can lag a fresh capture by hours. Look it up again later, or retry tomorrow. Nothing needs fixing.
+
+**Section 9 — an archive line says `a revisit record`, or is followed by an `Archive lookup note`**  
+A revisit record is archive.org's pointer for a page it found unchanged, and the date beside it is the day it confirmed that, not the day it stored new bytes. The availability API never lists one, so `--archive-only` also asks the CDX index and trusts a revisit only when its content digest matches a `200` capture. An `Archive lookup note` means that second lookup failed, so the "none" or `STALE` above it came from the availability API alone and does not prove the page is unarchived. Re-run, or check the CDX rows yourself: `https://web.archive.org/cdx/search/cdx?url=<url>&output=txt&fl=timestamp,statuscode,mimetype,digest`.
+
 **Wayback submissions don't show up as archived**  
 Check the `archive_outcome` on the entry before assuming it is a timing issue. Without credentials a successful capture reports its snapshot URL in the same run, so a citation that is *not* archived usually means a real failure rather than a pending one — see the three entries above. If submissions are failing outright, you're likely hitting unauthenticated rate limits — configure `api_keys.archive_org` ([CONFIGURATION.md](CONFIGURATION.md#api-keys)).
 

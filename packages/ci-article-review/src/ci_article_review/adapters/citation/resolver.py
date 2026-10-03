@@ -1268,6 +1268,15 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
     hear about it. The branches below are what can actually be true after a
     submission, and exactly one of them claims the page is archived — the one
     holding a snapshot URL.
+
+    A *refusal* — archive.org answering a capture request with HTTP 200 and an
+    error body, which is how it reports a URL at its per-day capture cap —
+    carries archive.org's own ``error_code`` and spn-client's ``retry_category``
+    for it, recorded here as ``submission_error_code`` and
+    ``submission_retry_category`` for the same reason a failed capture job's
+    are: the category decides what the author should do next, and the code is
+    what makes a repeat diagnosable. A transport failure carries neither, and a
+    code spn-client does not recognize has no category.
     """
     wb = entry.setdefault("wayback", {})
     wb["submitted"] = bool(sub.get("submitted"))
@@ -1292,6 +1301,17 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
                 or sub.get("error")
                 or "archive.org did not accept the submission"
             )
+            if sub.get("error_code"):
+                wb["submission_error_code"] = sub["error_code"]
+            # spn-client sets ``retry_category`` whenever it sets a code, so the
+            # fallback is normally unused; it is here for the same reason as in
+            # ``_record_job_status``: the two fields are independent in the
+            # response shape.
+            category = sub.get("retry_category") or wayback.categorize_job_error(
+                sub.get("error_code")
+            )
+            if category:
+                wb["submission_retry_category"] = category
     elif sub.get("archived") and sub.get("snapshot_url"):
         _record_archived(wb, sub)
     elif sub.get("job_id"):
