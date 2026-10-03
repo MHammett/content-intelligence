@@ -182,6 +182,50 @@ The `prompts:` list is an **infrastructure key** — it survives `cost_preset` o
 
 Claude used to be the standard example here, kept off `fact_check` because it could not search. It can now: it searches wherever `web_search` covers the domain — the key works as in [OpenAI web search](#openai-web-search) — and the `maximum` preset sets `web_search: [fact_check]` for it. A `prompts:` list that still drops `fact_check` from Claude keeps it off that domain under every preset, so the `maximum` preset's search never runs.
 
+#### Narrowing a whole run to a subset of domains
+
+`prompts:` is also the way to run an entire review on fewer than five domains —
+set it on *every* model, in a copy of `configs/`, and point `--config-dir` at
+the copy. Measured 2026-09-10 on an About page: 23 calls across four domains
+instead of 29 across five.
+
+Reach for that rather than repeated `--only-domain`. That flag is single-valued,
+so N domains means N invocations — the *same* total call count, no saving — and
+it sets `backfill=False` (see "Backfill" below), so each domain also loses its
+top-up when a model is unavailable. You get N reports and N history entries
+under one key. It exists to price one cell, not to select domains.
+
+Both backfill and the empty-domain substitution pass re-check `prompts:`, so an
+excluded domain stays excluded even when another model fails. The report says so
+rather than leaving a silent hole: a "Domains not reviewed" banner, plus a
+per-section line reading "empty because nothing ran, not because the draft is
+clean."
+
+`.env` is found by `find_dotenv()` walking up from the working directory, not
+from `--config-dir`, so a config directory copied to a scratch path still
+resolves the real credentials as long as you run from the checkout.
+
+#### Checking a run's shape before paying for it
+
+There is no dry run that makes model calls free, but the two things most likely
+to be wrong are both answerable offline by importing the code:
+
+```python
+# Does the handoff parse? Prints every field; look for empty strings.
+from ci_article_review.handoff_parser import parse_metadata_only
+print(parse_metadata_only(open("metadata.md", encoding="utf-8").read()))
+
+# Which calls will actually be made?
+from ci_article_review.pipeline import _build_assignments
+print(_build_assignments(thoroughness, models, api_keys, drafting_model="claude"))
+```
+
+The first is the only way to catch the silent-drop failure in the handoff
+parser, which does not error on a malformed header — it returns an empty
+section and the review runs against it. The second prints the exact
+`(model, domain)` pairs, so a narrowed config can be diffed against the
+baseline before either one is paid for.
+
 #### The three timeout layers (streaming)
 
 The review adapters stream responses (Server-Sent Events). That splits "the timeout" into three layers with distinct jobs — knowing which is which is the key to tuning:
