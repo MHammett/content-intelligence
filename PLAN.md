@@ -714,8 +714,14 @@ around its output. 239 lines is not where the pain is.
    **nothing above can be re-scored against it**. Worse, the 12 run captures the
    study was computed from are gone: they lived in a worktree-scoped,
    gitignored `pipeline_history/`, and went with the session. Only the recorded
-   numbers survive. Any future study must copy its captures into the main
-   checkout as each run lands.
+   numbers survive.
+
+   **Set `CI_HISTORY_ROOT` before buying any of the runs below.** #303 (2026-10-03,
+   closing #266) landed the real fix for this the same day: it points every
+   checkout's saved runs, daily log and `_replay/` tree at one directory, so
+   removing a worktree no longer deletes its runs. That is what a multi-run study
+   needs — not the manual copy-into-the-main-checkout discipline this paragraph
+   would otherwise have to recommend. `docs/REPLAY-AND-HISTORY.md` has it.
 
    **Costs re-derived, free, from captures that do survive.** Two real
    `maximum` captures of dc-environment-v26 and one `thorough` capture remain in
