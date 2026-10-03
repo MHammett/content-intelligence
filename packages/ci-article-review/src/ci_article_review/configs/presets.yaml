@@ -71,6 +71,27 @@
 # still preview-only on Vertex AI as of this date (see the maximum tier's gemini
 # note) and ci-discover found no newer Mistral model than mistral-medium-3-5.
 #
+# 2026-09-30 GPT-6 refresh. OpenAI shipped gpt-6-sol and gpt-6-luna on
+# 2026-09-22 and gpt-6.1-sol on 2026-09-29; there is no gpt-6 Terra. Every tier
+# moved to the cheaper model of its slot, prices per MTok in/out (verified on
+# developers.openai.com 2026-09-30):
+#
+#     economy, wide        gpt-5.6-luna   0.20/ 1.20  ->  gpt-6-luna   0.10/ 0.50
+#     balanced, thorough   gpt-5.6-terra  2.00/12.00  ->  gpt-6.1-sol  2.00/10.00
+#     maximum              gpt-5.6-sol    4.00/20.00  ->  gpt-6.1-sol  2.00/10.00
+#
+# 6.1-sol over 6-sol: same price, cache reads at half (0.10), and OpenAI calls it
+# the default Sol. Efforts are unchanged; 6.1-sol takes low..max but not
+# `none`/`minimal`, which no tier sets. gpt-6-astra (10.00/50.00) is NOT used:
+# `maximum` gets 6.1-sol at xhigh, and whether Astra earns 5x that is a measured
+# question, not a price-tier one. The reproducibility table in CLAUDE.md was
+# measured on 5.6 and has not been re-measured since this change.
+#
+# No shipped litellm wheel bundles gpt-6-sol, gpt-6-luna or gpt-6.1-sol yet, so
+# ci_core.llm.client registers litellm's own entries for them at import
+# (_register_pending_models); without that they are refused whenever litellm's
+# live-map fetch fails. test_preset_native_streaming.py holds the result.
+#
 # 2026-09-27 Gemini refresh. Gemini 2.5 Pro, Flash and Flash-Lite are listed to
 # retire on Vertex AI on 2026-10-20 (Google Cloud's "Model versions and
 # lifecycle" page, read 2026-09-19; the Gemini API lists no date). Google names
@@ -304,7 +325,7 @@ economy:
   thoroughness: standard
   models:
     openai:
-      model: gpt-5.6-luna   # was gpt-5.4-mini; matching price tier, 2026-08-18 refresh
+      model: gpt-6-luna   # was gpt-5.6-luna; see the GPT-6 refresh note above
     gemini:
       model: gemini-3.5-flash   # was gemini-2.5-flash; see the Gemini refresh note above
       thinking_level: low
@@ -325,7 +346,7 @@ wide:
   thoroughness: thorough
   models:
     openai:
-      model: gpt-5.6-luna
+      model: gpt-6-luna   # was gpt-5.6-luna; see the GPT-6 refresh note above
     gemini:
       model: gemini-3.5-flash   # was gemini-2.5-flash; see the Gemini refresh note above
       thinking_level: low
@@ -432,7 +453,7 @@ balanced:
   thoroughness: thorough
   models:
     openai:
-      model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
+      model: gpt-6.1-sol   # was gpt-5.6-terra; see the GPT-6 refresh note above
       reasoning_effort: low
     gemini:
       model: gemini-3.5-flash   # was gemini-2.5-flash; see the Gemini refresh note above
@@ -455,7 +476,7 @@ thorough:
   thoroughness: thorough
   models:
     openai:
-      model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
+      model: gpt-6.1-sol   # was gpt-5.6-terra; see the GPT-6 refresh note above
       reasoning_effort: high
       # No stream_read_timeout override — Responses API + reasoning.summary
       # keeps the default 120s read-gap safe (see the note above).
@@ -559,7 +580,7 @@ maximum:
   thoroughness: maximum
   models:
     openai:
-      model: gpt-5.6-sol   # was gpt-5.5; matching price tier, 2026-08-18 refresh
+      model: gpt-6.1-sol   # was gpt-5.6-sol; see the GPT-6 refresh note above
       reasoning_effort: xhigh
       # No stream_read_timeout override — and note that first-byte is NOT this
       # tier's openai problem. The note above ("live-verified against xhigh,

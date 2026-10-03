@@ -13,7 +13,7 @@ from ci_core.llm.model_registry import (
 class TestCheckModelCurrency:
     def test_current_models_no_warnings(self):
         models = {
-            "openai": {"model": "gpt-5.6-terra", "provider": "openai"},
+            "openai": {"model": "gpt-6.1-sol", "provider": "openai"},
             "gemini": {"model": "gemini-3.5-flash-lite", "provider": "ai_studio"},
             "grok": {"model": "grok-4.3", "provider": "grok"},
             "claude": {"model": "claude-opus-5", "provider": "anthropic"},
@@ -41,7 +41,7 @@ class TestCheckModelCurrency:
         w = result["warnings"][0]
         assert w["provider"] == "openai"
         assert w["model"] == "gpt-4o"
-        assert w["replacement"] == "gpt-5.6-terra"
+        assert w["replacement"] == "gpt-6.1-sol"
 
     def test_multiple_superseded(self):
         models = {
@@ -61,12 +61,12 @@ class TestCheckModelCurrency:
 
     def test_newer_available_is_notice_not_warning(self):
         models = {
-            "openai": {"model": "gpt-5.6-luna", "provider": "openai"},
+            "openai": {"model": "gpt-6-luna", "provider": "openai"},
         }
         result = check_model_currency(models)
         assert result["warnings"] == []
         assert len(result["notices"]) == 1
-        assert result["notices"][0]["newer"] == "gpt-5.6-terra"
+        assert result["notices"][0]["newer"] == "gpt-6.1-sol"
 
     def test_empty_config_no_crash(self):
         result = check_model_currency({})

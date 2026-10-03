@@ -25,7 +25,7 @@ economy:
       model: claude-haiku-4-5-20251001
       effort: low
     openai:
-      model: gpt-5.6-luna   # was gpt-5.4-mini; matching price tier, 2026-08-18 refresh
+      model: gpt-6-luna   # was gpt-5.6-luna; gpt-6 refresh 2026-09-30, see ci-article-review's presets.yaml
     gemini:
       model: gemini-3.5-flash-lite   # was gemini-2.5-flash-lite; 2.5 retires on Vertex AI 2026-10-20.
       thinking_level: low            # `low` does not search (measured 2026-09-27); style analysis has no use for it.
@@ -44,7 +44,7 @@ standard:
     claude:
       model: claude-haiku-4-5-20251001
     openai:
-      model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
+      model: gpt-6.1-sol   # was gpt-5.6-terra; gpt-6 refresh 2026-09-30, see ci-article-review's presets.yaml
     gemini:
       model: gemini-3.5-flash-lite   # was gemini-2.5-flash
       thinking_level: low
@@ -62,7 +62,7 @@ balanced:
     claude:
       model: claude-sonnet-5   # was claude-sonnet-4-6; 2026-08-18 refresh
     openai:
-      model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
+      model: gpt-6.1-sol   # was gpt-5.6-terra; gpt-6 refresh 2026-09-30, see ci-article-review's presets.yaml
     gemini:
       model: gemini-3.5-flash-lite   # was gemini-2.5-flash
       thinking_level: low
@@ -81,7 +81,7 @@ thorough:
       model: claude-sonnet-5   # was claude-sonnet-4-6; 2026-08-18 refresh
       effort: medium
     openai:
-      model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
+      model: gpt-6.1-sol   # was gpt-5.6-terra; gpt-6 refresh 2026-09-30, see ci-article-review's presets.yaml
       reasoning_effort: medium
     gemini:
       model: gemini-3.5-flash   # was gemini-2.5-pro
@@ -101,7 +101,7 @@ maximum:
       model: claude-opus-5   # was claude-opus-4-8; 2026-08-18 refresh, same price
       effort: high
     openai:
-      model: gpt-5.6-terra   # was gpt-5.4; matching price tier, 2026-08-18 refresh
+      model: gpt-6.1-sol   # was gpt-5.6-terra; gpt-6 refresh 2026-09-30, see ci-article-review's presets.yaml
       reasoning_effort: high
     gemini:
       model: gemini-3.5-flash   # was gemini-2.5-pro + thinking_budget 8192; a budget does nothing on a 3.x model.

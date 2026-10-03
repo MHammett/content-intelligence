@@ -109,7 +109,7 @@ class TestApplyPresetOverrides:
         # Preset set low; override should have bumped it to high
         assert models_final["openai"]["reasoning_effort"] == "high"
         # Preset's model selection should still be in effect
-        assert models_final["openai"]["model"] == "gpt-5.6-terra"
+        assert models_final["openai"]["model"] == "gpt-6.1-sol"
 
     def test_invalid_overrides_type_raises(self):
         with pytest.raises(ValueError, match="preset_overrides must be a mapping"):

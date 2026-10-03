@@ -251,3 +251,57 @@ class TestAzureKeepsStreaming:
         assert wire == []
         assert result["failed"] is True
         assert "azure/my-deployment" in result["error"]
+
+
+class TestPendingModels:
+    """Models litellm's main branch lists and its released wheel does not.
+
+    ``client._register_pending_models`` hands litellm its own entries for them at
+    import, so a preset naming one streams whichever map litellm loaded. These
+    run under the bundled map (the package conftest forces it), the one that
+    lacks them.
+    """
+
+    def _pending(self):
+        with open(client._PENDING_MODELS, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_each_routes_and_streams_natively(self, litellm_map):
+        for model in self._pending():
+            assert litellm_map.get_llm_provider(model=model)[1] == "openai", model
+            assert client._refuse_fake_stream(model) is None, model
+
+    def test_a_pending_model_reaches_the_wire_streaming(self, litellm_map, wire):
+        _call(
+            model="gpt-6.1-sol",
+            provider_config={"model": "gpt-6.1-sol", "reasoning_effort": "max"},
+        )
+        (request,) = wire
+        body = json.loads(request.content)
+        assert request.url.host == "api.openai.com"
+        assert body["model"] == "gpt-6.1-sol"
+        assert body["stream"] is True
+        assert body["reasoning"]["effort"] == "max"
+
+    def test_an_entry_the_loaded_map_already_has_wins(self, litellm_map):
+        """A live map, or a later wheel, knows better than a copied entry."""
+        mine = {"litellm_provider": "openai", "mode": "responses", "marker": 1}
+        litellm_map.model_cost["gpt-6-luna"] = mine
+        client._register_pending_models(litellm_map)
+        assert litellm_map.model_cost["gpt-6-luna"] is mine
+
+    def test_the_installed_wheel_still_lacks_one(self):
+        """When this fails, the shim has outlived its reason: delete
+        ``_register_pending_models``, its JSON file, and this class."""
+        import importlib.resources
+
+        bundled = json.loads(
+            importlib.resources.files("litellm")
+            .joinpath("model_prices_and_context_window_backup.json")
+            .read_text(encoding="utf-8")
+        )
+        missing = set(self._pending()) - set(bundled)
+        assert missing, (
+            "litellm's bundled map now lists every model in "
+            "litellm_pending_models.json; remove the shim"
+        )
