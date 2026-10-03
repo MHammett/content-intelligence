@@ -691,6 +691,7 @@ def _resolve_known_url(
     checksum_index=None,
     timeout=15,
     author=None,
+    verify_claim=None,
 ):
     """Resolve a claim whose source URL is already known (e.g. supplied by the
     fact-check model itself), bypassing the narrow adapter matching entirely.
@@ -963,8 +964,12 @@ def _resolve_known_url(
         )
         return _check_drift(result, checksum_index)
 
+    # ``verify_claim`` is the claim minus date parentheticals the fact-check
+    # model copied from its own source label (``pipeline._claim_for_verifier``).
+    # The result keeps ``claim`` as the model wrote it; the verifier is shown
+    # the cleaned text, and ``verified_as`` records what that was.
     verdict_info, verification_call_log = _verify_relevance(
-        claim, content, api_keys, author
+        verify_claim or claim, content, api_keys, author
     )
     if call_log is not None and verification_call_log is not None:
         call_log.append(verification_call_log)
@@ -1054,7 +1059,13 @@ def _informativeness(result):
 
 
 def _resolve_candidates(
-    claim, known_urls, api_keys=None, call_log=None, checksum_index=None, author=None
+    claim,
+    known_urls,
+    api_keys=None,
+    call_log=None,
+    checksum_index=None,
+    author=None,
+    verify_claim=None,
 ):
     """Check a claim against the sources cited for it, best candidate first.
 
@@ -1078,7 +1089,10 @@ def _resolve_candidates(
             call_log=call_log,
             checksum_index=checksum_index,
             author=author,
+            verify_claim=verify_claim,
         )
+        if verify_claim:
+            result["verified_as"] = verify_claim
         if result.get("verification") == "checksum":
             # Supported. Note the sources that failed to back it anyway — a
             # citation list where only the third entry carries the claim is
@@ -1128,6 +1142,7 @@ def _resolve_one(
     call_log=None,
     checksum_index=None,
     author=None,
+    verify_claim=None,
 ):
     """Resolve a single claim against the configured sources, in order.
 
@@ -1150,6 +1165,7 @@ def _resolve_one(
             call_log=call_log,
             checksum_index=checksum_index,
             author=author,
+            verify_claim=verify_claim,
         )
 
     for source_config in citation_sources:
@@ -2283,6 +2299,10 @@ def resolve_citations(
         return []
 
     normalized = [_normalize_claim_entry(entry) for entry in claims]
+    verify_claims = [
+        entry.get("verify_claim") if isinstance(entry, dict) else None
+        for entry in claims
+    ]
     call_log = verification_call_log if verification_call_log is not None else []
     checksum_index = build_checksum_index(history_root) if history_root else {}
 
@@ -2294,18 +2314,23 @@ def resolve_citations(
     jobs = [
         (
             str(idx),
-            lambda claim=claim, known_urls=known_urls: _resolve_one(
-                claim,
-                citation_sources,
-                known_urls,
-                api_keys,
-                call_log,
-                checksum_index,
-                author,
+            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim: (
+                _resolve_one(
+                    claim,
+                    citation_sources,
+                    known_urls,
+                    api_keys,
+                    call_log,
+                    checksum_index,
+                    author,
+                    verify_claim,
+                )
             ),
             _RESOLVE_TIMEOUT_SECONDS,
         )
-        for idx, (claim, known_urls, _bucket) in enumerate(normalized)
+        for idx, ((claim, known_urls, _bucket), verify_claim) in enumerate(
+            zip(normalized, verify_claims)
+        )
     ]
     outcomes = run_all_bounded(jobs, max_parallel=_MAX_PARALLEL)
 
