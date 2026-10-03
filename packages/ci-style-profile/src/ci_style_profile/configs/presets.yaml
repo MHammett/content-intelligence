@@ -8,7 +8,11 @@
 # left out stays the user's, `provider` is never replaced, and a provider the
 # user has not configured is skipped. Leaving `effort` out does not turn
 # thinking off: claude-sonnet-5 and claude-opus-5 think at high with none set
-# (ci_core.llm.output_tokens._EFFORT_WHEN_UNSET).
+# (ci_core.llm.output_tokens._EFFORT_WHEN_UNSET). A blank on one of those
+# models cannot be read as a decision either way, so every tier that runs one
+# states an `effort`, and the levels only rise with the tier -- both pinned by
+# tests/test_presets.py::TestTheReasoningLadder, after a blank at `balanced`
+# ran it at high under a `thorough` at medium (#268).
 #
 # This file is required. A missing or malformed one raises PackagedConfigError,
 # and the CLI's --preset choices must name the same five tiers.
@@ -42,6 +46,13 @@ standard:
   detection_models: [claude]
   models:
     claude:
+      # No effort, and here that is a real "no thinking": haiku-4-5 is not in
+      # _EFFORT_WHEN_UNSET, so nothing is sent and nothing is inferred (probed:
+      # max_tokens 8000, no thinking block). It is also the only way to say so,
+      # since litellm drops `effort: none` and YAML reads `off` as false. Not
+      # the #268 case, which was a blank on a model that thinks by default.
+      # That `economy` below asks this same model for thinking while this tier,
+      # the dearer one, asks for none is a separate question -- issue #291.
       model: claude-haiku-4-5-20251001
     openai:
       model: gpt-6.1-sol   # was gpt-5.6-terra; gpt-6 refresh 2026-09-30, see ci-article-review's presets.yaml
@@ -61,6 +72,26 @@ balanced:
   models:
     claude:
       model: claude-sonnet-5   # was claude-sonnet-4-6; 2026-08-18 refresh
+      effort: low   # DECIDED (#268), not omitted. Blank is not off: sonnet-5
+                    # thinks at high when the request names no effort
+                    # (output_tokens._EFFORT_WHEN_UNSET), so this tier used to
+                    # run harder than `thorough`'s medium and exactly as hard
+                    # as `maximum`. Probed on the wire, the blank sent no
+                    # effort at all plus `thinking: {type: adaptive, display:
+                    # summarized}` -- the same request `effort: high` sends.
+                    #
+                    # `low` and not `medium`: medium is what `thorough` runs,
+                    # and two tiers sending the same model the same effort
+                    # would differ only in max_styles and max_input_chars.
+                    # ci-article-review's presets.yaml settles the ordering
+                    # the same way -- its `balanced` states claude
+                    # `effort: medium` under a `thorough` at high, and its
+                    # grok entry writes the rule down: "Unset meant the
+                    # provider default, which is high -- the one setting
+                    # `balanced` is explicitly not asking for." The values
+                    # differ because that package's `thorough` is high where
+                    # this one's is medium; what carries over is that the
+                    # cheaper tier is strictly lower, and says so.
     openai:
       model: gpt-6.1-sol   # was gpt-5.6-terra; gpt-6 refresh 2026-09-30, see ci-article-review's presets.yaml
     gemini:

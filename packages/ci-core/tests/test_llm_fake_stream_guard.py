@@ -12,9 +12,10 @@ rather than at the model.
 ``responses()`` is about to ask it, before anything is sent. These tests cover
 the three answers that matter — a model the map streams, one it marks as not
 streaming, one it does not list — and that nothing reaches the wire for the last
-two. presets.yaml is held to the same rule in CI by ci-article-review's
-``test_preset_native_streaming.py``; this file is about what happens at runtime,
-where the map is whichever one litellm managed to load.
+two. Each presets.yaml that names openai models is held to the same rule in
+CI by its own package's ``test_preset_native_streaming.py`` (ci-article-review's
+and ci-style-profile's); this file is about what happens at runtime, where the
+map is whichever one litellm managed to load.
 """
 
 import json
