@@ -436,12 +436,21 @@ models:
 # All VERIFIED 2026-09-19 on each provider's own pricing page:
 #   Anthropic  $10 per 1,000 searches, platform.claude.com/docs/en/about-claude/
 #              pricing ("Web search tool"). Web fetch costs nothing extra.
-#   OpenAI     developers.openai.com/api/docs/pricing ("Built-in tools"):
+#   OpenAI     developers.openai.com/api/docs/pricing ("Tools"):
 #              web_search_preview is $10 per 1,000 calls on reasoning models,
 #              which every gpt-5 model is, and $25 per 1,000 on non-reasoning
 #              models, none of which is configured here. The web-search guide
 #              says "Search actions incur a tool call cost" and says nothing of
 #              open_page or find_in_page, so only search actions are billed here.
+#              RE-READ 2026-10-03 for the gpt-6 row below: the table now leads
+#              with "Web search (all models) $10.00 / 1k calls", so the rate no
+#              longer turns on the model being a reasoning one, and gpt-6 bills
+#              the same $10. The non-reasoning $25 row still exists and still
+#              matches nothing configured here. PR #286 moved every preset to
+#              gpt-6 and left no gpt-6 key here, so from 2026-09-30 until this
+#              row landed every grounded gpt-6 call billed $0.00 for search:
+#              `maximum` runs openai on fact_check, which is grounded. The
+#              dollars are small -- one call, $0.01 -- but it was silent.
 #   Gemini     ai.google.dev/gemini-api/docs/pricing: 2.5 Pro, Flash and
 #              Flash-Lite bill $35 per 1,000 grounded prompts; 3.x bills $14 per
 #              1,000 search queries. Google's grounding guide: on Gemini 3 "your
@@ -512,6 +521,7 @@ models:
 search_fees:
   claude-:                 [10.00, search]
   gpt-5:                   [10.00, call]
+  gpt-6:                   [10.00, call]    # verified 2026-10-03 - see above
   gemini-3:                [14.00, query]
   gemini-2.5:              [35.00, prompt]
   sonar-deep-research:     [ 5.00, query]
