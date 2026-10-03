@@ -443,7 +443,7 @@ uv run ci-history-report
 
 | Flag | Purpose |
 |---|---|
-| `--history-root DIR` | Directory containing per-article run history (default `pipeline_history`) |
+| `--history-root DIR` | Directory containing per-article run history (default `$CI_HISTORY_ROOT` if set, else `pipeline_history`) |
 | `--article SLUG` | Scope to one article — the `pipeline_history/` subdirectory name, not the article title |
 | `--recent-window N` | How many of the most recent calls/runs count as "recent" vs. baseline (default 5) |
 | `--json` | Print the raw result as JSON instead of the console summary |
@@ -473,7 +473,7 @@ uv run ci-voice-patterns --publication NAME --config configs/NAME.yaml
 
 | Flag | Purpose |
 |---|---|
-| `--history-root DIR` | Directory containing per-article run history (default `pipeline_history`) |
+| `--history-root DIR` | Directory containing per-article run history (default `$CI_HISTORY_ROOT` if set, else `pipeline_history`) |
 | `--publication NAME` | Scope to reports whose `publication` field matches this value |
 | `--config PATH` | Publication config YAML to read existing `style_rules.banned_words`/`banned_phrases` from, so already-banned patterns are excluded (read-only, never modified) |
 | `--min-articles N` | Minimum distinct articles a pattern must appear in to be reported (default 3) |

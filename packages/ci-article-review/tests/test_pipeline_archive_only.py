@@ -340,3 +340,32 @@ class TestArchiveOnlyTouchesNoModelProvider:
             _run_archive_only(draft)
 
         mock_call_provider.assert_not_called()
+
+
+class TestArchiveOnlyHonoursTheHistoryRootOverride:
+    """The archiving pass looks for earlier captures in the history it is given."""
+
+    def test_submission_is_handed_the_override(self, tmp_path, monkeypatch):
+        shared = tmp_path / "shared"
+        monkeypatch.setenv("CI_HISTORY_ROOT", str(shared))
+        draft = _write(
+            tmp_path,
+            "draft.md",
+            "A claim. [1]\n\n## Sources\n\n[1] A source. https://a.example/one\n",
+        )
+
+        _, mock_submit, _, _ = _run_archive_only(draft)
+
+        mock_submit.assert_called_once()
+        assert mock_submit.call_args.args[2] == str(shared)
+
+    def test_unset_it_is_still_the_working_directory_s_history(self, tmp_path):
+        draft = _write(
+            tmp_path,
+            "draft.md",
+            "A claim. [1]\n\n## Sources\n\n[1] A source. https://a.example/one\n",
+        )
+
+        _, mock_submit, _, _ = _run_archive_only(draft)
+
+        assert mock_submit.call_args.args[2] == pipeline.HISTORY_ROOT
