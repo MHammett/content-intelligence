@@ -18,6 +18,7 @@ import copy
 import pytest
 
 from ci_core.config_helpers import PackagedConfigError
+from ci_core.llm import output_tokens
 from ci_style_profile import bootstrap
 
 
@@ -208,3 +209,73 @@ class TestAzureKeepsItsModel:
         user = {"openai": {"provider": "openai", "model": "gpt-5.4"}}
         out = bootstrap._apply_preset_models(user, self.TIER)
         assert out["openai"]["model"] == "gpt-5.6-terra"
+
+
+class TestTheReasoningLadder:
+    """A dearer tier never reasons less than a cheaper one.
+
+    `balanced` ran claude-sonnet-5 with no `effort` while `thorough` ran the
+    same model at medium, and an unset effort is not off: sonnet-5 thinks at
+    high (``output_tokens._EFFORT_WHEN_UNSET``), so the cheaper tier thought
+    harder than the dearer one, and as hard as `maximum` (#268).
+
+    Invariants, not values: neither test names a model, an effort or a count,
+    so a retune that keeps the ordering passes and one that inverts it fails.
+    """
+
+    #: Cheapest first. Shared with the CLI by
+    #: TestTheShippedFileIsLoaded::test_the_cli_and_the_file_name_the_same_tiers,
+    #: which is what makes it safe to read an order into the file's keys.
+    ORDER = ("economy", "standard", "balanced", "thorough", "maximum")
+    RANK = {"minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5}
+
+    def test_the_tiers_are_in_cost_order_in_the_file(self):
+        """The two tests below read a ladder off ORDER, so the file has to be
+        the same ladder: a tier added in the middle, or renamed, invalidates
+        the ordering they check rather than silently dropping out of it."""
+        assert tuple(bootstrap._load_presets()) == self.ORDER
+
+    @pytest.mark.parametrize("tier", ORDER)
+    def test_a_model_that_thinks_by_default_states_its_effort(self, tier):
+        """The #268 bug itself. On these models a blank reads as neither "off"
+        nor "high" -- it runs at high and says nothing -- so the tier has to
+        state what it means. Models that do not think by default are exempt:
+        for them a blank really is no thinking, and it is the only way to say
+        so, since litellm drops ``effort: none``."""
+        cfg = bootstrap._load_presets()[tier]["models"].get("claude")
+        if not isinstance(cfg, dict):
+            pytest.skip(f"{tier} names no claude model")
+        if not output_tokens.effort_when_unset("claude", cfg.get("model")):
+            pytest.skip(
+                f"{tier} runs {cfg.get('model')}, which does not think unless asked"
+            )
+        assert cfg.get("effort"), (
+            f"{tier} runs {cfg.get('model')}, which thinks at "
+            f"{output_tokens.effort_when_unset('claude', cfg.get('model'))} when the "
+            "request names no effort, so leaving `effort` out is not a decision "
+            "anyone can read -- state it (#268)"
+        )
+
+    @pytest.mark.parametrize("provider", ("claude", "openai"))
+    def test_a_cheaper_tier_never_reasons_harder(self, provider):
+        """Over the effort each tier really runs at, blanks resolved through
+        ``effort_of`` -- which is the key the client reads and no other. A tier
+        that reasons not at all is skipped rather than ranked: that is a real
+        setting, and whether the two haiku tiers should differ on it is its own
+        question (#291)."""
+        presets = bootstrap._load_presets()
+        ladder = []
+        for tier in self.ORDER:
+            cfg = presets[tier]["models"].get(provider)
+            if not isinstance(cfg, dict):
+                continue
+            effort = output_tokens.effort_of(provider, cfg)
+            if effort is None:
+                continue
+            ladder.append((tier, effort))
+        assert len(ladder) >= 2, f"nothing to order for {provider}: {ladder}"
+        for (cheap, lo), (dear, hi) in zip(ladder, ladder[1:]):
+            assert self.RANK[lo] <= self.RANK[hi], (
+                f"{provider}: {cheap} reasons at {lo}, above {dear}'s {hi} -- "
+                "the cheaper tier is the harder one (#268)"
+            )
