@@ -1114,6 +1114,48 @@ def _claim_key(claim: str) -> frozenset:
     return frozenset(w for w in words if w not in _CLAIM_STOPWORDS)
 
 
+#: A parenthetical that carries a year: ``(2022-23)``, ``(January 2018)``.
+_YEAR_PARENTHETICAL = re.compile(r"\((?=[^()]*\b(?:19|20)\d\d)[^()]*\)")
+
+
+def _fold(text: str) -> str:
+    """Case, whitespace, dash and quote variants folded, for containment tests."""
+    text = re.sub(r"[\u2010-\u2015\u2212]", "-", text or "")
+    return " ".join(text.casefold().split())
+
+
+def _claim_for_verifier(claim: str, source: str, draft: str) -> str:
+    """``claim`` without the date parentheticals the model copied from its own source label.
+
+    The fact-check prompt asks for the draft's own words, and a model sometimes
+    writes "Honda ServiceNews A21120A (2022-23) covers the Accord, Odyssey ..."
+    instead of the draft's "[3] covers the Accord, Odyssey ...": the marker
+    became the reference-list entry, and the entry's ``(2022-23)`` came with it.
+    That is the bulletin's date range. The verifier read it as model years and
+    refuted the claim against a page listing exactly the vehicles named: "does
+    not include the 2022-23 Accord, Odyssey, Pilot ..." (2026-09-18 GPS run,
+    issue #302).
+
+    A parenthetical goes only when it is in the model's own ``source`` text and
+    nowhere in the draft. Both halves matter. The first keeps a date the claim
+    got from somewhere else; the second keeps one the author wrote, such as
+    "IARC Monograph 98 (2010)", which is part of the assertion and which a
+    "year in parentheses" rule alone would delete (measured: grok, 2026-09-09).
+    """
+    if not source:
+        return claim
+    folded_source, folded_draft = _fold(source), _fold(draft)
+    stripped = claim
+    for found in _YEAR_PARENTHETICAL.findall(claim):
+        folded = _fold(found)
+        if folded in folded_source and folded not in folded_draft:
+            stripped = stripped.replace(found, "")
+    if stripped == claim:
+        return claim
+    stripped = re.sub(r"\s+([,.;:])", r"\1", " ".join(stripped.split()))
+    return stripped or claim
+
+
 def _is_duplicate_claim(key: frozenset, seen_keys: list) -> bool:
     """True if ``key`` restates a claim already collected.
 
@@ -1381,20 +1423,25 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
                         known_urls = known_urls + [weak]
                         weak_urls.append(weak)
 
-            claims.append(
-                {
-                    "claim": claim,
-                    "known_urls": known_urls,
-                    # Which of those URLs got in only on a weak span match, so
-                    # a resolution that ends up resting on one can say so.
-                    "weak_source_urls": weak_urls,
-                    "fact_check_bucket": bucket,
-                    # Which model asserted this. `_build_fact_check` tags every
-                    # merged item with it; it was being dropped here, which is
-                    # why a refuted claim had no one to hand back to.
-                    "source_model": item.get("source_model", ""),
-                }
-            )
+            entry = {
+                "claim": claim,
+                "known_urls": known_urls,
+                # Which of those URLs got in only on a weak span match, so
+                # a resolution that ends up resting on one can say so.
+                "weak_source_urls": weak_urls,
+                "fact_check_bucket": bucket,
+                # Which model asserted this. `_build_fact_check` tags every
+                # merged item with it; it was being dropped here, which is
+                # why a refuted claim had no one to hand back to.
+                "source_model": item.get("source_model", ""),
+            }
+            # What the verifier is shown, when that differs from what the model
+            # wrote. The report keeps the model's wording: it is what the
+            # fact-check section says, and other passes match on it.
+            verify_claim = _claim_for_verifier(claim, source_field, draft)
+            if verify_claim != claim:
+                entry["verify_claim"] = verify_claim
+            claims.append(entry)
     log.info(
         "Citations: %d of %d claim(s) traced to a citation in the draft",
         anchored,
