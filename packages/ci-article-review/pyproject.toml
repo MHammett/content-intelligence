@@ -11,8 +11,11 @@ dependencies = [
     # logic) can depend on it too, instead of each maintaining a copy.
     # 0.2.1 (not just 0.1.0) matters here: it paces/breaker-protects submit()
     # at archive.org's own documented capture-endpoint limits, which 0.1.0
-    # did not do at all.
-    "spn-client>=0.3.0,<0.4",
+    # did not do at all. 0.4.0 matters for --archive-only: check(cdx_fallback=)
+    # and the refusal fields on submit() (error_code, retry_category), which
+    # run_archive_only and _record_submission use. A test reads the installed
+    # signature, so an older client fails the suite rather than the CLI.
+    "spn-client>=0.4.0,<0.5",
     "requests>=2.31.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "python-dotenv>=1.0.0,<2.0",
@@ -21,6 +24,26 @@ dependencies = [
     # Python-Markdown does the parsing; the block wrapping in adapters/cms/
     # blocks.py uses the stdlib, which is why beautifulsoup4 is not here too.
     "markdown>=3.4,<4.0",
+    # Strips EXIF/XMP/IPTC from an image before it is uploaded to a media
+    # library, where it would be public immediately (issue #288). Required and
+    # not an extra on purpose: a privacy default that silently does not apply
+    # because an optional dependency is absent is the same bug with a quieter
+    # failure, and this repo has already been bitten by exactly that (see the
+    # ci-core[unblock] note in the root pyproject).
+    #
+    # 11.3.0 (2025-07-01) is the floor: it is the release that brought AVIF
+    # read/write into Pillow's own wheels (libaom encoding, dav1d decoding), and
+    # .avif is one of the types stripped (issue #299). Before it, AVIF needed a
+    # separate plugin. The wheels cover every platform this runs on; Pillow's
+    # notes except Windows ARM64 and iOS, which is why a missing codec still
+    # falls through to the fail-closed path rather than being assumed away.
+    # Earlier floors this clears on the way: ExifTags.IFD (9.4.0), Base and GPS
+    # (9.3.0). The behaviour the module depends on -- that none of Pillow's own
+    # writers copies EXIF out of ``im.info`` -- is asserted by
+    # tests/test_wordpress_images.py against whichever version uv.lock pins, so
+    # a release that changed it would fail the suite rather than quietly publish
+    # a GPS block.
+    "pillow>=11.3,<13",
 ]
 
 [project.optional-dependencies]

@@ -1442,6 +1442,54 @@ at it and nothing is uploaded. It is not in this site's media library, so it has
 no attachment, and its alt text lives on the block alone. Its reachability is
 not checked.
 
+**Metadata is stripped before upload.** A phone photo carries EXIF: the GPS
+position it was taken at, the device make and model, the capture time. A
+media-library file is public from the moment it is uploaded, so uploading the
+original would publish all of that before anyone had chosen to publish the post.
+A `.jpg`, `.jpeg`, `.png`, `.webp` or `.avif` therefore goes up as a scrubbed copy — EXIF,
+XMP, IPTC and any embedded comment removed, the EXIF orientation applied to the
+pixels so a rotated photo is not sideways, the ICC colour profile kept because it
+describes colour and not a person. **The file on your disk is never modified.**
+
+A JPEG is re-encoded with its own quantisation tables and chroma subsampling, so
+it keeps the quality level it already had. A lossless WebP stays lossless; a lossy
+one is re-saved at quality 95, which can make the file bigger, because nothing in
+the format records what quality it was written at. PNG is lossless either way.
+
+A lossy AVIF is re-saved at 95 like a lossy WebP, for the same reason: it has no
+working lossless re-save either.
+
+`.tif`, `.tiff`, `.gif`, `.bmp` and `.svg` are uploaded as they are, and so is an
+animation (APNG, animated WebP), because re-encoding one would mean rebuilding
+every frame's timing. When a file in that group records a location, the `IMAGES`
+list says so before the checklist asks for a yes — a TIFF cannot be stripped, but
+its EXIF can be *read*, so you choose with the facts in front of you.
+
+**`.heic` and `.heif` are refused** while stripping is on, and the publish stops
+before anything is sent. They are the one case where neither half works: nothing
+here can open one, so what it carries cannot even be reported, and there is no
+lossless way to re-save one — at a quality that does not visibly degrade the photo
+the result is *larger than a JPEG of the same picture*, which is not a strip but a
+bad conversion. Since this is also the format an iPhone writes by default, and the
+one most likely to carry a GPS position, uploading it blind is exactly the failure
+this section exists to prevent.
+
+The fix the error names is to export a JPEG, which the photo needed regardless:
+HEVC is patent-encumbered, so Safari displays a `.heic` and Chrome, Firefox and
+Edge do not. `--keep-image-metadata` still uploads one as it is, with a warning
+saying to assume it records where it was taken.
+
+`--keep-image-metadata` turns the stripping off and uploads every file exactly as
+it is. If a file of a stripped type cannot be opened as an image at all, the
+publish stops and names it rather than sending the original: a scrubber that
+quietly gives up is worse than none, because the publish still looks like it
+worked.
+
+None of this makes a photo anonymous. A photo *of a screen* can show a location in
+plain text — a navigation unit's coordinates, a map, a dashboard, a hostname in a
+terminal — and no metadata strip touches pixels. Look at each photo at full size
+first.
+
 **What stops a publish.** All of it is checked before the SEO suggestion call
 is paid for and before the checklist asks for a yes, everything wrong is
 reported at once, and each line names the image:
@@ -1472,9 +1520,10 @@ alignment or a width is not supported; an attribute list such as
 `{: width=300 }` is dropped, with a warning.
 
 **What you see.** Before the checklist, an `IMAGES` list: each image's
-resolved path or link, its alt text and caption, and any image with no alt
-text. After the push, next to the post URL: how many were uploaded and how many
-linked, with the media IDs.
+resolved path or link, its alt text and caption, what metadata the file carries
+and what will happen to it, and any image with no alt text. After the push, next
+to the post URL: how many were uploaded and how many linked, with the media IDs,
+and a note on any whose metadata was not stripped.
 
 ---
 
@@ -1669,6 +1718,32 @@ History key: dc-environment
 ```
 
 Set it once, when you start the piece, and leave it alone however much the headline moves. Omit it and the title is used exactly as before, so existing handoffs keep working.
+
+---
+
+## History location
+
+Run history is written to `pipeline_history/` under the **working directory**, so each git checkout, and each worktree, has its own. Removing a worktree deletes its git-ignored files, and its runs go with it (issue #266).
+
+Set `CI_HISTORY_ROOT` to point every checkout at one directory:
+
+```powershell
+# Windows, for your user (new shells pick it up)
+setx CI_HISTORY_ROOT "C:\Users\you\ci-history"
+```
+
+```bash
+# bash/zsh: put it in your profile
+export CI_HISTORY_ROOT="$HOME/ci-history"
+```
+
+- **Unset or blank, nothing changes:** history stays in `pipeline_history/` under the working directory.
+- **What it moves:** everything `pipeline_history/` holds, for `ci-review` (saved runs, the daily `pipeline_<date>.log`, the `_replay/` tree that `--replay` writes, and the prior-run and archive lookups that a draft run and `--archive-only` make) and for the readers `ci-history-report` and `ci-voice-patterns`. A leading `~` is expanded; a relative path is relative to the working directory, as the default is. When it is set, the run's log starts with a `History root:` line saying where history went.
+- **Readers keep their flag.** `--history-root DIR` on `ci-history-report` and `ci-voice-patterns` still wins over the variable. `ci-review` has no such flag; for a one-off, set the variable for the one command.
+- **`--replay <capture>` and `--retry-failed <capture>` take a path you give them**, so they are not moved: pass the capture's real location, which is now under the shared directory.
+- **Why a variable and not a `user.yaml` key:** `configs/` is git-ignored and per checkout too, so a key there would have to be copied into every new worktree, and `main()` opens the history directory (for its log file) before it loads any config. The variable is shared by every checkout and read first.
+- **Moving history you already have:** copy each checkout's `pipeline_history/` into the new directory without overwriting, as described in [Replaying a run, and where run history lives](REPLAY-AND-HISTORY.md#where-a-runs-output-lives). `run_N` is per article key, and two worktrees can have written the same `run_N`.
+- **Sharing has a cost:** the run number and the delta baseline are read from the shared directory, so two sessions reviewing the same article at the same moment can pick the same `run_N`. Nothing is overwritten (file names carry a timestamp), but the numbers are not guaranteed unique.
 
 ---
 

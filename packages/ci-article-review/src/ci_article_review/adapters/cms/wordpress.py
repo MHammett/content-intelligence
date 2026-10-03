@@ -2,6 +2,7 @@ import base64
 import html
 import logging
 import os
+import tempfile
 from dataclasses import dataclass, field
 
 import requests
@@ -309,6 +310,12 @@ class ImagePlan:
     #: Source as written -> the file on disk, for each local image that becomes
     #: a block.
     uploads: dict = field(default_factory=dict)
+    #: Source as written -> what that file carries besides pixels, for each one
+    #: that was readable. Read without the network, like everything else here.
+    metadata: dict = field(default_factory=dict)
+    #: Whether the metadata is removed before upload. False is
+    #: ``--keep-image-metadata``, and means every file goes up exactly as it is.
+    strip_metadata: bool = True
     #: What stops the publish: one entry per image, each naming it.
     problems: list = field(default_factory=list)
     #: What does not stop it, but the author should see.
@@ -325,14 +332,18 @@ class ImagePlan:
         return [r for r in self.block_images if r.kind == images.URL]
 
 
-def plan_images(content, base_dir=None):
+def plan_images(content, base_dir=None, strip_metadata=True):
     """Find the draft's images and check every local file, sending nothing.
 
     ``base_dir`` is what a relative path is relative to: the directory of the
     handoff file, so the same handoff resolves the same way wherever the command
     is run from. Left unset it is the working directory.
+
+    Each local file is also read for what it carries besides pixels, so that a
+    photograph that records where it was taken can be named on the page the
+    author confirms rather than after it is already public.
     """
-    plan = ImagePlan(refs=blocks.find_images(content))
+    plan = ImagePlan(refs=blocks.find_images(content), strip_metadata=strip_metadata)
     structural = blocks.image_problems(plan.refs)
     for i, ref in enumerate(plan.refs):
         label = images.describe(ref, i + 1, len(plan.refs))
@@ -343,16 +354,100 @@ def plan_images(content, base_dir=None):
             continue
         if ref.kind == images.LOCAL:
             try:
-                plan.uploads[ref.src] = images.resolve_local_image(ref.src, base_dir)
+                path = images.resolve_local_image(ref.src, base_dir)
             except images.ImageError as e:
                 plan.problems.append(f"{label}: {e}")
                 continue
+            plan.uploads[ref.src] = path
+            problem = _read_metadata(plan, ref.src, path, label)
+            if problem:
+                plan.problems.append(problem)
+                continue
+            warning = _location_warning(plan, ref.src, label)
+            if warning:
+                plan.warnings.append(warning)
         if not ref.alt.strip():
             plan.warnings.append(
                 f"{label}: no alt text. It goes between the square brackets: "
                 "![alt text](...)."
             )
     return plan
+
+
+def _read_metadata(plan, src, path, label):
+    """Record what ``path`` carries. Returns a problem, or None.
+
+    A file whose type is stripped but which Pillow cannot open is a problem and
+    not a warning: the strip would fail at upload time instead, after the term
+    lookups and after the author said yes, and the one answer that is never
+    right is to send the original anyway.
+    """
+    if plan.strip_metadata:
+        refusal = images.refusal(path)
+        if refusal:
+            # Before inspect_metadata, which cannot open one of these and would
+            # report "could not be read" as if the file were damaged.
+            return f"{label}: {refusal}"
+    try:
+        meta = plan.metadata[src] = images.inspect_metadata(path)
+    except images.ImageError as e:  # Pillow missing from the environment
+        if plan.strip_metadata:
+            return f"{label}: {e}"
+        # Nothing is being stripped, so this costs only the warning below.
+        plan.warnings.append(f"{label}: its metadata could not be read ({e})")
+        return None
+    if plan.strip_metadata and meta.unreadable and images.strippable(path):
+        return (
+            f"{label}: {path.name} is a {path.suffix.lower()} file that cannot be "
+            f"opened as an image ({meta.unreadable}), so the metadata it may "
+            "carry cannot be stripped. Fix or convert the file, or pass "
+            "--keep-image-metadata to upload it as it is."
+        )
+    return None
+
+
+def _will_strip(plan, src):
+    """Whether this image's metadata is removed before it is uploaded."""
+    path, meta = plan.uploads.get(src), plan.metadata.get(src)
+    if not plan.strip_metadata or path is None or meta is None:
+        return False
+    # An animation is left alone: re-encoding it would mean rebuilding every
+    # frame's timing and disposal, and getting that wrong is a worse outcome
+    # than the metadata it would remove.
+    return images.strippable(path) and not meta.animated and not meta.unreadable
+
+
+def _location_warning(plan, src, label):
+    """A warning when a file that records where it was taken will keep it.
+
+    Also when that cannot be established: a kept ``.heic`` gets the warning on
+    the strength of what the format usually carries, because nothing here can
+    open one to check, and silence would read as "nothing found".
+    """
+    path = plan.uploads.get(src)
+    if path is not None and path.suffix.lower() in images.REFUSED:
+        return (
+            f"{label}: this is a {path.suffix.lower()} file being uploaded as "
+            "it is, and nothing here can read it. A phone writes a GPS "
+            "position into this format by default, so assume it records WHERE "
+            "IT WAS TAKEN. A media-library file is public the moment it is "
+            "uploaded."
+        )
+    meta = plan.metadata.get(src)
+    if not meta or not meta.location or _will_strip(plan, src):
+        return None
+    why = (
+        "--keep-image-metadata was passed"
+        if not plan.strip_metadata
+        else f"{plan.uploads[src].suffix.lower()} is not stripped"
+        if not images.strippable(plan.uploads[src])
+        else "an animation is not re-encoded"
+    )
+    return (
+        f"{label}: this file records WHERE IT WAS TAKEN (GPS, "
+        f"{len(meta.location)} tags) and will be uploaded with it, because "
+        f"{why}. A media-library file is public the moment it is uploaded."
+    )
 
 
 def describe_problems(plan):
@@ -534,6 +629,12 @@ def upload_images(plan, api_base, headers):
     one attachment. Each block keeps its own alt text; the attachment can hold
     only one, so it gets the first that is not empty.
 
+    What goes up is a scrubbed copy in a temporary directory, not the file on the
+    author's disk: a media-library item is public the moment it exists, and the
+    original carries whatever the camera wrote into it. The author's file is
+    never modified, and the copy keeps its name so the attachment still has the
+    name they chose.
+
     Raises ``ImageError`` naming the image, and what was already uploaded.
     """
     first_alt = {}
@@ -543,34 +644,58 @@ def upload_images(plan, api_base, headers):
             first_alt.setdefault(_file_key(path), ref.alt)
 
     by_file, resolved, uploads, warnings = {}, {}, [], []
-    for i, ref in enumerate(plan.refs):
-        path = plan.uploads.get(ref.src)
-        if path is None:
-            continue
-        key = _file_key(path)
-        if key not in by_file:
-            label = images.describe(ref, i + 1, len(plan.refs))
-            try:
-                by_file[key], warning = _upload_one(
-                    api_base, headers, path, first_alt.get(key, "")
+    with tempfile.TemporaryDirectory(prefix="ci-image-scrub-") as scratch:
+        for i, ref in enumerate(plan.refs):
+            path = plan.uploads.get(ref.src)
+            if path is None:
+                continue
+            key = _file_key(path)
+            if key not in by_file:
+                label = images.describe(ref, i + 1, len(plan.refs))
+                send, stripped = path, _will_strip(plan, ref.src)
+                if stripped:
+                    try:
+                        send = images.strip_metadata(
+                            path, _scrub_dir(scratch, len(by_file))
+                        )
+                    except images.ImageError as e:
+                        raise images.ImageError(
+                            f"{label}: {e}{_left_behind(uploads)}"
+                        ) from e
+                try:
+                    by_file[key], warning = _upload_one(
+                        api_base, headers, send, first_alt.get(key, "")
+                    )
+                except images.ImageError as e:
+                    raise images.ImageError(
+                        f"{label}: {e}{_left_behind(uploads)}"
+                    ) from e
+                log.info(
+                    "Uploaded %s: media ID %s, %s size, metadata %s",
+                    path.name,
+                    by_file[key].attachment_id,
+                    by_file[key].size_slug,
+                    "stripped" if stripped else "NOT stripped",
                 )
-            except images.ImageError as e:
-                raise images.ImageError(f"{label}: {e}{_left_behind(uploads)}") from e
-            log.info(
-                f"Uploaded {path.name}: media ID {by_file[key].attachment_id}, "
-                f"{by_file[key].size_slug} size"
-            )
-            uploads.append(
-                {
-                    "src": ref.src,
-                    "id": by_file[key].attachment_id,
-                    "url": by_file[key].url,
-                }
-            )
-            if warning:
-                warnings.append(f"{label}: {warning}")
-        resolved[ref.src] = by_file[key]
+                uploads.append(
+                    {
+                        "src": ref.src,
+                        "id": by_file[key].attachment_id,
+                        "url": by_file[key].url,
+                        "stripped": stripped,
+                    }
+                )
+                if warning:
+                    warnings.append(f"{label}: {warning}")
+            resolved[ref.src] = by_file[key]
     return resolved, uploads, warnings
+
+
+def _scrub_dir(root, n):
+    """One directory per file, so two images with the same name do not collide."""
+    out = os.path.join(root, str(n))
+    os.mkdir(out)
+    return out
 
 
 def _size(path):
@@ -603,6 +728,8 @@ def print_image_plan(plan):
         print(f"     alt:     {ref.alt.strip() or '(none)'}")
         if ref.caption.strip():
             print(f"     caption: {ref.caption.strip()}")
+        if ref.src in plan.uploads:
+            print(f"     metadata: {_metadata_line(plan, ref.src)}")
     for warning in plan.warnings:
         print(f"  ! {warning}")
     if plan.uploads:
@@ -610,6 +737,48 @@ def print_image_plan(plan):
             "Uploaded files are public from the moment they are uploaded, even "
             "though the post stays a draft."
         )
+        if not plan.strip_metadata:
+            print(
+                "--keep-image-metadata: nothing is stripped. Every file goes up "
+                "with whatever its camera wrote into it."
+            )
+
+
+def _metadata_line(plan, src):
+    """What this file carries and what becomes of it: one line for the listing.
+
+    The author has read the draft, so the resolved path is one of the two things
+    on that page they have not already seen. What the file says about them is
+    the other.
+    """
+    meta = plan.metadata.get(src)
+    path = plan.uploads[src]
+    if meta is None:
+        return "not read"
+    if _will_strip(plan, src):
+        notes = []
+        if meta.orientation != 1:
+            # Said because it is the one thing the strip changes about the
+            # picture: dropping the tag without turning the pixels is how a
+            # stripped phone photo ends up on its side.
+            notes.append("the EXIF rotation is applied to the pixels")
+        if meta.icc_profile:
+            notes.append("the ICC colour profile is kept")
+        tail = f" ({'; '.join(notes)})" if notes else ""
+        found = meta.summary()
+        if found == "none":
+            return f"none found; stripped anyway before upload{tail}"
+        return f"{found} -> stripped before upload{tail}"
+    if path.suffix.lower() in images.REFUSED:
+        return (
+            f"NOT stripped, and NOT readable either ({path.suffix.lower()}): "
+            "whether this file records where it was taken is unknown"
+        )
+    if not images.strippable(path):
+        return f"NOT stripped ({path.suffix.lower()} is uploaded as it is)"
+    if meta.animated:
+        return "NOT stripped (an animation is not re-encoded)"
+    return f"{meta.summary()} -> KEPT (--keep-image-metadata)"
 
 
 def print_image_result(result):
@@ -620,7 +789,8 @@ def print_image_result(result):
             f"library, {result['images_linked']} linked from an existing URL"
         )
         for up in result["image_uploads"]:
-            print(f"  - {up['src']} -> media ID {up['id']}")
+            note = "" if up.get("stripped") else "  (metadata NOT stripped)"
+            print(f"  - {up['src']} -> media ID {up['id']}{note}")
     for warning in result.get("image_warnings", []):
         print(f"WARNING: {warning}")
 
@@ -633,6 +803,7 @@ def push(
     publish_live=False,
     allow_missing_terms=False,
     image_base_dir=None,
+    strip_image_metadata=True,
 ):
     """Push article to WordPress.  Always saves as draft unless publish_live=True.
 
@@ -645,6 +816,12 @@ def push(
     local file is checked before the first request, and if an upload fails the
     post is not created. Uploads are not undone when a later step fails: they are
     named in the error, since a media-library item is public the moment it exists.
+
+    A JPEG, PNG or WebP goes up as a scrubbed copy: EXIF (the GPS position, the
+    device, the capture time), XMP, IPTC and any comment removed, the EXIF
+    orientation applied to the pixels, the ICC colour profile kept. The original
+    on disk is untouched. ``strip_image_metadata=False`` is
+    ``--keep-image-metadata`` and uploads every file exactly as it is.
 
     ``pub_params["post_type"]`` selects the REST route: ``post`` (default) or
     ``page``. A page carries no categories or tags, so for that type the term
@@ -674,7 +851,7 @@ def push(
     # Every local image is checked here, before the first request of any kind. A
     # mistyped path costs nothing now; found after an earlier image had gone up,
     # it would cost an orphaned upload as well.
-    image_plan = plan_images(content, image_base_dir)
+    image_plan = plan_images(content, image_base_dir, strip_image_metadata)
     if image_plan.problems:
         log.error(describe_problems(image_plan))
         return {"success": False, "error": describe_problems(image_plan)}
@@ -790,6 +967,9 @@ def push(
             # print it next to the success message instead of it scrolling past.
             result["unresolved_terms"] = sorted(unresolved)
         if image_plan.block_images:
+            result["images_stripped"] = sum(
+                1 for up in image_uploads if up.get("stripped")
+            )
             result["images_uploaded"] = len(image_uploads)
             result["images_linked"] = len(image_plan.linked)
             result["image_uploads"] = image_uploads

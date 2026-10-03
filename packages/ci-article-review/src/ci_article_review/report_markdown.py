@@ -1594,6 +1594,85 @@ def _capture_note(citation):
     return ""
 
 
+def _revisit_note(citation):
+    """Suffix for the Archive line when the snapshot is a revisit record.
+
+    archive.org stores a ``warc/revisit`` pointer, not new bytes, when a capture
+    finds the page unchanged, and the availability API never lists one. A
+    snapshot reaching this renderer as a revisit therefore came from the CDX
+    second opinion, which only trusts one whose digest matches a ``200``
+    capture. Saying so keeps the date honest: it is the day archive.org
+    confirmed the page unchanged, not the day it last stored new bytes.
+    """
+    if not (citation.get("wayback") or {}).get("snapshot_is_revisit"):
+        return ""
+    return (
+        " — a revisit record: archive.org confirmed the page unchanged on that "
+        "date, with the same content as an earlier capture"
+    )
+
+
+#: archive.org's code for a URL that has hit its per-day capture cap. Duplicated
+#: from spn-client for the same reason as ``_ARCHIVE_*`` above, and kept in step
+#: by a test. It gets its own wording because the cap is the one refusal whose
+#: message *establishes* something about the page: "already captured N times
+#: today" means a capture from today exists.
+_ERROR_DAILY_CAP = "error:too-many-daily-captures"
+
+
+def _submission_failed_lines(wb, detail, indent):
+    """The Archive line for a capture request archive.org did not accept.
+
+    What the author should do next depends on *why*, and the answers differ the
+    way a failed capture's do (see the ``capture_failed`` branch): a refusal
+    spn-client categorizes as permanent will be refused identically every time,
+    so "re-run" is wrong advice; a transient one will be retried by the next
+    run; and one it does not recognize is unknown, which is the wording this
+    branch used for every case before archive.org's own codes reached it.
+
+    The daily cap is the exception worth special-casing. The old text said "It
+    is NOT archived", and for a URL archive.org says it has already captured
+    today that is untrue: a capture exists, and the lookup simply has not listed
+    it. The lookup lags fresh captures by hours (Internet Archive's own help
+    centre says so), so the honest advice is to look again, or retry tomorrow.
+    """
+    code = wb.get("submission_error_code")
+    category = wb.get("submission_retry_category")
+    why = detail or "no reason given"
+    if code == _ERROR_DAILY_CAP:
+        return [
+            f"{indent}- Archive: NOT RE-SUBMITTED TODAY — archive.org says it "
+            f"has already captured this URL the maximum number of times today "
+            f"({why}). A capture from today therefore exists, even though the "
+            f"lookup lists no snapshot yet. Look it up again in a few hours, or "
+            f"retry tomorrow."
+        ]
+    code_note = f", code {code}" if code else ""
+    if category == "permanent":
+        advice = (
+            "archive.org will refuse it the same way every time, so re-running "
+            "will not help. Archive it by hand, or re-source the claim."
+        )
+    elif category == "transient":
+        advice = (
+            "the refusal looks temporary, and the next run will try again on "
+            "its own. Archive it by hand only if it keeps recurring."
+        )
+    elif category == "quota_exhausted":
+        advice = (
+            "archive.org refused on a limit that covers the account, this "
+            "address or the target host, so asking again sooner will not "
+            "help. Retry later."
+        )
+    else:
+        advice = "Archive it by hand, or re-run."
+    return [
+        f"{indent}- Archive: SUBMISSION FAILED — archive.org did not accept "
+        f"the request to capture this URL ({why}{code_note}). It is NOT "
+        f"archived. {advice}"
+    ]
+
+
 def _render_archive_pair(citation, indent="  "):
     """Lines pairing a citation's live URL with its archive copy.
 
@@ -1656,7 +1735,10 @@ def _render_archive_pair(citation, indent="  "):
             if wb.get("snapshot_stale")
             else ""
         )
-        out.append(f"{indent}- Archive: {archive}{stale}{_capture_note(citation)}")
+        out.append(
+            f"{indent}- Archive: {archive}{stale}{_capture_note(citation)}"
+            f"{_revisit_note(citation)}"
+        )
         if wb.get("snapshot_is_error_capture"):
             # A snapshot exists, and it is a capture of an error page. "Archived"
             # would be true and useless: what is preserved is the refusal, not
@@ -1671,11 +1753,7 @@ def _render_archive_pair(citation, indent="  "):
         out.extend(_archive_match_lines(citation, indent))
         out.append(f"{indent}- Cite both: {live} (archived: {archive})")
     elif outcome == _ARCHIVE_SUBMIT_FAILED:
-        out.append(
-            f"{indent}- Archive: SUBMISSION FAILED — archive.org did not accept "
-            f"the request to capture this URL ({detail or 'no reason given'}). "
-            f"It is NOT archived. Archive it by hand, or re-run."
-        )
+        out.extend(_submission_failed_lines(wb, detail, indent))
     elif outcome == _ARCHIVE_NOT_ATTEMPTED:
         # "re-run once archiving succeeds" would be a promise nothing is going
         # to keep for an internal address, and a misleading one for a host that
@@ -1822,6 +1900,21 @@ def _render_archive_pair(citation, indent="  "):
         out.append(
             f"{indent}- Archive history: a previous capture of this URL "
             f"failed{where} — {prior.get('reason') or 'no reason given'}."
+        )
+
+    # The CDX second opinion was asked for and did not answer. The availability
+    # API it backs up never lists a revisit record and can lag a fresh capture by
+    # hours, so a "none" or a STALE above came from the weaker source alone, and
+    # without this line a failed second opinion reads exactly like a confirmed
+    # absence.
+    cdx_error = wb.get("cdx_error")
+    if cdx_error:
+        out.append(
+            f"{indent}- Archive lookup note: archive.org's CDX index could not "
+            f"be asked ({cdx_error}), so the answer above rests on the "
+            f"availability API alone. It never lists a revisit record and can "
+            f'lag a fresh capture by hours, so "none" or STALE here does not '
+            f"prove the page is unarchived."
         )
     return out
 

@@ -14,6 +14,8 @@ process.
 """
 
 import base64
+import inspect
+import io
 import json
 import logging
 from pathlib import Path
@@ -21,6 +23,8 @@ from unittest.mock import patch
 
 import pytest
 import requests
+from PIL import ExifTags, Image, ImageCms, features
+from PIL.TiffImagePlugin import IFDRational
 
 from ci_article_review import handoff_parser
 from ci_article_review.adapters.cms import blocks
@@ -43,6 +47,18 @@ RANK_MATH = {"auto_set_og_tags": True, "default_schema_type": "Article"}
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
+
+
+def _pixels(data):
+    """``(format, size, pixels)`` of an image's bytes.
+
+    What an upload can be asserted against now that the bytes that leave are a
+    scrubbed copy and not the file on disk: the picture has to be the same one,
+    byte-for-byte equality is gone on purpose, and which of the two a test means
+    should be visible in the test.
+    """
+    with Image.open(io.BytesIO(data)) as im:
+        return im.format, im.size, im.convert("RGBA").tobytes()
 
 
 class Resp:
@@ -678,7 +694,9 @@ class TestPushUploadsImages:
         ]
         assert upload["name"] == "grid.png"
         assert upload["mime"] == "image/png"
-        assert upload["bytes"] == PNG
+        # The same picture, re-saved without its metadata (TestStrippingMetadata),
+        # so it is the pixels and not the bytes that have to match.
+        assert _pixels(upload["bytes"]) == _pixels(PNG)
 
     def test_the_upload_is_authenticated_and_is_not_labelled_json(self, tmp_path):
         """A JSON Content-Type on a multipart body breaks the boundary, so the
@@ -744,8 +762,10 @@ class TestPushUploadsImages:
                 "src": "maps/grid.png",
                 "id": 500,
                 "url": "https://example.com/wp-content/uploads/2026/09/grid-1024x576.png",
+                "stripped": True,
             }
         ]
+        assert result["images_stripped"] == 1
 
     def test_a_hosted_url_is_linked_and_not_uploaded(self, tmp_path):
         md = "# T\n\n![Logo](https://cdn.example.com/logo.png)\n"
@@ -1233,7 +1253,7 @@ class TestPublishCommand:
             handoff_dir=tmp_path / "handoff",
         )
         assert code is None
-        assert fake.uploads[0]["bytes"] == PNG
+        assert _pixels(fake.uploads[0]["bytes"]) == _pixels(PNG)
 
     def test_the_uploaded_image_reaches_the_post_as_a_block(self, tmp_path):
         code, fake, _ = _run_publish(
@@ -1316,6 +1336,504 @@ class TestPublishCommand:
 # The convention is written down where the next person looks
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Metadata (#288)
+#
+# A media-library file is public the moment it is uploaded, so an untouched phone
+# photo publishes where it was taken before anyone has chosen to publish the
+# post. These assert on the bytes that left the process, because that is the only
+# place the question is settled.
+# ---------------------------------------------------------------------------
+
+GPS_TAGS = {
+    ExifTags.GPS.GPSLatitudeRef: "N",
+    ExifTags.GPS.GPSLatitude: (IFDRational(41), IFDRational(52), IFDRational(55)),
+    ExifTags.GPS.GPSLongitudeRef: "W",
+    ExifTags.GPS.GPSLongitude: (IFDRational(87), IFDRational(37), IFDRational(40)),
+    ExifTags.GPS.GPSAltitudeRef: 0,
+    ExifTags.GPS.GPSAltitude: IFDRational(181),
+    ExifTags.GPS.GPSTimeStamp: (IFDRational(16), IFDRational(22), IFDRational(33)),
+    ExifTags.GPS.GPSDateStamp: "2026:07:04",
+}
+
+
+def phone_exif(orientation=1):
+    """The EXIF a phone writes: where, when, and on what."""
+    exif = Image.Exif()
+    exif[ExifTags.Base.Make] = "ACME"
+    exif[ExifTags.Base.Model] = "Phone X"
+    exif[ExifTags.Base.Software] = "Phone OS 9"
+    exif[ExifTags.Base.Orientation] = orientation
+    exif[ExifTags.Base.DateTime] = "2026:07:04 11:22:33"
+    # A dict under the sub-IFD's own tag is how Pillow is given one to write:
+    # ``get_ifd`` returns a throwaway dict when the tag is absent, so mutating it
+    # writes nothing. The capture time belongs here and not in IFD0, which is
+    # what a phone does and what inspect_metadata has to read.
+    exif[ExifTags.Base.ExifOffset] = {
+        ExifTags.Base.DateTimeOriginal: "2026:07:04 11:22:33"
+    }
+    exif[ExifTags.Base.GPSInfo] = dict(GPS_TAGS)
+    return exif
+
+
+def phone_photo(orientation=1, fmt="JPEG", size=(24, 16), **kw):
+    """Bytes of an image carrying that EXIF, the way a camera hands one over."""
+    im = Image.new("RGB", size)
+    for x in range(size[0]):  # not flat, so a quality change would show
+        for y in range(size[1]):
+            im.putpixel((x, y), (x * 9 % 256, y * 15 % 256, (x + y) * 7 % 256))
+    out = io.BytesIO()
+    im.save(out, fmt, exif=phone_exif(orientation), **kw)
+    return out.getvalue()
+
+
+def read_exif(data):
+    """``(ifd0 tag names, gps tag names)`` of an image's bytes."""
+    with Image.open(io.BytesIO(data)) as im:
+        exif = im.getexif()
+        ifd0 = {ExifTags.TAGS.get(t, t) for t in exif}
+        ifd0 |= {ExifTags.TAGS.get(t, t) for t in exif.get_ifd(ExifTags.IFD.Exif) or {}}
+        gps = {
+            ExifTags.GPSTAGS.get(t, t)
+            for t in (exif.get_ifd(ExifTags.IFD.GPSInfo) or {})
+        }
+    return ifd0, gps
+
+
+#: A draft whose only image is one photograph.
+DAM = "# T\n\n![Dam](dam.jpg)\n"
+
+
+class TestTheFixtureReallyCarriesGPS:
+    """If the sample had no GPS block, every test below would pass vacuously."""
+
+    def test_the_jpeg_has_a_gps_block_and_a_device(self):
+        ifd0, gps = read_exif(phone_photo())
+        assert "GPSLatitude" in gps and "GPSLongitude" in gps
+        assert len(gps) == len(GPS_TAGS)
+        assert {"Make", "Model", "Software"} <= ifd0
+        assert b"Exif\x00\x00" in phone_photo()
+
+    def test_inspect_reads_it_back(self, tmp_path):
+        path = tmp_path / "shot.jpg"
+        path.write_bytes(phone_photo(orientation=6))
+        meta = img.inspect_metadata(path)
+        assert len(meta.location) == len(GPS_TAGS)
+        assert meta.identity == ("Make", "Model", "Software")
+        assert "DateTime" in meta.times and "DateTimeOriginal" in meta.times
+        assert meta.orientation == 6
+        assert meta.found is True
+        assert "GPS location" in meta.summary()
+
+    def test_a_plain_image_carries_nothing(self, tmp_path):
+        path = tmp_path / "chart.png"
+        path.write_bytes(PNG)
+        meta = img.inspect_metadata(path)
+        assert meta.found is False
+        assert meta.summary() == "none"
+        assert meta.location == () and meta.orientation == 1
+
+
+class TestStrippingMetadata:
+    def test_the_uploaded_jpeg_has_no_gps_and_no_device(self, tmp_path):
+        result, fake = _push(
+            tmp_path, "# T\n\n![Dam](dam.jpg)\n", files={"dam.jpg": phone_photo()}
+        )
+        assert result["success"] is True
+        sent = fake.uploads[0]["bytes"]
+        ifd0, gps = read_exif(sent)
+        assert gps == set()
+        assert ifd0 == set()
+        assert b"Exif" not in sent
+        assert b"ACME" not in sent and b"Phone X" not in sent
+
+    def test_the_original_on_disk_is_not_touched(self, tmp_path):
+        before = phone_photo()
+        _push(tmp_path, "# T\n\n![Dam](dam.jpg)\n", files={"dam.jpg": before})
+        assert (tmp_path / "dam.jpg").read_bytes() == before
+
+    def test_the_picture_is_the_same_one(self, tmp_path):
+        raw = phone_photo()
+        _, fake = _push(tmp_path, "# T\n\n![Dam](dam.jpg)\n", files={"dam.jpg": raw})
+        fmt, size, _ = _pixels(fake.uploads[0]["bytes"])
+        assert (fmt, size) == ("JPEG", (24, 16))
+
+    def test_a_rotated_photo_is_rotated_in_the_pixels_not_a_tag(self, tmp_path):
+        """Orientation 6 means "turn it 90 degrees to show it". Dropping the tag
+        without turning the pixels is how a stripped phone photo ends up on its
+        side, which is the case the lossless segment drop could not handle."""
+        raw = phone_photo(orientation=6, size=(24, 16))
+        _, fake = _push(tmp_path, "# T\n\n![Dam](dam.jpg)\n", files={"dam.jpg": raw})
+        sent = fake.uploads[0]["bytes"]
+        _, size, _ = _pixels(sent)
+        assert size == (16, 24)  # turned, not merely re-labelled
+        assert read_exif(sent) == (set(), set())
+
+    def test_an_upright_photo_is_not_turned(self, tmp_path):
+        raw = phone_photo(orientation=1, size=(24, 16))
+        _, fake = _push(tmp_path, "# T\n\n![Dam](dam.jpg)\n", files={"dam.jpg": raw})
+        assert _pixels(fake.uploads[0]["bytes"])[1] == (24, 16)
+
+    def test_the_icc_profile_survives(self, tmp_path):
+        """Colour, not a person."""
+        icc = b"\x00\x00\x02\x0cmntrRGB XYZ " + b"\x00" * 512
+        raw = phone_photo(icc_profile=icc)
+        _, fake = _push(tmp_path, "# T\n\n![Dam](dam.jpg)\n", files={"dam.jpg": raw})
+        with Image.open(io.BytesIO(fake.uploads[0]["bytes"])) as im:
+            assert im.info.get("icc_profile") == icc
+
+    def test_a_jpeg_comment_goes_too(self, tmp_path):
+        """Pillow's JPEG writer takes the COM segment from ``im.info`` when the
+        save does not name one, so this is the block that survives a naive
+        re-save."""
+        raw = phone_photo(comment=b"shot at home")
+        _, fake = _push(tmp_path, "# T\n\n![Dam](dam.jpg)\n", files={"dam.jpg": raw})
+        assert b"shot at home" not in fake.uploads[0]["bytes"]
+
+    def test_png_text_chunks_and_its_exif_go(self, tmp_path):
+        from PIL import PngImagePlugin
+
+        info = PngImagePlugin.PngInfo()
+        info.add_text("Comment", "taken at 41.88, -87.63")
+        out = io.BytesIO()
+        Image.new("RGB", (8, 8), (1, 2, 3)).save(
+            out, "PNG", pnginfo=info, exif=phone_exif()
+        )
+        raw = out.getvalue()
+        # A PNG keeps EXIF in an ``eXIf`` chunk, whose payload is a bare TIFF
+        # header -- no "Exif\0\0" prefix to look for, unlike a JPEG's APP1.
+        assert b"41.88" in raw and b"eXIf" in raw  # the fixture really has them
+        _, fake = _push(tmp_path, "# T\n\n![C](c.png)\n", files={"c.png": raw})
+        sent = fake.uploads[0]["bytes"]
+        assert b"41.88" not in sent and b"eXIf" not in sent
+        assert read_exif(sent) == (set(), set())
+
+    def test_a_webp_loses_its_exif(self, tmp_path):
+        raw = phone_photo(fmt="WEBP", lossless=True)
+        assert read_exif(raw)[1]  # the fixture really has a GPS block
+        _, fake = _push(tmp_path, "# T\n\n![W](w.webp)\n", files={"w.webp": raw})
+        sent = fake.uploads[0]["bytes"]
+        assert read_exif(sent) == (set(), set())
+        assert _pixels(sent) == _pixels(raw)  # lossless in, lossless out
+
+    def test_a_jpeg_is_re_encoded_at_the_quality_it_already_was(self, tmp_path):
+        """The quantisation tables come from the source, so the strip does not
+        quietly cost a quality step or a size increase."""
+        raw = phone_photo(size=(64, 64), quality=40)
+        _, fake = _push(tmp_path, "# T\n\n![D](d.jpg)\n", files={"d.jpg": raw})
+        sent = fake.uploads[0]["bytes"]
+        with Image.open(io.BytesIO(raw)) as a, Image.open(io.BytesIO(sent)) as b:
+            a.load()
+            b.load()
+            assert b.quantization == a.quantization
+        assert len(sent) <= len(raw)
+
+    def test_pillow_is_not_trusted_to_drop_exif_on_its_own(self):
+        """The assertion that dates this module: none of the three writers copies
+        EXIF out of ``im.info``, which is why a plain re-save already loses it.
+        A Pillow that changed that would fail here rather than quietly publish a
+        GPS block, and ``strip_metadata`` passes ``exif=b""`` regardless."""
+        for fmt in ("JPEG", "PNG", "WEBP"):
+            out = io.BytesIO()
+            with Image.open(io.BytesIO(phone_photo())) as im:
+                im.save(out, fmt)
+            assert read_exif(out.getvalue()) == (set(), set()), fmt
+
+
+class TestWhatTheAuthorIsTold:
+    def test_the_listing_names_what_each_file_carries(self, tmp_path, capsys):
+        (tmp_path / "dam.jpg").write_bytes(phone_photo())
+        plan = wp.plan_images("# T\n\n![Dam](dam.jpg)\n", tmp_path)
+        wp.print_image_plan(plan)
+        out = capsys.readouterr().out
+        assert "GPS location (8 tags)" in out
+        assert "Make, Model, Software" in out
+        assert "capture time" in out
+        assert "stripped before upload" in out
+
+    def test_a_rotated_photo_says_the_rotation_is_applied(self, tmp_path, capsys):
+        """The one thing the strip changes about the picture, said where the
+        author can see it before confirming."""
+        (tmp_path / "dam.jpg").write_bytes(phone_photo(orientation=6))
+        wp.print_image_plan(wp.plan_images(DAM, tmp_path))
+        assert "the EXIF rotation is applied to the pixels" in capsys.readouterr().out
+
+    def test_a_file_with_nothing_says_so(self, tmp_path, capsys):
+        (tmp_path / "c.png").write_bytes(PNG)
+        wp.print_image_plan(wp.plan_images("# T\n\n![C](c.png)\n", tmp_path))
+        assert "metadata: none found" in capsys.readouterr().out
+
+    def test_the_result_counts_what_was_stripped(self, tmp_path):
+        result, _ = _push(
+            tmp_path, "# T\n\n![Dam](dam.jpg)\n", files={"dam.jpg": phone_photo()}
+        )
+        assert result["images_stripped"] == 1
+        assert result["image_uploads"][0]["stripped"] is True
+
+
+class TestKeepImageMetadata:
+    def test_the_file_goes_up_byte_for_byte(self, tmp_path):
+        raw = phone_photo()
+        result, fake = _push(
+            tmp_path,
+            "# T\n\n![Dam](dam.jpg)\n",
+            files={"dam.jpg": raw},
+            strip_image_metadata=False,
+        )
+        assert result["success"] is True
+        assert fake.uploads[0]["bytes"] == raw
+        assert result["images_stripped"] == 0
+        assert result["image_uploads"][0]["stripped"] is False
+
+    def test_the_listing_says_the_location_is_going_public(self, tmp_path, capsys):
+        (tmp_path / "dam.jpg").write_bytes(phone_photo())
+        plan = wp.plan_images(
+            "# T\n\n![Dam](dam.jpg)\n", tmp_path, strip_metadata=False
+        )
+        wp.print_image_plan(plan)
+        out = capsys.readouterr().out
+        assert "KEPT (--keep-image-metadata)" in out
+        assert "records WHERE IT WAS TAKEN" in out
+        assert "nothing is stripped" in out
+
+    def test_the_flag_exists_and_stripping_is_the_default(self):
+        """A rename or a store_true flipped the wrong way would leave the strip
+        silently off, which looks exactly like a working publish."""
+        from ci_article_review import pipeline
+
+        parser = pipeline.build_parser()
+        base = ["--publish", "x", "--publication", "p"]
+        assert parser.parse_args(base).keep_image_metadata is False
+        assert parser.parse_args(base + ["--keep-image-metadata"]).keep_image_metadata
+        signature = inspect.signature(pipeline.run_publish_pipeline)
+        assert signature.parameters["strip_image_metadata"].default is True
+        assert (
+            inspect.signature(wp.push).parameters["strip_image_metadata"].default
+            is True
+        )
+
+
+class TestTypesThatAreNotStripped:
+    def test_an_unstripped_type_is_uploaded_as_it_is_and_said_so(
+        self, tmp_path, capsys
+    ):
+        """A TIFF carries the same GPS block and is not re-encoded. The author is
+        told, rather than the file being quietly published either way."""
+        out = io.BytesIO()
+        # ``.tobytes()``: Pillow's TIFF writer cannot take an ``Image.Exif``
+        # object (it reaches for a file handle the object does not have).
+        Image.new("RGB", (8, 8)).save(out, "TIFF", exif=phone_exif().tobytes())
+        raw = out.getvalue()
+        assert read_exif(raw)[1]  # the fixture really has a GPS block
+        (tmp_path / "s.tif").write_bytes(raw)
+        plan = wp.plan_images("# T\n\n![S](s.tif)\n", tmp_path)
+        wp.print_image_plan(plan)
+        printed = capsys.readouterr().out
+        assert "NOT stripped (.tif is uploaded as it is)" in printed
+        assert "records WHERE IT WAS TAKEN" in printed
+        _, fake = _push(tmp_path, "# T\n\n![S](s.tif)\n", files={"s.tif": raw})
+        assert fake.uploads[0]["bytes"] == raw
+
+    def test_an_animation_is_not_re_encoded(self, tmp_path, capsys):
+        """An APNG. Re-saving one means rebuilding every frame's timing and
+        disposal, and a still image where an animation used to be is a worse
+        outcome than the metadata the strip would have removed."""
+        out = io.BytesIO()
+        frames = [Image.new("RGB", (8, 8), c) for c in ((1, 0, 0), (0, 1, 0))]
+        frames[0].save(
+            out, "PNG", save_all=True, append_images=frames[1:], duration=100
+        )
+        raw = out.getvalue()
+        (tmp_path / "a.png").write_bytes(raw)
+        plan = wp.plan_images("# T\n\n![A](a.png)\n", tmp_path)
+        assert plan.metadata["a.png"].animated is True
+        wp.print_image_plan(plan)
+        assert "NOT stripped (an animation" in capsys.readouterr().out
+        _, fake = _push(tmp_path, "# T\n\n![A](a.png)\n", files={"a.png": raw})
+        assert fake.uploads[0]["bytes"] == raw
+
+    def test_an_svg_is_not_reported_as_unreadable(self, tmp_path, capsys):
+        """Pillow cannot open one, which is not a problem to report: it is simply
+        not a type the strip handles."""
+        raw = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'
+        (tmp_path / "d.svg").write_bytes(raw)
+        plan = wp.plan_images("# T\n\n![D](d.svg)\n", tmp_path)
+        assert plan.problems == []
+        wp.print_image_plan(plan)
+        printed = capsys.readouterr().out
+        assert "NOT stripped (.svg is uploaded as it is)" in printed
+        assert "could not be read" not in printed
+
+
+class TestFailingClosed:
+    def test_a_jpeg_that_cannot_be_opened_stops_the_publish(self, tmp_path):
+        """The one answer that is never right is uploading the original because
+        the scrubber choked: the publish would look like it worked."""
+        result, fake = _push(
+            tmp_path,
+            "# T\n\n![Broken](broken.jpg)\n",
+            files={"broken.jpg": b"\xff\xd8\xff not really a jpeg"},
+        )
+        assert result["success"] is False
+        assert fake.media_requests == []
+        assert "cannot be opened as an image" in result["error"]
+        assert "--keep-image-metadata" in result["error"]
+
+    def test_that_same_file_publishes_with_the_opt_out(self, tmp_path):
+        raw = b"\xff\xd8\xff not really a jpeg"
+        result, fake = _push(
+            tmp_path,
+            "# T\n\n![Broken](broken.jpg)\n",
+            files={"broken.jpg": raw},
+            strip_image_metadata=False,
+        )
+        assert result["success"] is True
+        assert fake.uploads[0]["bytes"] == raw
+
+    def test_a_strip_that_fails_at_upload_time_names_what_went_up(self, tmp_path):
+        """``strip_metadata`` raising after the plan passed must not be answered
+        by sending the original either, and must say what is already public."""
+        md = "# T\n\n![One](1.jpg)\n\n![Two](2.jpg)\n"
+        calls = []
+        real = img.strip_metadata
+
+        def fail_on_second(path, out_dir):
+            calls.append(path)
+            if len(calls) == 2:
+                raise ImageError("the metadata could not be stripped (boom)")
+            return real(path, out_dir)
+
+        with patch.object(img, "strip_metadata", fail_on_second):
+            result, fake = _push(
+                tmp_path, md, files={f"{n}.jpg": phone_photo() for n in (1, 2)}
+            )
+        assert result["success"] is False
+        assert "could not be stripped" in result["error"]
+        assert "still in the media library" in result["error"]
+        assert len(fake.uploads) == 1  # the first one, and no post
+
+
+class TestSameNameDifferentFolders:
+    def test_two_files_called_the_same_thing_do_not_collide(self, tmp_path):
+        md = "# T\n\n![A](a/shot.jpg)\n\n![B](b/shot.jpg)\n"
+        a, b = phone_photo(size=(24, 16)), phone_photo(size=(32, 8))
+        result, fake = _push(tmp_path, md, files={"a/shot.jpg": a, "b/shot.jpg": b})
+        assert result["success"] is True
+        assert [u["name"] for u in fake.uploads] == ["shot.jpg", "shot.jpg"]
+        assert [_pixels(u["bytes"])[1] for u in fake.uploads] == [(24, 16), (32, 8)]
+        assert all(read_exif(u["bytes"]) == (set(), set()) for u in fake.uploads)
+
+
+# ---------------------------------------------------------------------------
+# AVIF and HEIC (#299)
+#
+# Two formats that were uploaded untouched after #288. They end up in opposite
+# places, and the line between them is not "can it be stripped" but "can it be
+# read": Pillow opens an AVIF, so it is stripped like the other four; nothing
+# here opens a HEIC, so there is no informed choice to offer and it is refused
+# rather than uploaded blind.
+# ---------------------------------------------------------------------------
+
+#: An ISO-BMFF ftyp box declaring a HEIC brand. Enough to be the file a draft
+#: names and nothing more: every assertion below is about a file that is refused
+#: or passed through untouched, so none of them decodes it.
+HEIC = (
+    b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1"
+    + b"\x00\x00\x00\x08mdat"
+    + b"\x00" * 64
+)
+
+avif_only = pytest.mark.skipif(
+    not features.check("avif"),
+    reason="this Pillow build has no AVIF codec (its wheels cover every platform "
+    "here, but not Windows ARM64 or iOS)",
+)
+
+
+@avif_only
+class TestAvifIsStripped:
+    def test_its_gps_block_does_not_reach_the_upload(self, tmp_path):
+        raw = phone_photo(fmt="AVIF")
+        assert read_exif(raw)[1]  # the fixture really has a GPS block
+        result, fake = _push(tmp_path, "# T\n\n![A](a.avif)\n", files={"a.avif": raw})
+        assert result["success"] is True
+        sent = fake.uploads[0]["bytes"]
+        assert read_exif(sent) == (set(), set())
+        assert b"ACME" not in sent and b"Phone X" not in sent
+        assert result["images_stripped"] == 1
+
+    def test_a_rotated_one_is_rotated_in_the_pixels(self, tmp_path):
+        raw = phone_photo(fmt="AVIF", orientation=6, size=(24, 16))
+        _, fake = _push(tmp_path, "# T\n\n![A](a.avif)\n", files={"a.avif": raw})
+        fmt, size, _ = _pixels(fake.uploads[0]["bytes"])
+        assert (fmt, size) == ("AVIF", (16, 24))
+
+    def test_the_icc_profile_survives(self, tmp_path):
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        raw = phone_photo(fmt="AVIF", icc_profile=icc)
+        _, fake = _push(tmp_path, "# T\n\n![A](a.avif)\n", files={"a.avif": raw})
+        with Image.open(io.BytesIO(fake.uploads[0]["bytes"])) as im:
+            assert im.info.get("icc_profile") == icc
+
+    def test_the_listing_says_what_it_carried(self, tmp_path, capsys):
+        (tmp_path / "a.avif").write_bytes(phone_photo(fmt="AVIF"))
+        wp.print_image_plan(wp.plan_images("# T\n\n![A](a.avif)\n", tmp_path))
+        out = capsys.readouterr().out
+        assert "GPS location" in out and "stripped before upload" in out
+
+
+class TestHeicIsRefused:
+    """Not stripped and not sent. #288's own failure was uploading the format an
+    iPhone writes by default without being able to say what was in it."""
+
+    @pytest.mark.parametrize("name", ["shot.heic", "shot.heif", "SHOT.HEIC"])
+    def test_it_stops_the_publish_before_anything_is_sent(self, tmp_path, name):
+        result, fake = _push(tmp_path, f"# T\n\n![S]({name})\n", files={name: HEIC})
+        assert result["success"] is False
+        assert fake.requests == []  # not one request, let alone an upload
+        assert "Export it as a JPEG" in result["error"]
+        assert "--keep-image-metadata" in result["error"]
+
+    def test_the_reason_says_why_rather_than_that_it_is_broken(self, tmp_path):
+        """It is a sound file. Saying "cannot be opened as an image" -- what the
+        unreadable path would say -- would send the author looking for damage."""
+        (tmp_path / "s.heic").write_bytes(HEIC)
+        plan = wp.plan_images("# T\n\n![S](s.heic)\n", tmp_path)
+        (problem,) = plan.problems
+        assert "no lossless way to re-save one" in problem
+        assert "do not display a .heic" in problem
+        assert "cannot be opened as an image" not in problem
+
+    def test_the_opt_out_uploads_it_byte_for_byte_and_says_what_is_unknown(
+        self, tmp_path, capsys
+    ):
+        (tmp_path / "s.heic").write_bytes(HEIC)
+        plan = wp.plan_images("# T\n\n![S](s.heic)\n", tmp_path, strip_metadata=False)
+        assert plan.problems == []
+        wp.print_image_plan(plan)
+        printed = capsys.readouterr().out
+        assert "NOT stripped, and NOT readable either (.heic)" in printed
+        assert "assume it records WHERE IT WAS TAKEN" in printed
+        result, fake = _push(
+            tmp_path,
+            "# T\n\n![S](s.heic)\n",
+            files={"s.heic": HEIC},
+            strip_image_metadata=False,
+        )
+        assert result["success"] is True
+        assert fake.uploads[0]["bytes"] == HEIC
+        assert fake.uploads[0]["mime"] == "image/heic"
+        assert result["images_stripped"] == 0
+
+    def test_pillow_still_cannot_open_one(self):
+        """The premise of the refusal. If a Pillow release (or a plugin arriving
+        through another dependency) starts opening these, the refusal is no
+        longer the honest answer and #299 is worth reopening."""
+        with pytest.raises(Exception):
+            Image.open(io.BytesIO(HEIC)).load()
+        assert ".heic" not in Image.registered_extensions()
+
+
 TEMPLATE = Path(handoff_parser.__file__).parent / "handoff_templates" / "publication.md"
 
 
@@ -1329,6 +1847,15 @@ def _images_section():
 class TestTheTemplateDocumentsIt:
     def test_the_section_exists(self):
         assert "IMAGES AND ALT TEXT" in TEMPLATE.read_text(encoding="utf-8")
+
+    def test_it_says_metadata_is_stripped_and_that_pixels_are_not(self):
+        """#288: the strip is a default the author should know about, and a photo
+        of a screen can show a location that no strip touches."""
+        section = _images_section()
+        assert "scrubbed copy" in section
+        assert "GPS" in section
+        assert "photo of a screen" in section
+        assert "coordinates" in section
         assert "IMAGES AND ALT TEXT" in handoff_parser.PUB_HEADERS
 
     def test_its_example_is_an_image_the_publish_actually_reads(self):

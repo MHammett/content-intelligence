@@ -31,7 +31,12 @@ import yaml
 
 from ci_core.console import force_utf8_stdio
 
-from .history_analytics import HISTORY_ROOT, load_reports
+from .history_analytics import (
+    HISTORY_ROOT,
+    HISTORY_ROOT_ENV,
+    load_reports,
+    resolve_history_root,
+)
 
 # Every flagged passage this prints is article prose, quoted as it was written.
 force_utf8_stdio()
@@ -239,12 +244,14 @@ def candidate_patterns(
 
 
 def build_voice_pattern_report(
-    history_root=HISTORY_ROOT,
+    history_root=None,
     publication=None,
     min_articles=MIN_ARTICLES,
     similarity_threshold=SIMILARITY_THRESHOLD,
     config_path=None,
 ):
+    if history_root is None:
+        history_root = resolve_history_root()
     entries = load_reports(history_root)
     findings = extract_voice_findings(entries, publication=publication)
     banned_words, banned_phrases = load_banned_terms(config_path)
@@ -341,8 +348,11 @@ def build_parser():
     )
     parser.add_argument(
         "--history-root",
-        default=HISTORY_ROOT,
-        help=f"Directory containing per-article run history (default: {HISTORY_ROOT})",
+        default=resolve_history_root(),
+        help=(
+            "Directory containing per-article run history (default: "
+            f"${HISTORY_ROOT_ENV} if set, else {HISTORY_ROOT})"
+        ),
     )
     parser.add_argument(
         "--publication",

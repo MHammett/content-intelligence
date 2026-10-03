@@ -46,6 +46,7 @@ operates at.
 import argparse
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,24 @@ force_utf8_stdio()
 log = logging.getLogger(__name__)
 
 HISTORY_ROOT = "pipeline_history"
+
+#: Environment variable that moves every run's history somewhere else. Unset or
+#: blank, history stays in ``HISTORY_ROOT`` under the working directory, which
+#: is per checkout; and removing a git worktree deletes its checkout's copy.
+#: Set once for the user, it points every worktree at one shared directory.
+HISTORY_ROOT_ENV = "CI_HISTORY_ROOT"
+
+
+def resolve_history_root(default=HISTORY_ROOT):
+    """Where run history lives: ``$CI_HISTORY_ROOT`` if set, else ``default``.
+
+    Read on each call and never cached, so a test or a wrapper script that sets
+    the variable after import is honoured. A leading ``~`` is expanded; a
+    relative value, like the default, is relative to the working directory.
+    """
+    value = os.environ.get(HISTORY_ROOT_ENV, "").strip()
+    return os.path.expanduser(value) if value else default
+
 
 # How many of the most recent data points (calls, for provider reliability;
 # runs, for cost/quality) count as "recent" vs everything before them being
@@ -621,8 +640,10 @@ def pass_contribution(entries):
 
 
 def build_history_report(
-    history_root=HISTORY_ROOT, article_slug=None, recent_window=RECENT_WINDOW
+    history_root=None, article_slug=None, recent_window=RECENT_WINDOW
 ):
+    if history_root is None:
+        history_root = resolve_history_root()
     entries = load_reports(history_root, article_slug)
     return {
         "history_root": str(history_root),
@@ -811,8 +832,11 @@ def build_parser():
     )
     parser.add_argument(
         "--history-root",
-        default=HISTORY_ROOT,
-        help=f"Directory containing per-article run history (default: {HISTORY_ROOT})",
+        default=resolve_history_root(),
+        help=(
+            "Directory containing per-article run history (default: "
+            f"${HISTORY_ROOT_ENV} if set, else {HISTORY_ROOT})"
+        ),
     )
     parser.add_argument(
         "--article",

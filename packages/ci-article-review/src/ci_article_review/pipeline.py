@@ -66,6 +66,7 @@ from .handoff_parser import (
     build_handoff_from_raw_draft_and_metadata,
 )
 from . import history as hist
+from .history_analytics import resolve_history_root
 from . import consolidation
 from . import handoff_gaps
 from . import reproducibility
@@ -100,6 +101,18 @@ from .adapters.citation.disposition import disposition as citation_disposition
 log = logging.getLogger("pipeline")
 
 HISTORY_ROOT = "pipeline_history"
+
+
+def _history_root():
+    """Where this run reads and writes history: ``$CI_HISTORY_ROOT``, else ``HISTORY_ROOT``.
+
+    Every reader and writer in this module goes through here, not through the
+    constant, so one variable moves the daily log, the saved runs, the
+    ``_replay/`` tree and the archive lookups together. ``HISTORY_ROOT`` stays the
+    default (and what the tests patch); see ``history_analytics.resolve_history_root``.
+    """
+    return resolve_history_root(HISTORY_ROOT)
+
 
 # Module-level prompt cache — files are read once per process lifetime.
 _PROMPT_CACHE: dict[str, str] = {}
@@ -1101,6 +1114,48 @@ def _claim_key(claim: str) -> frozenset:
     return frozenset(w for w in words if w not in _CLAIM_STOPWORDS)
 
 
+#: A parenthetical that carries a year: ``(2022-23)``, ``(January 2018)``.
+_YEAR_PARENTHETICAL = re.compile(r"\((?=[^()]*\b(?:19|20)\d\d)[^()]*\)")
+
+
+def _fold(text: str) -> str:
+    """Case, whitespace, dash and quote variants folded, for containment tests."""
+    text = re.sub(r"[\u2010-\u2015\u2212]", "-", text or "")
+    return " ".join(text.casefold().split())
+
+
+def _claim_for_verifier(claim: str, source: str, draft: str) -> str:
+    """``claim`` without the date parentheticals the model copied from its own source label.
+
+    The fact-check prompt asks for the draft's own words, and a model sometimes
+    writes "Honda ServiceNews A21120A (2022-23) covers the Accord, Odyssey ..."
+    instead of the draft's "[3] covers the Accord, Odyssey ...": the marker
+    became the reference-list entry, and the entry's ``(2022-23)`` came with it.
+    That is the bulletin's date range. The verifier read it as model years and
+    refuted the claim against a page listing exactly the vehicles named: "does
+    not include the 2022-23 Accord, Odyssey, Pilot ..." (2026-09-18 GPS run,
+    issue #302).
+
+    A parenthetical goes only when it is in the model's own ``source`` text and
+    nowhere in the draft. Both halves matter. The first keeps a date the claim
+    got from somewhere else; the second keeps one the author wrote, such as
+    "IARC Monograph 98 (2010)", which is part of the assertion and which a
+    "year in parentheses" rule alone would delete (measured: grok, 2026-09-09).
+    """
+    if not source:
+        return claim
+    folded_source, folded_draft = _fold(source), _fold(draft)
+    stripped = claim
+    for found in _YEAR_PARENTHETICAL.findall(claim):
+        folded = _fold(found)
+        if folded in folded_source and folded not in folded_draft:
+            stripped = stripped.replace(found, "")
+    if stripped == claim:
+        return claim
+    stripped = re.sub(r"\s+([,.;:])", r"\1", " ".join(stripped.split()))
+    return stripped or claim
+
+
 def _is_duplicate_claim(key: frozenset, seen_keys: list) -> bool:
     """True if ``key`` restates a claim already collected.
 
@@ -1368,20 +1423,25 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
                         known_urls = known_urls + [weak]
                         weak_urls.append(weak)
 
-            claims.append(
-                {
-                    "claim": claim,
-                    "known_urls": known_urls,
-                    # Which of those URLs got in only on a weak span match, so
-                    # a resolution that ends up resting on one can say so.
-                    "weak_source_urls": weak_urls,
-                    "fact_check_bucket": bucket,
-                    # Which model asserted this. `_build_fact_check` tags every
-                    # merged item with it; it was being dropped here, which is
-                    # why a refuted claim had no one to hand back to.
-                    "source_model": item.get("source_model", ""),
-                }
-            )
+            entry = {
+                "claim": claim,
+                "known_urls": known_urls,
+                # Which of those URLs got in only on a weak span match, so
+                # a resolution that ends up resting on one can say so.
+                "weak_source_urls": weak_urls,
+                "fact_check_bucket": bucket,
+                # Which model asserted this. `_build_fact_check` tags every
+                # merged item with it; it was being dropped here, which is
+                # why a refuted claim had no one to hand back to.
+                "source_model": item.get("source_model", ""),
+            }
+            # What the verifier is shown, when that differs from what the model
+            # wrote. The report keeps the model's wording: it is what the
+            # fact-check section says, and other passes match on it.
+            verify_claim = _claim_for_verifier(claim, source_field, draft)
+            if verify_claim != claim:
+                entry["verify_claim"] = verify_claim
+            claims.append(entry)
     log.info(
         "Citations: %d of %d claim(s) traced to a citation in the draft",
         anchored,
@@ -2843,7 +2903,7 @@ def run_draft_pipeline(
     # obviously the later one. Trust the handoff unless history already has that
     # number, and say so rather than silently renumbering.
     run_number = handoff.get("run_number", 1)
-    _existing = hist.existing_run_numbers(HISTORY_ROOT, _history_key(handoff))
+    _existing = hist.existing_run_numbers(_history_root(), _history_key(handoff))
     if run_number in _existing:
         _next = max(_existing) + 1
         log.warning(
@@ -3291,7 +3351,7 @@ def run_draft_pipeline(
     # models be told which passages were already flagged and survived a
     # revision — otherwise run 20 of an article opens exactly as cold as run 1.
     prior_report, prior_report_path = hist.load_prior_report(
-        HISTORY_ROOT, _history_key(handoff), before_ts=run_start_ts
+        _history_root(), _history_key(handoff), before_ts=run_start_ts
     )
 
     # Everything the pipeline measured before this point, handed to the models
@@ -3731,7 +3791,7 @@ def run_draft_pipeline(
     # its own findings and report near-perfect reproduction, which is the one
     # number this whole feature exists to stop the report from implying.
     history_root = (
-        str(Path(HISTORY_ROOT) / "_replay") if replay_results else HISTORY_ROOT
+        str(Path(_history_root()) / "_replay") if replay_results else _history_root()
     )
 
     # Measure this run against every earlier run of the same draft under the
@@ -3808,7 +3868,7 @@ def run_draft_pipeline(
             citation_sources,
             api_keys,
             verification_call_log=api_call_log,
-            history_root=HISTORY_ROOT,
+            history_root=_history_root(),
             # Who "I" is. A first-person claim cannot be checked against a page
             # without it. Told nothing, the verifier bound "I" to the first
             # person it found and offered a stranger's family as evidence; told
@@ -3892,7 +3952,7 @@ def run_draft_pipeline(
                         citation_sources,
                         api_keys,
                         verification_call_log=api_call_log,
-                        history_root=HISTORY_ROOT,
+                        history_root=_history_root(),
                         author=citation_author,
                         capture_settings=pipeline_cfg.get("wayback_capture"),
                     )
@@ -5064,7 +5124,7 @@ def _print_draft_summary(
     if markdown_path:
         report_dir = Path(markdown_path).parent
     else:
-        report_dir = Path(HISTORY_ROOT) / hist._slug(report.get("article_title", ""))
+        report_dir = Path(_history_root()) / hist._slug(report.get("article_title", ""))
     print(f"\nFull report: {report_dir}")
     if markdown_path:
         print(f"Readable review (paste into chat): {markdown_path}")
@@ -5172,6 +5232,7 @@ def run_publish_pipeline(
     api_key_overrides=None,
     wp_user=None,
     wp_password=None,
+    strip_image_metadata=True,
 ):
     log.info(f"Loading configs (publication={publication_name})")
     user_config = load_user_config(config_dir)
@@ -5282,7 +5343,9 @@ def run_publish_pipeline(
     # would come to nothing. A relative path is relative to the handoff file, not
     # to wherever this was run from, so the same handoff finds the same files.
     image_base_dir = Path(handoff_path).resolve().parent
-    image_plan = wp.plan_images(pub_handoff["final_draft"], image_base_dir)
+    image_plan = wp.plan_images(
+        pub_handoff["final_draft"], image_base_dir, strip_image_metadata
+    )
     if image_plan.problems:
         log.error(wp.describe_problems(image_plan))
         sys.exit(1)
@@ -5342,6 +5405,7 @@ def run_publish_pipeline(
         rank_math_config,
         publish_live=publish_live,
         image_base_dir=image_base_dir,
+        strip_image_metadata=strip_image_metadata,
     )
 
     if result["success"]:
@@ -5455,7 +5519,15 @@ def run_archive_only(
     # markers (or twice in one entry) gets checked once and each entry below
     # gets its own copy of the result, never a shared dict two mutations could
     # step on.
-    checked = {url: wayback.check(url) for url in unique_urls}
+    #
+    # cdx_fallback=True because this mode's whole job is to decide, from this
+    # answer, whether to spend a capture request. The availability API alone
+    # never lists a warc/revisit record, so a page that has not changed reads
+    # stale on every run and would be re-submitted every time (measured
+    # 2026-09-28 on one NHTSA PDF). The fallback is slow, up to cdx_timeout per
+    # stale or unarchived URL, which is why the full review's own lookups do not
+    # use it; see content-intelligence#289 for measuring that before widening it.
+    checked = {url: wayback.check(url, cdx_fallback=True) for url in unique_urls}
     results = [
         {"resolved": True, "url": url, "marker": marker, "wayback": dict(checked[url])}
         for marker, url in targets
@@ -5464,7 +5536,7 @@ def run_archive_only(
     from .adapters.citation.resolver import _submit_missing_archives
 
     _submit_missing_archives(
-        results, api_keys.get("archive_org"), HISTORY_ROOT, capture_settings
+        results, api_keys.get("archive_org"), _history_root(), capture_settings
     )
 
     from .report_markdown import _render_archive_pair
@@ -5607,6 +5679,16 @@ def build_parser():
         "archive_org.access_key, archive_org.secret_key.",
     )
     parser.add_argument(
+        "--keep-image-metadata",
+        action="store_true",
+        help="Upload each local image exactly as it is (--publish mode). By "
+        "default a JPEG, PNG or WebP is uploaded as a scrubbed copy: EXIF "
+        "(including the GPS position a phone writes), XMP, IPTC and any comment "
+        "removed, the EXIF orientation applied to the pixels, the ICC colour "
+        "profile kept. A media-library file is public the moment it is "
+        "uploaded, so this publishes whatever the camera recorded.",
+    )
+    parser.add_argument(
         "--wp-user",
         metavar="USERNAME",
         help="Override the WordPress username for this run only (--publish "
@@ -5735,7 +5817,7 @@ def main():
     )
     # Also write all log output to a persistent file so warnings aren't lost on scroll.
     # Daily rotation: one file per UTC day; same-day runs append to the same file.
-    _log_dir = Path(HISTORY_ROOT)
+    _log_dir = Path(_history_root())
     _log_dir.mkdir(parents=True, exist_ok=True)
     _log_date = datetime.now(timezone.utc).strftime("%Y%m%d")
     _file_handler = logging.FileHandler(
@@ -5749,6 +5831,8 @@ def main():
         )
     )
     logging.getLogger().addHandler(_file_handler)
+    if _log_dir != Path(HISTORY_ROOT):
+        log.info("History root: %s (from $CI_HISTORY_ROOT)", _log_dir)
 
     try:
         validate_publication_name(args.publication)
@@ -5835,6 +5919,7 @@ def main():
                 api_key_overrides=api_key_overrides,
                 wp_user=args.wp_user,
                 wp_password=args.wp_password,
+                strip_image_metadata=not args.keep_image_metadata,
             )
     except (FileNotFoundError, ValueError) as e:
         log.error(str(e))

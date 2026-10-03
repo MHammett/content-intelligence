@@ -174,7 +174,12 @@ Images in the FINAL DRAFT are ordinary Markdown,
 `![alt text](path/to/file.png "optional caption")`, alone on a line. A file on
 disk is uploaded to the WordPress media library and becomes a native Image
 block you can edit in the block editor; an `https://` URL is linked and not
-uploaded. See [Images in the FINAL DRAFT](docs/CONFIGURATION.md#images-in-the-final-draft).
+uploaded. A `.jpg`, `.png`, `.webp` or `.avif` is uploaded as a scrubbed copy —
+EXIF (including the GPS position a phone writes), XMP, IPTC and any comment
+removed, the orientation applied to the pixels, the ICC profile kept — and your
+own file is not modified. A `.heic` stops the publish, because its metadata can
+be neither removed nor read; `--keep-image-metadata` turns all of this off. See
+[Images in the FINAL DRAFT](docs/CONFIGURATION.md#images-in-the-final-draft).
 
 **Analyze an existing web page:**
 
@@ -439,7 +444,7 @@ uv run ci-history-report
 
 | Flag | Purpose |
 |---|---|
-| `--history-root DIR` | Directory containing per-article run history (default `pipeline_history`) |
+| `--history-root DIR` | Directory containing per-article run history (default `$CI_HISTORY_ROOT` if set, else `pipeline_history`) |
 | `--article SLUG` | Scope to one article — the `pipeline_history/` subdirectory name, not the article title |
 | `--recent-window N` | How many of the most recent calls/runs count as "recent" vs. baseline (default 5) |
 | `--json` | Print the raw result as JSON instead of the console summary |
@@ -469,7 +474,7 @@ uv run ci-voice-patterns --publication NAME --config configs/NAME.yaml
 
 | Flag | Purpose |
 |---|---|
-| `--history-root DIR` | Directory containing per-article run history (default `pipeline_history`) |
+| `--history-root DIR` | Directory containing per-article run history (default `$CI_HISTORY_ROOT` if set, else `pipeline_history`) |
 | `--publication NAME` | Scope to reports whose `publication` field matches this value |
 | `--config PATH` | Publication config YAML to read existing `style_rules.banned_words`/`banned_phrases` from, so already-banned patterns are excluded (read-only, never modified) |
 | `--min-articles N` | Minimum distinct articles a pattern must appear in to be reported (default 3) |
@@ -508,6 +513,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--config-dir DIR` | Config directory (default `configs`) |
 | `--cost-preset PRESET` | Override `cost_preset` for this run: `economy` / `wide` / `balanced` / `thorough` / `maximum`. Doesn't modify `user.yaml`. (`standard` was retired 2026-09-05; it still runs, as `wide`, with a warning.) |
 | `--api-key PROVIDER[.FIELD]=VALUE` | Override one credential field for this run only — highest tier of the credential precedence (CLI > publication config > `.env`/`user.yaml` > OS environment variable). Repeatable. `PROVIDER=VALUE` is shorthand for `api_key` (`openai`, `gemini`, `mistral`, `grok`, `perplexity`, `claude`); multi-field credentials need `PROVIDER.FIELD` (`languagetool.username`, `archive_org.secret_key`, etc.). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#api-key-precedence). |
+| `--keep-image-metadata` | Upload each local image exactly as it is (`--publish` mode). By default a `.jpg`/`.png`/`.webp`/`.avif` is uploaded as a scrubbed copy — EXIF (including the GPS position a phone writes), XMP, IPTC and any comment removed, the EXIF orientation applied to the pixels, the ICC colour profile kept — and a `.heic`, whose metadata can be neither removed nor read, stops the publish instead. A media-library file is public the moment it is uploaded, so this flag publishes whatever the camera recorded. |
 | `--wp-user USERNAME` | Override the WordPress username for this run only (`--publish` mode) — same precedence idea as `--api-key`, applied to `publication.wordpress`. |
 | `--wp-password APPLICATION_PASSWORD` | Override the WordPress application password for this run only (`--publish` mode). |
 | `--expand` | Add the **expansion pass**: a sixth review domain that proposes additional sources, topics, angles and data fitting the draft's existing primary claim, instead of judging what is already there. Its output is SECTION 10, and every URL it proposes is fetched and marked resolved or not. Off by default — it costs extra model calls, and it earns them early in a draft rather than on a final revision. See [Expansion pass](#expansion-pass). |
@@ -555,6 +561,8 @@ uv run ci-review --raw-draft handoff.md --publication mypub --archive-only
 ```
 
 It reads every URL out of the draft's own citation block (`## Sources` / `## Citations` / etc. — whatever heading [docs/CITATIONS.md](docs/CITATIONS.md) documents), checks each one's current Wayback status, and submits the ones that are missing or stale — the same dedupe-by-URL, pacing and outcome bookkeeping a normal run's Pass 3 uses, just run directly against the draft's URLs instead of only the ones a resolved fact-check claim cites. Each URL's outcome prints in the same wording Section 9 uses, ending with `Estimated cost: $0.0000 (no model calls)` so it's never mistaken for a real spend line. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`, which turns off the very network calls this flag exists to make.
+
+**A page that has not changed is not re-submitted.** archive.org's availability API never lists a `warc/revisit` record (its pointer for an unchanged page), so an unchanged page reads stale on every run however often it is captured. For a URL that API calls stale or missing, this mode also asks archive.org's CDX index, which does list them, and trusts a revisit only after finding a `200` capture with the same content digest. That second lookup is slow, roughly 10 to 50 seconds per URL when it answers, so a draft with many stale sources takes minutes; a URL the first lookup already shows as fresh costs one request. The full review's own lookups do not use it. A CDX lookup that fails is printed as an `Archive lookup note`, because the answer then rests on the weaker source alone.
 
 ---
 

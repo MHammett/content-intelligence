@@ -45,7 +45,7 @@ def _run_archive_only(
         patch(
             "ci_article_review.adapters.citation.wayback.check",
             side_effect=wayback_check
-            or (lambda url: {"archived": False, "snapshot_url": None}),
+            or (lambda url, **kwargs: {"archived": False, "snapshot_url": None}),
         ) as mock_check,
         patch(
             "ci_article_review.adapters.citation.resolver._submit_missing_archives",
@@ -201,7 +201,7 @@ class TestOutputReusesReportMarkdownVocabulary:
             "[3] Missing. https://a.example/missing\n",
         )
 
-        def fake_check(url):
+        def fake_check(url, **kwargs):
             if url.endswith("fresh"):
                 return {
                     "archived": True,
@@ -236,7 +236,7 @@ class TestALookupThatDidNotCompleteIsNotCountedAsNoSnapshot:
             "[2] Confirmed absent. https://a.example/two\n",
         )
 
-        def fake_check(url):
+        def fake_check(url, **kwargs):
             if url.endswith("one"):
                 return {"archived": None, "error": "archive.org refused the lookup"}
             return {"archived": False, "snapshot_url": None}
@@ -279,7 +279,7 @@ class TestAStaleSnapshotDoesNotHideTheReArchiveOutcome:
         )
         *_, out = _run_archive_only(
             draft,
-            wayback_check=lambda url: dict(self._STALE),
+            wayback_check=lambda url, **kw: dict(self._STALE),
             submit=self._submit_that_records(
                 "submit_failed", "archive.org refused the request: try tomorrow"
             ),
@@ -304,7 +304,7 @@ class TestAStaleSnapshotDoesNotHideTheReArchiveOutcome:
             wb["snapshot_stale"] = False
 
         *_, out = _run_archive_only(
-            draft, wayback_check=lambda url: dict(self._STALE), submit=recaptured
+            draft, wayback_check=lambda url, **kw: dict(self._STALE), submit=recaptured
         )
         assert "Re-archive attempt" not in out
         assert "1 with a fresh Wayback snapshot" in out
@@ -314,7 +314,7 @@ class TestAStaleSnapshotDoesNotHideTheReArchiveOutcome:
             tmp_path, "draft.md", "## Sources\n\n[1] Fine. https://a.example/x\n"
         )
         fresh = {**self._STALE, "snapshot_stale": False}
-        *_, out = _run_archive_only(draft, wayback_check=lambda url: dict(fresh))
+        *_, out = _run_archive_only(draft, wayback_check=lambda url, **kw: dict(fresh))
         assert "Re-archive attempt" not in out
 
 
@@ -340,3 +340,264 @@ class TestArchiveOnlyTouchesNoModelProvider:
             _run_archive_only(draft)
 
         mock_call_provider.assert_not_called()
+
+
+class TestArchiveOnlyHonoursTheHistoryRootOverride:
+    """The archiving pass looks for earlier captures in the history it is given."""
+
+    def test_submission_is_handed_the_override(self, tmp_path, monkeypatch):
+        shared = tmp_path / "shared"
+        monkeypatch.setenv("CI_HISTORY_ROOT", str(shared))
+        draft = _write(
+            tmp_path,
+            "draft.md",
+            "A claim. [1]\n\n## Sources\n\n[1] A source. https://a.example/one\n",
+        )
+
+        _, mock_submit, _, _ = _run_archive_only(draft)
+
+        mock_submit.assert_called_once()
+        assert mock_submit.call_args.args[2] == str(shared)
+
+    def test_unset_it_is_still_the_working_directory_s_history(self, tmp_path):
+        draft = _write(
+            tmp_path,
+            "draft.md",
+            "A claim. [1]\n\n## Sources\n\n[1] A source. https://a.example/one\n",
+        )
+
+        _, mock_submit, _, _ = _run_archive_only(draft)
+
+        assert mock_submit.call_args.args[2] == pipeline.HISTORY_ROOT
+
+
+def _run_with_real_submit(draft_path, check, submit):
+    """Run ``run_archive_only`` with the *real* ``_submit_missing_archives``.
+
+    Only archive.org's own HTTP surface is stubbed: ``check`` and ``submit``
+    (what the pipeline decides from, and decides to do), plus the two calls the
+    real submission pass makes around them. With no credentials configured that
+    is ``capture_capacity`` and, once a submission has failed, ``system_status``;
+    ``_reconcile_prior_captures`` and ``_poll_capture_outcomes`` return before
+    any request without a key pair. ``classify_host`` is stubbed so the example
+    URLs need no DNS. Returns (mock_submit, printed_output).
+    """
+    import contextlib
+    import io
+
+    from ci_article_review.adapters.citation.resolver import HOST_PUBLIC
+
+    with (
+        patch("ci_article_review.pipeline.load_user_config", return_value={}),
+        patch("ci_article_review.pipeline.load_publication_config", return_value={}),
+        patch("ci_article_review.pipeline.merge_configs", return_value=_MINIMAL_CONFIG),
+        patch("ci_article_review.adapters.citation.wayback.check", side_effect=check),
+        patch(
+            "ci_article_review.adapters.citation.wayback.submit", side_effect=submit
+        ) as mock_submit,
+        patch(
+            "ci_article_review.adapters.citation.wayback.capture_capacity",
+            return_value={"daily_exhausted": False, "available": None},
+        ),
+        patch(
+            "ci_article_review.adapters.citation.wayback.system_status",
+            return_value={"known": False},
+        ),
+        patch(
+            "ci_article_review.adapters.citation.resolver.classify_host",
+            return_value=HOST_PUBLIC,
+        ),
+    ):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pipeline.run_archive_only(draft_path, "myblog")
+    return mock_submit, buf.getvalue()
+
+
+# What spn-client's check() returns for a page whose newest capture is a revisit
+# record, as measured 2026-09-28 for one NHTSA PDF: the availability API only knew
+# the 2024 capture, and CDX supplied the 2026-09-27 revisit after verifying its
+# digest against a 200 capture.
+_REVISIT_PROMOTED = {
+    "archived": True,
+    "found_via": "cdx",
+    "snapshot_is_revisit": True,
+    "snapshot_url": "https://web.archive.org/web/20260927204213/https://a.example/doc.pdf",
+    "snapshot_ts": "20260927204213",
+    "snapshot_age_days": 6,
+    "snapshot_stale": False,
+    "snapshot_status": "200",
+    "snapshot_is_error_capture": False,
+}
+
+# What spn-client's submit() returns for a URL at its per-day capture cap.
+_CAP_REFUSAL = {
+    "url": "https://a.example/doc.pdf",
+    "submitted": False,
+    "job_id": None,
+    "archived": False,
+    "error": (
+        "This URL has been already captured 1 times today, which is a daily limit "
+        "we have set for that Resource type. Please try again tomorrow."
+    ),
+    "error_summary": (
+        "archive.org refused the request: This URL has been already captured 1 "
+        "times today, which is a daily limit we have set for that Resource type. "
+        "Please try again tomorrow."
+    ),
+    "error_code": "error:too-many-daily-captures",
+    "retry_category": "transient",
+}
+
+_ONE_PDF = "## Sources\n\n[1] A PDF. https://a.example/doc.pdf\n"
+
+
+class TestTheCdxSecondOpinion:
+    """The reason ``--archive-only`` asks for ``cdx_fallback``: an unchanged page
+    reads stale on every run through the availability API alone, so every run
+    re-submits it. content-intelligence#289."""
+
+    def test_every_lookup_asks_for_the_second_opinion(self, tmp_path):
+        draft = _write(
+            tmp_path,
+            "draft.md",
+            "## Sources\n\n[1] One. https://a.example/one\n\n"
+            "[2] Two. https://a.example/two\n",
+        )
+        mock_check, *_ = _run_archive_only(draft)
+
+        assert mock_check.call_count == 2
+        for call in mock_check.call_args_list:
+            assert call.kwargs == {"cdx_fallback": True}
+
+    def test_a_page_whose_newest_capture_is_a_revisit_is_not_resubmitted(
+        self, tmp_path
+    ):
+        draft = _write(tmp_path, "draft.md", _ONE_PDF)
+        mock_submit, out = _run_with_real_submit(
+            draft,
+            check=lambda url, **kw: dict(_REVISIT_PROMOTED),
+            submit=AssertionError("a fresh capture must not be re-requested"),
+        )
+
+        mock_submit.assert_not_called()
+        assert "20260927204213" in out
+        assert "a revisit record" in out
+        assert "STALE" not in out
+        assert "1 citation URL(s): 1 with a fresh Wayback snapshot" in out
+
+    def test_a_stale_page_with_nothing_newer_is_still_submitted(self, tmp_path):
+        """The fallback only ever promotes. A page CDX has nothing newer for keeps
+        its stale answer, and the submission pass still acts on it."""
+        stale = {
+            "archived": True,
+            "snapshot_url": "https://web.archive.org/web/20240812234508/https://a.example/doc.pdf",
+            "snapshot_ts": "20240812234508",
+            "snapshot_age_days": 777,
+            "snapshot_stale": True,
+        }
+        draft = _write(tmp_path, "draft.md", _ONE_PDF)
+        mock_submit, out = _run_with_real_submit(
+            draft,
+            check=lambda url, **kw: dict(stale),
+            submit=lambda url, **kw: {
+                "url": url,
+                "submitted": True,
+                "job_id": None,
+                "archived": True,
+                "snapshot_url": "https://web.archive.org/web/20261003120000/" + url,
+                "snapshot_ts": "20261003120000",
+                "snapshot_age_days": 0,
+                "snapshot_stale": False,
+            },
+        )
+
+        mock_submit.assert_called_once()
+        assert "20261003120000" in out
+
+    def test_a_failed_second_opinion_is_said_out_loud(self, tmp_path):
+        """Otherwise a CDX lookup that timed out reads exactly like a confirmed
+        absence."""
+        draft = _write(tmp_path, "draft.md", _ONE_PDF)
+        _, out = _run_with_real_submit(
+            draft,
+            check=lambda url, **kw: {
+                "archived": False,
+                "cdx_error": "archive.org did not answer within the timeout",
+            },
+            submit=lambda url, **kw: dict(_CAP_REFUSAL),
+        )
+
+        assert "Archive lookup note" in out
+        assert "archive.org did not answer within the timeout" in out
+        assert "does not prove the page is unarchived" in out
+
+
+class TestADailyCapRefusalIsNotCalledNotArchived:
+    """The consumer half of spn-client's refusal handling: the real submission
+    pass records the refusal's code and category, and the report says what is
+    actually known. The old wording said "It is NOT archived" for a URL archive.org
+    had just said it already captured today."""
+
+    def test_the_refusal_flows_from_submit_to_the_printed_line(self, tmp_path):
+        draft = _write(tmp_path, "draft.md", _ONE_PDF)
+        mock_submit, out = _run_with_real_submit(
+            draft,
+            check=lambda url, **kw: {"archived": False},
+            submit=lambda url, **kw: dict(_CAP_REFUSAL),
+        )
+
+        mock_submit.assert_called_once()
+        assert "NOT RE-SUBMITTED TODAY" in out
+        assert "already captured 1 times today" in out
+        assert "retry tomorrow" in out
+        assert "It is NOT archived" not in out
+        assert "SUBMISSION FAILED" not in out
+
+    def test_a_refusal_with_no_code_keeps_the_original_wording(self, tmp_path):
+        """A transport failure carries no archive.org code, so it has nothing to
+        key on and must read as it always did."""
+        draft = _write(tmp_path, "draft.md", _ONE_PDF)
+        _, out = _run_with_real_submit(
+            draft,
+            check=lambda url, **kw: {"archived": False},
+            submit=lambda url, **kw: {
+                "url": url,
+                "submitted": False,
+                "job_id": None,
+                "error": "connection refused",
+                "error_summary": "could not reach archive.org when asked to capture",
+            },
+        )
+
+        assert "SUBMISSION FAILED" in out
+        assert "It is NOT archived. Archive it by hand, or re-run." in out
+        assert "NOT RE-SUBMITTED TODAY" not in out
+
+
+class TestInstalledSpnClientHasWhatArchiveOnlyCalls:
+    """Every other test here stubs ``wayback.check``, so none of them can notice
+    an installed spn-client that predates what ``run_archive_only`` calls: the
+    CLI would raise ``TypeError`` on its first lookup while the suite stayed
+    green. This is the one test that looks at the real signature, so it is what
+    holds the dependency pin in ``pyproject.toml`` to a release that has them."""
+
+    def test_check_accepts_cdx_fallback(self):
+        import inspect
+
+        from ci_article_review.adapters.citation import wayback
+
+        assert "cdx_fallback" in inspect.signature(wayback.check).parameters, (
+            "run_archive_only calls wayback.check(url, cdx_fallback=True); raise "
+            "the spn-client pin in packages/ci-article-review/pyproject.toml to "
+            "the release that added it"
+        )
+
+    def test_submit_reports_a_refusal_code_and_category(self):
+        from ci_article_review.adapters.citation import wayback
+
+        for key in ("error_code", "retry_category"):
+            assert key in wayback.SubmitResult.__annotations__, (
+                f"_record_submission reads {key!r} from wayback.submit(); raise "
+                "the spn-client pin to the release that returns it"
+            )
