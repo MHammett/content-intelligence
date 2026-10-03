@@ -63,6 +63,18 @@ def _watch(reader, reads):
 
 
 @pytest.fixture(autouse=True)
+def history_root_env_unset(monkeypatch):
+    """No test inherits the developer's ``CI_HISTORY_ROOT``.
+
+    The variable moves every run's history to one shared directory, which is
+    the point of it and exactly what a test must not do: a developer who has it
+    set would otherwise have the suite read, and write, their real store. A test
+    about the override sets it itself, after this has run.
+    """
+    monkeypatch.delenv("CI_HISTORY_ROOT", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def cwd_history_reads(monkeypatch):
     """The lookups this test makes in the working directory's ``pipeline_history/``.
 

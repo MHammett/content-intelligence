@@ -276,7 +276,7 @@ def build_checksum_index(history_root=None):
     would report every previously-cited source as changed. See ``_check_drift``.
     """
     if history_root is None:
-        history_root = history_analytics.HISTORY_ROOT
+        history_root = history_analytics.resolve_history_root()
 
     index = {}
     for entry in history_analytics.load_reports(history_root):
@@ -1437,7 +1437,7 @@ def build_pending_capture_index(history_root=None):
     question.
     """
     if history_root is None:
-        history_root = history_analytics.HISTORY_ROOT
+        history_root = history_analytics.resolve_history_root()
 
     index = {}
     for entry in history_analytics.load_reports(history_root):

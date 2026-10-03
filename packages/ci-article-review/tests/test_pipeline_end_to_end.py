@@ -2023,3 +2023,61 @@ class TestAReportSaysWhetherItsLinksWereChecked:
         pre = json.loads(path.read_text(encoding="utf-8"))["pre_analysis"]
         assert pre["links"] is None
         assert pre["links_skipped_reason"] == "offline"
+
+
+class TestHistoryRootOverride:
+    """``CI_HISTORY_ROOT`` reaches every place a run writes or looks.
+
+    ``_stubbed_run`` points ``pipeline.HISTORY_ROOT`` at ``<tmp_path>/history``,
+    so a run that ignored the variable would leave its files there, and every
+    test below asserts that directory stayed empty. Issue #266: with a
+    per-checkout history, removing a worktree deleted the runs made in it.
+    """
+
+    def _shared(self, tmp_path, monkeypatch):
+        shared = tmp_path / "shared"
+        monkeypatch.setenv("CI_HISTORY_ROOT", str(shared))
+        return shared
+
+    def test_a_run_saves_under_the_override(self, tmp_path, monkeypatch):
+        shared = self._shared(tmp_path, monkeypatch)
+
+        with _stubbed_run(tmp_path / "run", offline=True):
+            pass
+
+        assert len(list(shared.rglob("run_*_report.json"))) == 1
+        assert len(list(shared.rglob("run_*_results.json"))) == 1
+        assert not (tmp_path / "run" / "history").exists()
+
+    def test_the_second_run_finds_the_first_there(self, tmp_path, monkeypatch):
+        """Renumbering and the delta baseline both read the override too."""
+        shared = self._shared(tmp_path, monkeypatch)
+
+        with _stubbed_run(tmp_path / "one", offline=True):
+            pass
+        with _stubbed_run(tmp_path / "two", offline=True):
+            pass
+
+        reports = sorted(
+            p.name.split("_")[1] for p in shared.rglob("run_*_report.json")
+        )
+        assert reports == ["1", "2"]
+        assert not (tmp_path / "one" / "history").exists()
+        assert not (tmp_path / "two" / "history").exists()
+
+    def test_a_replay_lands_in_the_override_s_replay_tree(self, tmp_path, monkeypatch):
+        with _stubbed_run(tmp_path / "original", offline=True):
+            pass
+        capture = next((tmp_path / "original" / "history").rglob("*_results.json"))
+
+        shared = self._shared(tmp_path, monkeypatch)
+        with _stubbed_run(
+            tmp_path / "replay", offline=True, replay_results=str(capture)
+        ):
+            pass
+
+        saved = list((shared / "_replay").rglob("run_*_report.json"))
+        assert len(saved) == 1
+        assert not (tmp_path / "replay" / "history").exists()
+        # Quarantined like any replay: nothing at the article's own level.
+        assert not [p for p in shared.glob("*/run_*_report.json")]

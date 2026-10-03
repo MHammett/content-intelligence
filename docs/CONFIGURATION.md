@@ -1670,6 +1670,32 @@ Set it once, when you start the piece, and leave it alone however much the headl
 
 ---
 
+## History location
+
+Run history is written to `pipeline_history/` under the **working directory**, so each git checkout, and each worktree, has its own. Removing a worktree deletes its git-ignored files, and its runs go with it (issue #266).
+
+Set `CI_HISTORY_ROOT` to point every checkout at one directory:
+
+```powershell
+# Windows, for your user (new shells pick it up)
+setx CI_HISTORY_ROOT "C:\Users\you\ci-history"
+```
+
+```bash
+# bash/zsh: put it in your profile
+export CI_HISTORY_ROOT="$HOME/ci-history"
+```
+
+- **Unset or blank, nothing changes:** history stays in `pipeline_history/` under the working directory.
+- **What it moves:** everything `pipeline_history/` holds, for `ci-review` (saved runs, the daily `pipeline_<date>.log`, the `_replay/` tree that `--replay` writes, and the prior-run and archive lookups that a draft run and `--archive-only` make) and for the readers `ci-history-report` and `ci-voice-patterns`. A leading `~` is expanded; a relative path is relative to the working directory, as the default is. When it is set, the run's log starts with a `History root:` line saying where history went.
+- **Readers keep their flag.** `--history-root DIR` on `ci-history-report` and `ci-voice-patterns` still wins over the variable. `ci-review` has no such flag; for a one-off, set the variable for the one command.
+- **`--replay <capture>` and `--retry-failed <capture>` take a path you give them**, so they are not moved: pass the capture's real location, which is now under the shared directory.
+- **Why a variable and not a `user.yaml` key:** `configs/` is git-ignored and per checkout too, so a key there would have to be copied into every new worktree, and `main()` opens the history directory (for its log file) before it loads any config. The variable is shared by every checkout and read first.
+- **Moving history you already have:** copy each checkout's `pipeline_history/` into the new directory without overwriting, as described in [Replaying a run, and where run history lives](REPLAY-AND-HISTORY.md#where-a-runs-output-lives). `run_N` is per article key, and two worktrees can have written the same `run_N`.
+- **Sharing has a cost:** the run number and the delta baseline are read from the shared directory, so two sessions reviewing the same article at the same moment can pick the same `run_N`. Nothing is overwritten (file names carry a timestamp), but the numbers are not guaranteed unique.
+
+---
+
 ## URL input mode
 
 Instead of a local handoff document, you can point the pipeline at an already
