@@ -23,7 +23,7 @@ from unittest.mock import patch
 
 import pytest
 import requests
-from PIL import ExifTags, Image
+from PIL import ExifTags, Image, ImageCms, features
 from PIL.TiffImagePlugin import IFDRational
 
 from ci_article_review import handoff_parser
@@ -1722,6 +1722,116 @@ class TestSameNameDifferentFolders:
         assert [u["name"] for u in fake.uploads] == ["shot.jpg", "shot.jpg"]
         assert [_pixels(u["bytes"])[1] for u in fake.uploads] == [(24, 16), (32, 8)]
         assert all(read_exif(u["bytes"]) == (set(), set()) for u in fake.uploads)
+
+
+# ---------------------------------------------------------------------------
+# AVIF and HEIC (#299)
+#
+# Two formats that were uploaded untouched after #288. They end up in opposite
+# places, and the line between them is not "can it be stripped" but "can it be
+# read": Pillow opens an AVIF, so it is stripped like the other four; nothing
+# here opens a HEIC, so there is no informed choice to offer and it is refused
+# rather than uploaded blind.
+# ---------------------------------------------------------------------------
+
+#: An ISO-BMFF ftyp box declaring a HEIC brand. Enough to be the file a draft
+#: names and nothing more: every assertion below is about a file that is refused
+#: or passed through untouched, so none of them decodes it.
+HEIC = (
+    b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1"
+    + b"\x00\x00\x00\x08mdat"
+    + b"\x00" * 64
+)
+
+avif_only = pytest.mark.skipif(
+    not features.check("avif"),
+    reason="this Pillow build has no AVIF codec (its wheels cover every platform "
+    "here, but not Windows ARM64 or iOS)",
+)
+
+
+@avif_only
+class TestAvifIsStripped:
+    def test_its_gps_block_does_not_reach_the_upload(self, tmp_path):
+        raw = phone_photo(fmt="AVIF")
+        assert read_exif(raw)[1]  # the fixture really has a GPS block
+        result, fake = _push(tmp_path, "# T\n\n![A](a.avif)\n", files={"a.avif": raw})
+        assert result["success"] is True
+        sent = fake.uploads[0]["bytes"]
+        assert read_exif(sent) == (set(), set())
+        assert b"ACME" not in sent and b"Phone X" not in sent
+        assert result["images_stripped"] == 1
+
+    def test_a_rotated_one_is_rotated_in_the_pixels(self, tmp_path):
+        raw = phone_photo(fmt="AVIF", orientation=6, size=(24, 16))
+        _, fake = _push(tmp_path, "# T\n\n![A](a.avif)\n", files={"a.avif": raw})
+        fmt, size, _ = _pixels(fake.uploads[0]["bytes"])
+        assert (fmt, size) == ("AVIF", (16, 24))
+
+    def test_the_icc_profile_survives(self, tmp_path):
+        icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        raw = phone_photo(fmt="AVIF", icc_profile=icc)
+        _, fake = _push(tmp_path, "# T\n\n![A](a.avif)\n", files={"a.avif": raw})
+        with Image.open(io.BytesIO(fake.uploads[0]["bytes"])) as im:
+            assert im.info.get("icc_profile") == icc
+
+    def test_the_listing_says_what_it_carried(self, tmp_path, capsys):
+        (tmp_path / "a.avif").write_bytes(phone_photo(fmt="AVIF"))
+        wp.print_image_plan(wp.plan_images("# T\n\n![A](a.avif)\n", tmp_path))
+        out = capsys.readouterr().out
+        assert "GPS location" in out and "stripped before upload" in out
+
+
+class TestHeicIsRefused:
+    """Not stripped and not sent. #288's own failure was uploading the format an
+    iPhone writes by default without being able to say what was in it."""
+
+    @pytest.mark.parametrize("name", ["shot.heic", "shot.heif", "SHOT.HEIC"])
+    def test_it_stops_the_publish_before_anything_is_sent(self, tmp_path, name):
+        result, fake = _push(tmp_path, f"# T\n\n![S]({name})\n", files={name: HEIC})
+        assert result["success"] is False
+        assert fake.requests == []  # not one request, let alone an upload
+        assert "Export it as a JPEG" in result["error"]
+        assert "--keep-image-metadata" in result["error"]
+
+    def test_the_reason_says_why_rather_than_that_it_is_broken(self, tmp_path):
+        """It is a sound file. Saying "cannot be opened as an image" -- what the
+        unreadable path would say -- would send the author looking for damage."""
+        (tmp_path / "s.heic").write_bytes(HEIC)
+        plan = wp.plan_images("# T\n\n![S](s.heic)\n", tmp_path)
+        (problem,) = plan.problems
+        assert "no lossless way to re-save one" in problem
+        assert "do not display a .heic" in problem
+        assert "cannot be opened as an image" not in problem
+
+    def test_the_opt_out_uploads_it_byte_for_byte_and_says_what_is_unknown(
+        self, tmp_path, capsys
+    ):
+        (tmp_path / "s.heic").write_bytes(HEIC)
+        plan = wp.plan_images("# T\n\n![S](s.heic)\n", tmp_path, strip_metadata=False)
+        assert plan.problems == []
+        wp.print_image_plan(plan)
+        printed = capsys.readouterr().out
+        assert "NOT stripped, and NOT readable either (.heic)" in printed
+        assert "assume it records WHERE IT WAS TAKEN" in printed
+        result, fake = _push(
+            tmp_path,
+            "# T\n\n![S](s.heic)\n",
+            files={"s.heic": HEIC},
+            strip_image_metadata=False,
+        )
+        assert result["success"] is True
+        assert fake.uploads[0]["bytes"] == HEIC
+        assert fake.uploads[0]["mime"] == "image/heic"
+        assert result["images_stripped"] == 0
+
+    def test_pillow_still_cannot_open_one(self):
+        """The premise of the refusal. If a Pillow release (or a plugin arriving
+        through another dependency) starts opening these, the refusal is no
+        longer the honest answer and #299 is worth reopening."""
+        with pytest.raises(Exception):
+            Image.open(io.BytesIO(HEIC)).load()
+        assert ".heic" not in Image.registered_extensions()
 
 
 TEMPLATE = Path(handoff_parser.__file__).parent / "handoff_templates" / "publication.md"

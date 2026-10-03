@@ -59,13 +59,19 @@ If a file is missing or is not an image, or an image is inside a sentence or a
 list, publishing stops before anything is sent and names the image. Uploaded
 files are public as soon as they are uploaded, even though the post stays a draft.
 
-A JPEG, PNG or WebP is uploaded as a scrubbed copy: the EXIF a camera writes --
-the GPS position, the device make and model, the capture time -- is removed, the
-orientation is applied to the pixels so the photo is not sideways, and the ICC
-colour profile is kept. The file on your disk is not changed. The IMAGES list
-before the checklist says what each file carried and what happened to it.
-Other types (.heic, .tif, .gif, .avif, .svg) are uploaded as they are, and an
-image of one of those that records a location is called out in that list.
+A JPEG, PNG, WebP or AVIF is uploaded as a scrubbed copy: the EXIF a camera
+writes -- the GPS position, the device make and model, the capture time -- is
+removed, the orientation is applied to the pixels so the photo is not sideways,
+and the ICC colour profile is kept. The file on your disk is not changed. The
+IMAGES list before the checklist says what each file carried and what happened
+to it. A .tif, .gif, .bmp or .svg is uploaded as it is, and one that records a
+location is called out in that list.
+
+A .heic or .heif stops the publish: its metadata cannot be removed and cannot
+even be read, so there is no way to tell you what is in it. Export it as a JPEG
+and point this at that file -- which it needs anyway, since Chrome, Firefox and
+Edge do not display a .heic at all. (If you took the photo on an iPhone, this is
+the format it used unless you changed the setting.)
 
 Stripping metadata does not make a photo anonymous. A photo of a screen can show
 a location in plain text that no metadata strip touches: a navigation unit's

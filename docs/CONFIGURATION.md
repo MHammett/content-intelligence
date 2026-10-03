@@ -1444,7 +1444,7 @@ not checked.
 position it was taken at, the device make and model, the capture time. A
 media-library file is public from the moment it is uploaded, so uploading the
 original would publish all of that before anyone had chosen to publish the post.
-A `.jpg`, `.jpeg`, `.png` or `.webp` therefore goes up as a scrubbed copy — EXIF,
+A `.jpg`, `.jpeg`, `.png`, `.webp` or `.avif` therefore goes up as a scrubbed copy — EXIF,
 XMP, IPTC and any embedded comment removed, the EXIF orientation applied to the
 pixels so a rotated photo is not sideways, the ICC colour profile kept because it
 describes colour and not a person. **The file on your disk is never modified.**
@@ -1454,11 +1454,28 @@ it keeps the quality level it already had. A lossless WebP stays lossless; a los
 one is re-saved at quality 95, which can make the file bigger, because nothing in
 the format records what quality it was written at. PNG is lossless either way.
 
-Any other type — `.heic`, `.heif`, `.tif`, `.tiff`, `.gif`, `.avif`, `.bmp`,
-`.svg` — is uploaded as it is, and so is an animation (APNG, animated WebP),
-because re-encoding one would mean rebuilding every frame's timing. When a file in
-that group records a location, the `IMAGES` list says so before the checklist asks
-for a yes.
+A lossy AVIF is re-saved at 95 like a lossy WebP, for the same reason: it has no
+working lossless re-save either.
+
+`.tif`, `.tiff`, `.gif`, `.bmp` and `.svg` are uploaded as they are, and so is an
+animation (APNG, animated WebP), because re-encoding one would mean rebuilding
+every frame's timing. When a file in that group records a location, the `IMAGES`
+list says so before the checklist asks for a yes — a TIFF cannot be stripped, but
+its EXIF can be *read*, so you choose with the facts in front of you.
+
+**`.heic` and `.heif` are refused** while stripping is on, and the publish stops
+before anything is sent. They are the one case where neither half works: nothing
+here can open one, so what it carries cannot even be reported, and there is no
+lossless way to re-save one — at a quality that does not visibly degrade the photo
+the result is *larger than a JPEG of the same picture*, which is not a strip but a
+bad conversion. Since this is also the format an iPhone writes by default, and the
+one most likely to carry a GPS position, uploading it blind is exactly the failure
+this section exists to prevent.
+
+The fix the error names is to export a JPEG, which the photo needed regardless:
+HEVC is patent-encumbered, so Safari displays a `.heic` and Chrome, Firefox and
+Edge do not. `--keep-image-metadata` still uploads one as it is, with a warning
+saying to assume it records where it was taken.
 
 `--keep-image-metadata` turns the stripping off and uploads every file exactly as
 it is. If a file of a stripped type cannot be opened as an image at all, the
