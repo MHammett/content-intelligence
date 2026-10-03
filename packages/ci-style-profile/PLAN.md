@@ -442,10 +442,19 @@ Mirrors the pipeline's `configs/presets.yaml` pattern. A preset bundles corpus b
 | Preset | style_mode | max_input_chars | max_styles | synthesis_models | detection_models | reasoning | Approx cost |
 |--------|-----------|-----------------|------------|------------------|------------------|-----------|-------------|
 | `economy` | canonical | 40,000 | — | `[claude]` only | — | low | ~$0.01–$0.05 |
-| `standard` | detect | 80,000 | 3 | `[claude, openai]` | `[claude]` | default | ~$0.10–$0.30 |
-| `balanced` | detect | 120,000 | 5 | all configured | style-weighted | default | ~$0.50–$1.50 |
+| `standard` | detect | 80,000 | 3 | `[claude, openai]` | `[claude]` | none | ~$0.10–$0.30 |
+| `balanced` | detect | 120,000 | 5 | all configured | style-weighted | low | ~$0.50–$1.50 |
 | `thorough` | detect | 160,000 | 7 | all configured | style-weighted | medium | ~$1.50–$3.00 |
 | `maximum` | detect | 200,000 | 10 | all configured | `"*"` (all) | high | ~$3.00–$8.00 |
+
+The `reasoning` column is the claude `effort` each tier states, and every tier
+states one or means none by it. No cell says "default": an unset effort is not
+a rung between `low` and `medium`, which is how this table used to read it.
+claude-sonnet-5 and claude-opus-5 think at `high` with no effort set, so the
+blank `balanced` carried ran it above `thorough` and level with `maximum`
+(#268). `standard` is `none` rather than blank-as-default because its model,
+haiku 4.5, does not think unless asked -- for it the blank really is none, and
+that `economy` below it does ask is issue #291.
 
 **`economy`** — single-model canonical synthesis on a small corpus sample. No detection pass, no ensemble voting. Useful for a quick sanity check on a new corpus before investing in a full run.
 
