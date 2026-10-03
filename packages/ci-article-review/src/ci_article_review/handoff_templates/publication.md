@@ -57,7 +57,21 @@ as an escape, so C:\photos\_map.png reaches the script as C:\photos_map.png.
 Wrap a path that has spaces in angle brackets: ![alt](<my photo.png>)
 If a file is missing or is not an image, or an image is inside a sentence or a
 list, publishing stops before anything is sent and names the image. Uploaded
-files are public as soon as they are uploaded, even though the post stays a draft.]
+files are public as soon as they are uploaded, even though the post stays a draft.
+
+A JPEG, PNG or WebP is uploaded as a scrubbed copy: the EXIF a camera writes --
+the GPS position, the device make and model, the capture time -- is removed, the
+orientation is applied to the pixels so the photo is not sideways, and the ICC
+colour profile is kept. The file on your disk is not changed. The IMAGES list
+before the checklist says what each file carried and what happened to it.
+Other types (.heic, .tif, .gif, .avif, .svg) are uploaded as they are, and an
+image of one of those that records a location is called out in that list.
+
+Stripping metadata does not make a photo anonymous. A photo of a screen can show
+a location in plain text that no metadata strip touches: a navigation unit's
+coordinates, a map, a monitoring dashboard, a terminal with a hostname, a
+visible street sign or door number. Open each photo at full size and read what
+is actually in the frame before you publish it.]
 
 DISPOSITION LOG
 Consensus flags addressed: [count]
