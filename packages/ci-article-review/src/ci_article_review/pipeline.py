@@ -66,6 +66,7 @@ from .handoff_parser import (
     build_handoff_from_raw_draft_and_metadata,
 )
 from . import history as hist
+from .history_analytics import resolve_history_root
 from . import consolidation
 from . import handoff_gaps
 from . import reproducibility
@@ -100,6 +101,18 @@ from .adapters.citation.disposition import disposition as citation_disposition
 log = logging.getLogger("pipeline")
 
 HISTORY_ROOT = "pipeline_history"
+
+
+def _history_root():
+    """Where this run reads and writes history: ``$CI_HISTORY_ROOT``, else ``HISTORY_ROOT``.
+
+    Every reader and writer in this module goes through here, not through the
+    constant, so one variable moves the daily log, the saved runs, the
+    ``_replay/`` tree and the archive lookups together. ``HISTORY_ROOT`` stays the
+    default (and what the tests patch); see ``history_analytics.resolve_history_root``.
+    """
+    return resolve_history_root(HISTORY_ROOT)
+
 
 # Module-level prompt cache — files are read once per process lifetime.
 _PROMPT_CACHE: dict[str, str] = {}
@@ -2843,7 +2856,7 @@ def run_draft_pipeline(
     # obviously the later one. Trust the handoff unless history already has that
     # number, and say so rather than silently renumbering.
     run_number = handoff.get("run_number", 1)
-    _existing = hist.existing_run_numbers(HISTORY_ROOT, _history_key(handoff))
+    _existing = hist.existing_run_numbers(_history_root(), _history_key(handoff))
     if run_number in _existing:
         _next = max(_existing) + 1
         log.warning(
@@ -3291,7 +3304,7 @@ def run_draft_pipeline(
     # models be told which passages were already flagged and survived a
     # revision — otherwise run 20 of an article opens exactly as cold as run 1.
     prior_report, prior_report_path = hist.load_prior_report(
-        HISTORY_ROOT, _history_key(handoff), before_ts=run_start_ts
+        _history_root(), _history_key(handoff), before_ts=run_start_ts
     )
 
     # Everything the pipeline measured before this point, handed to the models
@@ -3731,7 +3744,7 @@ def run_draft_pipeline(
     # its own findings and report near-perfect reproduction, which is the one
     # number this whole feature exists to stop the report from implying.
     history_root = (
-        str(Path(HISTORY_ROOT) / "_replay") if replay_results else HISTORY_ROOT
+        str(Path(_history_root()) / "_replay") if replay_results else _history_root()
     )
 
     # Measure this run against every earlier run of the same draft under the
@@ -3808,7 +3821,7 @@ def run_draft_pipeline(
             citation_sources,
             api_keys,
             verification_call_log=api_call_log,
-            history_root=HISTORY_ROOT,
+            history_root=_history_root(),
             # Who "I" is. A first-person claim cannot be checked against a page
             # without it. Told nothing, the verifier bound "I" to the first
             # person it found and offered a stranger's family as evidence; told
@@ -3892,7 +3905,7 @@ def run_draft_pipeline(
                         citation_sources,
                         api_keys,
                         verification_call_log=api_call_log,
-                        history_root=HISTORY_ROOT,
+                        history_root=_history_root(),
                         author=citation_author,
                         capture_settings=pipeline_cfg.get("wayback_capture"),
                     )
@@ -5064,7 +5077,7 @@ def _print_draft_summary(
     if markdown_path:
         report_dir = Path(markdown_path).parent
     else:
-        report_dir = Path(HISTORY_ROOT) / hist._slug(report.get("article_title", ""))
+        report_dir = Path(_history_root()) / hist._slug(report.get("article_title", ""))
     print(f"\nFull report: {report_dir}")
     if markdown_path:
         print(f"Readable review (paste into chat): {markdown_path}")
@@ -5464,7 +5477,7 @@ def run_archive_only(
     from .adapters.citation.resolver import _submit_missing_archives
 
     _submit_missing_archives(
-        results, api_keys.get("archive_org"), HISTORY_ROOT, capture_settings
+        results, api_keys.get("archive_org"), _history_root(), capture_settings
     )
 
     from .report_markdown import _render_archive_pair
@@ -5735,7 +5748,7 @@ def main():
     )
     # Also write all log output to a persistent file so warnings aren't lost on scroll.
     # Daily rotation: one file per UTC day; same-day runs append to the same file.
-    _log_dir = Path(HISTORY_ROOT)
+    _log_dir = Path(_history_root())
     _log_dir.mkdir(parents=True, exist_ok=True)
     _log_date = datetime.now(timezone.utc).strftime("%Y%m%d")
     _file_handler = logging.FileHandler(
@@ -5749,6 +5762,8 @@ def main():
         )
     )
     logging.getLogger().addHandler(_file_handler)
+    if _log_dir != Path(HISTORY_ROOT):
+        log.info("History root: %s (from $CI_HISTORY_ROOT)", _log_dir)
 
     try:
         validate_publication_name(args.publication)
