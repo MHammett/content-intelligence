@@ -53,6 +53,9 @@ PUB_HEADERS = [
     "PUBLICATION PARAMETERS",
     "SEO METADATA",
     "EMBEDS AND SPECIAL ELEMENTS",
+    # A note about FINAL DRAFT, not data: nothing reads it. It is listed so the
+    # section above it ends where it does, and does not carry the note along.
+    "IMAGES AND ALT TEXT",
     "DISPOSITION LOG",
     "FINAL DRAFT",
 ]

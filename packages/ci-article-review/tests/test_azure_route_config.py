@@ -285,7 +285,7 @@ class TestEveryPresetKeepsTheAzureRoute:
             + "pipeline:\n  cost_preset: maximum\n"
         )
         openai = merge_configs(_load(config_dir, text), {})["models"]["openai"]
-        assert openai["model"] == "gpt-5.6-sol"
+        assert openai["model"] == "gpt-6.1-sol"
 
 
 class TestAnAzureUserYamlReachesAzure:

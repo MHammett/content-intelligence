@@ -12,7 +12,7 @@ Three more are provider/model reference data rather than review settings, so the
 - `model_registry.yaml` — model deprecation tracking; edit to add superseded entries and bump the date
 - `timeouts.yaml` — sliding-scale timeout model (size × model × effort multipliers)
 
-The first two are gitignored and have example templates you copy (`user.example.yaml`, `publication.example.yaml`, plus worked examples in `configs/examples/`). The rest are committed defaults — they ship with the repo and *are* their own reference; edit them in place, no copy step.
+The first two are gitignored and have example templates you copy (`user.example.yaml`, `publication.example.yaml`, plus worked examples in `examples/`). Those templates ship inside the package, under `packages/ci-article-review/src/ci_article_review/configs/` — a checkout has no `configs/` at all until `uv run ci-setup` creates one. The rest are committed defaults — they ship with the repo and *are* their own reference; edit them in place, no copy step.
 
 ---
 
@@ -42,7 +42,7 @@ cp packages/ci-article-review/src/ci_article_review/configs/user.example.yaml co
 cp packages/ci-article-review/src/ci_article_review/configs/publication.example.yaml configs/your_publication_name.yaml
 ```
 
-The `.gitignore` excludes `configs/user.yaml` and all `configs/*.yaml` files that aren't examples or committed defaults. Your keys will not be committed.
+The `.gitignore` excludes the whole `configs/` directory — everything in it, at any depth, not just the `*.yaml` at its top level. Nothing under it is tracked, so your keys will not be committed, and neither will a backup copy you leave beside them.
 
 ---
 
@@ -203,9 +203,9 @@ The stall detector is enforced outside the socket, because iterating a stream bl
 
 **Measuring them.** Every `[CALIBRATION]` log line ends with `first_byte=` and `max_gap=`: the longest the call went without receiving anything before real output began, and after — the numbers `stream_read_timeout` and `stream_gap_timeout` have to exceed. Both budgets restart on every chunk, so every chunk ends a silence, but only real output (the stall detector's own test) moves a stream from the first phase to the second. There is one value per stream, oldest first, so a call whose first attempt stalled shows two. A stream cut short in a phase can only give a lower bound for it, written `>120.02s`; `-` means the phase never began. The report's `api_call_log` has the same values under `stream_timing`, with the budgets in force and `first_output_s` (request to first real output). Do not size either knob from a single-call run: stalls track concurrency, and an isolated call reproduces the healthy case by construction — see the CONCURRENCY note in `presets.yaml`.
 
-**Caveat found in production:** the 120s default read gap assumed only *grounded* (search) calls have a long silent period before the first token. In practice, `high`/`xhigh` reasoning effort also produces a long silent stretch — the model "thinks" with zero bytes on the wire, not even a keep-alive — before it starts streaming visible output. Observed directly: `gpt-5.5` at `xhigh` failed 5/5 calls at ~121s with 0 output tokens against the 120s default. The presets ship a `stream_read_timeout` override wherever a model has needed one: 200s for Mistral at `high` (`thorough` and `maximum`), 260s for Gemini at `maximum`, where grounding and a thinking budget stack (below), and 500s for Grok at `thorough` and `maximum`, where 28 measured streams put nine silences past the 120s default — worst 354.1s — every one of which then completed. OpenAI needs none, because its Responses API streams reasoning summaries through the silent phase, and Perplexity's Agent API reports each step of its search, so it runs on the grounded 160s default (the notes in `presets.yaml` have the measurements). If you define a custom preset or override `reasoning_effort` to `high`/`xhigh` on a provider the built-in presets don't cover, set `stream_read_timeout` yourself — don't rely on the 120s default.
+**Caveat found in production:** the 120s default read gap assumed only *grounded* (search) calls have a long silent period before the first token. In practice, `high`/`xhigh` reasoning effort also produces a long silent stretch — the model "thinks" with zero bytes on the wire, not even a keep-alive — before it starts streaming visible output. Observed directly: `gpt-5.5` at `xhigh` failed 5/5 calls at ~121s with 0 output tokens against the 120s default. The presets ship a `stream_read_timeout` override wherever a model has needed one: 200s for Mistral at `high` (`thorough` and `maximum`), 260s for Gemini at `maximum`, where grounding and extended thinking stack (below), and 500s for Grok at `thorough` and `maximum`, where 28 measured streams put nine silences past the 120s default — worst 354.1s — every one of which then completed. OpenAI needs none, because its Responses API streams reasoning summaries through the silent phase, and Perplexity's Agent API reports each step of its search, so it runs on the grounded 160s default (the notes in `presets.yaml` have the measurements). If you define a custom preset or override `reasoning_effort` to `high`/`xhigh` on a provider the built-in presets don't cover, set `stream_read_timeout` yourself — don't rely on the 120s default.
 
-The two silent-period causes **stack** when a model does both at once. The `maximum` preset's Gemini entry sets `thinking_budget: 16000` on top of the model's default 160s grounded read gap; a live Vertex AI run timed out at 205.78s (search + extended thinking, both silent, ahead of the 160s default). Gemini's `maximum` entry now carries its own `stream_read_timeout: 260` for this reason — grounding and reasoning-effort overrides aren't mutually exclusive, so check whether both apply when tuning a custom config.
+The two silent-period causes **stack** when a model does both at once. The `maximum` preset's Gemini entry used to be gemini-2.5-pro with `thinking_budget: 16000`, on top of the model's default 160s grounded read gap; a live Vertex AI run timed out at 205.78s (search + extended thinking, both silent, ahead of the 160s default). The entry carried its own `stream_read_timeout: 260` for this reason, and the gemini-3.5-flash entry that replaced it (`thinking_level: high`) keeps it. On a 9,456-character draft its worst first byte was 24s and its longest call 135s, so 260 has room there; a long draft is unmeasured. Grounding and reasoning-effort overrides aren't mutually exclusive, so check whether both apply when tuning a custom config.
 
 #### Wall-clock backstop is automatic (sliding scale)
 
@@ -1100,6 +1100,8 @@ ensemble:
   grounding_bonus: 1.5       # multiplier when a fact_check call actually consulted live sources
 ```
 
+For Gemini, "consulted live sources" means Google listed sources **or** listed any search query. Google names sources only when it chooses to: on 2026-09-28 a `gemini-3.5-flash` fact-check on Vertex AI ran 21 searches, cited an article dated after the model's training, and came back with no source list at all, so it was reported as ungrounded until the flag followed the search.
+
 **Measured 2026-09-05 — what these weights actually change.** Re-scoring 12 captured ensembles with the default table against a flat 1.0 for every model produced **identical Section 1 membership in all 12**, while changing the *order* in 10 of them. The same held for `grounding_bonus` at 1.5 versus 1.0: no membership change.
 
 The reason is that `consensus_threshold: 2.0` sits below the point where weights discriminate. Two models at 1.0 already reach exactly 2.0, so any passage with two distinct voters clears the bar whatever the weights say, and a bonus can only move something already over the line further over it. Sweeping the threshold, output was identical at 1.0, 1.5 and 2.0, and only began to cut at 2.5.
@@ -1363,6 +1365,73 @@ seo_rules:
 
 ---
 
+### Images in the FINAL DRAFT
+
+Write each image as ordinary Markdown, alone on its own line, with a blank line
+above and below:
+
+```markdown
+![Grid load by county, August peak](images/grid-load.png "Figure 1: Grid load by county")
+```
+
+| Part | What it does |
+|---|---|
+| Alt text, in the square brackets | What a screen reader reads in place of the image. It is set on the image block **and** on the media-library item. An empty one is allowed (a purely decorative image), and is listed before the confirmation prompt so it is a choice rather than an oversight. |
+| Source, in the parentheses | A path to a file on disk, or an `http(s)` URL. |
+| Caption, the optional quoted text after the source | Shown under the image. Markdown calls it the title. Plain text only; leave it out for no caption. |
+
+A **file on disk** is uploaded to the WordPress media library when you publish,
+and the post gets a native Image block that points at the attachment, so the
+block editor's replace, resize and alt-text controls work on it. The path is
+relative to the directory of the handoff file you pass to `--publish`, wherever
+you run the command from, or absolute. Use forward slashes on Windows
+(`C:/photos/grid-load.png`): Markdown reads a backslash as an escape, so
+`C:\photos\_grid.png` reaches the script as `C:\photos_grid.png`. A path with
+spaces is written `<my photo.png>` or `my%20photo.png`. WordPress decides which
+types it accepts (`.svg` needs a plugin); the script itself only checks that the
+extension is an image type, so a PDF is refused before anything is uploaded.
+
+An **`https://` URL** is for an image that is already hosted. The block points
+at it and nothing is uploaded. It is not in this site's media library, so it has
+no attachment, and its alt text lives on the block alone. Its reachability is
+not checked.
+
+**What stops a publish.** All of it is checked before the SEO suggestion call
+is paid for and before the checklist asks for a yes, everything wrong is
+reported at once, and each line names the image:
+
+- a file that is missing, is a folder, is not an image type, is empty or cannot
+  be read;
+- a local image inside a sentence, list, quote, table or link, which cannot
+  become an image block. Put it on a line of its own. (A URL image there is left
+  as it always was, since it still renders);
+- an image with no source, or one that is neither a path nor an `http(s)` URL
+  (`data:`, `file:`);
+- a local image in a draft whose HTML could not be parsed at all, which would
+  otherwise publish its path as if it were a URL.
+
+An upload WordPress refuses (credentials, file type, size) stops the publish
+too, and the post is not created. The error names the image, the HTTP status
+and WordPress's own reason, and says what to check.
+
+**What it does not do.** Uploaded files are public from the moment they are
+uploaded, even though the post stays a draft: WordPress serves media by URL.
+Nothing is deleted if a later step fails, so an image already uploaded stays in
+the media library, and the error lists which by ID. Nothing is remembered
+between runs: publishing the same handoff twice uploads its images twice, and
+WordPress names the second copy `grid-load-1.png`. Within one publish a file
+used twice is uploaded once. The uploads are made before the post exists, so the
+Media Library lists them as unattached; they are still the images the post uses. A linked image (`[![alt](x.png)](url)`), an
+alignment or a width is not supported; an attribute list such as
+`{: width=300 }` is dropped, with a warning.
+
+**What you see.** Before the checklist, an `IMAGES` list: each image's
+resolved path or link, its alt text and caption, and any image with no alt
+text. After the push, next to the post URL: how many were uploaded and how many
+linked, with the media IDs.
+
+---
+
 ### SEO suggestions
 
 The pre-analysis SEO pass reports what's missing. The suggestion pass proposes
@@ -1513,7 +1582,7 @@ wordpress:
   application_password: ${WP_APPLICATION_PASSWORD}
 ```
 
-See `configs/examples/` for complete worked examples.
+See `packages/ci-article-review/src/ci_article_review/configs/examples/` for complete worked examples.
 
 ---
 

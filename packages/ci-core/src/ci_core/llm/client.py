@@ -117,12 +117,14 @@ after real output began, each flagged when it is only a lower bound. See
 :class:`_StreamTiming`.
 """
 
+import json
 import logging
 import os
 import queue
 import re
 import threading
 import time
+from pathlib import Path
 
 import httpx
 
@@ -178,8 +180,44 @@ def _litellm():
 
                 _module.suppress_debug_info = True
                 _module.telemetry = False
+                _register_pending_models(_module)
                 _litellm_module = _module
     return _litellm_module
+
+
+_PENDING_MODELS = (
+    Path(__file__).parent.parent / "configs" / "litellm_pending_models.json"
+)
+
+
+def _register_pending_models(litellm):
+    """Tell litellm about models its main branch lists but its release does not.
+
+    litellm streams a ``responses()`` call natively only for a model its map
+    says streams, and cannot route a bare name the map does not list at all
+    (see :func:`_refuse_fake_stream`). The map it loads is the live one fetched
+    at import, or the copy bundled in the wheel when that 5s fetch fails. On
+    2026-09-30 the live map listed gpt-6-sol, gpt-6-luna and gpt-6.1-sol and
+    every released wheel did not: 1.96.2 (installed) bundles no gpt-6 model,
+    1.103.1 (latest) only gpt-6-astra, 1.104.0rc2 adds sol and luna. So a preset
+    naming them worked or was refused per process, on whether one GET succeeded.
+
+    The JSON file holds litellm's OWN entries for those models, copied verbatim
+    from BerriAI/litellm@b370996 ``model_prices_and_context_window.json`` — not
+    entries written here — so a model streams, routes and prices exactly as the
+    next release will have it. Registered only where the loaded map lacks the
+    key: a live map, or a later wheel, that already lists a model wins. Measured
+    on the wire under the bundled 1.96.2 map: ``gpt-6.1-sol`` was unroutable
+    before, and after went out with ``"stream": true`` and the effort it was
+    given, ``max`` included.
+
+    Delete this, and the file, once the pinned litellm bundles all four.
+    """
+    with open(_PENDING_MODELS, encoding="utf-8") as fh:
+        pending = json.load(fh)
+    missing = {k: v for k, v in pending.items() if k not in litellm.model_cost}
+    if missing:
+        litellm.register_model(missing)
 
 
 def __getattr__(name):
@@ -1771,7 +1809,9 @@ def _read_searches(provider, assembled, model=""):
       ``searches`` 0 and ``grounding_available`` False were right. The tool is
       optional per call, and the old adapter's ``grounding_available`` meant
       only "tool attached", so its 153 of 153 is no baseline for 0 of 37 since
-      the move to litellm.
+      the move to litellm. ``grounding_available`` follows this count as well
+      as the source list (``_extras_from``): on 2026-09-28 gemini-3.5-flash ran
+      21 searches and named no source at all.
     * perplexity, Sonar: 1. The fee is per request, and this response is one.
       Perplexity also prices it in ``usage.cost.request_cost``, but litellm does
       not carry that through a stream. sonar-deep-research is the exception:
@@ -2663,7 +2703,21 @@ def _attempt(
         extras = {}
         if provider == "gemini":
             extras["grounding_chunks"] = grounding
-            extras["grounding_available"] = bool(grounding)
+            # Sources OR a search, because Google names sources only when it
+            # chooses to. Measured 2026-09-28 (Vertex `us`, gemini-3.5-flash, the
+            # smoke draft's fact_check): 83 events, groundingMetadata on the last
+            # one alone, holding 21 webSearchQueries and a searchEntryPoint and no
+            # groundingChunks or groundingSupports anywhere in the stream, while
+            # the answer cited an article dated after the model's training.
+            # Reading the source list alone called that call ungrounded and cost
+            # it the fact-check bonus. This is the rule the branch below states,
+            # true when a search ran even if the provider named no sources.
+            # ``searches`` is Google's own query list, else litellm's count of
+            # them, which outlives the metadata drop of BerriAI/litellm#41492.
+            # 0 and None (unknown) stay False.
+            extras["grounding_available"] = bool(grounding) or bool(
+                assembled.get("searches")
+            )
         elif (
             provider == "perplexity"
             or citations

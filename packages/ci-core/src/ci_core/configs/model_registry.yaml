@@ -13,38 +13,47 @@ stale_notice_days: 60
 stale_warning_days: 120
 
 superseded:
-  # OpenAI
+  # OpenAI. gpt-6 (2026-09-22) and 6.1 Sol (2026-09-29) undercut the 5.6 tier
+  # each replaces, so these are straight upgrades: 6.1-sol costs 5.6-terra's
+  # input price with a lower output price, and less than 5.6-sol on both. There
+  # is no gpt-6 Terra, so Terra's slot goes to 6.1-sol too. Prices verified
+  # 2026-09-30; see pricing.yaml.
   gpt-4:
-    replacement: gpt-5.6-terra
-    note: "GPT-5.6 family available (2026-07-09)"
+    replacement: gpt-6.1-sol
   gpt-4-turbo:
-    replacement: gpt-5.6-terra
-    note: "GPT-5.6 family available (2026-07-09)"
+    replacement: gpt-6.1-sol
   gpt-4-turbo-preview:
-    replacement: gpt-5.6-terra
+    replacement: gpt-6.1-sol
   gpt-4o:
-    replacement: gpt-5.6-terra
-    note: "GPT-5.6 family available (2026-07-09)"
+    replacement: gpt-6.1-sol
   gpt-4o-mini:
-    replacement: gpt-5.6-luna
-    note: "GPT-5.6 family available (2026-07-09)"
+    replacement: gpt-6-luna
   gpt-3.5-turbo:
-    replacement: gpt-5.6-luna
+    replacement: gpt-6-luna
   o3:
-    replacement: gpt-5.6-sol
-    note: "gpt-5.6-sol with reasoning_effort: xhigh supersedes o3 at maximum preset"
+    replacement: gpt-6.1-sol
+    note: "gpt-6.1-sol with reasoning_effort: xhigh supersedes o3 at maximum preset"
   o4-mini:
-    replacement: gpt-5.6-terra
-    note: "gpt-5.6-terra with reasoning_effort supersedes o4-mini at balanced/thorough presets"
+    replacement: gpt-6.1-sol
+    note: "gpt-6.1-sol with reasoning_effort supersedes o4-mini at balanced/thorough presets"
   gpt-5.5:
-    replacement: gpt-5.6-sol
-    note: "gpt-5.6 family launched 2026-07-09 at matching price tiers"
+    replacement: gpt-6.1-sol
   gpt-5.4:
-    replacement: gpt-5.6-terra
-    note: "gpt-5.6 family launched 2026-07-09 at matching price tiers"
+    replacement: gpt-6.1-sol
   gpt-5.4-mini:
-    replacement: gpt-5.6-luna
-    note: "gpt-5.6 family launched 2026-07-09 at matching price tiers"
+    replacement: gpt-6-luna
+  gpt-5.6-sol:
+    replacement: gpt-6.1-sol
+    note: "gpt-6.1-sol (2026-09-29) is $2/$10 per MTok against 5.6-sol's $4/$20 promotional rate"
+  gpt-5.6-terra:
+    replacement: gpt-6.1-sol
+    note: "no gpt-6 Terra; gpt-6.1-sol is $2/$10 per MTok against 5.6-terra's $2/$12"
+  gpt-5.6-luna:
+    replacement: gpt-6-luna
+    note: "gpt-6-luna (2026-09-22) is $0.10/$0.50 per MTok against 5.6-luna's $0.20/$1.20"
+  gpt-6-sol:
+    replacement: gpt-6.1-sol
+    note: "gpt-6.1-sol (2026-09-29): same price, cheaper cache reads; OpenAI's default Sol"
 
   # Google Gemini. The 2.5 models are listed to retire on Vertex AI on 2026-10-20
   # (Google Cloud's "Model versions and lifecycle" page, read 2026-09-19), with 3.5
@@ -176,9 +185,16 @@ newer_available:
   # claude-opus-4-8) were removed rather than updated in place — both source models
   # are now fully superseded (see above) and no preset tier configures them anymore,
   # so they no longer belong in "still in use with an upgrade path".
-  gpt-5.6-luna:
-    newer: gpt-5.6-terra
-    note: "gpt-5.6-terra ($2.00/$12.00 MTok) available for heavier tasks; luna remains the right choice for fast/cheap everyday work"
+  gpt-6-luna:
+    newer: gpt-6.1-sol
+    note: "gpt-6.1-sol ($2.00/$10.00 MTok) available for heavier tasks; luna remains the right choice for fast/cheap everyday work"
+  # 2026-09-29: repointed from claude-sonnet-5 to claude-sonnet-5-5, which ships
+  # at the same $2.00/$10.00 and whose retirement floor is 15 months later
+  # (platform.claude.com/docs/en/about-claude/model-deprecations, read that
+  # day). The price in the note was still right, so nothing flagged the model id
+  # going a generation stale. The preset names were wrong too: `standard` was
+  # retired 2026-09-05, and `economy` disables claude entirely -- `wide` is the
+  # only tier that configures haiku.
   claude-haiku-4-5-20251001:
-    newer: claude-sonnet-5
-    note: "claude-sonnet-5 ($2.00/$10.00 MTok) available; haiku remains better value for economy/standard presets"
+    newer: claude-sonnet-5-5
+    note: "claude-sonnet-5-5 ($2.00/$10.00 MTok) available; haiku remains better value for `wide`, the only preset that runs it"

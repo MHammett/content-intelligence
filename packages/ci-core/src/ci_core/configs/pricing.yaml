@@ -27,8 +27,9 @@
 #
 # Last verified: OpenAI against developers.openai.com/api/docs/pricing 2026-09-17
 # (gpt-5.6 sol/terra/luna — sol's rate CHANGED, see its block below); Anthropic
-# against litellm's model_prices_and_context_window.json 2026-08-18 with
-# claude-opus-5's [5.00, 25.00] re-confirmed 2026-09-17; xAI against
+# against platform.claude.com/docs/en/about-claude/pricing 2026-09-29, the
+# vendor's own page rather than litellm's mirror (every claude row re-read:
+# six unchanged, three ADDED -- see its block below); xAI against
 # docs.x.ai/developers/pricing 2026-09-19 (every grok row; grok-4.6's cached
 # rate CHANGED, $0.20 to $0.50 — see its block below); Mistral against
 # Mistral's own model cards and pricing page 2026-09-18 (all three rows, and
@@ -91,6 +92,18 @@ unknown_price: [2.50, 10.00]   # fallback for unrecognized model IDs (conservati
 
 models:
   # ── OpenAI ──────────────────────────────────────────────────────────────────
+  # gpt-6: Astra 2026-09-03, Sol and Luna 2026-09-22, 6.1 Sol 2026-09-29. There
+  # is no gpt-6 Terra: 6-sol and 6.1-sol sit at 5.6-terra's input price with a
+  # lower output price, and 6-luna at half of 5.6-luna. Verified against
+  # developers.openai.com/api/docs/pricing and each model page 2026-09-30. Same
+  # tiering as below — cache writes 1.25x input, 2x input / 1.5x output past
+  # 272k prompt tokens, neither modelled. 6.1-sol's cache read is 5% of input,
+  # not 10%: the one rate that differs from 6-sol.
+  gpt-6-astra:           [10.00, 50.00, 1.00]
+  gpt-6.1-sol:           [2.00, 10.00,  0.10]
+  gpt-6-sol:             [2.00, 10.00,  0.20]
+  gpt-6-luna:            [0.10,  0.50,  0.01]
+  #
   # gpt-5.6 (Sol/Terra/Luna) launched 2026-07-09, replacing 5.5/5.4/5.4-mini at
   # matching price points; Terra and Luna then got price cuts on 2026-07-30
   # (20% and 80% respectively). Terra and Luna re-confirmed unchanged 2026-09-17.
@@ -368,11 +381,34 @@ models:
   # not work". That is the same blind-instrument failure that made the
   # pre-#103 OpenAI cache A/B worthless; see PLAN.md §5 decision 2.
   #
-  # Note the 0.1x multiplier is not universal: Claude Fable 5.1 reads at
-  # 0.025x ($0.25/MTok). Fable *5* — the row below — is a normal 0.1x model.
-  # Check the multiplier per model when adding a row, do not copy this block.
+  # THE 0.1x CACHE MULTIPLIER IS NOT UNIVERSAL. Anthropic's pricing page states
+  # it as "0.1x base input price (0.025x on Claude Fable 5.1 and Claude Mythos
+  # 5.1; 0.05x on Claude Opus 5.5)". Fable *5* and Opus *5* below are normal
+  # 0.1x models; their successors are not. Check the multiplier per model when
+  # adding a row, do not copy the row above it.
+  #
+  # claude-opus-5-5, claude-sonnet-5-5 and claude-fable-5-1 added 2026-09-29,
+  # VERIFIED that day on platform.claude.com/docs/en/about-claude/pricing
+  # ("Model pricing" plus the prompt-caching multiplier table), read twice in a
+  # real browser because that table is JS-rendered and a fetch-and-summarize
+  # reader mis-attributes its cells. All three are Active on
+  # .../about-claude/model-deprecations, with retirement floors of not sooner
+  # than 2027-09-22, 2027-09-28 and 2027-09-01 respectively.
+  #
+  # A ROW IS NEEDED EVEN WHERE THE PRICE IS UNCHANGED, because _lookup takes the
+  # longest matching PREFIX: "claude-opus-5-5" starts with "claude-opus-5", so
+  # until today it priced at opus-5's $5.00/$25.00/$0.50 and still reported
+  # pricing_known TRUE. That is 25% over its real $4.00/$20.00 - one 100k-in /
+  # 20k-out call read $1.00 against a true $0.80, with nothing in the report
+  # saying the rate was borrowed. claude-fable-5-1 borrowed fable-5's $1.00
+  # cached read, 4x its real $0.25. claude-sonnet-5-5 borrowed a rate that
+  # happens to be right, which is luck, not a reason to omit the row. Same
+  # failure gemini-3.5-flash-lite had; tests/test_cost.py now guards both.
+  claude-fable-5-1:             [10.00, 50.00,  0.25]   # verified 2026-09-29; 0.025x cache read
   claude-fable-5:               [10.00, 50.00,  1.00]
+  claude-opus-5-5:              [4.00,  20.00,  0.20]   # verified 2026-09-29; 0.05x cache read
   claude-opus-5:                [5.00,  25.00,  0.50]
+  claude-sonnet-5-5:            [2.00,  10.00,  0.20]   # verified 2026-09-29
   claude-sonnet-5:              [2.00,  10.00,  0.20]
   claude-opus-4-8:              [5.00,  25.00,  0.50]
   claude-sonnet-4-6:            [3.00,  15.00,  0.30]

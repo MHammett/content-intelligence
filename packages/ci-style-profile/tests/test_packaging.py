@@ -44,9 +44,11 @@ MODULE = "ci_style_profile"
 STATE_PREFIX = f"packages/{PACKAGE}/src/{MODULE}/"
 
 #: Files the package really ships, relative to ``src/ci_style_profile/``: a module,
-#: a prompt, and the presets bootstrap loads from ``configs/`` (the root .gitignore
-#: has an anchored ``configs/*.yaml`` that must not reach it). The build has to keep
-#: all three, or "nothing leaked" would also be true of an empty wheel.
+#: a prompt, and the presets bootstrap loads from ``configs/`` (the root .gitignore's
+#: ``/configs/`` must not reach it -- it is anchored for that reason, and unanchored
+#: it would empty this directory from the wheel and the sdist; #281 measured it, and
+#: ci-article-review's test_gitignore_configs.py holds the anchoring). The build has
+#: to keep all three, or "nothing leaked" would also be true of an empty wheel.
 SHIPPED = ("__init__.py", "prompts/detect_styles.txt", "configs/presets.yaml")
 
 

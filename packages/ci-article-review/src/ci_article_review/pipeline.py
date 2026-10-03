@@ -1320,6 +1320,7 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
             seen_keys.append(key)
             source_field = item.get(url_key, "") if url_key else ""
             known_urls = cited.candidates_for(claim, source_field)
+            anchored_this_claim = bool(known_urls)
             if known_urls:
                 anchored += 1
             # ``source_url`` is a dedicated field the prompt asks for outright;
@@ -1350,10 +1351,30 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
                 if extra not in known_urls:
                     known_urls = known_urls + [extra]
 
+            # Last of all, and only for a claim the draft's citation block could
+            # not place: a span it *nearly* matched, when that span beats its
+            # runner-up decisively. See ``fallback_candidates_for``.
+            #
+            # Appended behind everything above rather than returned by
+            # ``candidates_for``, which is the whole safety property: a weak
+            # match can never displace a source that would have resolved the
+            # claim, and is only fetched once every better candidate has already
+            # failed — i.e. only for claims that were going to be reported
+            # unsupported anyway.
+            weak_urls = []
+            if not anchored_this_claim:
+                for weak in cited.fallback_candidates_for(claim):
+                    if weak not in known_urls:
+                        known_urls = known_urls + [weak]
+                        weak_urls.append(weak)
+
             claims.append(
                 {
                     "claim": claim,
                     "known_urls": known_urls,
+                    # Which of those URLs got in only on a weak span match, so
+                    # a resolution that ends up resting on one can say so.
+                    "weak_source_urls": weak_urls,
                     "fact_check_bucket": bucket,
                     # Which model asserted this. `_build_fact_check` tags every
                     # merged item with it; it was being dropped here, which is
@@ -5256,9 +5277,20 @@ def run_publish_pipeline(
 
     from .adapters.cms import wordpress as wp
 
+    # Images are refused here with the other bad handoffs: before the SEO
+    # suggestion call is paid for, and before the checklist asks for a yes that
+    # would come to nothing. A relative path is relative to the handoff file, not
+    # to wherever this was run from, so the same handoff finds the same files.
+    image_base_dir = Path(handoff_path).resolve().parent
+    image_plan = wp.plan_images(pub_handoff["final_draft"], image_base_dir)
+    if image_plan.problems:
+        log.error(wp.describe_problems(image_plan))
+        sys.exit(1)
+
     if seo_suggestions is not False:
         _suggest_seo_for_publish(pub_handoff, pub_config, config["api_keys"])
 
+    wp.print_image_plan(image_plan)
     confirmed = wp.print_checklist_and_confirm()
     if not confirmed:
         sys.exit(0)
@@ -5304,7 +5336,12 @@ def run_publish_pipeline(
         "publish" if publish_live else "draft",
     )
     result = wp.push(
-        content, pub_params, wp_config, rank_math_config, publish_live=publish_live
+        content,
+        pub_params,
+        wp_config,
+        rank_math_config,
+        publish_live=publish_live,
+        image_base_dir=image_base_dir,
     )
 
     if result["success"]:
@@ -5312,6 +5349,7 @@ def run_publish_pipeline(
         print(f"Type:     {result.get('post_type', 'post')}")
         print(f"Post URL: {result['post_url']}")
         print(f"Post ID:  {result['post_id']}")
+        wp.print_image_result(result)
         if result.get("ignored_terms"):
             # A page cannot carry them. Said plainly, because the handoff named
             # them and the author would otherwise assume they applied.
