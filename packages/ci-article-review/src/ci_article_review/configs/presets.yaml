@@ -628,8 +628,14 @@ thorough:
                                # unmeasured, so it is not reached for here.
       # FIRST-BYTE, measured rather than guessed: stage 0 of the concurrency
       # experiment described at the top of this file (2026-09-18) ran 28 grok
-      # streams on a 28,746-char draft with 900s budgets, so no silence was cut
-      # off by a budget. Nine ran past the stock 120s default before any output
+      # streams on an 18,167-char draft with 900s budgets, so no silence was cut
+      # off by a budget. (This said 28,746 chars until 2026-10-04, which was the
+      # isolated claude test's draft, not this one. Checked against the five
+      # captures: corrected_draft is 18,167 chars in every one, and stage 0's
+      # README names gps-rollover-that-isnt.2026-09-17.pre-edit.md. The
+      # distinction matters because the paragraph below reasons about fan-out
+      # rather than length — a reader checking whether 500 generalises upward
+      # should know the draft was the SMALLER one.) Nine ran past the stock 120s default before any output
       # and every one of them then completed — slow, not dead. The worst was
       # 354.1s on argument_integrity, with red_team at 348.1s and fact_check at
       # 303.9s; voice_style and completeness never passed 76s. Under the default
