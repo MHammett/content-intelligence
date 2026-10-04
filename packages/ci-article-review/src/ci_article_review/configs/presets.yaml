@@ -254,17 +254,36 @@
 # wire, not even a keep-alive — while the model reasons before emitting visible
 # output. That is a first-byte problem, so it belongs to stream_read_timeout.
 #
-# ── CONCURRENCY IS THE AXIS, NOT DRAFT SIZE (measured 2026-09-09) ─────────────
+# ── DRAFT SIZE IS NOT THE AXIS; WHAT IS, IS PER-PROVIDER (2026-09-09..10-04) ──
 #
-# Two maximum-preset runs on an 18,167-char draft produced eight stalls across
-# three providers and BOTH phases. Run 1 lost grok:red_team outright (it stalled
-# twice, at 337.56s and 302.16s); run 2 stalled seven calls, all of which then
-# recovered:
+# This heading read "CONCURRENCY IS THE AXIS, NOT DRAFT SIZE" until 2026-10-04.
+# Half of it survived measurement and half did not: draft size is still the
+# wrong axis (see the next paragraph), but concurrency turned out NOT to be the
+# right one for the first provider actually measured. Stage 0 found grok's
+# silences tracked the DOMAIN, not fan-out — argument_integrity was silent for
+# 248s and 354s with nothing else in flight. Do not assume fan-out for the
+# providers still unmeasured; each one needs its own serial control, which is
+# what stage 0 earned the hard way.
 #
-#   provider / model     phase         elapsed when it gave up
-#   grok-4.6             first-byte    337.56s, 302.16s (run 1) · 314.10s (run 2)
-#   claude-opus-5        first-byte    253.31s, 343.85s
-#   gpt-5.6-sol          mid-stream    355.87s, 358.90s, 399.74s, 531.59s
+# Two 2026-09-09 runs on an 18,167-char draft produced eight stalls across three
+# providers and BOTH phases. They are often described here as two `maximum`
+# runs; they were not, checked against the saved reports 2026-10-04. Only
+# run_2_20260909_013901 was `maximum` (gpt-5.6-sol). run_1_20260909_012057 was
+# `thorough` (gpt-5.6-terra), and it is the one that lost grok:red_team
+# outright, so its two grok stalls are a 12-call fan-out, not a 29-call one:
+#
+#   provider / model     phase         elapsed when it gave up      preset
+#   grok-4.6             first-byte    337.56s, 302.16s             thorough
+#   grok-4.6             first-byte    314.10s                      maximum
+#   claude-opus-5        first-byte    253.31s, 343.85s              maximum
+#   gpt-5.6-sol          mid-stream    355.87s, 358.90s, 399.74s,
+#                                      531.59s                      maximum
+#
+# EVERY MODEL IN THAT TABLE BUT GROK HAS SINCE BEEN REPLACED. gpt-5.6-sol went
+# to gpt-6.1-sol (#286, 2026-10-03) and no preset runs any 5.6-era model, so the
+# mid-stream row is now a fact about a model this file cannot reach; see the
+# OpenAI paragraph below for what replaced it and what that measured. claude's
+# rows stand — `maximum` still runs claude-opus-5 at effort high.
 #
 # None of these was short of WALL-CLOCK budget. grok:red_team was killed with
 # 782.8s of its 1085s budget unspent — dead at 28% utilisation, 0 output tokens.
@@ -277,13 +296,19 @@
 # allowance would have been 120 x 0.8 = 96s, and every failure above would have
 # been killed EARLIER. The draft here was small; the failures were not.
 #
-# What they correlate with is FAN-OUT, and the repo already measured that axis:
-# see client.py's openai provider entry, 2026-08-16 — "gpt-5.5 at xhigh exceeds
-# 60s between reasoning-summary deltas when the pipeline runs six of them at
-# once (a single call shows a 1.3s worst gap; concurrency is what stretches
-# it)". maximum fans out to 29 in-flight ensemble calls, and run 2's recovery
-# pass re-ran 7 of them and got all 7 back. That is the same mechanism one tier
-# further along, not a new one.
+# FAN-OUT WAS THE HYPOTHESIS, and it is still the only one with a measurement
+# behind it on any provider: see client.py's openai provider entry, 2026-08-16 —
+# "gpt-5.5 at xhigh exceeds 60s between reasoning-summary deltas when the
+# pipeline runs six of them at once (a single call shows a 1.3s worst gap;
+# concurrency is what stretches it)". maximum fans out to 29 in-flight ensemble
+# calls, and the maximum run's recovery pass re-ran 7 of them and got all 7
+# back, which is what a load-dependent failure looks like.
+#
+# But that was gpt-5.5, and it is the ONLY provider for which concurrency was
+# ever shown to stretch a gap. When grok was finally measured on this axis
+# directly (stage 0, below), fan-out did nothing and the domain did everything.
+# So "29 calls at once" remains a plausible mechanism for openai and claude and
+# a refuted one for grok. Treat it as a hypothesis per provider, not a finding.
 #
 # CLAUDE ALSO HAD A CAUSE THAT IS NOT FAN-OUT (measured 2026-09-18). One
 # claude-opus-5 fact_check run entirely alone (--only-model claude
@@ -295,8 +320,14 @@
 # claude request thinks adaptively (see _provider_params). The same isolated
 # pass then ran as a single stream: first output at 252.15s, yet
 # first_byte=7.01s, max_gap=0.45s.
-# Fan-out may still lengthen claude's silences; that is unmeasured, and no
-# value in this file changed.
+#
+# Fan-out may still lengthen claude's silences. That is stage 2, it is still
+# unmeasured as of 2026-10-04, and no value in this file changed for it. It is
+# the only row of the stall table whose model still ships, so it is the one
+# genuinely open question here — and #287's `maximum` runs answer it, since
+# claude runs four of the 29 calls. Note what the fix already bought: the
+# "omitted" display meant every thinking phase was a silence at ANY fan-out, so
+# the two >120s stalls are not evidence for the concurrency hypothesis.
 #
 # CONSEQUENCE FOR CALIBRATION: measuring ONE call at a time (--only-model /
 # --only-domain / --no-timeout) is the correct method for the WALL-CLOCK cells
@@ -311,15 +342,53 @@
 # a stall written as a lower bound (`>120.02s`), never as the budget. The same
 # values, with the budgets in force, are in each report's
 # api_call_log[].stream_timing, including the streams of calls the recovery
-# pass later got back. Stage 0 of that experiment — grok alone — HAS been run
-# (2026-09-18, 28 streams, raw data in pipeline_history/_experiments/
-# 2026-09-18-stage0-grok-silences/), and grok's entries below are sized from it.
-# The other providers' stages have not, so nothing else here is set from a
-# measurement of these two knobs; the perplexity entry this file carried until
-# 2026-09-28 is the standing reminder of what guessing costs instead (160 -> 280
-# -> 350 -> 500, three bumps that each looked marginal within days). It went
-# because the model behind it did, not because the experiment ran; see the
-# Perplexity refresh note.
+# pass later got back. Recording is unconditional — client.py attaches
+# _stream_timing_field to every call result and pipeline.py copies it into the
+# api_call_log — so no flag or override is needed to collect it. Raising the
+# budgets (via pipeline.preset_overrides) only changes whether a long silence
+# is MEASURED or recorded as a lower bound.
+#
+# WHERE THE STAGES STAND, re-checked against the saved reports 2026-10-04:
+#
+#   stage 0  grok alone          DONE 2026-09-18. 28 streams. grok's entries
+#                                below are sized from it. Raw data in
+#                                pipeline_history/_experiments/
+#                                2026-09-18-stage0-grok-silences/ (self-
+#                                contained: README, analyze.py, consoles).
+#   stage 1  openai mid-stream   SUPERSEDED, then measured on the replacement.
+#                                See the OpenAI paragraph below.
+#   stage 2  claude first-byte   NOT RUN. The one row of the stall table whose
+#                                model still ships, and nothing else will
+#                                answer it.
+#   stage 3  the 29-call fan-out NOT RUN, and NOT RUNNABLE FROM WHAT IS ON
+#                                DISK: every full 29-call `maximum` run on
+#                                record (2026-09-09 x3, 2026-09-18 x1)
+#                                predates the stream_timing instrumentation
+#                                (#195) and carries none. Four 29-call
+#                                captures, zero timed streams. The widest
+#                                instrumented fan-out that exists is FIVE
+#                                calls — stage 0's grok-only runs and the
+#                                2026-10-04 openai-only runs below.
+#
+# DO NOT BUY STAGE 3 ON ITS OWN. Issue #287 already prices `maximum` x3 for the
+# GPT-6 reproducibility re-measure ($25-27, unbought as of 2026-10-04). Those
+# would be the first instrumented 29-call runs ever made, and because recording
+# is unconditional they answer stages 2 and 3 as a by-product, at no marginal
+# cost. The rider is on #287: copy each capture into the main checkout as it
+# lands and read its stream_timing. Buying a separate fan-out stage would pay
+# twice for the same 29 streams.
+#
+# At stock budgets a censored stream IS the finding: a lower bound appears only
+# where a budget actually bit. If #287's runs censor nothing, every value in
+# this file is adequate at the production condition and the answer for all six
+# providers is "measured, no change needed". If one provider censors, isolate
+# that provider alone with raised budgets — stage 0's method, about $0.6-2.8 a
+# run — and size it from what the silence really was.
+#
+# The perplexity entry this file carried until 2026-09-28 is the standing
+# reminder of what guessing costs instead (160 -> 280 -> 350 -> 500, three bumps
+# that each looked marginal within days). It went because the model behind it
+# did, not because the experiment ran; see the Perplexity refresh note.
 #
 # OpenAI: originally hit this hard — gpt-5.5 at xhigh failed 5/5 calls at ~121s
 # with 0 output tokens against the default 120s read-gap under Chat Completions,
@@ -328,9 +397,35 @@
 # enabled (ci_core/llm/adapters/openai.py): response.reasoning_summary_text.delta
 # events stream real bytes DURING the silent phase. Live-verified (2 xhigh
 # calls, no override, default 120s read-gap): reasoning-summary deltas start
-# ~2-6s in and recur throughout, with a worst observed gap of ~8s — no longer
-# anywhere near the 120s default, so no per-model override is needed for
-# openai here anymore.
+# ~2-6s in and recur throughout, with a worst observed gap of ~8s.
+#
+# That verification was gpt-5.5 at n=2, and it did NOT hold for gpt-5.6-sol: the
+# four mid-stream deaths in the table above are sol at 29-call fan-out. The
+# question is now moot for sol and reopened on its replacement, because #286
+# retired every 5.6-era model.
+#
+# MEASURED ON gpt-6.1-sol, 2026-10-04 (stage 1, on the model that now ships).
+# Three `maximum` openai-only runs on the 9,456-char smoke draft, five calls in
+# flight each, at reasoning_effort high / xhigh / max, --no-timeout, budgets
+# left at the stock 120/120 so anything approaching them would show:
+#
+#   15 streams, 15 ok, 0 retries, 0 discarded attempts, 0 censored values
+#   worst first_byte  16.4s   (vs the 120s allowance — 7.3x headroom)
+#   worst max_gap     21.2s   (vs the 120s gap      — 5.7x headroom)
+#   max_gap clusters at 14-21s on 13 of 15 streams: that is the
+#   reasoning-summary delta cadence, and it is nowhere near 120s.
+#
+# Captures: pipeline_history/short-example-smoke-test/run_3, run_4, run_5
+# (20261004). Longest calls were fact_check, grounded: 371s / 634s / 1352s at
+# high / xhigh / max. The 1352s one is a wall-clock problem, not a socket one,
+# and it belongs to issue #309 (no model_multipliers row has followed OpenAI
+# past gpt-5.5, so every current model silently takes the default 1.0).
+#
+# SO NO OVERRIDE IS SET FOR OPENAI, and now for a measured reason rather than an
+# unknown one. The caveat is honest and narrow: five calls in flight, not 29.
+# The 2026-08-16 gpt-5.5 result is precisely a case of concurrency stretching a
+# gap ~46x (1.3s single-call to over 60s at six), and 120/21.2 is only 5.7x, so
+# 29-call fan-out is not excluded by this. That is the stage-3 rider on #287.
 #
 # Mistral was NOT migrated (still Chat Completions, no reasoning-summary
 # equivalent available) and keeps its stopgap bump: mistral-medium-3-5 high
@@ -338,7 +433,10 @@
 # Worth revisiting: streaming.accumulate_chat_completions shows Mistral emits
 # typed {"type": "thinking"} chunks in delta.content, so it may already be
 # feeding the socket during reasoning and not need the override at all. Measure
-# with --no-timeout before removing it.
+# with --no-timeout before removing it — and that measurement is free on the
+# same #287 rider, since mistral runs five of the 29 calls. Removing a 200 that
+# nothing needs is worth the read: it is 80s of extra first-byte patience on a
+# provider that may already stream through its reasoning.
 #
 # Gemini thinking: each tier below states a `thinking_level`, and that is what
 # turns the thought summaries on. The old hand-written adapter sent
@@ -622,22 +720,29 @@ maximum:
     openai:
       model: gpt-6.1-sol   # was gpt-5.6-sol; see the GPT-6 refresh note above
       reasoning_effort: xhigh
-      # No stream_read_timeout override — and note that first-byte is NOT this
-      # tier's openai problem. The note above ("live-verified against xhigh,
-      # reasoning.summary deltas keep the socket active well inside the 120s
-      # default") was verified on gpt-5.5 with 2 calls and does NOT hold for
-      # gpt-5.6-sol under full fan-out: on 2026-09-09 four sol calls died
-      # "stream stalled MID-STREAM: nothing received for 120.0s" at 355.87s,
-      # 358.90s, 399.74s and 531.59s elapsed.
+      # MEASURED, NO CHANGE NEEDED — neither knob is overridden, and as of
+      # 2026-10-04 that is a measurement rather than an unknown.
       #
+      # History, because the shape of it matters: first-byte was never this
+      # tier's openai problem; MID-STREAM was. On 2026-09-09 four gpt-5.6-sol
+      # calls died "stream stalled MID-STREAM: nothing received for 120.0s" at
+      # 355.87s, 358.90s, 399.74s and 531.59s elapsed, at 29-call fan-out.
       # Mid-stream is stream_gap_timeout (120 for openai, set in client.py's
-      # provider table), NOT this knob. Raising stream_read_timeout would not
-      # have saved one of them. No value is set here because the correct one is
-      # not known — see the CONCURRENCY note at the top of this file. What is
-      # known is that the same run completed a sol call that ran 796.93s and
-      # emitted 42,016 tokens, so these are not slow-but-alive calls hitting a
-      # wall-clock limit; the wall-clock budget (1085s) was never the binding
-      # constraint on any of them.
+      # provider table), NOT stream_read_timeout; raising the read timeout would
+      # not have saved one of them. The same run completed a sol call that ran
+      # 796.93s and emitted 42,016 tokens, so these were not slow-but-alive
+      # calls hitting the 1085s wall-clock budget.
+      #
+      # sol is gone (#286) and its replacement was measured directly: three
+      # openai-only `maximum` runs on 2026-10-04, five calls in flight, at high
+      # / xhigh / max, stock 120/120 budgets. 15 streams, 0 censored, worst
+      # first_byte 16.4s and worst max_gap 21.2s — 7.3x and 5.7x headroom. The
+      # full table and its caveat (five concurrent, not 29) are in the OpenAI
+      # paragraph of the note at the top of this file.
+      #
+      # Leave both unset. If #287's 29-call runs censor an openai stream, the
+      # knob to raise is stream_gap_timeout, in client.py's provider table —
+      # not anything here.
     gemini:
       model: gemini-3.5-flash   # was gemini-2.5-pro + thinking_budget 16000; see the Gemini refresh note above
       thinking_level: high   # the deepest it goes, which is what the 16000 budget asked of 2.5 Pro
@@ -656,7 +761,12 @@ maximum:
                                   # for 3.5 Flash at `high` on 2026-09-27, all five domains of
                                   # a 9,456-char draft: worst first byte 24s, worst gap 0.9s
                                   # (the thought summaries stream), longest call 135s, so 260
-                                  # has room there. A long draft is unmeasured.
+                                  # has room there — 10.8x headroom on the measured worst case.
+                                  # Unmeasured on a long draft and at 29-call fan-out; both
+                                  # arrive free on the #287 rider (its runs use v26, ~135K
+                                  # chars, which is the long-draft case). Read before cutting
+                                  # this: 260 is inherited from 2.5 Pro, which timed out at
+                                  # 205.78s, and 3.5 Flash has not been shown to need it.
     mistral:
       model: mistral-medium-3-5
       reasoning_effort: high
@@ -685,6 +795,20 @@ maximum:
     claude:
       model: claude-opus-5   # was claude-opus-4-8; 2026-08-18 refresh, same price
       effort: high
+      # NOT MEASURED — this is stage 2, the one open question in this file. No
+      # override is set, so both knobs are at the default 120/120, and claude
+      # is the only provider in the 2026-09-09 stall table whose model still
+      # ships: two first-byte stalls at 253.31s and 343.85s under 29-call
+      # fan-out. Those are explained, though, and not by concurrency — opus-5's
+      # thinking display defaulted to "omitted", which put nothing on the wire
+      # while it thought at any fan-out. client.py now asks for "summarized"
+      # (#212, see _provider_params), and an isolated pass after the fix showed
+      # first_byte 7.01s against first output at 252.15s.
+      #
+      # So the live question is narrow: does 29-call fan-out stretch a 7s
+      # first-byte past 120s? Do NOT set a value from the pre-#212 numbers —
+      # they measure the bug, not the provider. #287's `maximum` runs settle it
+      # for free (claude runs 4 of the 29 calls); until then, unset is correct.
       web_search: [fact_check]   # Same check, same result. fact_check had two
                                   # grounded models out of six; this makes four.
                                   # Scoped to fact_check because every search
