@@ -779,15 +779,120 @@ class TestEveryGroundedPresetModelHasASearchFeeRow:
         )
 
     def test_the_guard_would_have_caught_the_gpt_6_miss(self):
-        """Red-proof: with only the gpt-5 row, a gpt-6 model resolves to None."""
+        """Red-proof by RUNNING the guard, so its failure message runs too.
+
+        See the matching test on the model_multipliers guard below for why this
+        drives the real method instead of re-deriving the comparison: a guard
+        whose message never executes can hold an error that only surfaces when
+        it fires.
+        """
         from ci_core.llm import cost
 
         assert cost.known_search_fee("gpt-6.1-sol") == (10.00, "call")
+
         saved = dict(cost._SEARCH_FEES)
         try:
             cost._SEARCH_FEES.pop("gpt-6", None)
             assert cost.known_search_fee("gpt-6.1-sol") is None
+            with pytest.raises(AssertionError) as caught:
+                self.test_each_grounded_providers_preset_models_resolve_to_a_fee_row()
         finally:
             cost._SEARCH_FEES.clear()
             cost._SEARCH_FEES.update(saved)
+
+        message = str(caught.value)
+        assert "gpt-6.1-sol" in message and "gpt-6-luna" in message
+        assert "$0.00" in message, "says what goes wrong, not just that it did"
         assert cost.known_search_fee("gpt-6.1-sol") == (10.00, "call")
+        self.test_each_grounded_providers_preset_models_resolve_to_a_fee_row()
+
+
+class TestEveryPresetModelResolvesATimeoutMultiplier:
+    """A model move must not leave its ``model_multipliers`` row behind either.
+
+    Same defect as the ``search_fees`` guard above, found the same way (#309):
+    ``timeouts.yaml`` had rows for ``gpt-5.4`` and ``gpt-5.5`` and none for
+    ``gpt-5.6`` or ``gpt-6``, and ``_model_mult`` prefix-matches, so every current
+    OpenAI model silently took ``default: 1.0`` instead of the 1.3 the file's own
+    calibration derived -- a 23% smaller budget on every cell the task ceiling does
+    not already clamp. Nothing failed and nothing warned.
+
+    This asserts a preset model resolves to a NAMED row, not merely to some value:
+    ``default`` exists, so a missing row is silent by construction. A family that
+    should take the default goes in TAKES_DEFAULT_DELIBERATELY with its reason, so
+    adding one is a decision someone wrote down.
+    """
+
+    # Claude has no row and never has. Whether that is right is open in #309; it is
+    # listed here so the guard reports the real state instead of failing on it.
+    TAKES_DEFAULT_DELIBERATELY = ("claude-",)
+
+    def _preset_models(self):
+        import ci_style_profile
+
+        import ci_article_review
+
+        out = set()
+        for pkg in (ci_article_review, ci_style_profile):
+            configs = os.path.join(os.path.dirname(pkg.__file__), "configs")
+            with open(os.path.join(configs, "presets.yaml"), encoding="utf-8") as f:
+                presets = yaml.safe_load(f) or {}
+            for tier, body in presets.items():
+                for provider, cfg in ((body or {}).get("models") or {}).items():
+                    model = (cfg or {}).get("model")
+                    if model:
+                        out.add((pkg.__name__, tier, provider, model))
+        return out
+
+    def test_each_preset_model_matches_a_named_multiplier_row(self):
+        from ci_core.llm.timeout_model import _CONFIG
+
+        table = _CONFIG["model_multipliers"]
+        named = [k for k in table if k != "default"]
+        missing = []
+        for pkg, tier, provider, model in sorted(self._preset_models()):
+            if model.startswith(self.TAKES_DEFAULT_DELIBERATELY):
+                continue
+            candidates = (model, f"{provider}/{model}")
+            if not any(c.startswith(k) for k in named for c in candidates):
+                missing.append(f"{pkg} {tier}: {provider} -> {model}")
+        assert not missing, (
+            "named in presets.yaml with no timeouts.yaml model_multipliers row, so it "
+            "silently takes default and its timeout budget is whatever default "
+            "happens to be:\n"
+            + "\n".join(f"  {m}" for m in missing)
+            + "\nAdd a row with a measured value, or list the family in "
+            "TAKES_DEFAULT_DELIBERATELY with the reason."
+        )
+
+    def test_the_guard_would_have_caught_the_gpt_6_miss(self):
+        """Red-proof by RUNNING the guard, not by re-deriving its logic.
+
+        Calling the real method with the row removed is what exercises the
+        failure branch, including the message. A first cut of this test
+        re-implemented the comparison inline and passed while the assert
+        message held an undefined name -- the guard would have raised
+        NameError instead of naming the offenders, in exactly the situation
+        it exists for. Only ruff caught it. Drive the real thing.
+        """
+        from ci_core.llm.timeout_model import _CONFIG, _model_mult
+
+        table = _CONFIG["model_multipliers"]
+        assert _model_mult("gpt-6.1-sol", table) == 1.3
+
+        saved = dict(table)
+        try:
+            table.pop("gpt-6", None)
+            assert _model_mult("gpt-6.1-sol", table) == 1.0  # silently the default
+            with pytest.raises(AssertionError) as caught:
+                self.test_each_preset_model_matches_a_named_multiplier_row()
+        finally:
+            table.clear()
+            table.update(saved)
+
+        message = str(caught.value)
+        assert "gpt-6.1-sol" in message and "gpt-6-luna" in message
+        assert "ci_style_profile" in message, "both packages' presets are swept"
+        assert "TAKES_DEFAULT_DELIBERATELY" in message, "says how to resolve it"
+        # Restored, and the guard is green again.
+        self.test_each_preset_model_matches_a_named_multiplier_row()
