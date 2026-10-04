@@ -50,6 +50,80 @@ The suite runs under pytest-socket (`--disable-socket --allow-hosts=127.0.0.1,::
 - **Test a guard in its own scenario.** A warning added at the end of `_submit_missing_archives` for a tripped rate-limit breaker was unreachable in exactly that case: the breaker makes lookups return `archived: None`, the pass selects on `archived is False`, the target list is empty, and the function returns a hundred lines before the warning. Ten tests passed because they called the function with a target already in hand. After adding a guard, trace the state its triggering scenario produces and confirm it reaches the new line, write the test from the scenario and not from the function signature, and negative-control it against the old placement.
 - **After rebasing a fix for a *class* of bug, grep the merged file for the pattern**, not only for conflict markers. 45 commits landed under one such fix, three of them added new instances of the bug (`(x or {}).get(...)` guards `None` but not a string), and the auto-merge was clean. Re-run the whole suite.
 
+## Verifying a publish without the live site
+
+`--replay` verifies the review pipeline for free (`docs/REPLAY-AND-HISTORY.md`), and
+cannot touch `--publish` at all: that path POSTs to a real site, every upload is
+public the moment it lands, and a test post has to be cleaned up by hand. So the one
+part of the pipeline with irreversible side effects was the one part nobody
+rehearsed. `tools/` holds what closed that gap.
+
+**`tools/publish_rehearsal.py` runs the real CLI with every socket blocked.**
+Argument parsing, config loading, the handoff parser, `run_publish_pipeline`,
+`wp.push`, the block conversion — all of it, against the suite's own `FakeWordPress`
+(imported from `packages/ci-article-review/tests/`, deliberately: a second fake of
+the same API would be a second thing to keep true). `socket.connect` and
+`socket.create_connection` are replaced with something that raises, as a tripwire
+rather than a courtesy — a new code path that reaches the network fails loudly
+instead of quietly publishing. `--wp-user`/`--wp-password` are forced to dummy
+values, which beat the config file in this project's credential precedence, so the
+real ones are never read. Flags after a bare `--` are forwarded, which is how to
+rehearse `--publish-live` or `--keep-image-metadata`.
+
+```bash
+uv run python tools/publish_rehearsal.py handoff.md --publication mikehammett \
+    --config-dir ../../configs -- --keep-image-metadata
+```
+
+Use it before committing any change to handoff parsing, `run_publish_pipeline` or
+`adapters/cms/`. It found the old parser sending "Schema type: AboutPage" to Rank
+Math as the Facebook and Twitter descriptions (PR #194); unit tests pinned that
+afterwards, but this is what found it.
+
+**`tools/image_metadata.py` reads an image with exifread, not Pillow.** The
+uploader's strip is built on Pillow, so checking it with Pillow would be Pillow
+agreeing with itself. `make` writes a photo carrying an 11-tag GPS block, make,
+model, software, an artist, a body serial number, a capture time, EXIF orientation
+6 and a real sRGB ICC profile; `report` prints what a file holds, including the
+JPEG APPn/COM segments walked straight off the bytes, and diffs two files when
+given two. Orientation 6 matters: dropping the tag without turning the pixels is
+how a stripped phone photo ends up on its side.
+
+```bash
+uv run python tools/image_metadata.py make /tmp/photo.jpg
+uv run python tools/publish_rehearsal.py ... --out-dir /tmp
+uv run python tools/image_metadata.py report /tmp/photo.jpg /tmp/rehearsal-upload-photo.jpg
+```
+
+**`tools/media_exif_audit.py` reports what is already public.** GETs only; it
+issues no DELETE, because a media DELETE without `force` is refused here (`501
+rest_trash_not_supported`, no `MEDIA_TRASH`) and `force=true` is permanent, so
+removal is a person's decision under Media > Library. Two traps it exists to
+avoid: `media_details.image_meta` holds **no GPS fields at all**
+(`wp_read_image_metadata` keeps aperture, camera and `created_timestamp`), so each
+file's own bytes have to be fetched; and WordPress serves a `-scaled` copy of
+anything over `big_image_size_threshold` (2560px) regenerated *without* EXIF while
+the untouched original stays public under `media_details.original_image` — so an
+audit that reads only `source_url` reports a clean library that is not clean.
+
+**Two things a rehearsal handoff needs.** A real `Article:` line: since PR #215
+`--publish` exits 1 when the title is missing, blank or a bracketed placeholder,
+before the SEO call and before the checklist, so a handoff without one never
+reaches the part being rehearsed. An unfilled `Post type:` is the opposite — it
+fails inside `wp.push`, after both — so a placeholder there exercises more of the
+path, not less.
+
+**To see whether the publish-time SEO backstop fires, without paying for a model
+call,** drop `--no-seo-suggestions` from the forwarded flags and patch
+`pipeline.seo_suggest.generate` to record its arguments and return `(None, None)`.
+That is how the bracketed-placeholder handling in PR #210 was checked.
+
+A rehearsal is not a live run. It proves this project's side of the conversation —
+what would have been sent, and in what order — and nothing about what WordPress
+does with it. Do one live run after the rehearsal is clean, upload as few files as
+the cases need, name them so they can be found, and expect the attachments to
+survive it.
+
 ## Dependencies and packaging
 
 - **`uv lock --upgrade-package X` can fork the lock.** When X's new release raises a shared dependency's floor, uv can keep the old locked version of that dependency in one Python fork and settle X at an older release there, leaving two versions of each and rewriting about twenty unrelated entries. Dry-run first: `uv lock --upgrade-package X --dry-run` prints `Update X v1 -> v2, v3`, and **two versions after the arrow means a fork**. Name the dependency too (`--upgrade-package X --upgrade-package <dep>`), which gave one version of each and a 7-line diff in the case that taught this. To compare options without disturbing a suite running in your worktree, lock a scratch copy.

@@ -61,6 +61,13 @@ dev = [
     # socket guard blocks the network. The floor is the release the hatchling
     # behaviour that test depends on was verified against (2026-09-19).
     "hatchling>=1.32.3",
+    # tools/image_metadata.py and tools/media_exif_audit.py read image metadata
+    # with it. A second reader on purpose: the uploader's strip
+    # (packages/ci-article-review/src/ci_article_review/adapters/cms/images.py)
+    # is built on Pillow, so checking it with Pillow would be Pillow agreeing
+    # with itself. exifread is pure Python, reads JPEG, PNG, WebP, HEIC and
+    # AVIF, and shares no code with it. Dev-only: nothing shipped imports it.
+    "exifread>=3.0,<4",
 ]
 
 [tool.uv.sources]
