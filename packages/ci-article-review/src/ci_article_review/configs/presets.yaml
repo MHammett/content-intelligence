@@ -82,10 +82,38 @@
 #
 # 6.1-sol over 6-sol: same price, cache reads at half (0.10), and OpenAI calls it
 # the default Sol. Efforts are unchanged; 6.1-sol takes low..max but not
-# `none`/`minimal`, which no tier sets. gpt-6-astra (10.00/50.00) is NOT used:
-# `maximum` gets 6.1-sol at xhigh, and whether Astra earns 5x that is a measured
-# question, not a price-tier one. The reproducibility table in CLAUDE.md was
-# measured on 5.6 and has not been re-measured since this change.
+# `none`/`minimal`, which no tier sets.
+#
+# gpt-6-astra (10.00/50.00) is NOT used, and that is now a DECISION, not a gap
+# (2026-10-03, issue #287). `maximum` keeps 6.1-sol at xhigh. The bar set when
+# this note was written was that only a measured repro or fact-check gain
+# justifies 5x; no such measurement was bought, so the bar is unmet and Astra
+# is not adopted. What IS measured is the price of asking: re-pricing the real
+# 2026-09-09 `maximum` capture of dc-environment-v26 call by call gives $7.79
+# on 6.1-sol against $13.96 on Astra, tokens only -- **+$6.17 a run, nearly 80%
+# of a whole `maximum` run, for one of six providers**. Against that, OpenAI
+# calls 6.1-sol "near-Astra", and `maximum` already buys only +13 points of
+# overall repro over `wide` at ~25x its cost, so the prior is against Astra
+# earning another 1.8x on top. To revisit: a full-ensemble 3-run study is
+# $44-45, or ~$12 for an openai-only head-to-head on `fact_check`, which is
+# where the 2026-09-08 study found nearly the entire quality gap lives.
+#
+# Astra at xhigh also carries a stall risk nothing has sized: `openai:fact_check`
+# on this draft already used 786s of its 1085s budget on 5.6-sol, and a retry
+# the provider bills without reporting usage prices at $0.00 (`uncosted_calls`),
+# so the $44-45 is a floor with a fatter tail than the figure suggests.
+#
+# The reproducibility table in CLAUDE.md was measured on 5.6 and has NOT been
+# re-measured since this change -- nor since gemini and perplexity moved in the
+# same week, so three of six models differ from what it describes. Still open
+# in #287, with the price on record there.
+#
+# And the COST side did not improve the way the price list implies: GPT-6 cuts
+# $1.81 of OpenAI tokens out of a `maximum` run on dc-environment-v26 ($9.60 ->
+# $7.79), but the same week moved gemini from $35/1k grounded prompts to $14/1k
+# search QUERIES on a model that searches far more, which gives most or all of
+# it back: ~$10.09 all-in before, ~$9.3-10.6 after. `maximum` did not get
+# cheaper -- its cost moved between providers. See PLAN.md 5.6.1.
 #
 # No shipped litellm wheel bundles gpt-6-sol, gpt-6-luna or gpt-6.1-sol yet, so
 # ci_core.llm.client registers litellm's own entries for them at import
@@ -540,10 +568,22 @@ thorough:
 #
 # † $10.27 was priced at a stale gpt-5.6-sol rate, corrected 2026-09-17. This
 #   average has not been re-derived, but a later single `maximum` run on the same
-#   draft comes to about $9.6 at current rates, which makes the multiple below
-#   about 25x rather than 27x. Only `maximum` runs sol -- `thorough`/`balanced`
-#   run terra, `wide` runs luna -- so the other three rows are unaffected and the
-#   comparison this table was built for still holds.
+#   draft comes to $9.60 at current rates (re-priced through ci_core.llm.cost
+#   2026-10-03), which makes the multiple below about 25x rather than 27x. Only
+#   `maximum` ran sol -- `thorough`/`balanced` ran terra, `wide` luna -- so the
+#   other three rows are unaffected and the comparison this table was built for
+#   still holds.
+#
+# THE REPRO COLUMNS ARE 5.6-ERA AND DESCRIBE A LINE-UP THAT NO LONGER SHIPS.
+#   Three of the six models moved in the week after: gemini-2.5-pro ->
+#   gemini-3.5-flash (#252), sonar-reasoning-pro -> sonar (#258), and every
+#   tier to GPT-6 (#286). reproducibility.py's ensemble_signature includes the
+#   model set, so nothing run today is comparable to these runs, and the 12
+#   captures behind them are gone (worktree-scoped pipeline_history/). Issue
+#   #287 holds the re-measure, unbought as of 2026-10-03: $6-7 for thorough x3,
+#   $25-27 for maximum x3, on dc-environment-v26. The COST column re-prices to
+#   $1.84 (thorough) and $7.79 (maximum) tokens-only under today's line-up --
+#   derived from the real captures, not measured.
 #
 # The sonnet-5 swap captures 84% of `maximum`'s overall reproducibility and 75% of
 # its fact-check reproducibility at 17% of the cost -- a far better marginal trade

@@ -32,10 +32,10 @@ This repo sees frequent concurrent PRs — a branch that opened cleanly can go `
 
 `configs/user.yaml` sets `cost_preset: maximum`, so a bare `ci-review` is the most expensive thing you can run. **Cost scales with draft size, so never quote it without one.** The old line here — "30 calls at $2.50–5.00" — was unsized, undercounted the calls, and used a stale price. Two `maximum` runs, both 2026-09-09, both re-costed 2026-09-17:
 
-| draft | API calls | reported then | **corrected** |
-|-------|----------:|--------------:|--------------:|
-| 18,167 chars (~2,900 words) | 100 | $7.37 | **$6.09** |
-| 135,514 chars (19,457 words) | 217 | $10.96 | **$9.56** |
+| draft | API calls | reported then | corrected (5.6) | **on GPT-6** |
+|-------|----------:|--------------:|----------------:|-------------:|
+| 18,167 chars (~2,900 words) | 100 | $7.37 | $6.16 | **$4.62** |
+| 135,514 chars (19,457 words) | 217 | $10.96 | $9.60 | **$7.79** |
 
 Three things to carry from that table:
 
@@ -43,7 +43,11 @@ Three things to carry from that table:
 - **Every figure is a floor, not a total.** Retried attempts that the provider billed while reporting zero usage are priced at $0.00 (`uncosted_calls` in `cost_summary`: 3 on the small run, 8 on the large). The report says so itself — "at least — 3 retried attempt(s) were billed by the provider with no usage reported". The true bill is above the corrected number by an unknown amount; closing that gap needs provider billing, not the call log.
 - **Cost is sub-linear in draft size.** 7.5x the characters cost 1.6x the money, because generation time tracks output length and output is bounded by what each domain prompt asks for — the same reason `configs/timeouts.yaml` uses a sub-linear size multiplier.
 
-Both corrected figures come from re-pricing `gpt-5.6-sol`, which sat at a stale pre-price-cut rate until 2026-09-17 (see its block in `configs/pricing.yaml`). **Only `maximum` uses sol** — `thorough`/`balanced` run terra, `wide`/`economy` run luna — so of the four measured rows in the table below, only the `maximum` one is overstated; that $10.27 average is uncorrected and its corrected value is near $9.56. Any other pre-2026-09-17 cost figure in this repo is high only if sol ran.
+The `corrected (5.6)` column re-prices `gpt-5.6-sol`, which sat at a stale pre-price-cut rate until 2026-09-17 (see its block in `configs/pricing.yaml`). Both figures in it are re-priced through `ci_core.llm.cost` on 2026-10-03 and differ slightly from the 2026-09-17 originals ($6.09 and $9.56); what moved in between is not fully accounted for — rolling the Mistral (#207/#216) and Perplexity (#235) rates back to their pre-correction values gives $9.17, not $9.56, so those corrections alone do not explain it, and it was not chased further at four cents. Use the re-priced figures: they come from today's table. The large run at **$9.60** is also what `presets.yaml` and `docs/CONFIGURATION.md` already said, against CLAUDE.md's $9.56; this file was the outlier. **Only `maximum` ran sol** — `thorough`/`balanced` ran terra, `wide`/`economy` luna — so any other pre-2026-09-17 cost figure in this repo is high only if sol ran.
+
+The **on GPT-6** column is what the same two captures cost under the line-up PR #286 and the late-September refreshes ship today — `gpt-6.1-sol`, `gemini-3.5-flash`, `sonar` — re-priced call by call from the real `api_call_log` of each run, tokens only. It is **derived, not measured**: no GPT-6 `maximum` run exists on either draft (issue MHammett/content-intelligence#287).
+
+**Do not read that column as a saving.** It is tokens only, and the same refresh that cut OpenAI's tokens moved Gemini onto per-query search billing. All-in on the large draft, same capture: **~$10.09** on the 5.6 line-up (tokens $9.60 + ~$0.49 search, where `gemini-2.5-pro` billed $35 per 1,000 *prompts* — 13 calls) against **~$9.3–10.6** on GPT-6 (tokens $7.79 + $1.5–2.8 search, where `gemini-3.5-flash` bills $14 per 1,000 *queries*). GPT-6 saved $1.81 in tokens and Gemini gave most or all of it back. The query count is the weak link: the only `maximum` figure on record is **103 queries / $1.44** on a 9,456-char draft (`docs/CONFIGURATION.md`, PR #252) and its capture is gone, so it is used here as a floor on a draft 14x larger. Gemini's first 5,000 queries a month are free and a run cannot see the month's count, so the real bill is below all of this by Gemini's share.
 
 That is the right preset for reviewing a real article and the wrong one for checking that your code works. With several sessions active at once, each verifying once, that default is the single largest avoidable cost in this repo.
 
@@ -95,16 +99,18 @@ EOF
 
 Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset on every axis, and cost less at that day's model line-up and prices — first measured at 55% of it, tokens only at that day's Mistral rates; re-priced, the saving is smaller and depends on what is counted, and on today's models it may be gone altogether, since `standard` never ran on `gemini-3.5-flash` (the note under `wide:` in `configs/presets.yaml` has the dated figures and that bound) — so `wide` is a sound working default and not a degraded one: the quality axes are what settle that, not the cost gap.
 
-Measured 2026-09-08 on a 19,457-word real article (dc-environment-v26), 3 isolated runs per condition, cross-run reproducibility scored against `wide` and `maximum` as anchors — the first measurement of anything above `wide`:
+**The reproducibility numbers below are 5.6-era and no longer describe what these presets run.** They were measured 2026-09-08 on a 19,457-word real article (dc-environment-v26), 3 isolated runs per condition, cross-run reproducibility scored against `wide` and `maximum` as anchors — the first measurement of anything above `wide`. Since then three of the six models in the ensemble changed: `gemini-2.5-pro` → `gemini-3.5-flash` (#252, 2026-09-27), `sonar-reasoning-pro` → `sonar` (#258, 2026-09-28), and every tier's OpenAI model to GPT-6 (#286, 2026-09-30). `reproducibility.py`'s own `ensemble_signature` includes the model set, so these runs are **not comparable** to anything run today — re-measuring is issue MHammett/content-intelligence#287, and the 12 run captures behind this table are gone (worktree-scoped `pipeline_history/`, deleted with the session).
 
-|            | cost (avg) | overall repro% | fact-check repro% |
-|------------|-----------:|----------------:|--------------------:|
-| `wide`     | $0.38      | 6.8%            | 0.0%                |
-| `balanced` | $1.28      | 6.4%            | 1.1%                |
-| `thorough` (claude-sonnet-5) | $1.74 | 16.9% | 22.1%      |
-| `maximum`  | $10.27 †   | 20.0%           | 29.6%               |
+|            | cost (avg), as measured | cost on GPT-6 ‡ | overall repro% | fact-check repro% |
+|------------|------------------------:|----------------:|----------------:|--------------------:|
+| `wide`     | $0.38      | $0.38–0.40 | 6.8%            | 0.0%                |
+| `balanced` | $1.28      | —          | 6.4%            | 1.1%                |
+| `thorough` (claude-sonnet-5) | $1.74 | $1.84 | 16.9% | 22.1%      |
+| `maximum`  | $10.27 †   | $7.79      | 20.0%           | 29.6%               |
 
-† Priced with the stale `gpt-5.6-sol` rate — see above; corrected it is near $9.56. The other three rows do not use sol and are unaffected, so the *ratios* this table was built to compare still hold; `maximum` is ~25x `wide`, not 27x.
+† Priced with the stale `gpt-5.6-sol` rate — see above; re-priced it is $9.60. The other three rows do not use sol and are unaffected, so the *ratios* this table was built to compare still hold; `maximum` is ~25x `wide`, not 27x.
+
+‡ Tokens only, **derived not measured**: real captures of this draft re-priced call by call under today's line-up (2026-10-03). `wide`'s is the one measured figure — three live runs, 2026-09-28, on the 9,456-char smoke test, not this draft. Add search fees on top: $0.45–0.9 at `thorough`, $1.5–2.8 at `maximum` — see the all-in paragraph above, which is why the `maximum` row is not the saving it looks like. `balanced` has no capture of this draft to re-price.
 
 Two conclusions came out of this and are now reflected in `configs/presets.yaml`:
 
