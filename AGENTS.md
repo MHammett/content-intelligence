@@ -14,6 +14,7 @@ Guidance for any coding agent or human contributor working in this repository. A
 | touching citations, archive lookups or link checks | [docs/CITATIONS.md](docs/CITATIONS.md) |
 | learning how the pipeline fits together | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | naming a package, module or concept | [docs/NAMING.md](docs/NAMING.md), [docs/TERMINOLOGY.md](docs/TERMINOLOGY.md) |
+| changing what a publish writes into WordPress (`adapters/cms/`, the block conversion) | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#checking-block-markup-in-the-real-editor) |
 
 ## Skills
 

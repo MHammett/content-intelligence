@@ -120,9 +120,98 @@ That is how the bracketed-placeholder handling in PR #210 was checked.
 
 A rehearsal is not a live run. It proves this project's side of the conversation —
 what would have been sent, and in what order — and nothing about what WordPress
-does with it. Do one live run after the rehearsal is clean, upload as few files as
+does with it, and that includes whether the block editor accepts the blocks (see
+"Checking block markup in the real editor", below). Do one live run after the
+rehearsal is clean, upload as few files as
 the cases need, name them so they can be found, and expect the attachments to
 survive it.
+
+## Checking block markup in the real editor
+
+A block that the REST API stored can still open in the editor as "Block contains
+unexpected or invalid content". The editor accepts a block only if its stored
+markup equals what that block's `save()` writes for the attributes in its
+delimiter comment. REST stores whatever it is sent and answers `200`, and the
+front end renders the markup fine, so a green publish, a rehearsal and a unit test
+written from the converter's own output all miss it. Issue #325 was a quote, a
+table, a code block and a separator, found by opening a pushed draft. Only an
+editor can say, so ask one.
+
+**What is checked in.** `packages/ci-article-review/tests/golden/wordpress_editor/`
+holds what a real editor wrote for each construct that `adapters/cms/blocks.py`
+emits (`blocks.json`), the script that captured it (`capture.js`), a document with
+one of every construct (`every_construct.md`) and a README saying how that capture
+was made. `test_wordpress_editor_blocks.py` holds the converter to those strings.
+They were written by an editor and not by hand, and the file records the editor's
+own verdict on each. Do not edit `blocks.json`; capture it again.
+
+**When to ask an editor.** Before committing a change that adds a block or changes
+what one writes. When the site's WordPress updates, because a block's `save()` can
+change: capture again, and the tests then say what moved. And when a published
+draft opens with that message.
+
+**Get an editor of the site's build.** None of this saves anything. Either:
+
+- a **disposable WordPress Playground**, which needs no login and touches no site.
+  Open
+  `https://playground.wordpress.net/#%7B%22landingPage%22:%22/wp-admin/post-new.php%22,%22preferredVersions%22:%7B%22php%22:%228.3%22,%22wp%22:%22latest%22%7D,%22login%22:true%7D`
+  (a blueprint that logs in and lands on a new post; set `wp` to the site's
+  release if `latest` is not it). It takes 20 to 30 seconds to boot. The editor
+  runs in a frame of another origin, which a console on that page cannot reach, so
+  read the frame's address from the outer page,
+  `document.querySelector('iframe').contentWindow.document.querySelector('iframe#wp').src`
+  (it is `https://playground.wordpress.net/scope:<name>/...`), and open
+  `https://playground.wordpress.net/scope:<name>/wp-admin/post-new.php` in a second
+  tab. Keep the first tab open, because it hosts the site. The second tab's console
+  is the editor's.
+- or **a post editor on the site itself** (Posts > Add New), logged in. Run the
+  same script in its console and save nothing: lock saving first with
+  `wp.data.dispatch('core/editor').lockPostSaving('x')`, and close the tab instead
+  of navigating away, because the editor marks the post changed and the browser
+  asks before leaving.
+
+**Is it the site's editor?** The validator, the serialiser and every block's
+`save()` are in two public script files, `/wp-includes/js/dist/blocks.min.js` and
+`/wp-includes/js/dist/block-library.min.js`. A site can hide its WordPress version
+but not those. Hash them from the site and from the editor you are using; the same
+digests mean the same editor. A release's own copies are at
+`https://raw.githubusercontent.com/WordPress/WordPress/<version>/wp-includes/js/dist/<file>.min.js`.
+`capture.js` records the first 12 hex digits of each in `blocks.json`. A
+Playground adds a shim to a third file, `block-editor.min.js`, so that one will not
+match a release; the other two will.
+
+```bash
+for f in blocks block-library; do curl -sL "https://example.com/wp-includes/js/dist/$f.min.js" | sha256sum | cut -c1-12; done
+```
+
+**Capture again.** Paste `capture.js` into the editor's console, then run
+`await wpEditorBlocks.capture()`. It returns `{ sha256, json }`. Save `json` as
+`blocks.json` and compare `sha256sum blocks.json` with `sha256`, because a long
+string is easy to lose a character from on its way out of a console. (A console's
+`copy(...)` puts text on the clipboard. A tool that returns a page script's result
+may cut a long one, so ask it for the hash and the length first.) Every case must
+come back `valid` and `round_trip`: that is the editor accepting what it wrote.
+Then run the tests. They fail where the converter and the editor now disagree,
+which is what they are for.
+
+**Check what `to_blocks` writes.** For a change to the converter, or a document the
+captures do not cover, run its markup through the editor's validator. This prints
+the markup for the sample as a JSON string:
+
+```bash
+uv run python -c "import json, pathlib; from ci_article_review.adapters.cms.blocks import to_blocks; print(json.dumps([{'name': 'every-construct', 'markup': to_blocks(pathlib.Path('packages/ci-article-review/tests/golden/wordpress_editor/every_construct.md').read_text(encoding='utf-8'))}]))"
+```
+
+In the editor's console, after pasting `capture.js`, run
+`await wpEditorBlocks.check(<that output>)`. Every top-level block must be
+`valid: true`, and inner blocks are checked too. `round_trip: false` is not a
+failure: the editor writes a heading with a class the converter leaves out and
+spaces a list differently, and accepts both. Each of the quote, table, code and
+separator blocks is `true` for both.
+
+A rehearsal and this are two halves. `tools/publish_rehearsal.py` shows what leaves
+the process, and the editor says whether it is accepted. The body a rehearsal
+prints is the publish path's own output, so it can be run through `check` too.
 
 ## Dependencies and packaging
 

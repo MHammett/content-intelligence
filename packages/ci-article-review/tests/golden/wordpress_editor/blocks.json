@@ -1,0 +1,341 @@
+{
+  "provenance": {
+    "captured_on": "2026-10-05",
+    "wordpress": "7.1.2",
+    "bundles_sha256_12": {
+      "blocks.min.js": "4b5f1f4b23be",
+      "block-library.min.js": "42d66f582f11",
+      "block-editor.min.js": "dc8506ba37fc"
+    },
+    "script": "tests/golden/wordpress_editor/capture.js"
+  },
+  "cases": [
+    {
+      "name": "quote-one-paragraph",
+      "markdown": "> A quoted paragraph.",
+      "expected": "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:paragraph -->\n<p>A quoted paragraph.</p>\n<!-- /wp:paragraph --></blockquote>\n<!-- /wp:quote -->",
+      "names": [
+        "core/quote"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "quote-two-paragraphs",
+      "markdown": "> First paragraph.\n>\n> Second paragraph.",
+      "expected": "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:paragraph -->\n<p>First paragraph.</p>\n<!-- /wp:paragraph -->\n\n<!-- wp:paragraph -->\n<p>Second paragraph.</p>\n<!-- /wp:paragraph --></blockquote>\n<!-- /wp:quote -->",
+      "names": [
+        "core/quote"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "quote-inline-formatting",
+      "markdown": "> **Bold**, *italic*, `code` and [a link](https://example.com/x).",
+      "expected": "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:paragraph -->\n<p><strong>Bold</strong>, <em>italic</em>, <code>code</code> and <a href=\"https://example.com/x\">a link</a>.</p>\n<!-- /wp:paragraph --></blockquote>\n<!-- /wp:quote -->",
+      "names": [
+        "core/quote"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "quote-special-characters",
+      "markdown": "> Fish & chips cost < 5 pounds.",
+      "expected": "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:paragraph -->\n<p>Fish &amp; chips cost &lt; 5 pounds.</p>\n<!-- /wp:paragraph --></blockquote>\n<!-- /wp:quote -->",
+      "names": [
+        "core/quote"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "quote-greater-than",
+      "markdown": "> 5 > 3 and 3 < 5.",
+      "expected": "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:paragraph -->\n<p>5 &gt; 3 and 3 &lt; 5.</p>\n<!-- /wp:paragraph --></blockquote>\n<!-- /wp:quote -->",
+      "names": [
+        "core/quote"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-basic",
+      "markdown": "| A |\n|---|\n| b |",
+      "expected": "<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th>A</th></tr></thead><tbody><tr><td>b</td></tr></tbody></table></figure>\n<!-- /wp:table -->",
+      "names": [
+        "core/table"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-bold-cell",
+      "markdown": "| Name | Count |\n|---|---|\n| **Bold cell** | 2 |\n| Plain | 30 |",
+      "expected": "<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th>Name</th><th>Count</th></tr></thead><tbody><tr><td><strong>Bold cell</strong></td><td>2</td></tr><tr><td>Plain</td><td>30</td></tr></tbody></table></figure>\n<!-- /wp:table -->",
+      "names": [
+        "core/table"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-column-alignment",
+      "markdown": "| Left | Centre | Right | None |\n|:--|:-:|--:|---|\n| a | b | c | d |",
+      "expected": "<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th class=\"has-text-align-left\" data-align=\"left\">Left</th><th class=\"has-text-align-center\" data-align=\"center\">Centre</th><th class=\"has-text-align-right\" data-align=\"right\">Right</th><th>None</th></tr></thead><tbody><tr><td class=\"has-text-align-left\" data-align=\"left\">a</td><td class=\"has-text-align-center\" data-align=\"center\">b</td><td class=\"has-text-align-right\" data-align=\"right\">c</td><td>d</td></tr></tbody></table></figure>\n<!-- /wp:table -->",
+      "names": [
+        "core/table"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-empty-cells",
+      "markdown": "| | B |\n|---|---|\n| | d |",
+      "expected": "<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th></th><th>B</th></tr></thead><tbody><tr><td></td><td>d</td></tr></tbody></table></figure>\n<!-- /wp:table -->",
+      "names": [
+        "core/table"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-header-only",
+      "markdown": "| A | B |\n|---|---|",
+      "expected": "<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th>A</th><th>B</th></tr></thead><tbody><tr><td></td><td></td></tr></tbody></table></figure>\n<!-- /wp:table -->",
+      "names": [
+        "core/table"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-raw-html-without-body-rows",
+      "markdown": "<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody></tbody></table>",
+      "expected": "<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th>A</th><th>B</th></tr></thead></table></figure>\n<!-- /wp:table -->",
+      "names": [
+        "core/table"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-special-characters",
+      "markdown": "| R&D | a < b |\n|---|---|\n| \"q\" | it's |",
+      "expected": "<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th>R&amp;D</th><th>a &lt; b</th></tr></thead><tbody><tr><td>\"q\"</td><td>it's</td></tr></tbody></table></figure>\n<!-- /wp:table -->",
+      "names": [
+        "core/table"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-greater-than",
+      "markdown": "| x > y |\n|---|\n| b |",
+      "expected": "<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th>x &gt; y</th></tr></thead><tbody><tr><td>b</td></tr></tbody></table></figure>\n<!-- /wp:table -->",
+      "names": [
+        "core/table"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-fenced-with-language",
+      "markdown": "```python\nprint(\"hi\")\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>print(\"hi\")\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-fenced-plain",
+      "markdown": "```\nplain text\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>plain text\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-indented",
+      "markdown": "Intro.\n\n    first line\n    second line",
+      "expected": "<!-- wp:paragraph -->\n<p>Intro.</p>\n<!-- /wp:paragraph -->\n\n<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>first line\nsecond line\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/paragraph",
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-blank-line-and-indent",
+      "markdown": "```\ndef f(x):\n\n    return x\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>def f(x):\n\n    return x\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-special-characters",
+      "markdown": "```\nif a < b && c > d:\n    print(\"it's\")\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>if a &lt; b &amp;&amp; c &gt; d:\n    print(\"it's\")\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-shortcode-brackets",
+      "markdown": "```\n[caption id=\"a\"]\nx[0] = y[1]\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>&#91;caption id=\"a\"]\nx&#91;0] = y&#91;1]\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-isolated-urls",
+      "markdown": "```\nhttps://example.com/a\nhttps://example.com/b\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>https:&#47;&#47;example.com/a\nhttps://example.com/b\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-url-in-a-sentence",
+      "markdown": "```\nsee https://example.com/a here\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>see https://example.com/a here\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-non-ascii",
+      "markdown": "```\ncafé — “q” ✓\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>café — “q” ✓\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-empty",
+      "markdown": "```\n```",
+      "expected": "<!-- wp:code -->\n<pre class=\"wp-block-code\"><code></code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "separator-dashes",
+      "markdown": "---",
+      "expected": "<!-- wp:separator -->\n<hr class=\"wp-block-separator has-alpha-channel-opacity\"/>\n<!-- /wp:separator -->",
+      "names": [
+        "core/separator"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "separator-asterisks",
+      "markdown": "* * *",
+      "expected": "<!-- wp:separator -->\n<hr class=\"wp-block-separator has-alpha-channel-opacity\"/>\n<!-- /wp:separator -->",
+      "names": [
+        "core/separator"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "quote-with-a-list-is-html",
+      "markdown": "> - one\n> - two",
+      "expected": "<!-- wp:html -->\n<blockquote>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n</blockquote>\n<!-- /wp:html -->",
+      "names": [
+        "core/html"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "nested-quote-is-html",
+      "markdown": "> outer\n>\n> > inner",
+      "expected": "<!-- wp:html -->\n<blockquote>\n<p>outer</p>\n<blockquote>\n<p>inner</p>\n</blockquote>\n</blockquote>\n<!-- /wp:html -->",
+      "names": [
+        "core/html"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "table-with-colspan-is-html",
+      "markdown": "<table><tr><td colspan=\"2\">x</td></tr></table>",
+      "expected": "<!-- wp:html -->\n<table><tr><td colspan=\"2\">x</td></tr></table>\n<!-- /wp:html -->",
+      "names": [
+        "core/html"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "code-with-a-class-is-html",
+      "markdown": "<pre class=\"x\"><code>raw</code></pre>",
+      "expected": "<!-- wp:html -->\n<pre class=\"x\"><code>raw</code></pre>\n<!-- /wp:html -->",
+      "names": [
+        "core/html"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "figure-is-html",
+      "markdown": "<figure><img src=\"https://example.com/a.png\" alt=\"A\" /><figcaption>Cap</figcaption></figure>",
+      "expected": "<!-- wp:html -->\n<figure><img src=\"https://example.com/a.png\" alt=\"A\"><figcaption>Cap</figcaption></figure>\n<!-- /wp:html -->",
+      "names": [
+        "core/html"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "rule-with-a-class-is-html",
+      "markdown": "<hr class=\"x\" />",
+      "expected": "<!-- wp:html -->\n<hr class=\"x\">\n<!-- /wp:html -->",
+      "names": [
+        "core/html"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "every-native-block-together",
+      "markdown": "> A quoted paragraph.\n\n| Name | Count |\n|---|---|\n| **Bold cell** | 2 |\n| Plain | 30 |\n\n```python\nprint(\"hi\")\n```\n\n---\n\n> First paragraph.\n>\n> Second paragraph.\n\n| Left | Centre | Right | None |\n|:--|:-:|--:|---|\n| a | b | c | d |\n\n```\nif a < b && c > d:\n    print(\"it's\")\n```",
+      "expected": "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:paragraph -->\n<p>A quoted paragraph.</p>\n<!-- /wp:paragraph --></blockquote>\n<!-- /wp:quote -->\n\n<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th>Name</th><th>Count</th></tr></thead><tbody><tr><td><strong>Bold cell</strong></td><td>2</td></tr><tr><td>Plain</td><td>30</td></tr></tbody></table></figure>\n<!-- /wp:table -->\n\n<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>print(\"hi\")\n</code></pre>\n<!-- /wp:code -->\n\n<!-- wp:separator -->\n<hr class=\"wp-block-separator has-alpha-channel-opacity\"/>\n<!-- /wp:separator -->\n\n<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:paragraph -->\n<p>First paragraph.</p>\n<!-- /wp:paragraph -->\n\n<!-- wp:paragraph -->\n<p>Second paragraph.</p>\n<!-- /wp:paragraph --></blockquote>\n<!-- /wp:quote -->\n\n<!-- wp:table -->\n<figure class=\"wp-block-table\"><table class=\"has-fixed-layout\"><thead><tr><th class=\"has-text-align-left\" data-align=\"left\">Left</th><th class=\"has-text-align-center\" data-align=\"center\">Centre</th><th class=\"has-text-align-right\" data-align=\"right\">Right</th><th>None</th></tr></thead><tbody><tr><td class=\"has-text-align-left\" data-align=\"left\">a</td><td class=\"has-text-align-center\" data-align=\"center\">b</td><td class=\"has-text-align-right\" data-align=\"right\">c</td><td>d</td></tr></tbody></table></figure>\n<!-- /wp:table -->\n\n<!-- wp:code -->\n<pre class=\"wp-block-code\"><code>if a &lt; b &amp;&amp; c &gt; d:\n    print(\"it's\")\n</code></pre>\n<!-- /wp:code -->",
+      "names": [
+        "core/quote",
+        "core/table",
+        "core/code",
+        "core/separator",
+        "core/quote",
+        "core/table",
+        "core/code"
+      ],
+      "valid": true,
+      "round_trip": true
+    }
+  ]
+}
