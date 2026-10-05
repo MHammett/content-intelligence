@@ -558,16 +558,34 @@ def _render_evidence_coverage(fact_check):
     whether it rested on anything they could open. In the 2026-08-12 run 85
     claims came back confirmed and 50 carried no URL at all.
 
-    Counted rather than enforced. A model that ignores the field still produces
-    a usable report — it just produces a visibly weaker one, which is the
-    information a reader needs.
+    Since 2026-10-05 consolidation also enforces it: a verdict without both is
+    moved to `unverifiable` or `primary_source_needed` and marked
+    `demoted_from` (``consolidation._demote_unevidenced_verdicts``). So on a
+    current report the counts below are full, and the line that matters is how
+    many were moved; a report built before then still shows the shortfall.
     """
     items = [i for b in _VERDICT_BUCKETS for i in (fact_check.get(b) or [])]
+    demoted = [
+        i
+        for b in ("unverifiable", "primary_source_needed")
+        for i in (fact_check.get(b) or [])
+        if i.get("demoted_from")
+    ]
+    lines = []
+    if demoted:
+        lines += [
+            f"**{len(demoted)} verdict(s) came back without the evidence the "
+            "fact-check prompt requires — a direct URL and a verbatim quote from "
+            "a page other than this article's own — and are listed under "
+            "Unverifiable or Primary source resolution required instead.** Each "
+            "says why in its own reason.",
+            "",
+        ]
     if not items:
-        return []
+        return lines
     quoted = sum(1 for i in items if (i.get("supporting_quote") or "").strip())
     linked = sum(1 for i in items if (i.get("source_url") or "").strip())
-    lines = [
+    lines += [
         f"**{quoted} of {len(items)} verdict(s) arrived with a verbatim "
         f"supporting quote; {linked} with a direct source URL.**",
         "",

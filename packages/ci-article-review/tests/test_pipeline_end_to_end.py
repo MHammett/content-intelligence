@@ -71,9 +71,13 @@ _DOMAIN_DATA = {
             {
                 "claim": "The grid served 41 percent of load from nuclear.",
                 "source": "EIA State Profile, https://example.org/eia-profile",
+                "source_url": "https://example.org/eia-profile",
+                "supporting_quote": "Nuclear: 41% of net generation.",
                 "confidence": "high",
             }
         ],
+        # No `supporting_quote`, so consolidation moves this one to
+        # `unverifiable`: the golden covers a kept verdict and a moved one.
         "outdated": [
             {
                 "claim": "The 2019 figure was 33 percent.",

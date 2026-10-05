@@ -657,9 +657,9 @@ class TestConsolidationWiring:
     def test_no_rules_leaves_the_section_alone_but_still_declares_the_bucket(self):
         """An older capture replayed must not crash the renderer on a missing key.
 
-        The claim carries a real source because ``_demote_unsourced_confirmations``
-        runs first and would otherwise move it to ``unverifiable`` — correctly,
-        and for reasons that have nothing to do with scope.
+        Calls ``_build_fact_check`` directly, so the evidence rules
+        (``_demote_unevidenced_verdicts``, applied by ``build_report`` before
+        this section is built) do not run and the verdict stays where it is.
         """
         section = consolidation._build_fact_check(
             self._results(

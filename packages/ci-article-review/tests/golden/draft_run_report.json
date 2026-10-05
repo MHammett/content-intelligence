@@ -506,7 +506,7 @@
       "section_2_fact_check": {
         "at_least_half": 0,
         "denominator": 0,
-        "findings": 2,
+        "findings": 1,
         "reproduced": 0
       },
       "section_3_voice": {
@@ -589,13 +589,16 @@
           "type": "most_vulnerable_claim"
         },
         {
+          "checked": "https://example.org/updated-table",
           "claim": "The 2019 figure was 33 percent.",
-          "confidence": "medium",
-          "current_value": "38 percent as of 2025",
+          "demoted_from": "outdated",
           "domain": "fact_check",
-          "source": "https://example.org/updated-table",
+          "reason": "Reported as outdated (as a verdict) without a verbatim quote from https://example.org/updated-table. A verdict nothing was quoted for has not been shown against the page. It reported the current value as: 38 percent as of 2025.",
           "source_model": "gemini",
-          "type": "outdated"
+          "sources_checked": [
+            "https://example.org/updated-table"
+          ],
+          "type": "unverifiable"
         }
       ],
       "languagetool_also_flagged": false,
@@ -695,22 +698,14 @@
         "grounding": true,
         "source": "EIA State Profile, https://example.org/eia-profile",
         "source_model": "gemini",
-        "source_weight": 1.5
+        "source_url": "https://example.org/eia-profile",
+        "source_weight": 1.5,
+        "supporting_quote": "Nuclear: 41% of net generation."
       }
     ],
     "contradicted": [],
     "out_of_scope": [],
-    "outdated": [
-      {
-        "claim": "The 2019 figure was 33 percent.",
-        "confidence": "medium",
-        "current_value": "38 percent as of 2025",
-        "grounding": true,
-        "source": "https://example.org/updated-table",
-        "source_model": "gemini",
-        "source_weight": 1.5
-      }
-    ],
+    "outdated": [],
     "primary_source_needed": [
       {
         "best_candidate_source": "https://example.org/water-report",
@@ -728,6 +723,18 @@
         "reason": "no public record found",
         "source_model": "gemini",
         "source_weight": 1.5
+      },
+      {
+        "checked": "https://example.org/updated-table",
+        "claim": "The 2019 figure was 33 percent.",
+        "demoted_from": "outdated",
+        "grounding": true,
+        "reason": "Reported as outdated (as a verdict) without a verbatim quote from https://example.org/updated-table. A verdict nothing was quoted for has not been shown against the page. It reported the current value as: 38 percent as of 2025.",
+        "source_model": "gemini",
+        "source_weight": 1.5,
+        "sources_checked": [
+          "https://example.org/updated-table"
+        ]
       }
     ]
   },

@@ -511,6 +511,18 @@ _SELF_REFERENTIAL_SOURCES = frozenset(
 #: A URL field the model filled in to mean "there isn't one".
 _EMPTY_URL_VALUES = frozenset({"", "n/a", "na", "none", "null", "-"})
 
+#: A `supporting_quote` the model filled in to mean "there isn't one". Strict
+#: schema mode requires the field, so a model with nothing to quote writes
+#: something rather than leaving it out. Seen in saved runs (2026-10-05, 888
+#: verdicts across 99 fact-check passes): "N/A" three times, "placeholder"
+#: once, "[]" once — and no quote left blank at all, so a check for "" alone
+#: would have caught none of them.
+_EMPTY_QUOTE_VALUES = _EMPTY_URL_VALUES | {"[]", "{}", "placeholder", "tbd", "unknown"}
+
+#: The buckets that assert a verdict, and so carry the evidence the prompt's
+#: EVIDENCE REQUIREMENTS demand: a direct URL and a verbatim quote from it.
+_VERDICT_BUCKETS = ("confirmed", "outdated", "contradicted")
+
 
 def _normalise_source(text):
     """Lowercase, strip punctuation, collapse whitespace."""
@@ -523,65 +535,212 @@ def _names_a_document(part):
     return bool(key) and key not in _SELF_REFERENTIAL_SOURCES
 
 
-def _has_external_source(item):
-    """Whether a `confirmed` finding points at anything outside the draft.
+def _names_any_document(source):
+    """Whether free-text ``source`` names something outside the draft.
 
-    A URL settles it. Without one, the free-text source has to name something
-    that is not the draft or the model's own reasoning — an unlinked "Honda
-    ServiceNews B18010I" is a real document and stays confirmed. Models list
-    several sources separated by semicolons, and one real document among them
-    is enough.
+    Models list several sources separated by semicolons, and one real document
+    among them is enough.
     """
-    url = str(item.get("source_url", "") or "").strip().lower()
-    if url and url not in _EMPTY_URL_VALUES:
-        return True
-    return any(
-        _names_a_document(part) for part in str(item.get("source", "")).split(";")
+    return any(_names_a_document(part) for part in str(source or "").split(";"))
+
+
+# Matches a URL embedded in a fact-check "source" field, which is often free
+# text like "Publisher Name, Article Title, https://example.com/path" rather
+# than a bare URL.
+_SOURCE_URL_RE = re.compile(r"https?://\S+")
+
+#: Models frequently emit the source as a markdown link rather than a bare URL.
+#: A real run produced `[www.cbc.ca](https://www.cbc.ca)`, and the bare-URL
+#: regex captured the whole construct — the fetch then failed against a
+#: hostname of literally "[www.cbc.ca]". Take the link target when we see one.
+_MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(\s*(https?://[^\s)]+)\s*\)")
+
+
+def extract_source_url(source_field: str) -> str | None:
+    """Pull an embedded URL out of a fact-check item's "source" field, if any.
+
+    The field is free text — models write "Publisher, Title, https://..." or a
+    markdown link, or occasionally both. Markdown is checked first because its
+    target is unambiguous, where the bare-URL pattern would swallow the
+    surrounding syntax.
+    """
+    if not source_field:
+        return None
+    m = _MARKDOWN_LINK_RE.search(source_field)
+    if m:
+        return m.group(1).rstrip(".,;:\"'")
+    m = _SOURCE_URL_RE.search(source_field)
+    if not m:
+        return None
+    return m.group(0).rstrip(".,;:)\"'")
+
+
+def _evidence_url(item):
+    """The verdict's openable URL, or "".
+
+    The prompt asks for `source_url` "starting with http:// or https://";
+    anything else — "N/A", a site name, a description of where to look — is not
+    one. Falls back to a URL written into the free-text `source`, the shape
+    output took before `source_url` existed, exactly as the citation collector
+    (``pipeline._collect_citation_claims``) does: the model did name a page.
+    """
+    return extract_source_url(str(item.get("source_url", "") or "")) or (
+        extract_source_url(str(item.get("source", "") or "")) or ""
     )
 
 
-def _demote_unsourced_confirmations(data):
-    """Move `confirmed` findings with no external source into `unverifiable`.
+def _evidence_quote(item):
+    """The verdict's `supporting_quote`, or "" when it is blank or a placeholder."""
+    quote = str(item.get("supporting_quote", "") or "").strip()
+    return "" if quote.strip("\"'“” ").lower() in _EMPTY_QUOTE_VALUES else quote
 
-    Returns a new data dict; the input is left alone. The claim is not dropped —
-    it moves to the bucket that means "nothing was found to check this against",
-    which is what actually happened, and keeps its original source text so a
-    reader can see what the model offered instead.
+
+def _site_host(url):
+    """Host of ``url``, lowercased and without a leading ``www.``."""
+    return url_key(url).partition("/")[0] if url else ""
+
+
+def _verdict_detail(bucket, item):
+    """What the verdict said, so a demoted outdated/contradicted keeps its point."""
+    if bucket == "outdated" and item.get("current_value"):
+        return f" It reported the current value as: {item['current_value']}."
+    if bucket == "contradicted" and item.get("contradiction"):
+        return f" It reported the contradiction as: {item['contradiction']}."
+    return ""
+
+
+def _demote_unevidenced_verdict(bucket, item, own_host):
+    """Where a verdict belongs under the prompt's evidence rules.
+
+    Returns ``None`` when it stays where it is, or ``(bucket, finding)`` for the
+    bucket it moves to. The rules are the prompt's own (``fact_check.txt``,
+    EVIDENCE REQUIREMENTS), applied to every bucket that asserts a verdict:
+
+    1. No openable URL. If the source names no document at all — "Manual
+       Calculation", "Draft Article" — nothing was checked, so `unverifiable`.
+       If it names one — an unlinked "Honda ServiceNews B18010I" — the prompt
+       says that claim goes to `primary_source_needed` with the document as the
+       candidate. This used to keep it `confirmed`; following the prompt was
+       chosen on 2026-10-05 (issue #334).
+    2. A URL but no verbatim quote: "If you cannot quote the page, you have not
+       verified the claim against it" — `unverifiable`, with the URL kept in
+       `sources_checked` so Section 9 can still go and read it.
+    3. The URL is on the publication's own site and the "quote" is the claim
+       itself: the draft checked against its own published copy. Measured in
+       the saved runs: 11 mistral `confirmed` verdicts for an about-page draft,
+       each citing mikehammett.net/about. Not kept in `sources_checked`, or
+       Section 9 would resolve the same page and confirm it a second time.
+       Narrow on purpose: a quote from your own earlier article that is not this
+       sentence is still a quote.
     """
-    confirmed = data.get("confirmed") or []
-    if not confirmed:
-        return data
-
-    kept, demoted = [], []
-    for item in confirmed:
-        if _has_external_source(item):
-            kept.append(item)
-            continue
-        demoted.append(
-            {
+    origin = "confirmed" if bucket == "confirmed" else f"{bucket} (as a verdict)"
+    detail = _verdict_detail(bucket, item)
+    source = item.get("source", "") or ""
+    url = _evidence_url(item)
+    if not url:
+        if not _names_any_document(source):
+            return "unverifiable", {
                 "claim": item.get("claim", ""),
-                "checked": item.get("source", "") or "nothing external",
+                "checked": source or "nothing external",
                 "sources_checked": [],
                 "reason": (
-                    "Reported as confirmed with no external source: "
-                    f"{item.get('source') or 'none given'}. A claim the model "
-                    "reasoned its way to is not a claim a document backs, so it "
-                    "is reported here rather than as confirmed."
+                    f"Reported as {origin} with no external source: "
+                    f"{source or 'none given'}. A claim the model reasoned its "
+                    "way to is not a claim a document backs, so it is reported "
+                    f"here rather than as {bucket}.{detail}"
                 ),
+                "demoted_from": bucket,
             }
-        )
-    if not demoted:
+        return "primary_source_needed", {
+            "claim": item.get("claim", ""),
+            "best_candidate_source": source,
+            "best_candidate_url": None,
+            "reason": (
+                f"Reported as {origin} citing a document but no openable URL. "
+                "The verdict cannot be checked until that document is found."
+                f"{detail}"
+            ),
+            "demoted_from": bucket,
+        }
+
+    quote = _evidence_quote(item)
+    if not quote:
+        return "unverifiable", {
+            "claim": item.get("claim", ""),
+            "checked": source or url,
+            "sources_checked": [url],
+            "reason": (
+                f"Reported as {origin} without a verbatim quote from {url}. A "
+                "verdict nothing was quoted for has not been shown against the "
+                f"page.{detail}"
+            ),
+            "demoted_from": bucket,
+        }
+
+    if (
+        own_host
+        and _site_host(url) == own_host
+        and same_passage(quote, item.get("claim", ""))
+    ):
+        return "unverifiable", {
+            "claim": item.get("claim", ""),
+            "checked": source or url,
+            "sources_checked": [],
+            "reason": (
+                f"Reported as {origin} by quoting the claim back from {url}, "
+                "this publication's own site — the draft's own published copy, "
+                f"not independent evidence.{detail}"
+            ),
+            "demoted_from": bucket,
+        }
+    return None
+
+
+def _demote_unevidenced_verdicts(data, own_site_url=None):
+    """Move verdicts that lack the evidence the prompt requires out of their bucket.
+
+    Returns a new data dict, or ``data`` itself when nothing moved; the input is
+    never mutated. A claim is never dropped — it moves to the bucket that says
+    what was actually found, and keeps the model's source and point in
+    ``checked``/``best_candidate_source`` and ``reason``, so a reader can see
+    what was offered instead. ``demoted_from`` records where it came from.
+
+    Runs once, from :func:`_normalise_fact_check_results`, so Section 1,
+    Section 2 and :func:`find_contradictions` all read the same buckets. It used
+    to run inside :func:`_build_fact_check` only, so a verdict demoted in
+    Section 2 still voted as `confirmed` in the contradiction list.
+    """
+    own_host = _site_host(own_site_url)
+    moved = {}
+    replaced = {}
+    for bucket in _VERDICT_BUCKETS:
+        items = data.get(bucket) or []
+        kept = []
+        for item in items:
+            outcome = _demote_unevidenced_verdict(bucket, item, own_host)
+            if outcome is None:
+                kept.append(item)
+            else:
+                moved.setdefault(outcome[0], []).append(outcome[1])
+        if len(kept) != len(items):
+            replaced[bucket] = kept
+    if not moved:
         return data
 
     log.info(
-        "Fact check: %d confirmed finding(s) cited no external source and were "
-        "moved to unverifiable.",
-        len(demoted),
+        "Fact check: %d verdict(s) lacked the evidence the prompt requires (a "
+        "direct URL and a verbatim quote, not from this article's own page) and "
+        "were moved (%s).",
+        sum(len(v) for v in moved.values()),
+        ", ".join(f"{len(v)} to {k}" for k, v in sorted(moved.items())),
     )
     return {
         **data,
-        "confirmed": kept,
-        "unverifiable": list(data.get("unverifiable") or []) + demoted,
+        **replaced,
+        **{
+            target: list(data.get(target) or []) + findings
+            for target, findings in moved.items()
+        },
     }
 
 
@@ -727,7 +886,7 @@ def _describe_malformed_bucket(note):
     return f"{where}: {', '.join(parts)}"
 
 
-def _normalise_fact_check_results(results):
+def _normalise_fact_check_results(results, own_site_url=None):
     """Make every fact-check payload safe to consolidate, before anything reads it.
 
     Returns ``(results, degradations)``. ``results`` is the same object when
@@ -739,6 +898,12 @@ def _normalise_fact_check_results(results):
     reader, because there are five of them and the first to run is
     :func:`_extract_passages`: fixing only :func:`_build_fact_check` would move
     the crash into Section 1 rather than remove it.
+
+    Verdicts without the evidence the prompt requires are moved here too
+    (:func:`_demote_unevidenced_verdicts`), for the same reason: every reader
+    has to see the same buckets. ``own_site_url`` is the publication's
+    ``wordpress.site_url``, used to recognise a draft confirmed against its own
+    published copy.
     """
     notes, cleaned = [], {}
     for key, result in results.items():
@@ -747,6 +912,7 @@ def _normalise_fact_check_results(results):
             continue
         data, result_notes = _coerce_fact_check_buckets(result["data"], model_name)
         notes.extend(result_notes)
+        data = _demote_unevidenced_verdicts(data, own_site_url)
         # Identity, not ``result_notes``: a present-but-null bucket is rewritten
         # and deliberately not reported, and gating the replacement on the notes
         # would drop exactly that repair on the floor.
@@ -757,7 +923,9 @@ def _normalise_fact_check_results(results):
         return results, []
     results = {**results, **cleaned}
     if not notes:
-        return results, []  # Nulls rewritten; nothing lost, so nothing said.
+        # Nulls rewritten or verdicts moved; nothing lost, so nothing said here.
+        # A moved verdict says so itself, in its own `reason`.
+        return results, []
 
     detail = (
         f"{_affected_sections(notes)} short findings this run paid for: "
@@ -819,7 +987,7 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
     exists at once.
     """
     domain_results = [
-        (model, {**r, "data": _demote_unsourced_confirmations(r["data"])})
+        (model, r)
         for (model, d), r in results.items()
         if d == "fact_check" and not r.get("failed") and r.get("data")
     ]
@@ -1846,6 +2014,7 @@ def build_report(
     fact_check_scope=None,
     domains_not_run=None,
     drafted_with="",
+    own_site_url=None,
 ):
     """Merge ensemble results into a structured report.
 
@@ -1865,6 +2034,11 @@ def build_report(
         the drafter exclusion; it cannot be recovered here, because every other
         record in this report is derived from ``results`` and a domain that was
         never attempted has no entry there to derive from.
+    own_site_url:
+        The publication's ``wordpress.site_url``. A fact-check verdict that
+        quotes the claim back from a page on this site is the draft confirmed
+        against its own published copy, and is not kept as a verdict. None
+        skips that one check; the other evidence rules still apply.
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -1874,7 +2048,15 @@ def build_report(
     # and neither checks the shape it assumes; a malformed one used to kill
     # report building wherever the first reader ran, after the ensemble had
     # been paid for in full.
-    results, fact_check_degradations = _normalise_fact_check_results(results)
+    # What the models actually sent, kept for the one reader that needs it:
+    # `_truncation_extent` works out which buckets a cut-off response never
+    # delivered from which keys are present, and moving an unevidenced verdict
+    # creates `unverifiable` or `primary_source_needed` where the model never
+    # wrote one — which would report a bucket as delivered that was lost.
+    received = results
+    results, fact_check_degradations = _normalise_fact_check_results(
+        results, own_site_url
+    )
     results, flags_degradations = _normalise_flags_results(results)
 
     # LanguageTool flagged passages used for consensus boosting
@@ -1976,7 +2158,7 @@ def build_report(
             "max_tokens": r.get("max_tokens"),
             **_truncation_extent(domain, r.get("data"), r.get("raw")),
         }
-        for (model, domain), r in results.items()
+        for (model, domain), r in received.items()
         if r.get("truncated")
     ]
 
