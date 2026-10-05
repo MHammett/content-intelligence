@@ -227,7 +227,24 @@ class TestTheReasoningLadder:
     #: TestTheShippedFileIsLoaded::test_the_cli_and_the_file_name_the_same_tiers,
     #: which is what makes it safe to read an order into the file's keys.
     ORDER = ("economy", "standard", "balanced", "thorough", "maximum")
-    RANK = {"minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5}
+
+    #: Every level a provider in this file reads, cheapest first. It has to
+    #: cover more than the tiers set today: `xhigh` is already live in
+    #: ci-article-review's `maximum`, and `max` is gpt-6.1-sol's top,
+    #: measured 2026-10-04 at roughly 2x xhigh in both time and output
+    #: tokens (#287). `max` is unusable today for an unrelated reason --
+    #: grounded fact_check at max took 1352s against the 1085s task ceiling
+    #: (#309) -- but a level a provider accepts has to be placeable here, or
+    #: the ordering check raises KeyError and reports nothing about the
+    #: ordering it exists to check.
+    RANK = {
+        "minimal": 1,
+        "low": 2,
+        "medium": 3,
+        "high": 4,
+        "xhigh": 5,
+        "max": 6,
+    }
 
     def test_the_tiers_are_in_cost_order_in_the_file(self):
         """The two tests below read a ladder off ORDER, so the file has to be
@@ -256,26 +273,99 @@ class TestTheReasoningLadder:
             "anyone can read -- state it (#268)"
         )
 
-    @pytest.mark.parametrize("provider", ("claude", "openai"))
-    def test_a_cheaper_tier_never_reasons_harder(self, provider):
-        """Over the effort each tier really runs at, blanks resolved through
-        ``effort_of`` -- which is the key the client reads and no other. A tier
-        that reasons not at all is skipped rather than ranked: that is a real
-        setting, and whether the two haiku tiers should differ on it is its own
-        question (#291)."""
-        presets = bootstrap._load_presets()
-        ladder = []
-        for tier in self.ORDER:
-            cfg = presets[tier]["models"].get(provider)
+    def _ladder(self, presets, provider, order):
+        """``(tier, effort)`` for each tier that reasons at all, cheapest first.
+
+        Blanks resolved through ``effort_of`` -- the key the client reads and
+        no other. A tier that reasons not at all is left out rather than
+        ranked: that is a real setting, and whether the two haiku tiers should
+        differ on it is its own question (#291).
+        """
+        out = []
+        for tier in order:
+            cfg = presets[tier].get("models", {}).get(provider)
             if not isinstance(cfg, dict):
                 continue
             effort = output_tokens.effort_of(provider, cfg)
-            if effort is None:
-                continue
-            ladder.append((tier, effort))
-        assert len(ladder) >= 2, f"nothing to order for {provider}: {ladder}"
+            if effort is not None:
+                out.append((tier, effort))
+        return out
+
+    def _assert_rises(self, provider, ladder):
+        """Each step reasons at least as hard as the one before it."""
+        for tier, effort in ladder:
+            assert effort in self.RANK, (
+                f"{provider} at {tier} reasons at {effort!r}, which this test "
+                f"cannot place: add it to RANK in cost order (known: "
+                f"{list(self.RANK)}). Ranking it is the fix -- unranked, the "
+                "ordering check raises KeyError and reports nothing"
+            )
         for (cheap, lo), (dear, hi) in zip(ladder, ladder[1:]):
             assert self.RANK[lo] <= self.RANK[hi], (
                 f"{provider}: {cheap} reasons at {lo}, above {dear}'s {hi} -- "
                 "the cheaper tier is the harder one (#268)"
             )
+
+    @pytest.mark.parametrize("provider", ("claude", "openai"))
+    def test_a_cheaper_tier_never_reasons_harder(self, provider):
+        """The shipped file, over the effort each tier really runs at."""
+        ladder = self._ladder(bootstrap._load_presets(), provider, self.ORDER)
+        assert len(ladder) >= 2, f"nothing to order for {provider}: {ladder}"
+        self._assert_rises(provider, ladder)
+
+
+class TestTheLadderPlacesEveryLevelAProviderAccepts:
+    """Through a crafted file, because the shipped one sets none of these.
+
+    The levels a tier may legitimately carry outrun the ones it carries today.
+    `max` was the live gap: gpt-6.1-sol accepts it, it was measured at ~2x
+    xhigh on 2026-10-04 (#287), and with it unranked the ordering check raised
+    ``KeyError: 'max'`` -- a crash where a verdict belonged.
+    Written from the scenario, a presets.yaml naming the level, so it covers
+    the load path and not just the helper.
+    """
+
+    ORDER = ("cheap", "dear")
+
+    @staticmethod
+    def _presets(tmp_path, cheap_effort, dear_effort):
+        """A two-tier file whose openai entries differ only in effort."""
+        (tmp_path / "presets.yaml").write_text(
+            "cheap:\n"
+            "  models:\n"
+            "    openai:\n"
+            "      model: gpt-6.1-sol\n"
+            f"      reasoning_effort: {cheap_effort}\n"
+            "dear:\n"
+            "  models:\n"
+            "    openai:\n"
+            "      model: gpt-6.1-sol\n"
+            f"      reasoning_effort: {dear_effort}\n",
+            encoding="utf-8",
+        )
+        return bootstrap._load_presets(config_dir=tmp_path)
+
+    def _walk(self, tmp_path, cheap_effort, dear_effort):
+        ladder = TestTheReasoningLadder()
+        return ladder, ladder._ladder(
+            self._presets(tmp_path, cheap_effort, dear_effort), "openai", self.ORDER
+        )
+
+    def test_max_is_placed_above_xhigh(self, tmp_path):
+        """The fix. A tier rising xhigh -> max passes instead of raising."""
+        rungs, ladder = self._walk(tmp_path, "xhigh", "max")
+        assert ladder == [("cheap", "xhigh"), ("dear", "max")]
+        rungs._assert_rises("openai", ladder)
+
+    def test_falling_from_max_to_xhigh_still_fails(self, tmp_path):
+        """Placing `max` must not buy a pass by skipping the comparison."""
+        rungs, ladder = self._walk(tmp_path, "max", "xhigh")
+        with pytest.raises(AssertionError, match="cheap reasons at max"):
+            rungs._assert_rises("openai", ladder)
+
+    def test_a_level_nobody_ranked_is_named_not_a_keyerror(self, tmp_path):
+        """What `max` used to do. The message says which level and where, so
+        the next new level is a one-line fix and not a puzzle."""
+        rungs, ladder = self._walk(tmp_path, "low", "sideways")
+        with pytest.raises(AssertionError, match="dear reasons at 'sideways'"):
+            rungs._assert_rises("openai", ladder)
