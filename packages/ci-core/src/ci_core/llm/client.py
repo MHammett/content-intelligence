@@ -1794,6 +1794,20 @@ def _read_searches(provider, assembled, model=""):
     * claude: ``usage.server_tool_use.web_search_requests``, Anthropic's own
       count, which litellm carries through the stream (checked 2026-09-19 with
       the final usage of a real opus-5 fact_check: 5 searches arrive as 5).
+      Absent means none. Anthropic sends the ``server_tool_use`` block when a
+      server tool ran, and the zeros inside it cover the tools in that block
+      that did not; when no server tool ran it sends no block at all. Measured
+      2026-10-04 on three live claude-haiku-4-5 calls that had web search
+      attached and were told not to use it: all three answered with text only
+      and returned no ``server_tool_use``, on the raw Messages API both
+      streamed and not, and through this client (issue #265). This read it as
+      unknown until then, so every ``maximum`` run whose ``claude:fact_check``
+      happened not to search earned a spurious "at least" on its cost. A block
+      present but carrying no ``web_search_requests`` -- only web_fetch ran --
+      is zero for the same reason. Verified on one model and one tool version
+      (``web_search_20250305``); it is a response-envelope behaviour of the
+      Messages API rather than a model one, so opus-5 and sonnet-5 are very
+      likely the same, but that is unverified.
     * openai: search-action ``web_search_call`` items; see
       :func:`_consume_responses_stream`.
     * gemini: distinct non-empty ``webSearchQueries``. Google bills Gemini 3 per
@@ -1825,9 +1839,9 @@ def _read_searches(provider, assembled, model=""):
       on a response that was not streamed. Grok's search is off in every preset
       until the litellm fix in UPSTREAM.md lands.
 
-    For gemini, openai and the Agent API a zero is inferred from absence (no
-    queries, no search items, no invocations), so it is only taken from a
-    response that reported tokens.
+    For claude, gemini, openai and the Agent API a zero is inferred from absence
+    (no block, no queries, no search items, no invocations), so it is only taken
+    from a response that reported tokens.
     An empty one is not a report of no searches. On 2026-09-19 a live
     gemini:fact_check came back empty four times running, 0+0 tokens and no
     text, and those counts are unknown, like its tokens.
@@ -1851,12 +1865,15 @@ def _read_searches(provider, assembled, model=""):
         count = assembled.get("web_search_calls")
     elif provider == "claude":
         server = _usage_as_dict(assembled.get("usage")).get("server_tool_use")
-        count = (
+        reported = (
             server.get("web_search_requests")
             if isinstance(server, dict)
             else getattr(server, "web_search_requests", None)
         )
-        return None if count is None else int(count)
+        # Absent is zero, not unknown -- measured 2026-10-04, see the
+        # docstring. Falls through to the shared tokens guard below, so an
+        # empty response is still unknown rather than a confident zero.
+        count = 0 if reported is None else int(reported)
     else:
         return None
     if count == 0 and not any(_read_tokens(assembled.get("usage")).values()):
