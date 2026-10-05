@@ -2,6 +2,7 @@ import base64
 import html
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 
@@ -39,11 +40,16 @@ SEO
 [ ] Focus keyword set in Rank Math
 [ ] Meta description under 155 characters
 [ ] OG tags set
+[ ] Featured image set: it is the share card (og:image) and the archive thumbnail
+    (the handoff's "Featured image:" line; listed under IMAGES above when there is
+    one, and public from the moment it is uploaded)
 [ ] Schema type correct for content type (set in Rank Math, not by this script)
 
 PUBLICATION
 [ ] WordPress category correct
 [ ] Tags applied
+[ ] Slug and excerpt are what you want (the handoff's "Slug:" and "Excerpt:"
+    lines; WordPress makes both up when they are left out)
 [ ] Status is draft (default) -- confirm before switching to live
 [ ] UpdraftPlus backup is current
 """
@@ -181,6 +187,7 @@ def _build_post_payload(
     category_ids,
     tag_ids,
     post_type="post",
+    featured_media=None,
 ):
     payload = {
         "title": pub_params.get("title", ""),
@@ -200,6 +207,29 @@ def _build_post_payload(
     author = pub_params.get("author")
     if author:
         payload["author"] = author
+
+    # Slug, excerpt and featured image are optional and are left out of the
+    # payload, not sent empty, when the handoff did not set them: an absent key
+    # is what lets WordPress derive the slug from the title and the excerpt from
+    # the opening words of the body, as it always has, and a handoff written
+    # before these fields existed publishes exactly the post it did.
+    #
+    # They go on pages as well. A page has a slug and a featured image by
+    # default but no excerpt unless the site adds one, and WordPress drops an
+    # unregistered field without an error, so what it kept is read back from
+    # its answer (_confirm_post_fields) rather than decided here for a site this
+    # cannot see.
+    slug = (pub_params.get("slug") or "").strip()
+    if slug:
+        payload["slug"] = slug
+    excerpt = (pub_params.get("excerpt") or "").strip()
+    if excerpt:
+        payload["excerpt"] = excerpt
+    # An attachment ID, which is the only thing ``featured_media`` takes: the
+    # image has to be in this site's media library already, which is why it is
+    # uploaded first (upload_images).
+    if featured_media:
+        payload["featured_media"] = featured_media
 
     # Rank Math SEO meta fields
     meta = {}
@@ -298,6 +328,12 @@ def _apply_rank_math_meta(site_url, headers, post_id, meta):
 # can be checked without a request is checked first (plan_images), so a mistyped
 # path fails before anything has been sent rather than after an earlier image
 # has already gone up.
+#
+# The handoff's "Featured image:" line goes through all of that with them: it is
+# planned before anything is sent, scrubbed, listed before the author says yes,
+# and uploaded. It differs in one way. A post's featured image is its
+# ``featured_media``, which WordPress takes as an attachment ID, so there is no
+# "already hosted" form to link to: it has to be a file, and it is uploaded.
 # ---------------------------------------------------------------------------
 
 
@@ -307,8 +343,15 @@ class ImagePlan:
 
     #: Every image the draft contains, in document order.
     refs: list = field(default_factory=list)
+    #: The image the handoff's ``Featured image:`` line names, once it has passed
+    #: every check, else None. It is not in ``refs``: those are numbered in
+    #: document order in every message ("Image 2 of 4") and this one is not in the
+    #: document. Its file is in ``uploads`` and ``metadata`` under its source as
+    #: written, like theirs, so the strip, the listing and the upload all treat
+    #: it the way they treat the others.
+    featured: images.ImageRef | None = None
     #: Source as written -> the file on disk, for each local image that becomes
-    #: a block.
+    #: a block, and for the featured image.
     uploads: dict = field(default_factory=dict)
     #: Source as written -> what that file carries besides pixels, for each one
     #: that was readable. Read without the network, like everything else here.
@@ -332,18 +375,26 @@ class ImagePlan:
         return [r for r in self.block_images if r.kind == images.URL]
 
 
-def plan_images(content, base_dir=None, strip_metadata=True):
+def plan_images(content, base_dir=None, strip_metadata=True, featured_image=None):
     """Find the draft's images and check every local file, sending nothing.
 
     ``base_dir`` is what a relative path is relative to: the directory of the
     handoff file, so the same handoff resolves the same way wherever the command
     is run from. Left unset it is the working directory.
 
+    ``featured_image`` is the handoff's ``Featured image:`` value, when it has
+    one. It is checked here, with the draft's own images, because it is a file
+    that gets uploaded and so fails for the same reasons, and has to fail at the
+    same point: before anything is sent.
+
     Each local file is also read for what it carries besides pixels, so that a
     photograph that records where it was taken can be named on the page the
     author confirms rather than after it is already public.
     """
     plan = ImagePlan(refs=blocks.find_images(content), strip_metadata=strip_metadata)
+    # First, so its problems lead: the handoff's parameters come before its draft.
+    if (featured_image or "").strip():
+        _plan_featured_image(plan, featured_image, base_dir)
     structural = blocks.image_problems(plan.refs)
     for i, ref in enumerate(plan.refs):
         label = images.describe(ref, i + 1, len(plan.refs))
@@ -372,6 +423,105 @@ def plan_images(content, base_dir=None, strip_metadata=True):
                 "![alt text](...)."
             )
     return plan
+
+
+#: How a message names the featured image. The draft's own are "Image 2 of 4",
+#: numbered in document order, and this one is not in the document.
+_FEATURED = "Featured image"
+
+
+def _featured_label(ref):
+    return f'{_FEATURED} "{images.shorten(ref.src.strip())}"'
+
+
+def _featured_ref(raw):
+    """The ``ImageRef`` a ``Featured image:`` value names, or an ``ImageError``.
+
+    Two spellings, and an author who has read the IMAGES note will try both. A
+    bare source (``images/hero.jpg``) is taken as it stands, with no Markdown
+    reading it, so a space or a Windows backslash needs no escaping. A Markdown
+    image (``![Alt text](images/hero.jpg)``) is read by the parser the draft's
+    own images go through, and is the only way to give a featured image alt text
+    on one line. Anything else that opens ``![`` is refused, not guessed at.
+    """
+    value = raw.strip()
+    if not value.startswith("!["):
+        return images.ImageRef(src=value)
+    found = blocks.find_images(value)
+    if len(found) != 1 or found[0].placement != images.BLOCK:
+        raise images.ImageError(
+            "the line could not be read as a single image. Give a path, or one "
+            "Markdown image: ![alt text](images/hero.jpg)."
+        )
+    return found[0]
+
+
+def _plan_featured_image(plan, raw, base_dir):
+    """Check the handoff's featured image the way the draft's own are checked.
+
+    Everything that stops a body image stops this one, for the same reasons: a
+    missing file, one that is not an image, one whose metadata cannot be
+    stripped, a ``.heic``. What differs is the source. A URL is refused, where a
+    body image would be linked: ``featured_media`` is an attachment ID, so a post
+    cannot point at an image hosted elsewhere, and the only way to give it one is
+    to upload the file. (WordPress 7.1 can fetch a URL into the media library
+    itself, through a ``url`` parameter on the media endpoint. That route is not
+    used. The fetch happens on the server, so the metadata strip never sees the
+    file, it needs a WordPress that has it, and its path was reported to skip
+    the fields a normal upload carries, alt text among them:
+    WordPress/gutenberg#82034.)
+    """
+    try:
+        ref = _featured_ref(raw)
+    except images.ImageError as e:
+        plan.problems.append(f"{_FEATURED}: {e}")
+        return
+    kind = ref.kind
+    if kind == images.EMPTY:
+        plan.problems.append(
+            f"{_FEATURED}: it has no source. Give a path to an image file."
+        )
+        return
+    label = _featured_label(ref)
+    if kind == images.URL:
+        plan.problems.append(
+            f"{label}: it is a URL, and a post's featured image has to be an item "
+            "in this site's media library (WordPress sets it by attachment ID), "
+            "so it cannot point at an image hosted elsewhere. Save the image as a "
+            "file and give that path: it is uploaded the way an image in the "
+            "draft is."
+        )
+        return
+    if kind == images.UNSUPPORTED:
+        plan.problems.append(
+            f"{label}: its source is not a path to a file. Save the image as a "
+            "file and give that path."
+        )
+        return
+    try:
+        path = images.resolve_local_image(ref.src, base_dir)
+    except images.ImageError as e:
+        plan.problems.append(f"{label}: {e}")
+        return
+    plan.uploads[ref.src] = path
+    problem = _read_metadata(plan, ref.src, path, label)
+    if problem:
+        plan.problems.append(problem)
+        return
+    plan.featured = ref
+    warning = _location_warning(plan, ref.src, label)
+    if warning:
+        plan.warnings.append(warning)
+    if not ref.alt.strip():
+        plan.warnings.append(
+            f"{label}: no alt text. Write the line as a Markdown image to give it "
+            "some: ![alt text](images/hero.jpg)."
+        )
+    if ref.caption.strip():
+        plan.warnings.append(
+            f"{label}: a featured image has no caption, so the one written here "
+            "is not used."
+        )
 
 
 def _read_metadata(plan, src, path, label):
@@ -452,10 +602,11 @@ def _location_warning(plan, src, label):
 
 def describe_problems(plan):
     return (
-        "The FINAL DRAFT has image(s) that cannot be published, so nothing was "
+        "The handoff has image(s) that cannot be published, so nothing was "
         "sent:\n  - "
         + "\n  - ".join(plan.problems)
-        + "\nFix the image line(s) in the handoff and re-run."
+        + "\nFix the image line(s) in the handoff (in the FINAL DRAFT, or the "
+        "Featured image: line) and re-run."
     )
 
 
@@ -623,11 +774,18 @@ def upload_images(plan, api_base, headers):
     """Upload each distinct local file once: ``(resolved, uploads, warnings)``.
 
     ``resolved`` is what ``blocks.to_blocks`` takes, source -> ``UploadedImage``.
-    ``uploads`` and ``warnings`` are for the result.
+    ``uploads`` and ``warnings`` are for the result. The featured image, when
+    there is one, is in all three: ``resolved`` is how ``push`` finds its
+    attachment ID (no block uses that entry), and its ``uploads`` entry says
+    ``"featured": True``.
 
     A file the draft uses twice is uploaded once and both blocks point at the
     one attachment. Each block keeps its own alt text; the attachment can hold
-    only one, so it gets the first that is not empty.
+    only one, so it gets the first that is not empty. The featured image goes
+    first, so when it is also a picture in the draft the attachment keeps its
+    alt text, which is where a theme reads the featured image's alt text from.
+    That also makes it the first upload: when it fails, nothing else went up,
+    and when a later one fails, it is named with the rest.
 
     What goes up is a scrubbed copy in a temporary directory, not the file on the
     author's disk: a media-library item is public the moment it exists, and the
@@ -637,21 +795,27 @@ def upload_images(plan, api_base, headers):
 
     Raises ``ImageError`` naming the image, and what was already uploaded.
     """
+    queue = [
+        (ref, images.describe(ref, i + 1, len(plan.refs)), False)
+        for i, ref in enumerate(plan.refs)
+    ]
+    if plan.featured is not None:
+        queue.insert(0, (plan.featured, _featured_label(plan.featured), True))
+
     first_alt = {}
-    for ref in plan.refs:
+    for ref, _, _ in queue:
         path = plan.uploads.get(ref.src)
         if path is not None and ref.alt.strip():
             first_alt.setdefault(_file_key(path), ref.alt)
 
     by_file, resolved, uploads, warnings = {}, {}, [], []
     with tempfile.TemporaryDirectory(prefix="ci-image-scrub-") as scratch:
-        for i, ref in enumerate(plan.refs):
+        for ref, label, featured in queue:
             path = plan.uploads.get(ref.src)
             if path is None:
                 continue
             key = _file_key(path)
             if key not in by_file:
-                label = images.describe(ref, i + 1, len(plan.refs))
                 send, stripped = path, _will_strip(plan, ref.src)
                 if stripped:
                     try:
@@ -683,6 +847,9 @@ def upload_images(plan, api_base, headers):
                         "id": by_file[key].attachment_id,
                         "url": by_file[key].url,
                         "stripped": stripped,
+                        # Only ever present, so a draft's own entries stay as
+                        # they were.
+                        **({"featured": True} if featured else {}),
                     }
                 )
                 if warning:
@@ -712,11 +879,23 @@ def print_image_plan(plan):
     one thing on this page the author has not already read in the draft: a
     handoff can name any file the machine can read, and this is the last point
     at which someone can see which.
+
+    The featured image is listed first, under its own heading, and counts as an
+    upload for the closing line: it is public from the moment it is uploaded
+    like any other, and is the one most likely to be a photograph.
     """
-    if not plan.block_images:
+    if not plan.block_images and plan.featured is None:
         return
     print("\nIMAGES")
     print("======")
+    if plan.featured is not None:
+        path = plan.uploads[plan.featured.src]
+        print("Featured image:")
+        print(f"  UPLOAD  {path}  ({_size(path)})")
+        print(f"     alt:     {plan.featured.alt.strip() or '(none)'}")
+        print(f"     metadata: {_metadata_line(plan, plan.featured.src)}")
+        if plan.block_images:
+            print("In the post:")
     for i, ref in enumerate(plan.refs, 1):
         if ref.placement != images.BLOCK:
             continue
@@ -789,9 +968,118 @@ def print_image_result(result):
             f"library, {result['images_linked']} linked from an existing URL"
         )
         for up in result["image_uploads"]:
-            note = "" if up.get("stripped") else "  (metadata NOT stripped)"
-            print(f"  - {up['src']} -> media ID {up['id']}{note}")
+            notes = [
+                note
+                for note, applies in (
+                    ("featured image", up.get("featured")),
+                    ("metadata NOT stripped", not up.get("stripped")),
+                )
+                if applies
+            ]
+            tail = f"  ({'; '.join(notes)})" if notes else ""
+            print(f"  - {up['src']} -> media ID {up['id']}{tail}")
     for warning in result.get("image_warnings", []):
+        print(f"WARNING: {warning}")
+
+
+def _stored_excerpt(data):
+    """The excerpt WordPress answered with, as plain text, or None if it sent none.
+
+    ``raw`` is what is in the database, and it comes back to the caller who
+    created the post. ``rendered`` is the fallback, with the paragraph tags the
+    ``the_excerpt`` filter wraps it in taken off.
+    """
+    excerpt = data.get("excerpt")
+    if isinstance(excerpt, dict):
+        raw = excerpt.get("raw")
+        if raw is None:
+            raw = re.sub(r"<[^>]+>", "", excerpt.get("rendered") or "")
+        return raw
+    return excerpt if isinstance(excerpt, str) else None
+
+
+def _confirm_post_fields(payload, data, featured_src=None):
+    """What WordPress kept of the slug, excerpt and featured image: ``(fields, warnings)``.
+
+    Read from the answer to the create and not taken from its ``200``. A page has
+    no excerpt unless the site adds one, a theme without post-thumbnail support
+    has no featured image, and WordPress drops a field the post type has not
+    registered without saying so: this repo's last fields to vanish that way,
+    Rank Math's, came back ``200`` with nothing set.
+
+    ``fields`` has an entry for each of the three the handoff asked for, with what
+    was sent and what came back, and nothing for one it did not. A slug WordPress
+    changed is not a warning (it cleans one with ``sanitize_title``, and adds
+    ``-2`` to a published one that is taken) but the author is shown both, since
+    the one in the handoff is no longer the one on the site. ``warnings`` is for
+    what did not land at all.
+    """
+    fields, warnings = {}, []
+    if "slug" in payload:
+        stored = data.get("slug") or ""
+        fields["slug"] = {"requested": payload["slug"], "stored": stored}
+        if not stored:
+            warnings.append(
+                "WordPress did not keep the slug (it answered with none), so the "
+                "post will be named from its title."
+            )
+    if "excerpt" in payload:
+        stored = _stored_excerpt(data)
+        fields["excerpt"] = {"requested": payload["excerpt"], "stored": stored}
+        if stored is None:
+            warnings.append(
+                "WordPress did not keep the excerpt (its answer has none). A page "
+                "has no excerpt unless the site adds that support to pages."
+            )
+        elif _plain(stored) != _plain(payload["excerpt"]):
+            warnings.append(
+                f"WordPress stored the excerpt as {stored!r}, not as written."
+            )
+    if "featured_media" in payload:
+        requested = payload["featured_media"]
+        try:
+            stored = int(data.get("featured_media"))
+        except (TypeError, ValueError):
+            stored = None
+        fields["featured_media"] = {
+            "requested": requested,
+            "stored": stored,
+            "src": featured_src,
+        }
+        if stored != requested:
+            warnings.append(
+                "WordPress did not set the featured image: it answered "
+                f"featured_media {data.get('featured_media')!r}, not {requested}. "
+                f"The image is in the media library as media ID {requested}; set "
+                "it as the featured image in the post's sidebar. (A theme with no "
+                "post-thumbnail support has none to set.)"
+            )
+    return fields, warnings
+
+
+def print_post_fields_result(result):
+    """Say what became of the slug, excerpt and featured image, next to the post URL.
+
+    A field the handoff did not set prints nothing, so a handoff without them
+    reads as it always has. The slug is the one WordPress answered with: it can
+    differ from the handoff's, and the author would otherwise find out from the
+    permalink.
+    """
+    fields = result.get("post_fields") or {}
+    slug = fields.get("slug")
+    if slug:
+        line = f"Slug:     {slug['stored'] or '(none)'}"
+        if slug["stored"] and slug["stored"] != slug["requested"]:
+            line += f"  (the handoff asked for {slug['requested']!r})"
+        print(line)
+    excerpt = fields.get("excerpt")
+    if excerpt and excerpt["stored"] is not None:
+        text = " ".join(excerpt["stored"].split())
+        print(f"Excerpt:  {text if len(text) <= 200 else text[:197] + '...'}")
+    featured = fields.get("featured_media")
+    if featured and featured["stored"] == featured["requested"]:
+        print(f"Featured: media ID {featured['stored']} ({featured['src']})")
+    for warning in result.get("post_field_warnings", []):
         print(f"WARNING: {warning}")
 
 
@@ -829,6 +1117,16 @@ def push(
     reported back on the result rather than dropped — naming a category on a
     page is an authoring mistake, and a silent drop is how it stays one.
 
+    ``pub_params["slug"]``, ``["excerpt"]`` and ``["featured_image"]`` are
+    optional. The first two are sent as ``slug`` and ``excerpt``. The featured
+    image is a path (or a Markdown image, for its alt text) that goes through the
+    same checks, scrub and upload as an image in the draft, first, and its
+    attachment ID is sent as ``featured_media``; a URL is refused, because a
+    post's featured image has to be in this site's media library. What
+    WordPress kept of all three is read back from its answer into
+    ``post_fields``, with a ``post_field_warnings`` entry for each that did not
+    land.
+
     Returns dict with keys: success (bool), post_id, post_url, error (if failed).
     """
     try:
@@ -851,7 +1149,12 @@ def push(
     # Every local image is checked here, before the first request of any kind. A
     # mistyped path costs nothing now; found after an earlier image had gone up,
     # it would cost an orphaned upload as well.
-    image_plan = plan_images(content, image_base_dir, strip_image_metadata)
+    image_plan = plan_images(
+        content,
+        image_base_dir,
+        strip_image_metadata,
+        featured_image=pub_params.get("featured_image"),
+    )
     if image_plan.problems:
         log.error(describe_problems(image_plan))
         return {"success": False, "error": describe_problems(image_plan)}
@@ -921,6 +1224,15 @@ def push(
         log.error(f"WordPress image conversion failed: {error}")
         return {"success": False, "error": error}
 
+    # Found by source, as a body image is: upload_images keys everything it put
+    # up by the source as written. The featured image is always in it, because a
+    # plan with a featured image has no problems and so uploaded it.
+    featured_media = (
+        hosted[image_plan.featured.src].attachment_id
+        if image_plan.featured is not None
+        else None
+    )
+
     payload = _build_post_payload(
         pub_params,
         wp_config,
@@ -929,6 +1241,7 @@ def push(
         category_ids=category_ids,
         tag_ids=tag_ids,
         post_type=post_type,
+        featured_media=featured_media,
     )
 
     if publish_live:
@@ -966,7 +1279,18 @@ def push(
             # Surfaced on the result, not just in a log line, so the caller can
             # print it next to the success message instead of it scrolling past.
             result["unresolved_terms"] = sorted(unresolved)
-        if image_plan.block_images:
+        post_fields, field_warnings = _confirm_post_fields(
+            payload,
+            data,
+            featured_src=(
+                image_plan.featured.src if image_plan.featured is not None else None
+            ),
+        )
+        if post_fields:
+            result["post_fields"] = post_fields
+        if field_warnings:
+            result["post_field_warnings"] = field_warnings
+        if image_plan.block_images or image_plan.featured is not None:
             result["images_stripped"] = sum(
                 1 for up in image_uploads if up.get("stripped")
             )

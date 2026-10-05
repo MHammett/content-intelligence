@@ -5342,9 +5342,16 @@ def run_publish_pipeline(
     # suggestion call is paid for, and before the checklist asks for a yes that
     # would come to nothing. A relative path is relative to the handoff file, not
     # to wherever this was run from, so the same handoff finds the same files.
+    #
+    # The handoff's Featured image: line is checked here too. It is a file that
+    # gets uploaded, so a missing or non-image one has to stop the publish at the
+    # same point a bad image in the draft does.
     image_base_dir = Path(handoff_path).resolve().parent
     image_plan = wp.plan_images(
-        pub_handoff["final_draft"], image_base_dir, strip_image_metadata
+        pub_handoff["final_draft"],
+        image_base_dir,
+        strip_image_metadata,
+        featured_image=pub_handoff["publication_parameters"].get("featured_image"),
     )
     if image_plan.problems:
         log.error(wp.describe_problems(image_plan))
@@ -5389,6 +5396,12 @@ def run_publish_pipeline(
         # every handoff written before the field existed still publishes as an
         # article.
         "post_type": pub_handoff["publication_parameters"].get("post_type"),
+        # Optional, and blank when the line is absent or still on its
+        # placeholder, which wp.push reads as "leave it to WordPress": the slug
+        # and excerpt it derives itself, and a post with no featured image.
+        "slug": pub_handoff["publication_parameters"].get("slug"),
+        "excerpt": pub_handoff["publication_parameters"].get("excerpt"),
+        "featured_image": pub_handoff["publication_parameters"].get("featured_image"),
     }
 
     content = pub_handoff["final_draft"]
@@ -5413,6 +5426,7 @@ def run_publish_pipeline(
         print(f"Type:     {result.get('post_type', 'post')}")
         print(f"Post URL: {result['post_url']}")
         print(f"Post ID:  {result['post_id']}")
+        wp.print_post_fields_result(result)
         wp.print_image_result(result)
         if result.get("ignored_terms"):
             # A page cannot carry them. Said plainly, because the handoff named
