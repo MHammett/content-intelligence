@@ -3200,8 +3200,39 @@ class TestSearchCountsReachTheResult:
     def test_claude_reports_a_search_it_did_not_run_as_zero(self):
         assert self._claude(_with_searches(0), web_search=True)["searches"] == 0
 
-    def test_a_claude_count_the_response_lacks_is_unknown_not_zero(self):
-        assert self._claude(_usage(), web_search=True)["searches"] is None
+    def test_an_absent_server_tool_use_block_is_zero_not_unknown(self):
+        """Anthropic sends no block when no server tool ran (#265).
+
+        This asserted ``is None`` until 2026-10-04, on the assumption that
+        absence meant the provider had not said. It was measured instead:
+        three live claude-haiku-4-5 calls with web search attached and told
+        not to use it answered with text only and returned no
+        ``server_tool_use``, on the raw Messages API streamed and not, and
+        through this client. Absence is the provider saying none. Reading it
+        as unknown put a spurious "at least" on the cost of every ``maximum``
+        run whose ``claude:fact_check`` happened not to search.
+        """
+        assert self._claude(_usage(), web_search=True)["searches"] == 0
+
+    def test_an_empty_claude_response_is_still_unknown(self):
+        """The zero is inferred only from a response that reported tokens.
+
+        Same rule as gemini/openai/Agent API. A call that came back with no
+        block AND no tokens searched an unknown number of times, like its
+        tokens -- not zero.
+        """
+        assert self._claude(_usage(0, 0), web_search=True)["searches"] is None
+
+    def test_a_block_without_web_search_requests_is_zero(self):
+        """Only web_fetch ran, so web_search ran zero times.
+
+        Anthropic's zeros cover the tools in the block that did not run; a
+        key missing from a block that IS present says the same thing about
+        that tool. This also returned None before #265.
+        """
+        usage = _usage()
+        usage.server_tool_use = {"web_fetch_requests": 2}
+        assert self._claude(usage, web_search=True)["searches"] == 0
 
     def test_claude_without_web_search_has_no_count_at_all(self):
         assert "searches" not in self._claude(_with_searches(0))
