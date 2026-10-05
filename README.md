@@ -4,6 +4,28 @@ Content Intelligence is a [uv](https://docs.astral.sh/uv/) workspace of tools fo
 producing and reviewing written content. Code lives under `packages/`, one package
 per capability (see [docs/NAMING.md](docs/NAMING.md) for the naming convention):
 
+> **Status: in active development, not finished.** `ci-article-review` is public so
+> others can read and try it, and it is used on real articles, but it is not a
+> finished or stable tool, and its output is a set of leads for a human editor, not a
+> verdict.
+>
+> **Works today:** an ensemble review of a draft across several model providers
+> (fact check, voice and style, completeness, argument integrity, red team); a
+> consolidated report with a worklist of what only a person can settle; citation
+> resolution (Section 9), where each cited page is fetched and a model judges whether
+> it supports the claim, and a "supports" verdict is only kept if its quote appears
+> (ignoring case and spacing) in the fetched page; run history and change tracking between runs;
+> free replay of a saved run; and publishing a new post to WordPress.
+>
+> **Does not work yet:** one review run is not reproducible, so a single run's findings
+> are unverified (the pipeline reports how few findings recurred across repeated runs);
+> the fact-check models' own quoted evidence is checked for being present but is not
+> checked against the page it cites; the citation resolver reads only the first page of
+> a source and does not follow pagination; publishing can only create a post, never
+> update one; and a scope call by a single model can still withdraw verdicts from
+> other models. The open issues list is the current record.
+
+
 - **ci-core** (`ci_core`) — the shared foundation both application packages build on.
   It owns the LLM layer (`ci_core.llm`: one streaming call path to all six
   providers via litellm, robust JSON extraction, token and cost accounting, the
@@ -34,7 +56,8 @@ per capability (see [docs/NAMING.md](docs/NAMING.md) for the naming convention):
   unchanged.
 - **ci-article-review** (`ci_article_review`) — the article-review pipeline: runs a
   drafted or already-published article through grammar correction and ensemble
-  multi-model AI review, then publishes to WordPress on approval. The mature package.
+  multi-model AI review, then publishes to WordPress on approval. The most developed
+  package, and still in active development (see the status note above).
 - **ci-style-profile** (`ci_style_profile`) — style-profile bootstrapping: analyzes a writing
   corpus across multiple sources and synthesizes a structured style profile for `publication.yaml`.
   Early-stage.

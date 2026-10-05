@@ -169,3 +169,39 @@ def test_the_draft_rule_leaves_the_shipped_templates_alone(scratch_repo):
         f"the .gitignore ignores a shipped template: {swallowed}. Git would show it "
         "as untracked-then-ignored, and a build would drop it from the wheel."
     )
+
+
+@pytest.mark.parametrize(
+    "name", ("pipeline-and-verification-update.md", "any-draft-handoff-r5.md")
+)
+def test_nothing_at_the_repo_root_handoff_dir_is_tracked(scratch_repo, name):
+    """The repo-root handoff_templates/ is a working directory, not source.
+
+    Every draft and handoff in it is private whatever it is called, so the whole
+    directory is ignored, not just the dc-environment names. The line is anchored
+    with a leading slash: bare, it would also match the packaged templates, and
+    the next test pins that they stay visible.
+    """
+    assert _ignored(scratch_repo, f"{LEGACY_DIR}/{name}"), (
+        f"{LEGACY_DIR}/{name} is not ignored. Add /{LEGACY_DIR}/ to .gitignore."
+    )
+
+
+def test_ignoring_the_root_handoff_dir_does_not_reach_the_packaged_templates(
+    scratch_repo,
+):
+    reached = []
+    for directory in _packaged_dirs():
+        for path in (
+            f"{directory}/anything.md",
+            f"{directory}/examples/anything.md",
+            f"{_from_package(directory)}/anything.md",
+            f"{_from_package(directory)}/examples/anything.md",
+        ):
+            if _ignored(scratch_repo, path):
+                reached.append(path)
+
+    assert not reached, (
+        f"ignoring the root {LEGACY_DIR}/ also ignores packaged paths: {reached}. "
+        "Anchor the line with a leading slash."
+    )
