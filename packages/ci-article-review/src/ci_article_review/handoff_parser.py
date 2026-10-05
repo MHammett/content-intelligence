@@ -398,6 +398,13 @@ def _extract_field(text, label):
 #: TestTheTwoAuthorLabelsAreDistinct. "Status:" is not read by anything; the
 #: line exists to remind whoever fills in the template that ``--publish-live``
 #: is the actual switch, not this field.
+#:
+#: "Slug:", "Excerpt:" and "Featured image:" are optional, and each has a safe
+#: "unset": WordPress derives the slug from the title, builds the excerpt from
+#: the opening words of the body, and a post with no featured image is what every
+#: post published before these fields existed looked like. So an unfilled
+#: placeholder reads as blank, the same as Post type, rather than being flagged
+#: the way category and tags are (see _RAW_PUBLICATION_PARAMETER_FIELDS).
 _PUBLICATION_PARAMETER_LABELS = {
     "status": "Status:",
     "post_type": "Post type:",
@@ -405,6 +412,9 @@ _PUBLICATION_PARAMETER_LABELS = {
     "tags": "Tags:",
     "wordpress_author": "WordPress author:",
     "author": "Author:",
+    "slug": "Slug:",
+    "excerpt": "Excerpt:",
+    "featured_image": "Featured image:",
 }
 
 #: Fields read raw rather than through _extract_field's placeholder collapse.

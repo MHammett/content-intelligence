@@ -15,6 +15,24 @@ display name and not a byline — this is the account the post is filed under.
 The draft handoff's own "Author:" line is a different field entirely: that
 one names who "I" is for citation verification. "Author:" is still accepted
 here for existing documents.]
+Slug: [optional. The last part of the post's web address: lowercase words
+joined by hyphens, such as grid-report-2026. Left out, WordPress makes one from
+the title when the post is published, and cleans it as it goes: it drops the
+colon from a time, so "Stuck at 0:00?" becomes stuck-at-000. A slug that is
+taken gets -2, also at publish. The push prints the slug WordPress stored.]
+Excerpt: [optional. One line of plain text for archive pages, search results and
+share cards. Left out, WordPress uses the opening words of the post, which for
+most articles is a dek or a pull quote. A page has no excerpt unless the site
+adds one, and the push says so if it was dropped.]
+Featured image: [optional. The picture that stands for the post on share cards
+(og:image), in archive lists and in the schema. A path to an image file,
+relative to THIS handoff or absolute: images/hero.jpg. For alt text, write it
+as a Markdown image instead: ![Alt text: what it shows](images/hero.jpg)
+It goes through everything the images note below says about an image in the
+draft: the checks, the scrubbed copy, the list before the checklist, and public
+the moment it is uploaded. It has to be a file: a post's featured image lives in
+the site's media library, so an https:// URL is refused. Left out, the post has
+none.]
 
 SEO METADATA
 Focus keyword: [keyword or phrase | or: derive from primary claim]
@@ -72,6 +90,12 @@ even be read, so there is no way to tell you what is in it. Export it as a JPEG
 and point this at that file -- which it needs anyway, since Chrome, Firefox and
 Edge do not display a .heic at all. (If you took the photo on an iPhone, this is
 the format it used unless you changed the setting.)
+
+The Featured image: line under PUBLICATION PARAMETERS goes through all of this
+too: the same checks, the same scrubbed copy, the same list before the
+checklist, and the same rule that it is public as soon as it is uploaded. Unlike
+an image in the draft it has to be a file: an https:// URL is refused, because a
+post's featured image has to be in this site's media library.
 
 Stripping metadata does not make a photo anonymous. A photo of a screen can show
 a location in plain text that no metadata strip touches: a navigation unit's

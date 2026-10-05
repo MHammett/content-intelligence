@@ -1545,6 +1545,85 @@ and a note on any whose metadata was not stripped.
 
 ---
 
+### Slug, excerpt and featured image
+
+Three optional lines under PUBLICATION PARAMETERS in the publication handoff, for
+the things a post needs to look right once it is shared or listed:
+
+```text
+Slug: grid-report-2026
+Excerpt: Grid load peaked in August, and the counties that carried it were not the ones anyone expected.
+Featured image: ![A lineworker on a pole at dusk](images/hero.jpg)
+```
+
+| Line | What it sets | Left out |
+|---|---|---|
+| `Slug:` | The last part of the post's URL, sent as `slug`. | WordPress makes one from the title when the post is published. |
+| `Excerpt:` | One line of plain text for archive pages, search results and share cards, sent as `excerpt`. | WordPress uses the opening words of the post, which for most articles is a dek or a pull quote. |
+| `Featured image:` | The picture that stands for the post: the share card (`og:image`), the archive thumbnail, the schema `image`. Uploaded, then set as the post's `featured_media`. | The post has none. |
+
+A line that is absent, blank or still on the template's bracketed placeholder
+sends nothing, so a handoff written before these lines existed publishes exactly
+the post it did.
+
+**Slug.** WordPress cleans the slug it is sent (`sanitize_title`): it lowercases,
+turns spaces into hyphens and drops punctuation, including the colon in a time,
+which is how "Stuck at 0:00?" in a title comes out as `stuck-at-000` in the
+slug when none is given. After the push the slug WordPress stored is printed next
+to the post URL, and when it is not the one in the handoff both are shown.
+
+A **draft's slug is not checked for uniqueness.** WordPress adds `-2` to a taken
+slug only when the post is published, and a draft with no `Slug:` has no slug
+at all until then. So the slug printed for a draft is what is stored now, and it
+can still change when the draft is published in WordPress. With `--publish-live`
+the check runs at once and the printed slug is final.
+
+**Excerpt.** Written on one line: a line that wraps in the handoff is read up to
+its first line break. The excerpt WordPress kept is printed after the push. A
+**page** has no excerpt unless the site adds that support to pages, and
+WordPress drops a field it has not registered without an error, so the answer to
+the create is read, and a `WARNING` is printed next to the post URL when the
+excerpt did not land.
+
+**Featured image.** A path to an image file, relative to the directory of the
+handoff or absolute, or the same path written as a Markdown image when it should
+have alt text: `![Alt text](images/hero.jpg)`. A bare path is read as it stands,
+so a space or a Windows backslash needs no escaping; with no alt text the
+`IMAGES` list says so. It is a file that gets uploaded, so it is treated like an
+image in the draft, and everything in [Images in the FINAL DRAFT](#images-in-the-final-draft)
+about checking, stripping and what becomes public applies to it:
+
+- It is checked before anything is sent, and before the SEO suggestion call and
+  the checklist: a file that is missing, a folder, not an image type, empty or
+  unreadable, or a `.heic`, stops the publish and names the `Featured image:`
+  line.
+- A photograph's EXIF, GPS position and device are stripped from the copy that is
+  uploaded, the rotation is applied to the pixels, and `--keep-image-metadata`
+  applies to it as it does to every other file.
+- It is listed first in the `IMAGES` list before the checklist, and it is
+  **public from the moment it is uploaded**, even though the post stays a draft.
+- It is uploaded before the images in the draft, then set as the post's
+  `featured_media`. A file the draft also uses is uploaded once. The alt text is
+  set on the media-library item, which is where a theme reads the featured
+  image's alt text from; the draft's own block keeps its own.
+- After the push, `Featured:` gives the media ID. A theme without post-thumbnail
+  support has no featured image to set, and WordPress drops the field without an
+  error, so a `WARNING` names the uploaded media ID to set by hand.
+- It cannot be a URL. WordPress sets a featured image by attachment ID, so the
+  image has to be in this site's media library and there is no "already hosted"
+  form to point at, as there is for an image in the draft. An `https://` URL is
+  refused before anything is sent, and the fix is to save the image and give its
+  path. (WordPress 7.1 can fetch a URL into the media library itself; this does
+  not use that, because the fetch happens on the server where the metadata strip
+  cannot see the file, and it needs a WordPress that has it.)
+- A caption written with it is not used, and a warning says so.
+
+**What it does not do.** It does not choose or generate the image, and it does not
+update a post that already exists: publishing the same handoff twice creates a
+second post and uploads the featured image a second time.
+
+---
+
 ### SEO suggestions
 
 The pre-analysis SEO pass reports what's missing. The suggestion pass proposes
