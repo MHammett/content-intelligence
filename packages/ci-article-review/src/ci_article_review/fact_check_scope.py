@@ -617,7 +617,7 @@ class ScopeRules:
                         "model": item.get("source_model", ""),
                         "bucket": bucket,
                         # `checked` last: a confirmation demoted by
-                        # `_demote_unsourced_confirmations` arrives here as
+                        # `_demote_unevidenced_verdicts` arrives here as
                         # `unverifiable` with the source the model originally
                         # offered moved into `checked`. Without this the record
                         # would say a verdict was withdrawn and name nothing —

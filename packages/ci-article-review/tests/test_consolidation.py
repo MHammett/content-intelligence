@@ -1049,8 +1049,19 @@ class TestMalformedFactCheckBuckets:
         identity*, and every reader below sees the object it always saw.
         """
         results = {
+            # Carries the evidence the prompt requires, or the verdict would be
+            # moved (`_demote_unevidenced_verdicts`) and the copy is correct.
             ("gemini", "fact_check"): _ok(
-                {"confirmed": [{"claim": "a", "source_url": "u"}]}, "gemini"
+                {
+                    "confirmed": [
+                        {
+                            "claim": "a",
+                            "source_url": "https://example.gov/a",
+                            "supporting_quote": "the page says a",
+                        }
+                    ]
+                },
+                "gemini",
             ),
             ("openai", "voice_style"): _ok({"flags": [_flag("p")]}, "openai"),
         }
