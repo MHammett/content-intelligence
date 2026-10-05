@@ -321,17 +321,11 @@
 # pass then ran as a single stream: first output at 252.15s, yet
 # first_byte=7.01s, max_gap=0.45s.
 #
-# Fan-out may still lengthen claude's silences, and no value in this file
-# changed for it. That is stage 2, and what is unmeasured is now narrower than
-# it was: claude-haiku-4-5 was measured at 12-call fan-out on 2026-10-04 (9
-# streams, worst first_byte 6.0s, worst gap 3.5s — see the row above), so
-# concurrency alone does not stretch a Claude stream. What that does NOT cover
-# is the model `maximum` actually runs, claude-opus-5 at effort high, which is
-# the one that stalled and the only row of the stall table whose model still
-# ships. #287's `maximum` runs answer it, since claude runs four of the 29
-# calls. Note what the #212 fix already bought: the "omitted" display meant
-# every thinking phase was a silence at ANY fan-out, so the two >120s stalls
-# are not evidence for the concurrency hypothesis either way.
+# FAN-OUT DOES NOT LENGTHEN CLAUDE'S SILENCES, measured 2026-10-05 at the full
+# 29-call fan-out: claude-opus-5 at effort high, worst first byte 13.1s against
+# 120s, worst gap 0.3s against 60s, nothing censored. That closes stage 2. The
+# two >120s stalls were the "omitted" display and nothing else, so the #212 fix
+# accounts for them completely and no value here needs changing.
 #
 # CONSEQUENCE FOR CALIBRATION: measuring ONE call at a time (--only-model /
 # --only-domain / --no-timeout) is the correct method for the WALL-CLOCK cells
@@ -361,9 +355,13 @@
 #                                contained: README, analyze.py, consoles).
 #   stage 1  openai mid-stream   SUPERSEDED, then measured on the replacement.
 #                                See the OpenAI paragraph below.
-#   stage 2  claude first-byte   NOT RUN. The one row of the stall table whose
-#                                model still ships, and nothing else will
-#                                answer it.
+#   stage 2  claude first-byte   MEASURED 2026-10-05, in the 29-call run below.
+#                                claude-opus-5 at effort high, under the full
+#                                fan-out: worst first byte 13.1s against its
+#                                120s allowance, worst gap 0.3s against 60s.
+#                                Fan-out does NOT stretch it. The 253.31s and
+#                                343.85s stalls were the "omitted" thinking
+#                                display in full, and #212 fixed that.
 #   12-CALL FAN-OUT, ALL SIX PROVIDERS   MEASURED 2026-10-04, free: the #285
 #                                cost runs instrumented every stream. Three
 #                                `wide` runs (12 calls, six providers) and
@@ -394,45 +392,80 @@
 #                                Table: pipeline_history/_experiments/
 #                                2026-10-04-stage1-gpt6-openai-silences/
 #                                results-all-20261004.txt
-#   stage 3  the 29-call fan-out NOT RUN, and NOT RUNNABLE FROM WHAT IS ON
-#                                DISK. Counted over all 173 saved reports with
-#                                NO filter, 2026-10-05: 63 captures run the
-#                                full ensemble (29-30 calls), spanning
-#                                2026-06-22 to 2026-10-03, and ZERO of them
-#                                carry a single timed ensemble stream. They all
-#                                predate the instrumentation (#195). Of the 37
-#                                captures that do carry one, the most any has
-#                                is TWELVE — so twelve is the widest
-#                                instrumented fan-out in the repo, and 29 has
-#                                never been observed.
+#   stage 3  the 29-call fan-out MEASURED 2026-10-05, FREE. Someone ran an
+#                                ordinary `maximum` review and the
+#                                instrumentation caught it: 29 ensemble calls,
+#                                all six providers, ALL 29 STREAMS TIMED,
+#                                stock budgets, not a replay. The experiment
+#                                this file proposed is answered, and nothing
+#                                was bought for it.
 #
-#                                THAT COUNT WAS WRONG TWICE, both times for
-#                                the same reason. It said FIVE streams and
-#                                "four 29-call captures" (#313), then twelve
-#                                streams and still four captures (#318). The
-#                                cause: both scans keyed on
-#                                report["ensemble"]["cost_preset"], and 92 of
-#                                the 173 reports — 53% — do not have that key
-#                                at all, so over half the corpus was dropped
-#                                silently and the survivors were read as the
-#                                whole. Scan on the field you are asking about
-#                                (`stream_timing`) and filter nothing else;
-#                                print what was rejected as well as what was
-#                                kept.
+#                                provider              worst fb / budget   worst gap / budget
+#                                claude-opus-5 high        13.1 / 120         0.3 / 60
+#                                gemini-3.5-flash high     27.1 / 260         0.5 / 60
+#                                grok-4.6 high             12.2 / 500         1.1 / 60
+#                                mistral-medium-3-5         1.4 / 200         0.4 / 60
+#                                gpt-6.1-sol xhigh         18.2 / 120        17.7 / 120
+#                                perplexity/sonar          13.8 / 160         0.2 / 60
 #
-# DO NOT BUY STAGE 3 ON ITS OWN. Issue #287 already prices `maximum` x3 for the
-# GPT-6 reproducibility re-measure ($25-27, unbought as of 2026-10-04). Those
-# would be the first instrumented 29-call runs ever made, and because recording
-# is unconditional they answer stages 2 and 3 as a by-product, at no marginal
-# cost. The rider is on #287: read each capture's stream_timing as it lands.
-# Buying a separate fan-out stage would pay twice for the same 29 streams.
+#                                NOT ONE provider came within 4x of either
+#                                budget. So the FAN-OUT HYPOTHESIS IS REFUTED
+#                                at the tier that fans out furthest: 29 calls
+#                                in flight stretches neither knob for any
+#                                provider. openai's gap is 11.6-17.7s here
+#                                against 21.2s at five calls, so going from 5
+#                                to 29 did not stretch it either — the four
+#                                gpt-5.6-sol mid-stream deaths were that
+#                                retired model, not concurrency.
 #
-# Captures used to need copying into the main checkout by hand, because
-# pipeline_history is per-checkout and archiving a session deletes its
-# worktree. CI_HISTORY_ROOT is now set user-wide to the main checkout's
-# pipeline_history (2026-10-04), which does that automatically — but it takes
-# effect only after the Claude app restarts, so until then check where a run
-# actually wrote before trusting that it survived.
+#                                CAVEAT, and it is the real one: the draft was
+#                                2,017 chars. Fan-out was the axis under test
+#                                and this is the widest fan-out on record, but
+#                                a LONG draft at 29 calls is still unmeasured,
+#                                and grok is the reason to care — its first
+#                                byte was 12.2s here against 354.1s on an
+#                                18,167-char draft in stage 0. Whatever drives
+#                                grok's long silences, this run does not
+#                                reproduce it, so do not cut 500 on this.
+#                                Capture and table: pipeline_history/
+#                                _experiments/2026-10-04-stage1-gpt6-openai-
+#                                silences/results-stage3-29call.txt
+#
+# HOW MANY FULL-FAN-OUT CAPTURES EXIST, and the counting lesson behind it. Two
+# bases, both correct, and the basis must be stated because choosing silently
+# is what went wrong twice:
+#
+#   64  reports that render a full ensemble (29-30 calls), ALL files
+#   12  distinct full-fan-out RUNS, excluding `_replay/` — a replay makes no
+#       model calls, so it is the same run counted again (CLAUDE.md says to
+#       drop `_replay/` before measuring)
+#    1  carries timed ensemble streams, on either basis: the 2026-10-05 run
+#
+# This count was wrong three times. #313 said five streams and four captures;
+# #318 corrected the streams to twelve and left the captures at four; the first
+# draft of this very block said 63 captures and ZERO timed, hours before the run
+# above existed. Three distinct causes, which is the point:
+#
+#   * a filter on the wrong field — both early scans keyed on
+#     report["ensemble"]["cost_preset"], and 92 of 173 reports have no such key,
+#     so over half the corpus was dropped silently;
+#   * a basis left unstated — 64 vs 12 is entirely `_replay/`, and quoting
+#     either without saying which invites the other;
+#   * a corpus that moved — the answer changed because a run landed, not
+#     because anyone miscounted.
+#
+# So: scan on the field you are asking about, filter nothing else, print what
+# was rejected as well as what was kept, SAY WHICH CORPUS YOU COUNTED, and date
+# the count. `inventory_all.py` in the experiment folder does the first three.
+#
+# IT WAS NEVER BOUGHT, and that is the useful part of the story. A standalone
+# stage-3 run was designed and priced at $15.6-20.2, then withdrawn on the
+# argument that recording is unconditional, so any 29-call run anyone made for
+# any reason would answer it as a by-product. That is exactly what happened,
+# eleven days later, for $0 of this experiment's money — an ordinary `maximum`
+# review someone ran for their own purposes. The rider on #287 still stands for
+# the one thing left (a LONG draft at 29 calls), and #287's own runs would
+# supply it; nothing here needs buying.
 #
 # READ `cut_short_by` BEFORE READING A CENSORED VALUE. A censored stream is a
 # lower bound, but NOT always a budget bite: a MidStreamFallbackError censors
@@ -441,9 +474,15 @@
 # more at 2-6.5s. All of them were recovered by the retry. So:
 #
 #   cut_short_by empty, value near the budget   -> the budget bit. Size from it.
-#   cut_short_by MidStreamFallbackError, value
-#     small                                     -> a dropped stream, not a
+#   cut_short_by MidStreamFallbackError         -> a dropped stream, not a
 #                                                  silence. Ignore for sizing.
+#   cut_short_by RateLimitError                 -> a 429 before the stream got
+#                                                  going. Ignore for sizing;
+#                                                  it is a rate-limit problem.
+#
+# The 2026-10-05 run censored 5 of its 34 streams and every one was a
+# RateLimitError on perplexity, which retried and completed. Not one censored
+# value in any run on record has been a budget bite.
 #
 # (This paragraph said "a lower bound appears only where a budget actually bit"
 # until 2026-10-05, which would have had a reader size a budget from a 3s
@@ -881,20 +920,20 @@ maximum:
     claude:
       model: claude-opus-5   # was claude-opus-4-8; 2026-08-18 refresh, same price
       effort: high
-      # NOT MEASURED — this is stage 2, the one open question in this file. No
-      # override is set, so both knobs are at the default 120/120, and claude
-      # is the only provider in the 2026-09-09 stall table whose model still
-      # ships: two first-byte stalls at 253.31s and 343.85s under 29-call
-      # fan-out. Those are explained, though, and not by concurrency — opus-5's
-      # thinking display defaulted to "omitted", which put nothing on the wire
-      # while it thought at any fan-out. client.py now asks for "summarized"
-      # (#212, see _provider_params), and an isolated pass after the fix showed
-      # first_byte 7.01s against first output at 252.15s.
+      # MEASURED, NO CHANGE NEEDED (2026-10-05). Both knobs stay at the
+      # default 120/60. Under the full 29-call fan-out, claude-opus-5 at
+      # effort high showed a worst first byte of 13.1s and a worst gap of
+      # 0.3s, nothing censored — 9.2x and 200x headroom. This was the last
+      # open question in this file; it is closed.
       #
-      # So the live question is narrow: does 29-call fan-out stretch a 7s
-      # first-byte past 120s? Do NOT set a value from the pre-#212 numbers —
-      # they measure the bug, not the provider. #287's `maximum` runs settle it
-      # for free (claude runs 4 of the 29 calls); until then, unset is correct.
+      # The 2026-09-09 stalls at 253.31s and 343.85s are fully explained and
+      # NOT by concurrency: opus-5's thinking display defaulted to "omitted",
+      # which put nothing on the wire while it thought, at any fan-out.
+      # client.py now asks for "summarized" (#212, see _provider_params).
+      # Do NOT size a value from those numbers — they measure the bug.
+      #
+      # Unmeasured: a long draft at this fan-out. The 2026-10-05 run used a
+      # 2,017-char draft.
       web_search: [fact_check]   # Same check, same result. fact_check had two
                                   # grounded models out of six; this makes four.
                                   # Scoped to fact_check because every search
