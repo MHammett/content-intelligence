@@ -321,13 +321,17 @@
 # pass then ran as a single stream: first output at 252.15s, yet
 # first_byte=7.01s, max_gap=0.45s.
 #
-# Fan-out may still lengthen claude's silences. That is stage 2, it is still
-# unmeasured as of 2026-10-04, and no value in this file changed for it. It is
-# the only row of the stall table whose model still ships, so it is the one
-# genuinely open question here — and #287's `maximum` runs answer it, since
-# claude runs four of the 29 calls. Note what the fix already bought: the
-# "omitted" display meant every thinking phase was a silence at ANY fan-out, so
-# the two >120s stalls are not evidence for the concurrency hypothesis.
+# Fan-out may still lengthen claude's silences, and no value in this file
+# changed for it. That is stage 2, and what is unmeasured is now narrower than
+# it was: claude-haiku-4-5 was measured at 12-call fan-out on 2026-10-04 (9
+# streams, worst first_byte 6.0s, worst gap 3.5s — see the row above), so
+# concurrency alone does not stretch a Claude stream. What that does NOT cover
+# is the model `maximum` actually runs, claude-opus-5 at effort high, which is
+# the one that stalled and the only row of the stall table whose model still
+# ships. #287's `maximum` runs answer it, since claude runs four of the 29
+# calls. Note what the #212 fix already bought: the "omitted" display meant
+# every thinking phase was a silence at ANY fan-out, so the two >120s stalls
+# are not evidence for the concurrency hypothesis either way.
 #
 # CONSEQUENCE FOR CALIBRATION: measuring ONE call at a time (--only-model /
 # --only-domain / --no-timeout) is the correct method for the WALL-CLOCK cells
@@ -360,30 +364,91 @@
 #   stage 2  claude first-byte   NOT RUN. The one row of the stall table whose
 #                                model still ships, and nothing else will
 #                                answer it.
+#   12-CALL FAN-OUT, ALL SIX PROVIDERS   MEASURED 2026-10-04, free: the #285
+#                                cost runs instrumented every stream. Three
+#                                `wide` runs (12 calls, six providers) and
+#                                three rebuilt-`standard` runs (7 calls,
+#                                five), on the 9,456-char smoke draft, stock
+#                                budgets. 74 ensemble streams with the openai
+#                                set below:
+#
+#                                  provider      streams  worst fb  worst gap
+#                                  claude-haiku-4-5   9      6.0s      3.5s
+#                                  gemini-3.5-flash  11     58.8s      0.5s
+#                                  grok-4.3           6      1.4s      0.6s
+#                                  mistral-small     15      1.0s      1.8s
+#                                  openai            30     16.4s     21.2s
+#                                  perplexity/sonar   3     19.9s      0.3s
+#
+#                                NOTHING came near a budget, so 12-way
+#                                concurrency on its own stretches neither
+#                                knob. Read it as a bound, not as stage 3:
+#                                these are the CHEAP tiers' models. `maximum`
+#                                runs claude-opus-5 at effort high, grok-4.6,
+#                                and gemini at thinking high — none of which
+#                                is here. gemini's 58.8s is the number to
+#                                watch: it is a fact_check at thinking `low`
+#                                on a small draft, already 2.4x the 24s
+#                                measured at `high` on 2026-09-27, against a
+#                                160s default here and 260 at `maximum`.
+#                                Table: pipeline_history/_experiments/
+#                                2026-10-04-stage1-gpt6-openai-silences/
+#                                results-all-20261004.txt
 #   stage 3  the 29-call fan-out NOT RUN, and NOT RUNNABLE FROM WHAT IS ON
 #                                DISK: every full 29-call `maximum` run on
 #                                record (2026-09-09 x3, 2026-09-18 x1)
 #                                predates the stream_timing instrumentation
 #                                (#195) and carries none. Four 29-call
 #                                captures, zero timed streams. The widest
-#                                instrumented fan-out that exists is FIVE
-#                                calls — stage 0's grok-only runs and the
-#                                2026-10-04 openai-only runs below.
+#                                instrumented fan-out that exists is TWELVE
+#                                calls — the row above. (This said FIVE until
+#                                2026-10-05. The scan behind it filtered to
+#                                `maximum`/`thorough` reports and so skipped
+#                                the `wide` and rebuilt-`standard` runs, which
+#                                were already on disk and fully timed. Six
+#                                runs and 45 streams were missed by the tool,
+#                                not missing from the repo: filter on
+#                                stream_timing, not on preset.)
 #
 # DO NOT BUY STAGE 3 ON ITS OWN. Issue #287 already prices `maximum` x3 for the
 # GPT-6 reproducibility re-measure ($25-27, unbought as of 2026-10-04). Those
 # would be the first instrumented 29-call runs ever made, and because recording
 # is unconditional they answer stages 2 and 3 as a by-product, at no marginal
-# cost. The rider is on #287: copy each capture into the main checkout as it
-# lands and read its stream_timing. Buying a separate fan-out stage would pay
-# twice for the same 29 streams.
+# cost. The rider is on #287: read each capture's stream_timing as it lands.
+# Buying a separate fan-out stage would pay twice for the same 29 streams.
 #
-# At stock budgets a censored stream IS the finding: a lower bound appears only
-# where a budget actually bit. If #287's runs censor nothing, every value in
-# this file is adequate at the production condition and the answer for all six
-# providers is "measured, no change needed". If one provider censors, isolate
-# that provider alone with raised budgets — stage 0's method, about $0.6-2.8 a
-# run — and size it from what the silence really was.
+# Captures used to need copying into the main checkout by hand, because
+# pipeline_history is per-checkout and archiving a session deletes its
+# worktree. CI_HISTORY_ROOT is now set user-wide to the main checkout's
+# pipeline_history (2026-10-04), which does that automatically — but it takes
+# effect only after the Claude app restarts, so until then check where a run
+# actually wrote before trusting that it survived.
+#
+# READ `cut_short_by` BEFORE READING A CENSORED VALUE. A censored stream is a
+# lower bound, but NOT always a budget bite: a MidStreamFallbackError censors
+# too, and it fires in SECONDS. The only censored stream in the 2026-10-04 runs
+# is a gemini voice_style at >3.0s against a 160s budget, and stage 0 saw three
+# more at 2-6.5s. All of them were recovered by the retry. So:
+#
+#   cut_short_by empty, value near the budget   -> the budget bit. Size from it.
+#   cut_short_by MidStreamFallbackError, value
+#     small                                     -> a dropped stream, not a
+#                                                  silence. Ignore for sizing.
+#
+# (This paragraph said "a lower bound appears only where a budget actually bit"
+# until 2026-10-05, which would have had a reader size a budget from a 3s
+# fallback error.)
+#
+# If #287's runs censor nothing against a budget, every value in this file is
+# adequate at the production condition and the answer for all six providers is
+# "measured, no change needed". If one provider does bite, isolate that provider
+# alone with raised budgets — stage 0's method, which cost $0.62 a run for
+# grok-only. Do not read that as the price of any isolation run: gemini's
+# per-query search fees were 84-92% of a `wide` run's total on 2026-10-04
+# ($0.44-0.76 of $0.63-0.94, re-measured in #317; its query count had roughly
+# doubled in a week on an unchanged command), so a gemini-only run is
+# fee-dominated, costs several times a grok-only one, and should be quoted as
+# a range or re-measured rather than quoted at all.
 #
 # The perplexity entry this file carried until 2026-09-28 is the standing
 # reminder of what guessing costs instead (160 -> 280 -> 350 -> 500, three bumps
@@ -767,12 +832,17 @@ maximum:
                                   # for 3.5 Flash at `high` on 2026-09-27, all five domains of
                                   # a 9,456-char draft: worst first byte 24s, worst gap 0.9s
                                   # (the thought summaries stream), longest call 135s, so 260
-                                  # has room there — 10.8x headroom on the measured worst case.
-                                  # Unmeasured on a long draft and at 29-call fan-out; both
-                                  # arrive free on the #287 rider (its runs use v26, ~135K
-                                  # chars, which is the long-draft case). Read before cutting
-                                  # this: 260 is inherited from 2.5 Pro, which timed out at
-                                  # 205.78s, and 3.5 Flash has not been shown to need it.
+                                  # has room there. DO NOT CUT IT ON THAT NUMBER ALONE. A
+                                  # `wide` fact_check at thinking `low`, on the same small
+                                  # draft, was silent 58.8s before its first byte on
+                                  # 2026-10-04 — 2.4x the 24s seen at `high`, and the largest
+                                  # first-byte silence any provider but openai showed in those
+                                  # 74 streams. The two measurements disagree about which
+                                  # direction thinking_level moves this, on a sample of one
+                                  # run each, so neither bounds the other. Still unmeasured on
+                                  # a long draft and at 29-call fan-out; both arrive free on
+                                  # the #287 rider (its runs use v26, ~135K chars). 260 is
+                                  # inherited from 2.5 Pro, which timed out at 205.78s.
     mistral:
       model: mistral-medium-3-5
       reasoning_effort: high
