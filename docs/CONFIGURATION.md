@@ -1411,6 +1411,24 @@ seo_rules:
 
 ---
 
+### Links in the FINAL DRAFT
+
+A link is ordinary Markdown, `[text](https://example.com/page)`, or a bare
+`http://` or `https://` URL, which is linked as written. A Sources list with one
+URL to a line publishes with every URL clickable. A full stop, comma, semicolon,
+colon, `!` or `?` after a URL stays outside the link, and so does a `)` or `]`
+that nothing in the URL opened: `(see https://example.com/a)` links
+`https://example.com/a`, and a Wikipedia address that ends in `)` keeps it. Only
+`http` and `https` are linked. `www.example.com`, `ftp://` and an email address
+stay text.
+
+A URL in backticks, in a code block, or already inside a link stays as written.
+One is left unlinked on purpose: a URL that Markdown has cut with emphasis marks,
+such as `https://example.com/_draft_/v1` or a path ending in `__init__.py`,
+because the part before the cut would link to the wrong page. The publish says so
+in its log. Write that URL as `<https://example.com/_draft_/v1>` and all of it is
+linked.
+
 ### Images in the FINAL DRAFT
 
 Write each image as ordinary Markdown, alone on its own line, with a blank line
