@@ -395,20 +395,30 @@
 #                                2026-10-04-stage1-gpt6-openai-silences/
 #                                results-all-20261004.txt
 #   stage 3  the 29-call fan-out NOT RUN, and NOT RUNNABLE FROM WHAT IS ON
-#                                DISK: every full 29-call `maximum` run on
-#                                record (2026-09-09 x3, 2026-09-18 x1)
-#                                predates the stream_timing instrumentation
-#                                (#195) and carries none. Four 29-call
-#                                captures, zero timed streams. The widest
-#                                instrumented fan-out that exists is TWELVE
-#                                calls — the row above. (This said FIVE until
-#                                2026-10-05. The scan behind it filtered to
-#                                `maximum`/`thorough` reports and so skipped
-#                                the `wide` and rebuilt-`standard` runs, which
-#                                were already on disk and fully timed. Six
-#                                runs and 45 streams were missed by the tool,
-#                                not missing from the repo: filter on
-#                                stream_timing, not on preset.)
+#                                DISK. Counted over all 173 saved reports with
+#                                NO filter, 2026-10-05: 63 captures run the
+#                                full ensemble (29-30 calls), spanning
+#                                2026-06-22 to 2026-10-03, and ZERO of them
+#                                carry a single timed ensemble stream. They all
+#                                predate the instrumentation (#195). Of the 37
+#                                captures that do carry one, the most any has
+#                                is TWELVE — so twelve is the widest
+#                                instrumented fan-out in the repo, and 29 has
+#                                never been observed.
+#
+#                                THAT COUNT WAS WRONG TWICE, both times for
+#                                the same reason. It said FIVE streams and
+#                                "four 29-call captures" (#313), then twelve
+#                                streams and still four captures (#318). The
+#                                cause: both scans keyed on
+#                                report["ensemble"]["cost_preset"], and 92 of
+#                                the 173 reports — 53% — do not have that key
+#                                at all, so over half the corpus was dropped
+#                                silently and the survivors were read as the
+#                                whole. Scan on the field you are asking about
+#                                (`stream_timing`) and filter nothing else;
+#                                print what was rejected as well as what was
+#                                kept.
 #
 # DO NOT BUY STAGE 3 ON ITS OWN. Issue #287 already prices `maximum` x3 for the
 # GPT-6 reproducibility re-measure ($25-27, unbought as of 2026-10-04). Those
