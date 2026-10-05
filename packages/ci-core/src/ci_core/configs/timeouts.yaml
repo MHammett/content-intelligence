@@ -64,6 +64,49 @@
 # gpt-5.5 xhigh — measured untruncated (--no-timeout), max 456s; budget 819s gives ~1.8x:
 #   red_team ~240s (13k tok) · argument 275s (19k) · completeness 325s (17k)
 #   voice_style 357s (21k) · fact_check 456s (30k)
+#
+# gpt-6 — MEASURED 2026-10-04, which is what the `gpt-6: 1.3` row above rests on.
+# Three --no-timeout runs of openai alone, gpt-6.1-sol, 5 domains each, on a
+# 9,456-char draft (size bucket 0.8), one after another, $3.61 total. Every call
+# completed first time: first byte 1.6-16s, no stalls, no retries, no discarded
+# attempts, nothing truncated. Captures: short-example-smoke-test run_3 (xhigh),
+# run_4 (max), run_5 (high), all 20261004.
+#
+#   domain              high    xhigh     max
+#   red_team            79.6s   190.0s   376.9s
+#   completeness       106.9s   219.2s   502.3s
+#   argument_integrity 121.8s   216.5s   353.6s
+#   voice_style        171.5s   357.9s   774.7s
+#   fact_check *       371.2s   634.3s  1352.4s     * grounded, 9-13 searches
+#
+# Why 1.3 and not the `default` 1.0 it had been taking by accident: normalised to
+# the 1.0 size bucket (x1.25), 6.1-sol's xhigh times land on gpt-5.5's measured
+# cell above for the four domains that do not search -- red_team 238 vs 240,
+# argument 271 vs 275, completeness 274 vs 325, voice_style 447 vs 357. Same
+# speed, so the same multiplier. fact_check is excluded from that comparison: it
+# searches here and the gpt-5.5 cell did not, so the two are not like for like.
+#
+# What 1.0 was costing, and it is NOT the cell that first looked wrong. openai runs
+# `high` only at `thorough`, and only on voice_style, completeness and
+# argument_integrity -- NOT fact_check, which openai gets solely at `maximum`,
+# where xhigh clamps to 1085s and no multiplier reaches it. So fact_check's thin
+# 371.2s-against-420s is a calibration artefact of this openai-only test, not a
+# shipped risk. The shipped risk is on a LARGE draft: scaling the three `thorough`
+# domains by their measured xhigh/high ratios off the real dc-environment-v26
+# maximum capture (2026-09-09) estimates 229-341s at high, against a 735s budget
+# at 1.0 -- 2.16-3.21x, with the worst cell BELOW the 2.5x variance_margin the
+# file targets. At 1.3 the budget is 955s and the range is 2.80-4.17x, at target.
+# That estimate mixes a measured ratio with a gpt-5.6-sol capture, so treat it as
+# an estimate; the direction is not in doubt.
+#
+# Still thin and NOT fixable here: `maximum`'s own openai:fact_check on
+# dc-environment-v26 ran 786.6s against the 1085s clamp, a 1.38x margin, with
+# voice_style at 1.62x and argument_integrity at 1.79x. All clamped, so the
+# multiplier cannot touch them -- same task_timeout_seconds decision as `max`.
+#
+# gpt-6-luna and gpt-6-astra also match this row and are UNMEASURED. luna is the
+# cheap fast model, so 1.3 is generous for it rather than tight, and the file's own
+# reasoning says over-sizing a wall-clock backstop costs almost nothing.
 # sonar-reasoning-pro (grounded): originally observed 59-141s, but later runs hit
 # 233.93s (succeeded, right at the old 240s wall-clock edge) and then hit the 240s
 # ceiling outright (unknown true value beyond that). model_multiplier raised
@@ -162,6 +205,10 @@ model_multipliers:
                             # is still unknown: it was cut off, not measured.
   gpt-5.4:            1.0
   gpt-5.5:            1.3
+  gpt-6:              1.3   # MEASURED 2026-10-04 -- see the gpt-6 note below.
+                            # No gpt-5.6 row: that family took `default` from the
+                            # 2026-08-18 refresh until it was retired from every
+                            # preset, was never measured, and nothing runs it now.
   mistral-small:      0.8
   mistral-large:      1.0
   mistral-medium-3-5: 1.7   # high effort is heavy-tailed & provider-latency-variable:
@@ -197,10 +244,21 @@ effort_multipliers:
   xhigh:   10.5  # gpt-5.5 xhigh × model 1.3 × base 60 ≈ 819s at the 1.0 size anchor.
                  # Raised from 8.3 after a run showed gpt-5.5 xhigh exceed 632s on
                  # this doc (heavy tail; typical 240-360s but occasional long outliers).
-  max:     10.5  # UNMEASURED. gpt-6's level above xhigh; no preset sets it. Sized as
-                 # xhigh, a floor, because a missing key falls to `default` (1.0) and
-                 # would give a max call a tenth of an xhigh budget. Measure with
-                 # --no-timeout before relying on it.
+  max:     10.5  # MEASURED 2026-10-04 and LEFT WRONG ON PURPOSE: the real ratio is
+                 # ~21, not 10.5, but no budget can reach it. gpt-6's level above
+                 # xhigh; no preset sets it, and none should until
+                 # task_timeout_seconds is raised. Three --no-timeout runs of
+                 # openai alone on a 9,456-char draft (gpt-6.1-sol, 5 domains each,
+                 # $3.61, captures in short-example-smoke-test/run_3 xhigh, run_4
+                 # max, run_5 high, 20261004) put max at 1.63-2.29x xhigh's elapsed
+                 # time and 1.67-2.28x its output tokens -- so ~21 is the honest
+                 # multiplier. It is not used because every max cell clamps to
+                 # task_ceiling - 15 (1085s) long before 10.5 or 21 matters, and
+                 # grounded fact_check at max took 1352s on that SMALL draft --
+                 # 1.25x the clamp. A preset setting max would have that call killed
+                 # at 1085s and retried, and the retry killed too. Raising
+                 # task_timeout_seconds is the only lever, and that is a "how long
+                 # am I willing to wait" decision, not a latency measurement.
   default: 1.0
 
 # For a call that searches because the model's `web_search` covers its domain:
