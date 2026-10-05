@@ -973,19 +973,19 @@ Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article
 
 **Two retirements, both handled.** Perplexity supported its Sonar chat-completions API until 2026-09-27; every preset moved from `sonar` and `sonar-reasoning-pro` to `perplexity/sonar` on its Agent API on 2026-09-28, the same Sonar model, which found more when measured; it costs less than `sonar-reasoning-pro` did and more than `sonar`. Google Cloud lists the Gemini 2.5 models for retirement on Vertex AI on 2026-10-20, and the presets moved off them to `gemini-3.5-flash` on 2026-09-27. Dates and sources are under [Perplexity](PROVIDERS.md#perplexity-ai-optional--recommended) and [Gemini](PROVIDERS.md#google-gemini-required) in PROVIDERS.md.
 
-**Gemini's search fees now show in the estimate, and they run ahead of the bill.** `gemini-3.5-flash` searches far more than `gemini-2.5-pro` did (103 queries over the five `maximum` domains on a 9,456-character draft, against 16), and the report prices each query at Google's list rate, $14 per 1,000. The first 5,000 queries a month are free and a run cannot see the month's count, so until the allowance is spent the estimate includes fees the bill does not: $0.18–$0.25 of a `wide` run's total (three runs, 2026-09-28) and $1.44 at `maximum` on that draft. The `low` level is what keeps the cheap tiers down, to 13–18 queries a `wide` run; see [Gemini — `thinking_level`](#gemini--thinking_level-and-thinking_budget).
+**Gemini's search fees now show in the estimate, and they run ahead of the bill.** `gemini-3.5-flash` searches far more than `gemini-2.5-pro` did (103 queries over the five `maximum` domains on a 9,456-character draft, against 16), and the report prices each query at Google's list rate, $14 per 1,000. The first 5,000 queries a month are free and a run cannot see the month's count, so until the allowance is spent the estimate includes fees the bill does not: most of a `wide` run's total and $1.44 at `maximum` on that draft. **Re-measured 2026-10-04, Gemini's query count on `wide` had roughly doubled** on the same preset and the same draft — 33–56 search units against 16–22 a week earlier, so $0.44–$0.76 of a run rather than $0.18–$0.25, and 84–92% of its total. `low` keeps the ensemble's own count down, but the citation re-ask path is not bounded by it: 8–24 queries a run, one re-ask alone costing $0.279 (issue #285); see [Gemini — `thinking_level`](#gemini--thinking_level-and-thinking_budget).
 
 **What a run costs.** Cost depends on the draft, so each figure below is tied to the draft it was measured on. Read each as a floor rather than a quote: a retried attempt that the provider billed but reported no usage for is priced at $0.00 (the report's `cost_summary` counts these as `uncosted_calls`). Every figure except `wide`'s at ~1,400 words is a token cost only, measured before the report priced search fees (2026-09-19) and before every preset moved to `gemini-3.5-flash` (PR #252, merged 2026-09-28), so search and request fees, Gemini's above all, come on top of those.
 
 | Preset | ~1,400 words (9,456 chars) | ~2,900 words (18,167 chars) | ~19,500 words (135,514 chars) |
 |---|---|---|---|
 | `economy` | — | — | — |
-| `wide` | $0.40, $0.23 of it search fees (1 run, 2026-09-28) | — | $0.38 (mean of 3) |
+| `wide` | $0.63–$0.94, $0.44–$0.76 of it search fees (4 runs, 2026-09-30 and 10-04) | — | $0.38 (mean of 3) |
 | `balanced` | — | — | $1.28 (mean of 3) |
 | `thorough` | — | $1.33 (1 run) | $1.74 (mean of 3) |
 | `maximum` | — | $6.15 (1 run) | ≈$9.6 (1 run) |
 
-A dash means no run at that size is on record. `economy` has none at any recorded size: it runs seven calls on four of `wide`'s six models where `wide` runs twelve, so on the same draft it costs less than `wide`. The `wide` run at ~1,400 words made 44 calls: 12 for the review, 30 to verify and re-ask citations, 2 for SEO. With `--offline`, which makes only the 12, two more runs that day came to $0.38 each. Before search was priced and before the move to `gemini-3.5-flash`, four runs came to $0.10–$0.15, tokens only. The three-run means are from the 2026-09-08 study behind the `thorough` change. `maximum`'s three-run mean in that study was $10.27, priced at a `gpt-5.6-sol` rate that has since been corrected; a later single run on the same draft, re-priced at current rates, gives $9.60. Cost grows far more slowly than the draft does: at `maximum`, 7.5× the characters cost about 1.6× the money.
+A dash means no run at that size is on record. `economy` has none at any recorded size: it runs seven calls on four of `wide`'s six models where `wide` runs twelve, so on the same draft it costs less than `wide`. A `wide` run at ~1,400 words makes 30–44 calls: 12 for the review, the rest to verify and re-ask citations, 2 for SEO. Its four GPT-6-era captures span $0.63–$0.94 for one unchanged command, because Gemini's query count — which is most of the bill — varies that much run to run; quote the range, not a single run. With `--offline`, which makes only the 12 ensemble calls, two runs came to $0.38 each, but that was 2026-09-28 and has not been re-measured since either GPT-6 or the query-count rise. Before search was priced and before the move to `gemini-3.5-flash`, four runs came to $0.10–$0.15, tokens only. The three-run means are from the 2026-09-08 study behind the `thorough` change. `maximum`'s three-run mean in that study was $10.27, priced at a `gpt-5.6-sol` rate that has since been corrected; a later single run on the same draft, re-priced at current rates, gives $9.60. Cost grows far more slowly than the draft does: at `maximum`, 7.5× the characters cost about 1.6× the money.
 
 **Every figure in that table predates GPT-6 (PR #286, 2026-09-30), and the move is close to cost-neutral rather than the saving the price list suggests.** Re-pricing the surviving `maximum` capture of the ~19,500-word draft call by call under today's line-up drops its tokens from $9.60 to **$7.79**, but the same week moved Gemini from $35 per 1,000 grounded prompts to $14 per 1,000 search *queries* on a model that searches far more, which returns most or all of it: roughly **$10.09 all-in before against $9.3–10.6 after**. At `thorough` the same re-price gives $1.84 of tokens. Both are derived from real captures, not measured — no GPT-6 run of that draft exists at either tier, and the reproducibility figures behind the `thorough` change were measured on a line-up where three of six models have since moved. Re-measuring is [issue #287](https://github.com/MHammett/content-intelligence/issues/287); `PLAN.md` §5.6.1 carries the derivation and the prices of the runs it would take.
 
@@ -1411,6 +1411,24 @@ seo_rules:
 
 ---
 
+### Links in the FINAL DRAFT
+
+A link is ordinary Markdown, `[text](https://example.com/page)`, or a bare
+`http://` or `https://` URL, which is linked as written. A Sources list with one
+URL to a line publishes with every URL clickable. A full stop, comma, semicolon,
+colon, `!` or `?` after a URL stays outside the link, and so does a `)` or `]`
+that nothing in the URL opened: `(see https://example.com/a)` links
+`https://example.com/a`, and a Wikipedia address that ends in `)` keeps it. Only
+`http` and `https` are linked. `www.example.com`, `ftp://` and an email address
+stay text.
+
+A URL in backticks, in a code block, or already inside a link stays as written.
+One is left unlinked on purpose: a URL that Markdown has cut with emphasis marks,
+such as `https://example.com/_draft_/v1` or a path ending in `__init__.py`,
+because the part before the cut would link to the wrong page. The publish says so
+in its log. Write that URL as `<https://example.com/_draft_/v1>` and all of it is
+linked.
+
 ### Images in the FINAL DRAFT
 
 Write each image as ordinary Markdown, alone on its own line, with a blank line
@@ -1524,6 +1542,85 @@ resolved path or link, its alt text and caption, what metadata the file carries
 and what will happen to it, and any image with no alt text. After the push, next
 to the post URL: how many were uploaded and how many linked, with the media IDs,
 and a note on any whose metadata was not stripped.
+
+---
+
+### Slug, excerpt and featured image
+
+Three optional lines under PUBLICATION PARAMETERS in the publication handoff, for
+the things a post needs to look right once it is shared or listed:
+
+```text
+Slug: grid-report-2026
+Excerpt: Grid load peaked in August, and the counties that carried it were not the ones anyone expected.
+Featured image: ![A lineworker on a pole at dusk](images/hero.jpg)
+```
+
+| Line | What it sets | Left out |
+|---|---|---|
+| `Slug:` | The last part of the post's URL, sent as `slug`. | WordPress makes one from the title when the post is published. |
+| `Excerpt:` | One line of plain text for archive pages, search results and share cards, sent as `excerpt`. | WordPress uses the opening words of the post, which for most articles is a dek or a pull quote. |
+| `Featured image:` | The picture that stands for the post: the share card (`og:image`), the archive thumbnail, the schema `image`. Uploaded, then set as the post's `featured_media`. | The post has none. |
+
+A line that is absent, blank or still on the template's bracketed placeholder
+sends nothing, so a handoff written before these lines existed publishes exactly
+the post it did.
+
+**Slug.** WordPress cleans the slug it is sent (`sanitize_title`): it lowercases,
+turns spaces into hyphens and drops punctuation, including the colon in a time,
+which is how "Stuck at 0:00?" in a title comes out as `stuck-at-000` in the
+slug when none is given. After the push the slug WordPress stored is printed next
+to the post URL, and when it is not the one in the handoff both are shown.
+
+A **draft's slug is not checked for uniqueness.** WordPress adds `-2` to a taken
+slug only when the post is published, and a draft with no `Slug:` has no slug
+at all until then. So the slug printed for a draft is what is stored now, and it
+can still change when the draft is published in WordPress. With `--publish-live`
+the check runs at once and the printed slug is final.
+
+**Excerpt.** Written on one line: a line that wraps in the handoff is read up to
+its first line break. The excerpt WordPress kept is printed after the push. A
+**page** has no excerpt unless the site adds that support to pages, and
+WordPress drops a field it has not registered without an error, so the answer to
+the create is read, and a `WARNING` is printed next to the post URL when the
+excerpt did not land.
+
+**Featured image.** A path to an image file, relative to the directory of the
+handoff or absolute, or the same path written as a Markdown image when it should
+have alt text: `![Alt text](images/hero.jpg)`. A bare path is read as it stands,
+so a space or a Windows backslash needs no escaping; with no alt text the
+`IMAGES` list says so. It is a file that gets uploaded, so it is treated like an
+image in the draft, and everything in [Images in the FINAL DRAFT](#images-in-the-final-draft)
+about checking, stripping and what becomes public applies to it:
+
+- It is checked before anything is sent, and before the SEO suggestion call and
+  the checklist: a file that is missing, a folder, not an image type, empty or
+  unreadable, or a `.heic`, stops the publish and names the `Featured image:`
+  line.
+- A photograph's EXIF, GPS position and device are stripped from the copy that is
+  uploaded, the rotation is applied to the pixels, and `--keep-image-metadata`
+  applies to it as it does to every other file.
+- It is listed first in the `IMAGES` list before the checklist, and it is
+  **public from the moment it is uploaded**, even though the post stays a draft.
+- It is uploaded before the images in the draft, then set as the post's
+  `featured_media`. A file the draft also uses is uploaded once. The alt text is
+  set on the media-library item, which is where a theme reads the featured
+  image's alt text from; the draft's own block keeps its own.
+- After the push, `Featured:` gives the media ID. A theme without post-thumbnail
+  support has no featured image to set, and WordPress drops the field without an
+  error, so a `WARNING` names the uploaded media ID to set by hand.
+- It cannot be a URL. WordPress sets a featured image by attachment ID, so the
+  image has to be in this site's media library and there is no "already hosted"
+  form to point at, as there is for an image in the draft. An `https://` URL is
+  refused before anything is sent, and the fix is to save the image and give its
+  path. (WordPress 7.1 can fetch a URL into the media library itself; this does
+  not use that, because the fetch happens on the server where the metadata strip
+  cannot see the file, and it needs a WordPress that has it.)
+- A caption written with it is not used, and a warning says so.
+
+**What it does not do.** It does not choose or generate the image, and it does not
+update a post that already exists: publishing the same handoff twice creates a
+second post and uploads the featured image a second time.
 
 ---
 

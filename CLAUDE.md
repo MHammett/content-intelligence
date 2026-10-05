@@ -67,12 +67,19 @@ uv run ci-review --draft packages/ci-article-review/src/ci_article_review/handof
 
 Replay is a real verification for anything in consolidation, scoring, the report, citations or history. It is **not** sufficient for changes to assignment, dispatch, retry, recovery or substitution — those decide which calls get made, and a replay makes none. Verify those live, at `--cost-preset wide`, not at `maximum` — after checking whether one of the cheaper checks below covers the change.
 
-**What `wide` costs on that draft** (9,456 chars, ~1,400 words), measured 2026-09-28 as shipped: **$0.40** for the first command above, 44 API calls (12 ensemble, 30 citation verifications and re-asks, 2 SEO); **$0.38** with `--offline` added, which makes only the 12 ensemble calls (two runs, $0.3779 and $0.3811). That matches `wide`'s $0.38 in the 2026-09-08 study below only by coincidence: that one is a 19,457-word article, tokens only, on Gemini 2.5. This section used to say "12 calls, ~$0.12". Two changes more than tripled it, and search fees are now more than half of it (56–67%):
+**What `wide` costs on that draft** (9,456 chars, ~1,400 words): **$0.63–$0.94 a full run**, across four GPT-6-era captures — three interleaved runs on 2026-10-04 at $0.6276 / $0.7576 / $0.8006 (mean **$0.73**) and one on 2026-09-30 at $0.9386. **This section said $0.40 until 2026-10-04 and that figure was stale by roughly 1.8x** — it is the number every session reaches for to price a "cheap" verification run, so it is worth knowing it nearly doubled.
 
-- **PR #252 (2026-09-28) moved every preset to `gemini-3.5-flash`, which bills per search query**, $14 per 1,000, where 2.5 billed a grounded prompt once. Its `fact_check` call made 11–16 queries in those three runs and cost $0.19–$0.26 on its own; Gemini's calls were 68–84% of each run's total.
-- **The report priced no search before PR #230 (2026-09-19)**, so "~$0.12" was tokens only. Search is now $0.22–$0.26 of each run: Gemini's queries plus Perplexity's $0.005 per request.
+**What moved was Gemini's query count, not the models.** Same preset, same draft: 16–22 search units on 2026-09-28, **33–56** on 2026-09-30 and 10-04. `gemini-3.5-flash` bills $14 per 1,000 *queries* where 2.5 billed a grounded prompt once (PR #252), so that count decides the total:
 
-The report prices every Gemini query at list. The first 5,000 Gemini 3 queries a month are free, and a run cannot see how many are left (`docs/PROVIDERS.md`, Gemini, "Search"), so until they run out the bill is below the report by up to Gemini's share of the fees, $0.18–$0.25 in these runs.
+- **Gemini is 84–92% of a `wide` run** and search fees are **70–81%** of it ($0.44–$0.76). Tokens are a rounding error by comparison.
+- **`fact_check` alone ran 21–28 queries.** The citation re-ask path is the volatile one: 8–24 queries across a run, and **one single re-ask cost $0.279** (run_6). That path, not the ensemble, is the lever on `wide`'s cost.
+- **A single run is not a quote.** The spread across four captures of one unchanged command is $0.63–$0.94. Quote the range, or re-measure.
+
+The `--offline` figure in this section, **$0.38** for the 12 ensemble calls (two runs, 2026-09-28), has **not** been re-measured since GPT-6 and sits on the low 16–22-unit era, so treat it the same way.
+
+The report prices every Gemini query at list. The first 5,000 Gemini 3 queries a month are free, and a run cannot see how many are left (`docs/PROVIDERS.md`, Gemini, "Search"), so until they run out the real bill is below the report by most of that 84–92% — these runs used 33–56 queries each.
+
+Measured against a rebuild of the retired `standard` preset the same day (three runs each, interleaved), `wide` cost **2.9x** `standard`'s $0.254 — and the entire gap is Gemini's per-query billing: on tokens alone `wide` is 105% of `standard`, and *excluding Gemini* it is **65%** of it while producing ~1.8x the consensus items. That is a statement about Gemini 3.5, not about the tier: had `standard` lived, #252 would have moved it to 3.5 Flash too. Full write-up in issue MHammett/content-intelligence#285.
 
 **Cheaper checks, when they cover the change** (each verified 2026-09-28). A worktree has no `configs/` — it is gitignored — so from one, point every command here at the main checkout's with `--config-dir <main checkout>/configs`.
 
@@ -103,14 +110,14 @@ Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset
 
 |            | cost (avg), as measured | cost on GPT-6 ‡ | overall repro% | fact-check repro% |
 |------------|------------------------:|----------------:|----------------:|--------------------:|
-| `wide`     | $0.38      | $0.38–0.40 | 6.8%            | 0.0%                |
+| `wide`     | $0.38      | $0.63–0.94 | 6.8%            | 0.0%                |
 | `balanced` | $1.28      | —          | 6.4%            | 1.1%                |
 | `thorough` (claude-sonnet-5) | $1.74 | $1.84 | 16.9% | 22.1%      |
 | `maximum`  | $10.27 †   | $7.79      | 20.0%           | 29.6%               |
 
 † Priced with the stale `gpt-5.6-sol` rate — see above; re-priced it is $9.60. The other three rows do not use sol and are unaffected, so the *ratios* this table was built to compare still hold; `maximum` is ~25x `wide`, not 27x.
 
-‡ Tokens only, **derived not measured**: real captures of this draft re-priced call by call under today's line-up (2026-10-03). `wide`'s is the one measured figure — three live runs, 2026-09-28, on the 9,456-char smoke test, not this draft. Add search fees on top: $0.45–0.9 at `thorough`, $1.5–2.8 at `maximum` — see the all-in paragraph above, which is why the `maximum` row is not the saving it looks like. `balanced` has no capture of this draft to re-price.
+‡ Tokens only, **derived not measured**: real captures of this draft re-priced call by call under today's line-up (2026-10-03). `wide`'s is the one measured figure, and it is measured on the 9,456-char smoke test rather than this draft — four GPT-6-era runs, 2026-09-30 and 10-04; see the `wide` section above for why its spread is this wide. Add search fees on top: $0.45–0.9 at `thorough`, $1.5–2.8 at `maximum` — see the all-in paragraph above, which is why the `maximum` row is not the saving it looks like. `balanced` has no capture of this draft to re-price.
 
 Two conclusions came out of this and are now reflected in `configs/presets.yaml`:
 

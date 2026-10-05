@@ -18,6 +18,7 @@ import inspect
 import io
 import json
 import logging
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -101,7 +102,20 @@ class FakeWordPress:
         self.echo_alt = True  # the upload response reports the alt it was given
         self.alt_update_response = None  # overrides the /media/<id> answer
         self.upload_body_override = None
-        self.post_response = Resp(200, {"id": 7, "link": "https://example.com/p/"})
+        #: Overrides the answer to a create outright (an error, say). Left None,
+        #: the answer is built from the post that was sent: see ``_created``.
+        self.post_response = None
+        #: Slugs already in use. WordPress adds ``-2`` to a taken slug when a post
+        #: is published, and not before: ``wp_unique_post_slug`` returns early for
+        #: a draft, so a draft keeps the slug it was given however many share it.
+        self.taken_slugs = set()
+        #: Core's ``page`` type has no excerpt (it is not in the type's
+        #: ``supports``), so WordPress ignores the field and the answer has none,
+        #: unless the site adds the support. A post always has one.
+        self.pages_have_excerpts = False
+        #: Without ``post-thumbnails`` support WordPress drops ``featured_media``
+        #: from a create without an error, and answers ``0``.
+        self.thumbnails_supported = True
 
     def post(self, url, **kw):
         self.requests.append(("POST", url))
@@ -115,7 +129,42 @@ class FakeWordPress:
         if "rankmath" in url:
             return Resp(200, {})
         self.created.append(kw["json"])
-        return self.post_response
+        if self.post_response is not None:
+            return self.post_response
+        return self._created(url, kw["json"])
+
+    def _created(self, url, payload):
+        """What WordPress answers to a create, built from what was sent.
+
+        The three fields a handoff can set are echoed the way WordPress stores
+        them, because the adapter reads them back and these are the cases that
+        read-back exists for: the slug as ``sanitize_title`` leaves it (and a
+        draft with no slug has none), the excerpt where the post type has one,
+        and ``featured_media`` where the theme supports it.
+        """
+        status = payload.get("status", "draft")
+        slug = _sanitize_title(payload.get("slug") or "")
+        if status == "publish":
+            slug = slug or _sanitize_title(payload.get("title") or "")
+            base, n = slug, 2
+            while slug in self.taken_slugs:
+                slug, n = f"{base}-{n}", n + 1
+        body = {
+            "id": 7,
+            "link": "https://example.com/p/",
+            "slug": slug,
+            "featured_media": (
+                payload.get("featured_media", 0) if self.thumbnails_supported else 0
+            ),
+        }
+        if url.endswith("/posts") or self.pages_have_excerpts:
+            excerpt = payload.get("excerpt", "")
+            body["excerpt"] = {
+                "raw": excerpt,
+                "rendered": f"<p>{excerpt}</p>\n" if excerpt else "",
+                "protected": False,
+            }
+        return Resp(200, body)
 
     def get(self, url, **kw):
         self.requests.append(("GET", url))
@@ -168,14 +217,36 @@ class FakeWordPress:
         return [r for r in self.requests if r[1].endswith(("/posts", "/pages"))]
 
 
-def _push(tmp_path, markdown, fake=None, files=None, **kw):
-    """Run ``wp.push`` against the fake, with ``files`` (name -> bytes) on disk."""
+def _sanitize_title(text):
+    """What WordPress's ``sanitize_title`` makes of ``text``: how a slug is cleaned.
+
+    The steps that matter here, in the order ``sanitize_title_with_dashes`` takes
+    them: lowercase, entities removed, ``.`` to a hyphen, everything outside
+    ``a-z0-9 _-`` dropped (which is what takes the colon out of ``0:00``),
+    whitespace to hyphens, runs of hyphens collapsed, the ends trimmed.
+    """
+    text = re.sub(r"&.+?;", "", text.lower()).replace(".", "-")
+    text = re.sub(r"\s+", "-", re.sub(r"[^%a-z0-9 _-]", "", text))
+    return re.sub(r"-+", "-", text).strip("-")
+
+
+def _push(tmp_path, markdown, fake=None, files=None, params=None, **kw):
+    """Run ``wp.push`` against the fake, with ``files`` (name -> bytes) on disk.
+
+    ``params`` adds to (or overrides) the post's parameters: a slug, an excerpt,
+    a featured image, or ``post_type`` to leave the default page.
+    """
     fake = fake or FakeWordPress()
     for name, data in (files or {}).items():
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-    pub_params = {"title": "Grid Report", "post_type": "page", "tags": []}
+    pub_params = {
+        "title": "Grid Report",
+        "post_type": "page",
+        "tags": [],
+        **(params or {}),
+    }
     with (
         patch("ci_article_review.adapters.cms.wordpress.requests.post", fake.post),
         patch("ci_article_review.adapters.cms.wordpress.requests.get", fake.get),
@@ -1198,8 +1269,28 @@ _HANDOFF = (
 )
 
 
-def _run_publish(tmp_path, image_line, fake=None, files=None, handoff_dir=None):
+def _handoff_text(image_line, params="", post_type="page"):
+    """``_HANDOFF`` with ``params`` (whole lines) added to PUBLICATION PARAMETERS."""
+    return _HANDOFF.format(image=image_line).replace(
+        "Post type: page\n", f"Post type: {post_type}\n{params}", 1
+    )
+
+
+def _run_publish(
+    tmp_path,
+    image_line,
+    fake=None,
+    files=None,
+    handoff_dir=None,
+    params="",
+    post_type="page",
+    on_confirm=None,
+):
     """``run_publish_pipeline`` on a handoff in ``handoff_dir``, network faked.
+
+    ``params`` is whole lines for PUBLICATION PARAMETERS, each ending in a
+    newline. ``on_confirm`` is called in place of the checklist prompt, to see
+    what had been printed by then.
 
     Returns ``(exit code or None, fake, steps)``.
     """
@@ -1213,7 +1304,10 @@ def _run_publish(tmp_path, image_line, fake=None, files=None, handoff_dir=None):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
     path = handoff_dir / "grid-publication.md"
-    path.write_text(_HANDOFF.format(image=image_line), encoding="utf-8")
+    path.write_text(_handoff_text(image_line, params, post_type), encoding="utf-8")
+    confirm_answer = (
+        {"side_effect": on_confirm} if on_confirm else {"return_value": True}
+    )
     config = {
         "publication": {"wordpress": dict(WP_CONFIG), "rank_math": dict(RANK_MATH)},
         "api_keys": {},
@@ -1224,7 +1318,7 @@ def _run_publish(tmp_path, image_line, fake=None, files=None, handoff_dir=None):
         patch("ci_article_review.pipeline.load_publication_config", return_value={}),
         patch("ci_article_review.pipeline.merge_configs", return_value=config),
         patch("ci_article_review.pipeline._suggest_seo_for_publish") as suggest,
-        patch(f"{wp_module}.print_checklist_and_confirm", return_value=True) as confirm,
+        patch(f"{wp_module}.print_checklist_and_confirm", **confirm_answer) as confirm,
         patch(f"{wp_module}.requests.post", fake.post),
         patch(f"{wp_module}.requests.get", fake.get),
     ):
@@ -1834,6 +1928,794 @@ class TestHeicIsRefused:
         assert ".heic" not in Image.registered_extensions()
 
 
+# ---------------------------------------------------------------------------
+# Slug, excerpt and featured image (#315)
+#
+# Template C had no field for the three things a post needs to look right once
+# it is shared or listed, so each was set by hand in WordPress after the push.
+# Slug and excerpt are text: what matters is that they are sent only when the
+# handoff set them, and that what WordPress kept is read back and not assumed.
+# The featured image is a file that gets uploaded, so it is public from that
+# moment, has to clear every check an image in the draft does before anything is
+# sent, and then has to become the post's ``featured_media``.
+# ---------------------------------------------------------------------------
+
+#: Where the featured image is, in most of what follows.
+HERO = "images/hero.jpg"
+
+#: A post, which is the type WordPress gives an excerpt to. ``_push`` publishes
+#: a page unless told otherwise.
+POST = {"post_type": "post"}
+
+
+def _push_featured(tmp_path, featured=HERO, files=None, md="# T\n\nBody.\n", **kw):
+    """``wp.push`` of a post whose handoff has a ``Featured image:``.
+
+    The file is a phone photo unless ``files`` says otherwise, so what leaves
+    the process is something to inspect.
+    """
+    files = {HERO: phone_photo()} if files is None else files
+    return _push(
+        tmp_path,
+        md,
+        files=files,
+        params={**POST, "featured_image": featured},
+        **kw,
+    )
+
+
+class TestSlugAndExcerptAreSent:
+    def test_both_are_in_the_create_payload(self, tmp_path):
+        result, fake = _push(
+            tmp_path,
+            "# T\n\nBody.\n",
+            params={
+                **POST,
+                "slug": "grid-report-2026",
+                "excerpt": "Load peaked in August.",
+            },
+        )
+        assert result["success"] is True
+        assert fake.created[0]["slug"] == "grid-report-2026"
+        assert fake.created[0]["excerpt"] == "Load peaked in August."
+
+    def test_left_out_they_are_absent_and_not_empty(self, tmp_path):
+        """An empty ``excerpt`` is a value WordPress takes literally, where an
+        absent key lets it derive one as it always has."""
+        _, fake = _push(
+            tmp_path, "# T\n\nBody.\n", params={**POST, "slug": "", "excerpt": "   "}
+        )
+        assert not {"slug", "excerpt", "featured_media"} & set(fake.created[0])
+
+    def test_a_handoff_that_sets_none_of_them_sends_what_it_always_did(self, tmp_path):
+        _, fake = _push(tmp_path, "# T\n\nBody.\n", params=POST)
+        assert set(fake.created[0]) == {
+            "title",
+            "content",
+            "status",
+            "categories",
+            "tags",
+        }
+
+    def test_stray_whitespace_is_not_sent(self, tmp_path):
+        _, fake = _push(
+            tmp_path,
+            "# T\n\nBody.\n",
+            params={**POST, "slug": "  my-slug ", "excerpt": "  Words.  "},
+        )
+        assert fake.created[0]["slug"] == "my-slug"
+        assert fake.created[0]["excerpt"] == "Words."
+
+    def test_a_page_is_sent_them_too(self, tmp_path):
+        """A page has a slug, and has an excerpt only if the site adds one.
+        Which of those is true is WordPress's to say and not this adapter's: it
+        is sent, and the answer is read (TestWhatWordPressKept)."""
+        _, fake = _push(
+            tmp_path, "# T\n\nBody.\n", params={"slug": "about", "excerpt": "Words."}
+        )
+        assert fake.created[0]["slug"] == "about"
+        assert fake.created[0]["excerpt"] == "Words."
+        assert "categories" not in fake.created[0], "still a page"
+
+
+class TestWhatWordPressKept:
+    """The answer to the create is read, and not the ``200``: a field the post
+    type has not registered is dropped without an error, which is how this
+    repo's Rank Math fields once vanished."""
+
+    def _sent(self, tmp_path, fake=None, **params):
+        return _push(tmp_path, "# T\n\nBody.\n", fake=fake, params={**POST, **params})
+
+    def _answering(self, **body):
+        fake = FakeWordPress()
+        fake.post_response = Resp(
+            200, {"id": 7, "link": "https://example.com/p/", **body}
+        )
+        return fake
+
+    def test_a_slug_that_landed_is_reported_without_a_warning(self, tmp_path):
+        result, _ = self._sent(tmp_path, slug="grid-report")
+        assert result["post_fields"]["slug"] == {
+            "requested": "grid-report",
+            "stored": "grid-report",
+        }
+        assert "post_field_warnings" not in result
+
+    def test_a_slug_wordpress_cleans_is_reported_both_ways(self, tmp_path):
+        """The colon in a time is what ``sanitize_title`` drops: the case this
+        field was added for. Not a warning, because the slug did land, but the
+        one in the handoff is no longer the one on the site."""
+        result, _ = self._sent(tmp_path, slug="Stuck at 0:00? Here")
+        assert result["post_fields"]["slug"] == {
+            "requested": "Stuck at 0:00? Here",
+            "stored": "stuck-at-000-here",
+        }
+        assert "post_field_warnings" not in result
+
+    def test_a_published_slug_that_is_taken_comes_back_with_a_suffix(self, tmp_path):
+        fake = FakeWordPress()
+        fake.taken_slugs = {"grid-report"}
+        result, _ = _push(
+            tmp_path,
+            "# T\n\nBody.\n",
+            fake=fake,
+            params={**POST, "slug": "grid-report"},
+            publish_live=True,
+        )
+        assert result["post_fields"]["slug"]["stored"] == "grid-report-2"
+
+    def test_a_draft_slug_is_not_made_unique_until_it_is_published(self, tmp_path):
+        """``wp_unique_post_slug`` returns early for a draft, so the ``-2`` a
+        draft will get is not in this answer. The docs say so, rather than let
+        a printed slug read as final."""
+        fake = FakeWordPress()
+        fake.taken_slugs = {"grid-report"}
+        result, _ = self._sent(tmp_path, fake=fake, slug="grid-report")
+        assert result["post_fields"]["slug"]["stored"] == "grid-report"
+
+    def test_a_slug_wordpress_did_not_keep_warns(self, tmp_path):
+        result, _ = self._sent(tmp_path, fake=self._answering(slug=""), slug="grid")
+        assert result["success"] is True
+        (warning,) = result["post_field_warnings"]
+        assert "did not keep the slug" in warning
+
+    def test_an_excerpt_that_landed_is_reported_without_a_warning(self, tmp_path):
+        result, _ = self._sent(tmp_path, excerpt="Load peaked in August.")
+        assert result["post_fields"]["excerpt"] == {
+            "requested": "Load peaked in August.",
+            "stored": "Load peaked in August.",
+        }
+        assert "post_field_warnings" not in result
+
+    def test_a_page_has_no_excerpt_by_default_and_the_push_says_so(self, tmp_path):
+        """Core's page type does not list ``excerpt`` in what it supports, so
+        WordPress ignores the field and answers without one."""
+        result, _ = _push(tmp_path, "# T\n\nBody.\n", params={"excerpt": "Words."})
+        assert result["success"] is True
+        (warning,) = result["post_field_warnings"]
+        assert "did not keep the excerpt" in warning and "page" in warning
+        assert result["post_fields"]["excerpt"]["stored"] is None
+
+    def test_a_site_that_gives_pages_excerpts_keeps_it(self, tmp_path):
+        fake = FakeWordPress()
+        fake.pages_have_excerpts = True
+        result, _ = _push(
+            tmp_path, "# T\n\nBody.\n", fake=fake, params={"excerpt": "Words."}
+        )
+        assert "post_field_warnings" not in result
+
+    def test_an_excerpt_that_came_back_different_is_reported(self, tmp_path):
+        fake = self._answering(
+            excerpt={"raw": "Something else.", "rendered": "<p>Something else.</p>"}
+        )
+        result, _ = self._sent(tmp_path, fake=fake, excerpt="Words.")
+        (warning,) = result["post_field_warnings"]
+        assert "'Something else.'" in warning and "not as written" in warning
+
+    def test_wordpress_escaping_is_not_a_difference(self, tmp_path):
+        """``kses`` stores an ampersand as ``&amp;``."""
+        fake = self._answering(
+            excerpt={"raw": "Load &amp; supply", "rendered": "<p>Load &amp; supply</p>"}
+        )
+        result, _ = self._sent(tmp_path, fake=fake, excerpt="Load & supply")
+        assert "post_field_warnings" not in result
+
+    def test_the_rendered_form_stands_in_when_there_is_no_raw(self, tmp_path):
+        fake = self._answering(excerpt={"rendered": "<p>Words.</p>\n"})
+        result, _ = self._sent(tmp_path, fake=fake, excerpt="Words.")
+        assert "post_field_warnings" not in result
+
+    def test_a_featured_image_that_landed_is_reported(self, tmp_path):
+        result, _ = _push_featured(tmp_path)
+        assert result["post_fields"]["featured_media"] == {
+            "requested": 500,
+            "stored": 500,
+            "src": HERO,
+        }
+        assert "post_field_warnings" not in result
+
+    def test_a_theme_without_thumbnails_drops_it_and_the_warning_names_the_upload(
+        self, tmp_path
+    ):
+        fake = FakeWordPress()
+        fake.thumbnails_supported = False
+        result, _ = _push_featured(tmp_path, fake=fake)
+        assert result["success"] is True
+        (warning,) = result["post_field_warnings"]
+        assert "did not set the featured image" in warning
+        assert "media ID 500" in warning
+
+    def test_a_handoff_that_asked_for_none_of_them_reports_none(self, tmp_path):
+        """And a response with none of the fields in it is not a problem then."""
+        fake = self._answering()
+        result, _ = self._sent(tmp_path, fake=fake)
+        assert "post_fields" not in result and "post_field_warnings" not in result
+
+
+class TestFeaturedImage:
+    def test_it_is_uploaded_and_becomes_the_posts_featured_media(self, tmp_path):
+        result, fake = _push_featured(tmp_path)
+        assert result["success"] is True
+        (upload,) = fake.uploads
+        assert upload["name"] == "hero.jpg" and upload["mime"] == "image/jpeg"
+        assert fake.created[0]["featured_media"] == 500
+
+    def test_it_is_in_the_media_library_before_the_post_exists(self, tmp_path):
+        _, fake = _push_featured(tmp_path)
+        urls = [u for _, u in fake.requests]
+        media = next(i for i, u in enumerate(urls) if u.endswith("/media"))
+        created = next(i for i, u in enumerate(urls) if u.endswith("/posts"))
+        assert media < created
+
+    def test_it_is_scrubbed_like_any_image_in_the_draft(self, tmp_path):
+        raw = phone_photo(orientation=6)
+        assert read_exif(raw)[1], "the fixture really has a GPS block"
+        result, fake = _push_featured(tmp_path, files={HERO: raw})
+        sent = fake.uploads[0]["bytes"]
+        assert read_exif(sent) == (set(), set())
+        assert b"ACME" not in sent and b"Phone X" not in sent
+        assert _pixels(sent)[1] == (16, 24), "the rotation is in the pixels"
+        assert (tmp_path / HERO).read_bytes() == raw, "the file on disk is untouched"
+        assert result["images_stripped"] == 1
+        assert result["image_uploads"][0]["stripped"] is True
+
+    def test_keep_image_metadata_uploads_it_as_it_is(self, tmp_path):
+        raw = phone_photo()
+        _, fake = _push_featured(
+            tmp_path, files={HERO: raw}, strip_image_metadata=False
+        )
+        assert fake.uploads[0]["bytes"] == raw
+
+    def test_a_markdown_image_gives_the_media_item_its_alt_text(self, tmp_path):
+        _, fake = _push_featured(
+            tmp_path, featured=f"![A lineworker on a pole at dusk]({HERO})"
+        )
+        assert fake.uploads[0]["data"] == {"alt_text": "A lineworker on a pole at dusk"}
+
+    def test_a_bare_path_sends_no_alt_text(self, tmp_path):
+        _, fake = _push_featured(tmp_path)
+        assert fake.uploads[0]["data"] == {}
+
+    def test_it_goes_up_first_and_the_drafts_images_follow(self, tmp_path):
+        result, fake = _push_featured(
+            tmp_path,
+            md="# T\n\n![Grid](grid.png)\n",
+            files={HERO: phone_photo(), "grid.png": PNG},
+        )
+        assert [u["name"] for u in fake.uploads] == ["hero.jpg", "grid.png"]
+        assert fake.created[0]["featured_media"] == 500
+        assert 'class="wp-image-501"' in fake.created[0]["content"]
+        featured, body = result["image_uploads"]
+        assert featured["featured"] is True and featured["id"] == 500
+        assert "featured" not in body, "a draft's own entries are as they were"
+
+    def test_a_file_that_is_also_in_the_draft_is_uploaded_once(self, tmp_path):
+        """Spelled two ways, which is one file."""
+        result, fake = _push_featured(
+            tmp_path,
+            featured=f"./{HERO}",
+            md=f"# T\n\n![Hero in the text]({HERO})\n",
+        )
+        assert len(fake.uploads) == 1
+        assert fake.created[0]["featured_media"] == 500
+        assert 'class="wp-image-500"' in fake.created[0]["content"]
+        (entry,) = result["image_uploads"]
+        assert entry["featured"] is True
+
+    def test_the_featured_alt_text_is_the_one_the_media_item_keeps(self, tmp_path):
+        """A media item has one alt text, and a theme reads the featured image's
+        alt text from it. The block in the draft keeps its own."""
+        _, fake = _push_featured(
+            tmp_path,
+            featured=f"![Featured alt]({HERO})",
+            md=f"# T\n\n![Body alt]({HERO})\n",
+        )
+        assert fake.uploads[0]["data"] == {"alt_text": "Featured alt"}
+        assert 'alt="Body alt"' in fake.created[0]["content"]
+
+    def test_a_post_with_only_a_featured_image_still_reports_the_upload(self, tmp_path):
+        result, _ = _push_featured(tmp_path)
+        assert result["images_uploaded"] == 1 and result["images_linked"] == 0
+        assert [u["src"] for u in result["image_uploads"]] == [HERO]
+
+    def test_a_page_can_have_one(self, tmp_path):
+        result, fake = _push(
+            tmp_path,
+            "# T\n\nBody.\n",
+            files={HERO: phone_photo()},
+            params={"featured_image": HERO},
+        )
+        assert result["success"] is True
+        assert fake.created[0]["featured_media"] == 500
+
+    def test_without_one_nothing_new_is_sent_or_reported(self, tmp_path):
+        result, fake = _push(tmp_path, "# T\n\nBody.\n", params=POST)
+        assert fake.media_requests == []
+        assert "featured_media" not in fake.created[0]
+        assert not [k for k in result if k.startswith(("image", "post_field"))]
+
+
+class TestAFeaturedImageThatCannotBePublished:
+    """The same rule as an image in the draft: nothing is sent, not even a term
+    lookup, and the error names the image."""
+
+    @pytest.mark.parametrize(
+        "featured,files,expect",
+        [
+            (HERO, {}, "file not found"),
+            ("report.pdf", {"report.pdf": b"%PDF-1.7"}, "not an image type"),
+            ("images", {"images/x.png": PNG}, "folder"),
+            ("shot.heic", {"shot.heic": HEIC}, "Export it as a JPEG"),
+            ("https://cdn.example.com/hero.jpg", {}, "media library"),
+            ("![alt]()", {}, "no source"),
+            ("![a](data:image/png;base64,AAAA)", {}, "not a path to a file"),
+            (f"![a]({HERO}) and some words", {HERO: PNG}, "single image"),
+            (f"![a]({HERO}) ![b]({HERO})", {HERO: PNG}, "single image"),
+        ],
+        ids=[
+            "missing",
+            "not-an-image",
+            "folder",
+            "heic",
+            "url",
+            "no-source",
+            "data-uri",
+            "words-beside-it",
+            "two-images",
+        ],
+    )
+    def test_it_stops_the_publish_before_anything_is_sent(
+        self, tmp_path, featured, files, expect
+    ):
+        result, fake = _push_featured(tmp_path, featured=featured, files=files)
+        assert result["success"] is False
+        assert fake.requests == [], "not even a term lookup"
+        assert result["error"].startswith(
+            "The handoff has image(s) that cannot be published, so nothing was sent"
+        )
+        assert "Featured image" in result["error"] and expect in result["error"]
+
+    def test_a_url_is_refused_with_the_reason_and_the_way_out(self, tmp_path):
+        result, _ = _push_featured(tmp_path, featured="https://cdn.example.com/h.jpg")
+        error = " ".join(result["error"].split())
+        assert "attachment ID" in error
+        assert "give that path" in error
+
+    def test_the_draft_is_not_blamed_for_it(self, tmp_path):
+        """The old wording named the FINAL DRAFT, which is not where the line is."""
+        result, _ = _push_featured(tmp_path, featured="missing.jpg")
+        assert "Featured image:" in result["error"].rsplit("\n", 1)[-1]
+
+    def test_a_refused_upload_stops_before_the_post_and_the_rest(self, tmp_path):
+        fake = FakeWordPress()
+        fake.fail_upload[1] = Resp(
+            403, {"code": "rest_cannot_create", "message": "not allowed"}
+        )
+        result, _ = _push_featured(
+            tmp_path,
+            fake=fake,
+            md="# T\n\n![Grid](grid.png)\n",
+            files={HERO: phone_photo(), "grid.png": PNG},
+        )
+        assert result["success"] is False
+        assert 'Featured image "images/hero.jpg"' in result["error"]
+        assert "HTTP 403" in result["error"] and "upload_files" in result["error"]
+        assert fake.post_requests == []
+        assert fake.upload_attempts == 1, "the draft's image was never sent after it"
+
+    def test_a_later_failure_names_it_among_what_was_left_behind(self, tmp_path):
+        fake = FakeWordPress()
+        fake.fail_upload[2] = Resp(500, {"code": "x", "message": "disk full"})
+        result, _ = _push_featured(
+            tmp_path,
+            fake=fake,
+            md="# T\n\n![Grid](grid.png)\n",
+            files={HERO: phone_photo(), "grid.png": PNG},
+        )
+        assert result["success"] is False
+        assert 'Image 1 of 1, "grid.png"' in result["error"]
+        assert "ID 500 (images/hero.jpg)" in result["error"]
+        assert "nothing was deleted" in result["error"]
+        assert fake.post_requests == []
+
+    def test_a_failed_post_still_names_the_upload(self, tmp_path):
+        fake = FakeWordPress()
+        fake.post_response = Resp(500, {"code": "internal", "message": "db error"})
+        result, _ = _push_featured(tmp_path, fake=fake)
+        assert result["success"] is False
+        assert "ID 500 (images/hero.jpg)" in result["error"]
+
+    def test_a_live_publish_refused_for_its_terms_uploads_nothing(self, tmp_path):
+        class NoTerms(FakeWordPress):
+            def get(self, url, **kw):
+                self.requests.append(("GET", url))
+                return Resp(200, [])
+
+        fake = NoTerms()
+        result, _ = _push(
+            tmp_path,
+            "# T\n\nBody.\n",
+            fake=fake,
+            files={HERO: phone_photo()},
+            params={**POST, "wordpress_category": "nope", "featured_image": HERO},
+            publish_live=True,
+        )
+        assert result["success"] is False
+        assert "unresolved taxonomy terms" in result["error"]
+        assert fake.media_requests == [] and fake.uploads == []
+
+
+class TestPlanningTheFeaturedImage:
+    def _file(self, tmp_path, name="hero.jpg", data=None):
+        (tmp_path / name).write_bytes(phone_photo() if data is None else data)
+
+    def test_it_is_held_apart_from_the_drafts_own_images(self, tmp_path):
+        self._file(tmp_path)
+        self._file(tmp_path, "a.png", PNG)
+        plan = wp.plan_images("![A](a.png)", tmp_path, featured_image="hero.jpg")
+        assert plan.problems == []
+        assert plan.featured.src == "hero.jpg"
+        assert [r.src for r in plan.refs] == ["a.png"], "the numbering does not move"
+        assert set(plan.uploads) == {"a.png", "hero.jpg"}
+
+    @pytest.mark.parametrize("value", [None, "", "   "])
+    def test_a_blank_value_is_no_featured_image(self, tmp_path, value):
+        plan = wp.plan_images("# T", tmp_path, featured_image=value)
+        assert plan.featured is None and plan.problems == [] and plan.uploads == {}
+
+    def test_planning_sends_nothing(self, tmp_path):
+        self._file(tmp_path)
+        with (
+            patch("ci_article_review.adapters.cms.wordpress.requests.post") as post,
+            patch("ci_article_review.adapters.cms.wordpress.requests.get") as get,
+        ):
+            wp.plan_images("# T", tmp_path, featured_image="hero.jpg")
+        assert not post.called and not get.called
+
+    def test_its_problems_come_first_and_are_named_apart_from_the_drafts(
+        self, tmp_path
+    ):
+        plan = wp.plan_images("![b](gone.png)", tmp_path, featured_image="missing.jpg")
+        assert plan.problems[0].startswith(
+            'Featured image "missing.jpg": file not found'
+        )
+        assert plan.problems[1].startswith('Image 1 of 1, "gone.png"')
+
+    def test_a_url_is_not_planned_as_an_upload_or_a_link(self, tmp_path):
+        plan = wp.plan_images(
+            "# T", tmp_path, featured_image="https://cdn.example.com/hero.jpg"
+        )
+        (problem,) = plan.problems
+        assert "attachment ID" in problem
+        assert plan.featured is None and plan.uploads == {}
+
+    def test_a_caption_is_not_used_and_says_so(self, tmp_path):
+        self._file(tmp_path)
+        plan = wp.plan_images(
+            "# T", tmp_path, featured_image='![Alt](hero.jpg "Photo: someone")'
+        )
+        assert plan.problems == []
+        (warning,) = plan.warnings
+        assert (
+            warning.startswith('Featured image "hero.jpg"') and "no caption" in warning
+        )
+
+    def test_no_alt_text_is_a_warning_and_not_a_problem(self, tmp_path):
+        self._file(tmp_path)
+        plan = wp.plan_images("# T", tmp_path, featured_image="hero.jpg")
+        assert plan.problems == []
+        (warning,) = plan.warnings
+        assert warning.startswith('Featured image "hero.jpg"')
+        assert "no alt text" in warning and "![alt text](images/hero.jpg)" in warning
+
+    def test_alt_text_means_no_warning(self, tmp_path):
+        self._file(tmp_path)
+        plan = wp.plan_images(
+            "# T", tmp_path, featured_image="![Dam at dusk](hero.jpg)"
+        )
+        assert plan.warnings == []
+
+    def test_a_location_it_will_keep_is_called_out_by_name(self, tmp_path):
+        self._file(tmp_path)
+        plan = wp.plan_images(
+            "# T", tmp_path, strip_metadata=False, featured_image="hero.jpg"
+        )
+        (warning,) = [w for w in plan.warnings if "WHERE IT WAS TAKEN" in w]
+        assert warning.startswith('Featured image "hero.jpg"')
+
+    def test_a_path_with_spaces_needs_no_escaping_when_it_is_bare(self, tmp_path):
+        self._file(tmp_path, "my photo.jpg")
+        plan = wp.plan_images("# T", tmp_path, featured_image="my photo.jpg")
+        assert plan.problems == [] and plan.featured.src == "my photo.jpg"
+
+    def test_the_markdown_form_takes_angle_brackets_like_the_drafts(self, tmp_path):
+        self._file(tmp_path, "my photo.jpg")
+        plan = wp.plan_images("# T", tmp_path, featured_image="![Dam](<my photo.jpg>)")
+        assert plan.problems == [] and plan.featured.src == "my photo.jpg"
+        assert plan.featured.alt == "Dam"
+
+    def test_an_absolute_path_is_taken_as_the_system_writes_it(self, tmp_path):
+        """On Windows that has backslashes in it, which Markdown would read as
+        escapes: the reason a bare value is not run through Markdown."""
+        self._file(tmp_path)
+        plan = wp.plan_images(
+            "# T", tmp_path / "elsewhere", featured_image=str(tmp_path / "hero.jpg")
+        )
+        assert plan.problems == [] and plan.featured is not None
+
+
+class TestWhatTheAuthorSeesOfThem:
+    def test_the_list_leads_with_the_featured_image(self, tmp_path, capsys):
+        (tmp_path / "hero.jpg").write_bytes(phone_photo())
+        (tmp_path / "a.png").write_bytes(PNG)
+        plan = wp.plan_images(
+            "![A](a.png)", tmp_path, featured_image="![Dam at dusk](hero.jpg)"
+        )
+        wp.print_image_plan(plan)
+        out = capsys.readouterr().out
+        assert out.index("Featured image:") < out.index("In the post:")
+        assert out.index("In the post:") < out.index("1. UPLOAD")
+        assert f"UPLOAD  {tmp_path / 'hero.jpg'}" in out
+        assert "alt:     Dam at dusk" in out
+        assert "GPS location (8 tags)" in out and "stripped before upload" in out
+        assert "public from the moment" in out
+
+    def test_a_featured_image_alone_still_prints_the_list(self, tmp_path, capsys):
+        (tmp_path / "hero.jpg").write_bytes(phone_photo())
+        wp.print_image_plan(
+            wp.plan_images("# T\n\nText.", tmp_path, featured_image="hero.jpg")
+        )
+        out = capsys.readouterr().out
+        assert "IMAGES" in out and "Featured image:" in out
+        assert "In the post:" not in out
+        assert "public from the moment" in out
+        assert "alt:     (none)" in out
+
+    def test_with_none_the_list_reads_as_it_did(self, tmp_path, capsys):
+        (tmp_path / "a.png").write_bytes(PNG)
+        wp.print_image_plan(wp.plan_images("![A](a.png)", tmp_path))
+        out = capsys.readouterr().out
+        assert "Featured image" not in out and "In the post" not in out
+
+    def test_keep_image_metadata_is_said_to_cover_it_too(self, tmp_path, capsys):
+        (tmp_path / "hero.jpg").write_bytes(phone_photo())
+        plan = wp.plan_images(
+            "# T", tmp_path, strip_metadata=False, featured_image="hero.jpg"
+        )
+        wp.print_image_plan(plan)
+        out = capsys.readouterr().out
+        assert "KEPT (--keep-image-metadata)" in out
+        assert "records WHERE IT WAS TAKEN" in out and "nothing is stripped" in out
+
+    def test_the_result_marks_the_featured_upload(self, capsys):
+        wp.print_image_result(
+            {
+                "images_uploaded": 3,
+                "images_linked": 0,
+                "image_uploads": [
+                    {
+                        "src": "h.jpg",
+                        "id": 5,
+                        "url": "u",
+                        "stripped": True,
+                        "featured": True,
+                    },
+                    {"src": "a.png", "id": 6, "url": "u", "stripped": False},
+                    {
+                        "src": "k.jpg",
+                        "id": 7,
+                        "url": "u",
+                        "stripped": False,
+                        "featured": True,
+                    },
+                ],
+            }
+        )
+        out = capsys.readouterr().out
+        assert "h.jpg -> media ID 5  (featured image)" in out
+        assert "a.png -> media ID 6  (metadata NOT stripped)" in out
+        assert "k.jpg -> media ID 7  (featured image; metadata NOT stripped)" in out
+
+    def test_the_checklist_asks_about_all_three(self):
+        checklist = " ".join(wp.CHECKLIST.split())
+        assert 'the handoff\'s "Featured image:" line' in checklist
+        assert 'the handoff\'s "Slug:" and "Excerpt:" lines' in checklist
+        assert "public from the moment it is uploaded" in checklist
+        assert "listed under IMAGES above" in checklist
+
+
+class TestPrintingWhatLanded:
+    def _print(self, capsys, **result):
+        wp.print_post_fields_result({"success": True, **result})
+        return capsys.readouterr().out
+
+    def test_a_handoff_that_set_none_prints_nothing(self, capsys):
+        assert self._print(capsys) == ""
+
+    def test_the_slug_is_the_one_wordpress_answered_with(self, capsys):
+        slug = {"requested": "grid-report", "stored": "grid-report"}
+        assert (
+            self._print(capsys, post_fields={"slug": slug}) == "Slug:     grid-report\n"
+        )
+
+    def test_a_changed_slug_shows_what_the_handoff_asked_for(self, capsys):
+        slug = {"requested": "Stuck at 0:00?", "stored": "stuck-at-000"}
+        out = self._print(capsys, post_fields={"slug": slug})
+        assert (
+            out == "Slug:     stuck-at-000  (the handoff asked for 'Stuck at 0:00?')\n"
+        )
+
+    def test_a_slug_that_did_not_land_prints_none_and_the_warning(self, capsys):
+        out = self._print(
+            capsys,
+            post_fields={"slug": {"requested": "x", "stored": ""}},
+            post_field_warnings=["WordPress did not keep the slug."],
+        )
+        assert "Slug:     (none)" in out
+        assert "WARNING: WordPress did not keep the slug." in out
+
+    def test_the_excerpt_is_shown_and_a_long_one_is_cut(self, capsys):
+        short = self._print(
+            capsys, post_fields={"excerpt": {"requested": "Words.", "stored": "Words."}}
+        )
+        assert short == "Excerpt:  Words.\n"
+        long = "word " * 80
+        cut = self._print(
+            capsys, post_fields={"excerpt": {"requested": long, "stored": long}}
+        )
+        assert cut.endswith("...\n") and len(cut) < 230
+
+    def test_a_dropped_excerpt_prints_no_line_of_its_own(self, capsys):
+        out = self._print(
+            capsys,
+            post_fields={"excerpt": {"requested": "Words.", "stored": None}},
+            post_field_warnings=["WordPress did not keep the excerpt."],
+        )
+        assert not out.startswith("Excerpt:") and "Excerpt:  " not in out
+        assert "WARNING: WordPress did not keep the excerpt." in out
+
+    def test_the_featured_line_names_the_media_id_and_the_source(self, capsys):
+        featured = {"requested": 500, "stored": 500, "src": "images/hero.jpg"}
+        out = self._print(capsys, post_fields={"featured_media": featured})
+        assert out == "Featured: media ID 500 (images/hero.jpg)\n"
+
+    def test_a_featured_image_that_did_not_land_prints_only_the_warning(self, capsys):
+        featured = {"requested": 500, "stored": 0, "src": "images/hero.jpg"}
+        out = self._print(
+            capsys,
+            post_fields={"featured_media": featured},
+            post_field_warnings=["WordPress did not set the featured image."],
+        )
+        assert "Featured:" not in out
+        assert "WARNING: WordPress did not set the featured image." in out
+
+
+class TestPublishCommandPostFields:
+    PARAMS = (
+        "Slug: grid-report-2026\n"
+        "Excerpt: Load peaked in August.\n"
+        f"Featured image: ![Dam at dusk]({HERO})\n"
+    )
+
+    def test_all_three_reach_the_post_and_are_printed_next_to_it(
+        self, tmp_path, capsys
+    ):
+        code, fake, _ = _run_publish(
+            tmp_path,
+            "Just words.",
+            files={HERO: phone_photo()},
+            params=self.PARAMS,
+            post_type="post",
+        )
+        out = capsys.readouterr().out
+        created = fake.created[0]
+        assert code is None
+        assert created["slug"] == "grid-report-2026"
+        assert created["excerpt"] == "Load peaked in August."
+        assert created["featured_media"] == 500
+        assert fake.uploads[0]["data"] == {"alt_text": "Dam at dusk"}
+        assert "Slug:     grid-report-2026" in out
+        assert "Excerpt:  Load peaked in August." in out
+        assert "Featured: media ID 500 (images/hero.jpg)" in out
+        assert "images/hero.jpg -> media ID 500  (featured image)" in out
+        assert out.index("Post ID:") < out.index("Slug:") < out.index("Images:")
+
+    def test_the_featured_image_is_listed_before_the_checklist_asks(
+        self, tmp_path, capsys
+    ):
+        seen = []
+
+        def confirm():
+            seen.append(capsys.readouterr().out)
+            return True
+
+        _run_publish(
+            tmp_path,
+            "Just words.",
+            files={HERO: phone_photo()},
+            params=self.PARAMS,
+            post_type="post",
+            on_confirm=confirm,
+        )
+        assert "Featured image:" in seen[0] and "UPLOAD" in seen[0]
+        assert "public from the moment" in seen[0]
+
+    def test_a_bad_featured_image_stops_before_the_seo_call_and_the_checklist(
+        self, tmp_path, caplog
+    ):
+        with caplog.at_level(logging.ERROR):
+            code, fake, steps = _run_publish(
+                tmp_path,
+                "Just words.",
+                params="Featured image: images/nope.jpg\n",
+                post_type="post",
+            )
+        assert code == 1
+        assert 'Featured image "images/nope.jpg"' in caplog.text
+        assert "file not found" in caplog.text
+        assert fake.requests == []
+        assert not steps["suggest"].called, "before the SEO call is paid for"
+        assert not steps["confirm"].called, "before the checklist asks for a yes"
+
+    def test_an_excerpt_the_site_drops_is_warned_about_next_to_the_post(
+        self, tmp_path, capsys
+    ):
+        """A page, which has no excerpt unless the site adds one."""
+        code, _, _ = _run_publish(tmp_path, "Just words.", params="Excerpt: Words.\n")
+        out = capsys.readouterr().out
+        assert code is None
+        assert "WARNING: WordPress did not keep the excerpt" in out
+        assert not [x for x in out.splitlines() if x.startswith("Excerpt:")]
+
+    def test_a_handoff_without_them_prints_none_of_the_new_lines(
+        self, tmp_path, capsys
+    ):
+        _run_publish(tmp_path, "Just words.", post_type="post")
+        out = capsys.readouterr().out
+        assert "WordPress push successful." in out
+        assert not [
+            x
+            for x in out.splitlines()
+            if x.startswith(("Slug:", "Excerpt:", "Featured"))
+        ]
+
+    def test_an_unfilled_placeholder_sets_none_of_them(self, tmp_path):
+        """As the template ships: bracketed, and wrapped onto further lines."""
+        params = (
+            "Slug: [optional. The last part of the web address:\n"
+            "joined by hyphens.]\n"
+            "Excerpt: [optional]\n"
+            "Featured image: [optional. A path to an image file,\n"
+            "relative to THIS handoff.]\n"
+        )
+        code, fake, _ = _run_publish(
+            tmp_path, "Just words.", params=params, post_type="post"
+        )
+        assert code is None
+        assert not {"slug", "excerpt", "featured_media"} & set(fake.created[0])
+        assert fake.media_requests == []
+
+
 TEMPLATE = Path(handoff_parser.__file__).parent / "handoff_templates" / "publication.md"
 
 
@@ -1842,6 +2724,56 @@ def _images_section():
     return text.split("\nIMAGES AND ALT TEXT\n", 1)[1].split("\nDISPOSITION LOG\n", 1)[
         0
     ]
+
+
+def _parameters_section():
+    text = TEMPLATE.read_text(encoding="utf-8")
+    return text.split("\nPUBLICATION PARAMETERS\n", 1)[1].split("\nSEO METADATA\n", 1)[
+        0
+    ]
+
+
+class TestTheTemplateOffersSlugExcerptAndFeaturedImage:
+    @pytest.mark.parametrize("label", ["Slug:", "Excerpt:", "Featured image:"])
+    def test_each_is_offered_once_as_a_placeholder(self, label):
+        """Once, so the first line with the label is the field and a note never
+        is; a placeholder, so a copy left unfilled reads as unset and publishes
+        as such posts always have."""
+        lines = [x for x in _parameters_section().splitlines() if x.startswith(label)]
+        assert len(lines) == 1
+        assert lines[0][len(label) :].strip().startswith("[")
+
+    def test_an_unfilled_copy_sets_none_of_them(self):
+        parsed = parse_publication_handoff(TEMPLATE.read_text(encoding="utf-8"))
+        params = parsed["publication_parameters"]
+        assert (params["slug"], params["excerpt"], params["featured_image"]) == (
+            "",
+            "",
+            "",
+        )
+
+    def test_the_markdown_form_it_shows_is_one_the_push_reads(self, tmp_path):
+        """A documented syntax that does not parse is worse than none. The
+        example is taken from the template itself, so rewording it there is
+        checked here."""
+        line = next(x for x in _parameters_section().splitlines() if "![" in x)
+        example = line[line.index("![") :]
+        (tmp_path / "images").mkdir()
+        (tmp_path / "images" / "hero.jpg").write_bytes(phone_photo())
+        plan = wp.plan_images("# T", tmp_path, featured_image=example)
+        assert plan.problems == []
+        assert plan.featured.alt == "Alt text: what it shows"
+
+    def test_it_says_a_url_is_refused_and_that_the_upload_is_public(self):
+        section = " ".join(_parameters_section().split())
+        assert "an https:// URL is refused" in section
+        assert "public the moment it is uploaded" in section
+
+    def test_the_images_note_covers_the_featured_image_too(self):
+        note = " ".join(_images_section().split())
+        assert "The Featured image: line" in note
+        assert "public as soon as it is uploaded" in note
+        assert "an https:// URL is refused" in note
 
 
 class TestTheTemplateDocumentsIt:

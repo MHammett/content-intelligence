@@ -27,12 +27,33 @@ putting a local file on the site takes a request this module must not make, so
 emit a local path it was not given a URL for. That refusal is the point. A
 relative ``src`` is a broken image on the live site, and before this a publish
 that shipped one, wrapped in a paragraph block, looked exactly like a good one.
+
+Bare URLs are linked too, because nothing downstream does: Python-Markdown links
+only ``<https://...>`` and ``[text](...)``, and WordPress applies
+``make_clickable`` to comments, not to post content. A Sources list written as
+people write one, a URL to a line, published with nothing clickable and no
+warning (issue #316). The linking is a pass over the HTML Python-Markdown
+produces, run before it is parsed so that a document which falls back to one
+``wp:html`` block gets its links too. That is what Python-Markdown's maintainers
+point to (Bleach's ``linkify`` over the output) and how GitHub Flavored
+Markdown's own autolinker works, a pass over text that skips links; the rules
+follow GFM's "Autolinks (extension)" for ``http(s)``. The libraries that exist were
+run against these cases and none was taken: ``pymdownx.magiclink`` 12.1 links
+``.../Foo_(bar)`` without its ``)``, nests an ``<a>`` in an ``<a>`` the draft
+already has, links ``www.``, ``ftp://`` and email with no way to stop it, and
+needs ``markdown>=3.6`` where this package allows 3.4; ``markdown-urlize`` has
+had no release since 2017; ``mdx_linkify`` is Bleach, whose README says (as of
+2026-06-05) that it is no longer maintained, security fixes included;
+``linkify-it-py`` keeps a trailing ``:`` and a full stop before ``)`` inside the
+link, and does not read HTML.
 """
 
 import json
 import logging
+import re
 import xml.etree.ElementTree as ET
 from html import escape as _escape
+from html import unescape as _unescape
 from html.parser import HTMLParser
 
 from .images import (
@@ -261,9 +282,17 @@ def _drop_leading_h1(text):
     return text
 
 
-def _render(markdown, text):
-    """Markdown to ``(html, root, error)``. ``root`` is None if the HTML is not XML."""
+def _render(markdown, text, link=True):
+    """Markdown to ``(html, root, error)``. ``root`` is None if the HTML is not XML.
+
+    ``link`` links the bare URLs in it, before the parse, so that a document too
+    broken to parse, which goes out as one ``wp:html`` block, has its links too.
+    ``find_images`` turns it off: links wrap text and cannot add, move or remove
+    an image, and the warning for a URL that cannot be linked would be given twice.
+    """
     html = markdown.markdown(text, extensions=list(_MD_EXTENSIONS))
+    if link:
+        html = _link_bare_urls(html)
     try:
         return html, ET.fromstring(f"<root>{html}</root>"), None
     except ET.ParseError as e:
@@ -284,6 +313,7 @@ def find_images(markdown_text, strip_leading_h1=True):
     The publish checks these before it sends a request or asks for a yes, so an
     image that cannot be published stops it early. It reads the same rendered
     HTML ``to_blocks`` does, so the two cannot disagree about what is an image.
+    (Minus the links ``to_blocks`` adds, which cannot change that.)
     """
     text = (markdown_text or "").strip()
     if not text or looks_like_block_markup(text):
@@ -293,7 +323,7 @@ def find_images(markdown_text, strip_leading_h1=True):
         return []
     if strip_leading_h1:
         text = _drop_leading_h1(text)
-    html, root, error = _render(markdown, text)
+    html, root, error = _render(markdown, text, link=False)
     if root is None:
         return _scan_html(html, str(error))
     return [ref for ref, _ in _images_in_tree(root)]
@@ -381,6 +411,124 @@ def _image_block_for(img, resolved):
 
 
 # ---------------------------------------------------------------------------
+# Bare URLs
+# ---------------------------------------------------------------------------
+
+#: What linking must not look inside. ``re`` tries the alternatives left to right
+#: at each position, so a comment and every tag are taken whole, and only the text
+#: between them reaches the last alternative. A URL in an attribute (``href``,
+#: ``src``, ``title``) sits inside a tag, so it is never offered either. The tags
+#: of an element whose text is already a link, or is code, are captured by name so
+#: that ``_link_bare_urls`` can count how many are open and skip the text in them.
+_URL_SCAN = re.compile(
+    r"""
+      <!--.*?-->
+    | <(?P<closing>/)?(?P<skip>a|code|pre|kbd|samp|script|style|textarea)\b
+        (?:[^>"']|"[^"]*"|'[^']*')*>
+    | </?[A-Za-z](?:[^>"']|"[^"]*"|'[^']*')*>
+    | <[^>]*>
+    | (?<![A-Za-z0-9])(?P<url>https?://[^\s<>"]+)
+    """,
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+#: What a sentence sets after a URL without meaning it as part of the address:
+#: GitHub Flavored Markdown's list (``? ! . , : * _``; it also has ``~``, for a
+#: strikethrough this Markdown lacks), plus the apostrophe and the closing quotes,
+#: guillemet and ellipsis that prose uses. ``;`` is not here because it may end an
+#: entity, so ``_link_end`` reads it on its own.
+_URL_TRAILING = (
+    ".,:!?'*_"
+    "\N{RIGHT SINGLE QUOTATION MARK}"
+    "\N{RIGHT DOUBLE QUOTATION MARK}"
+    "\N{RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK}"
+    "\N{HORIZONTAL ELLIPSIS}"
+)
+
+#: A closing bracket stays outside the link unless the URL opened it, which is
+#: how ``Foo_(bar)`` keeps its ``)`` and ``(see https://example.com/a)`` does not.
+_URL_CLOSERS = {")": "(", "]": "["}
+
+#: ``&amp;`` and its kind: how HTML writes a character, not part of an address.
+_ENTITY = re.compile(r"&#?[A-Za-z0-9]+;")
+
+#: The longest entity name HTML has is 31 characters, so an ``&`` further back
+#: than this is not the start of the entity that a ``;`` ends.
+_ENTITY_REACH = 40
+
+#: Markdown made emphasis or code of what came straight after a URL, so the URL
+#: as matched is only the part before it.
+_FORMATTING_OPENS = re.compile(r"<(?:em|strong|code)\b", re.IGNORECASE)
+
+
+def _link_end(url):
+    """How much of a matched ``url`` is the link. The rest is the sentence."""
+    end = len(url)
+    opened = {closer: url.count(opener) for closer, opener in _URL_CLOSERS.items()}
+    closed = {closer: url.count(closer) for closer in _URL_CLOSERS}
+    while end:
+        last = url[end - 1]
+        if last in _URL_TRAILING:
+            end -= 1
+        elif last == ";":
+            start = url.rfind("&", max(0, end - _ENTITY_REACH), end)
+            entity = start != -1 and _ENTITY.fullmatch(url, start, end)
+            end = start if entity else end - 1
+        elif last in closed and closed[last] > opened[last]:
+            closed[last] -= 1
+            end -= 1
+        else:
+            break
+    return end
+
+
+def _link_bare_urls(html):
+    """Wrap each bare ``http(s)://`` URL in rendered ``html`` in a link.
+
+    A URL runs to whitespace, ``<`` or ``"``, less what the sentence around it
+    adds: a trailing ``. , : ; ! ? ' * _``, a closing quote, an entity such as
+    ``&gt;``, and a ``)`` or ``]`` that the URL did not open. What is already a
+    link, what is code, and what sits in a tag's attributes is left as it is, so
+    a link the author wrote and a URL they put in backticks both stand. Text
+    after a tag that is never closed counts as inside it: nothing is linked
+    there, rather than nesting one link in another.
+
+    A URL that runs straight into emphasis or code is not linked, and a warning
+    says so. Markdown reads ``/_foo_/`` and ``__init__.py`` as emphasis and has
+    cut the URL before this pass sees it, so linking would point at the part
+    before the cut. ``<https://...>`` links the whole of it.
+    """
+    open_skips = 0  # how many a/code/pre/... elements the scan is currently inside
+
+    def link(m):
+        nonlocal open_skips
+        if m.group("skip"):
+            if m.group("closing"):
+                open_skips = max(0, open_skips - 1)
+            else:
+                open_skips += 1
+            return m.group(0)
+        url = m.group("url")
+        if url is None or open_skips:
+            return m.group(0)
+        end = _link_end(url)
+        if end <= url.index("://") + 3:
+            return url  # nothing was left of it but the scheme
+        text = url[:end]
+        if end == len(url) and _FORMATTING_OPENS.match(m.string, m.end()):
+            log.warning(
+                "The URL starting %s runs straight into emphasis or code (an "
+                "underscore or asterisk pair, or a backtick, inside it), so it "
+                "was not linked. Write it as <https://...> to link all of it.",
+                shorten(text),
+            )
+            return url
+        return f'<a href="{_attr(_unescape(text))}">{text}</a>{url[end:]}'
+
+    return _URL_SCAN.sub(link, html)
+
+
+# ---------------------------------------------------------------------------
 # Conversion
 # ---------------------------------------------------------------------------
 
@@ -396,6 +544,10 @@ def to_blocks(markdown_text, strip_leading_h1=True, resolved=None):
     ``UploadedImage`` it became. An image with an ``http(s)`` source needs no
     entry. A local one that has none raises ``ImageError`` instead of being
     written out as a path the live site cannot serve.
+
+    A bare ``http(s)://`` URL in the text becomes a link (``_link_bare_urls``
+    has the rules). One in backticks stays text, and one already in a link, in
+    code or in a tag is left as written.
 
     Content that is already block markup is returned unchanged. If the
     generated HTML cannot be parsed (a raw named entity in the source, say),

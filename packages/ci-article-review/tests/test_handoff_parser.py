@@ -787,6 +787,9 @@ class TestPublicationParametersPlaceholder:
         "tags",
         "wordpress_author",
         "author",
+        "slug",
+        "excerpt",
+        "featured_image",
     }
 
     def _handoff(self, *lines):
@@ -889,8 +892,122 @@ class TestPublicationParametersPlaceholder:
         assert params["post_type"] == ""
         assert params["wordpress_author"] == ""
         assert params["author"] == ""
+        assert (params["slug"], params["excerpt"], params["featured_image"]) == (
+            "",
+            "",
+            "",
+        )
         assert handoff["placeholder_publication_fields"] == {
             "wordpress_category",
             "tags",
         }
         assert set(params) == self._KNOWN_KEYS
+
+
+class TestSlugExcerptAndFeaturedImage:
+    """Three optional PUBLICATION PARAMETERS fields, each safe to leave unset.
+
+    WordPress derives a slug from the title and an excerpt from the opening
+    words of the body, and a post with no featured image is what every post
+    published before these fields existed looked like. So unlike category and
+    tags they are not flagged when they are still on the template's
+    placeholder: they read as blank, and the push leaves them to WordPress.
+    """
+
+    def _handoff(self, *lines, draft="Body text."):
+        return parse_publication_handoff(
+            "PUBLICATION HANDOFF\n"
+            "Article: T\n"
+            "\n"
+            "PUBLICATION PARAMETERS\n" + "\n".join(lines) + "\n"
+            "\n"
+            "FINAL DRAFT\n" + draft + "\n"
+        )
+
+    def _params(self, *lines, **kw):
+        return self._handoff(*lines, **kw)["publication_parameters"]
+
+    def test_each_one_is_read(self):
+        params = self._params(
+            "Slug: stuck-at-0-00",
+            "Excerpt: A short line for the archive card.",
+            "Featured image: images/hero.jpg",
+        )
+        assert params["slug"] == "stuck-at-0-00"
+        assert params["excerpt"] == "A short line for the archive card."
+        assert params["featured_image"] == "images/hero.jpg"
+
+    def test_absent_reads_as_blank(self):
+        params = self._params("Post type: post")
+        assert (params["slug"], params["excerpt"], params["featured_image"]) == (
+            "",
+            "",
+            "",
+        )
+
+    def test_a_blank_label_does_not_take_the_next_line(self):
+        """The failure every label here had once: a blank "Slug:" took the line
+        below it, so the slug became "Excerpt: ..."."""
+        params = self._params(
+            "Slug:", "Excerpt:", "Featured image: images/hero.jpg", "Tags: grid"
+        )
+        assert params["slug"] == "" and params["excerpt"] == ""
+        assert params["featured_image"] == "images/hero.jpg"
+        assert params["tags"] == "grid"
+
+    @pytest.mark.parametrize(
+        "label,key",
+        [
+            ("Slug:", "slug"),
+            ("Excerpt:", "excerpt"),
+            ("Featured image:", "featured_image"),
+        ],
+    )
+    def test_an_unfilled_placeholder_is_blank_and_not_flagged(self, label, key):
+        """Category and tags are flagged so a live publish cannot go out
+        uncategorised. These have nothing like that to protect: unset is a
+        post WordPress names and summarises itself, as before."""
+        handoff = self._handoff(
+            f"{label} [optional. A placeholder that wraps onto",
+            "a second line, as the template's do.]",
+        )
+        assert handoff["publication_parameters"][key] == ""
+        assert key not in handoff["placeholder_publication_fields"]
+
+    def test_a_leading_bracketed_span_is_a_value_and_not_a_placeholder(self):
+        """ "[Update] ..." is a common way to open an excerpt, and a
+        placeholder is only a value that is bracketed from end to end."""
+        params = self._params("Excerpt: [Update] The grid held through the peak.")
+        assert params["excerpt"] == "[Update] The grid held through the peak."
+
+    def test_a_markdown_image_is_kept_whole_for_its_alt_text(self):
+        line = "![A lineworker on a pole at dusk](images/hero.jpg)"
+        assert self._params(f"Featured image: {line}")["featured_image"] == line
+
+    def test_the_same_label_in_the_draft_is_not_the_field(self):
+        """The search is bounded to the section. A draft that quotes a line
+        beginning "Slug:" must not set the slug."""
+        params = self._params(
+            "Post type: post",
+            draft="# T\n\nSlug: not-a-field\nExcerpt: nor-this\nFeatured image: nor.png",
+        )
+        assert (params["slug"], params["excerpt"], params["featured_image"]) == (
+            "",
+            "",
+            "",
+        )
+
+    def test_the_first_line_with_the_label_is_the_field(self):
+        params = self._params("Slug: first", "Slug: second")
+        assert params["slug"] == "first"
+
+    def test_a_wrapped_placeholders_other_lines_are_not_values(self):
+        """The template's own placeholders wrap, and a continuation line that
+        happened to begin with a label's text would be read as the value."""
+        params = self._params(
+            "Slug: [optional. The last part of the web address:",
+            "joined by hyphens.]",
+            "Excerpt: written by hand",
+        )
+        assert params["slug"] == ""
+        assert params["excerpt"] == "written by hand"
