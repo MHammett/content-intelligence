@@ -18,6 +18,19 @@ Content that already carries block delimiters is passed through untouched, so
 a handoff written against the old behaviour (or by hand, in blocks) is not
 re-processed.
 
+The editor accepts a block only if what is stored equals what that block's
+``save()`` writes for the attributes in its delimiter comment. Anything else
+opens as "Block contains unexpected or invalid content", and REST stores
+whatever it is sent and answers ``200``, so a green publish says nothing about
+it (issue #325: a quote, a table, a code block and a separator all published
+that way). Each block here is built to follow ``save()``. Where an element has
+something its block cannot hold (a quote with a list in it, a table cell that
+spans columns) it goes out as a ``wp:html`` block, which is always valid, and
+is not guessed at. What ``save()`` writes was captured from the editor, not
+worked out from its source: ``tests/golden/wordpress_editor/`` holds the
+captures and how to take them again, and ``docs/DEVELOPMENT.md`` ("Checking
+block markup in the real editor") has the procedure.
+
 Images are found the same way, in Python-Markdown's output rather than with a
 pattern of our own, so titles, ``<angle-bracket>`` paths, reference-style
 images and escapes all arrive already parsed. An image alone in its paragraph
@@ -78,19 +91,6 @@ BLOCK_MARKER = "<!-- wp:"
 #: lists; ``sane_lists`` stops a list from swallowing the paragraph beneath it.
 _MD_EXTENSIONS = ("extra", "sane_lists")
 
-#: Element name -> (block name, extra JSON attributes). Anything absent falls
-#: back to a raw ``wp:html`` block, which renders correctly and stays editable
-#: as HTML — a worse editing experience than a native block, but never a
-#: dropped or mangled element.
-_SIMPLE_BLOCKS = {
-    "p": ("paragraph", ""),
-    "blockquote": ("quote", ""),
-    "pre": ("code", ""),
-    "hr": ("separator", ""),
-    "table": ("table", ""),
-    "figure": ("image", ""),
-}
-
 _HEADINGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
 
 #: The attributes an image block carries. Anything else on an ``<img>`` (a
@@ -113,8 +113,13 @@ def _element_html(el):
 
 
 def _inner_html(el):
-    """Serialise an element's children and text, but not its own tags."""
-    parts = [el.text or ""]
+    """Serialise an element's children and text, but not its own tags.
+
+    The element's own text is escaped the way ``ET.tostring`` escapes the text
+    that follows each child. It was not, so a ``<`` in a list item reached the
+    markup as a tag and the editor rejected the item.
+    """
+    parts = [_text(el.text or "")]
     parts.extend(ET.tostring(c, encoding="unicode", method="html") for c in el)
     return "".join(parts).strip()
 
@@ -134,6 +139,189 @@ def _list_block(el):
     return _wrap("list", f'<{tag} class="wp-block-list">\n{items}</{tag}>', attrs)
 
 
+def _blank(text):
+    return not (text or "").strip()
+
+
+def _only_children(el, tags):
+    """The children of ``el`` if it is pure structure, else ``None``.
+
+    Pure structure is no attributes, no text of its own, and nothing but ``tags``
+    elements with nothing between them. Anything more has no place in the block
+    the element is being fitted to.
+    """
+    if el.attrib or not _blank(el.text):
+        return None
+    kids = list(el)
+    if any(kid.tag not in tags or not _blank(kid.tail) for kid in kids):
+        return None
+    return kids
+
+
+def _quote_block(el):
+    """``core/quote``: a ``blockquote`` of one ``core/paragraph`` per paragraph.
+
+    The inner blocks are joined by a blank line, as the editor joins them. A
+    quote that holds anything but paragraphs (a list, a heading, another quote,
+    loose text) has no faithful form here, so it goes out as ``wp:html`` and is
+    not flattened into paragraphs.
+    """
+    paragraphs = _only_children(el, ("p",))
+    if not paragraphs:
+        return None
+    inner = "\n\n".join(_wrap("paragraph", _element_html(p)) for p in paragraphs)
+    return _wrap("quote", f'<blockquote class="wp-block-quote">{inner}</blockquote>')
+
+
+#: How Python-Markdown writes a column's alignment on a cell.
+_TEXT_ALIGN = re.compile(r"\s*text-align:\s*(left|center|right)\s*;?\s*", re.IGNORECASE)
+
+
+def _cell_align(cell):
+    """A cell's alignment: ``""``, ``left``, ``center`` or ``right``.
+
+    ``None`` if the cell carries anything else (a ``colspan``, a class, an
+    alignment the block lacks), which sends the whole table to ``wp:html``.
+
+    Python-Markdown writes alignment as ``style="text-align: right;"`` (``align=``
+    with an extension option). The table block reads neither: it keeps a cell's
+    alignment as ``data-align``, with a ``has-text-align-*`` class beside it.
+    """
+    attrs = dict(cell.attrib)
+    style, align = attrs.pop("style", None), attrs.pop("align", None)
+    if attrs:
+        return None
+    values = []
+    if style is not None:
+        found = _TEXT_ALIGN.fullmatch(style)
+        values.append(found.group(1).lower() if found else None)
+    if align is not None:
+        values.append(align.strip().lower())
+    if (
+        any(v not in ("left", "center", "right") for v in values)
+        or len(set(values)) > 1
+    ):
+        return None
+    return values[0] if values else ""
+
+
+def _table_cell(cell):
+    align = _cell_align(cell)
+    if align is None:
+        return None
+    attrs = f' class="has-text-align-{align}" data-align="{align}"' if align else ""
+    return f"<{cell.tag}{attrs}>{_inner_html(cell)}</{cell.tag}>"
+
+
+def _table_block(el):
+    """``core/table``: a ``table`` in a ``figure``, written as ``save()`` writes it.
+
+    That is no whitespace between the tags, ``has-fixed-layout`` on the ``table``
+    (the block's default), a section with no rows left out, and each cell's
+    alignment as the block stores it. A table with anything the block has no
+    place for (``colspan``, a caption, a ``tfoot``, attributes on a row) goes out
+    as ``wp:html`` as a whole.
+    """
+    sections = _only_children(el, ("thead", "tbody"))
+    if not sections or [s.tag for s in sections] not in (
+        ["thead", "tbody"],
+        ["thead"],
+        ["tbody"],
+    ):
+        return None
+    parts = []
+    for section in sections:
+        rows = _only_children(section, ("tr",))
+        if rows is None:
+            return None
+        rendered = []
+        for tr in rows:
+            cells = _only_children(tr, ("th", "td"))
+            html = [_table_cell(c) for c in cells] if cells else None
+            if not html or None in html:
+                return None
+            rendered.append(f"<tr>{''.join(html)}</tr>")
+        if rendered:
+            parts.append(f"<{section.tag}>{''.join(rendered)}</{section.tag}>")
+    if not parts:
+        return None
+    table = f'<table class="has-fixed-layout">{"".join(parts)}</table>'
+    return _wrap("table", f'<figure class="wp-block-table">{table}</figure>')
+
+
+#: What Python-Markdown puts on the ``<code>`` of a fenced block that names a
+#: language. The code block has no language to hold it, so it is dropped.
+_LANGUAGE_CLASS = re.compile(r"language-\S+")
+
+#: A URL alone on its line. The code block writes the ``//`` after its scheme as
+#: ``&#47;&#47;`` so that WordPress does not turn the line into an embed. It does
+#: that for the first such line only: captured from the editor, a second URL on
+#: a line of its own stays as written.
+_ISOLATED_URL = re.compile(r'^(\s*https?:)//([^\s<>"]+\s*)$', re.MULTILINE)
+
+
+def _code_text(text):
+    """Code as the block editor writes it back after reading it.
+
+    ``&``, ``<`` and ``>`` are escaped and quotes and everything else are left
+    alone. (Typed text keeps a bare ``>``, but a block read from stored markup is
+    written back with ``&gt;``, so a bare ``>`` would be rewritten the first time
+    the editor saved the post.) Every ``[`` is then written ``&#91;``, so that a
+    ``[gallery]`` in a code sample is not run as a shortcode on the front end, and
+    the first URL on a line of its own is written ``https:&#47;&#47;...``, in that
+    order, as the block's ``save()`` does.
+    """
+    text = _text(text).replace("[", "&#91;")
+    return _ISOLATED_URL.sub(r"\1&#47;&#47;\2", text, count=1)
+
+
+def _code_block(el):
+    """``core/code``: a ``pre`` holding one ``code`` element of plain text.
+
+    The ``language-*`` class Markdown adds to a fenced block goes, because the
+    block has nowhere to keep it. Any other class, id or attribute, or markup
+    inside the ``code``, sends the element to ``wp:html`` so that it survives.
+    """
+    kids = list(el)
+    if el.attrib or not _blank(el.text) or len(kids) != 1:
+        return None
+    code = kids[0]
+    language = code.get("class")
+    if (
+        code.tag != "code"
+        or len(code)
+        or not _blank(code.tail)
+        or set(code.attrib) - {"class"}
+        or (language is not None and not _LANGUAGE_CLASS.fullmatch(language))
+    ):
+        return None
+    inner = _code_text(code.text or "")
+    return _wrap("code", f'<pre class="wp-block-code"><code>{inner}</code></pre>')
+
+
+def _separator_block(el):
+    """``core/separator``, written with the opacity class the block defaults to."""
+    if el.attrib:
+        return None
+    return _wrap(
+        "separator", '<hr class="wp-block-separator has-alpha-channel-opacity"/>'
+    )
+
+
+#: Element name -> the builder of its native block. A builder returns ``None``
+#: when the element has something its block cannot hold, and so does an element
+#: with no entry (a ``div``, a definition list, a ``figure`` written as raw
+#: HTML): both go out as a raw ``wp:html`` block, which renders correctly and
+#: stays editable as HTML. That is a worse editing experience than a native
+#: block, and never a dropped, mangled or rejected element.
+_NATIVE_BLOCKS = {
+    "blockquote": _quote_block,
+    "table": _table_block,
+    "pre": _code_block,
+    "hr": _separator_block,
+}
+
+
 def _block_for(el):
     if el.tag in _HEADINGS:
         level = _HEADINGS[el.tag]
@@ -143,10 +331,10 @@ def _block_for(el):
         return _wrap("heading", _element_html(el), attrs)
     if el.tag in ("ul", "ol"):
         return _list_block(el)
-    if el.tag in _SIMPLE_BLOCKS:
-        name, attrs = _SIMPLE_BLOCKS[el.tag]
-        return _wrap(name, _element_html(el), attrs)
-    return _wrap("html", _element_html(el))
+    if el.tag == "p":
+        return _wrap("paragraph", _element_html(el))
+    build = _NATIVE_BLOCKS.get(el.tag)
+    return (build(el) if build else None) or _wrap("html", _element_html(el))
 
 
 # ---------------------------------------------------------------------------
