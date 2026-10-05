@@ -474,15 +474,27 @@
 # more at 2-6.5s. All of them were recovered by the retry. So:
 #
 #   cut_short_by empty, value near the budget   -> the budget bit. Size from it.
+#   cut_short_by RateLimitError                 -> a 429 before the stream got
+#                                                  going. Ignore for sizing.
 #   cut_short_by MidStreamFallbackError         -> a dropped stream, not a
 #                                                  silence. Ignore for sizing.
-#   cut_short_by RateLimitError                 -> a 429 before the stream got
-#                                                  going. Ignore for sizing;
-#                                                  it is a rate-limit problem.
+#   cut_short_by InternalServerError            -> a provider 5xx. Ignore for
+#                                                  sizing.
 #
-# The 2026-10-05 run censored 5 of its 34 streams and every one was a
-# RateLimitError on perplexity, which retried and completed. Not one censored
-# value in any run on record has been a budget bite.
+# Those are ALL THREE causes on record, counted over every saved capture on
+# 2026-10-05: of 1,351 stream records, 107 are censored — RateLimitError 93,
+# MidStreamFallbackError 7, InternalServerError 7. A `cut_short_by` of none at
+# all has never accompanied a censored stream.
+#
+# AND NOT ONE OF THOSE 107 SITS AT 90% OF ITS OWN BUDGET. Zero of 107, against
+# each stream's own stream_read_timeout or stream_gap_timeout. That is the
+# sentence to lean on if anyone proposes cutting a value in this file on the
+# strength of a censored reading: no censored value in this repo's history has
+# ever been a budget bite, and the figure has a denominator.
+#
+# (The 2026-10-05 run contributes 5 of the 107, all RateLimitError on
+# perplexity, which retried and completed. Its stream counts, stating the
+# basis: 34 ensemble streams, 41 including the citation and SEO passes.)
 #
 # (This paragraph said "a lower bound appears only where a budget actually bit"
 # until 2026-10-05, which would have had a reader size a budget from a 3s
