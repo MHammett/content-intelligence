@@ -444,8 +444,11 @@
 # "measured, no change needed". If one provider does bite, isolate that provider
 # alone with raised budgets — stage 0's method, which cost $0.62 a run for
 # grok-only. Do not read that as the price of any isolation run: gemini's
-# per-query search fees were 87% of a `wide` run on 2026-10-04 (#285), so a
-# gemini-only run is fee-dominated and costs several times a grok-only one.
+# per-query search fees were 84-92% of a `wide` run's total on 2026-10-04
+# ($0.44-0.76 of $0.63-0.94, re-measured in #317; its query count had roughly
+# doubled in a week on an unchanged command), so a gemini-only run is
+# fee-dominated, costs several times a grok-only one, and should be quoted as
+# a range or re-measured rather than quoted at all.
 #
 # The perplexity entry this file carried until 2026-09-28 is the standing
 # reminder of what guessing costs instead (160 -> 280 -> 350 -> 500, three bumps
