@@ -21,6 +21,7 @@ DISPOSITIONS = (
     ("content_mismatch", "Read, and does NOT support the claim"),
     ("unverifiable", "Fetched, but could not be read"),
     ("fetch_failed", "Source URL identified, but the fetch was refused"),
+    ("resolution_error", "Resolution did not complete (error or timeout)"),
     ("pointer", "Pointer only — nothing retrieved"),
     ("no_source", "No source identified"),
 )
@@ -32,10 +33,15 @@ _LABELS = dict(DISPOSITIONS)
 def disposition(citation):
     """Which :data:`DISPOSITIONS` bucket ``citation`` belongs in.
 
-    Anything that never reached a verification tier is one of the two
+    Anything that never reached a verification tier is one of the three
     "nothing was read" buckets, regardless of ``resolved``: ``fetch_failed``
     when a URL was identified and the fetch did not succeed, ``no_source``
-    when there was no URL to try.
+    when there was no URL to try, and ``resolution_error`` when the job for the
+    claim timed out or raised, which says nothing about whether a source exists
+    (issue #340; it used to be filed under ``no_source``, which reported a
+    claim whose fetch had not finished as one nobody had found a URL for). The
+    resolver writes that one as an explicit tier because the URL it was trying,
+    when it knew one, is kept on the entry and would otherwise read as a refusal.
 
     Total by construction — every citation lands in exactly one bucket, so
     counts built from this always sum to the number of citations.

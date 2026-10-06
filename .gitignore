@@ -32,6 +32,13 @@ pipeline_out.txt
 # new home under packages/. Bare, this matches at any depth in both, and still
 # covers the repo-root handoff_templates/ where the real drafts sit.
 dc-environment*.md
+# The whole repo-root handoff_templates/ is a working directory for private drafts
+# and handoffs, and none of it is source. Anchored with a leading slash on purpose:
+# a bare line would also match the packaged templates under packages/. Hatchling
+# reads an anchored line relative to each package directory, where no
+# handoff_templates/ sits at the top, so the build is unaffected (pinned in
+# test_gitignore_private_drafts.py).
+/handoff_templates/
 .env
 .env.*
 !.env.example

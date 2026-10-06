@@ -101,6 +101,12 @@ The readable report splits this in two, because the two halves call for differen
 
 **How much to trust it:** nothing to trust — this is a to-do.
 
+### Resolution did not complete — `verification: "resolution_error"`
+
+The job that resolves each claim has a 90 second safety net and can also raise. When it does either, the claim used to be written with no URL and no tier, which filed it under *No source identified* and described it as "no URL was found, so nothing was fetched": false for a claim whose source was named and whose fetch had not finished. It now has its own tier, `error_kind` (`timeout` or `error`), the URL it was working on when one was known (with several, the first, and the note says how many), and a `note` saying which happened and that a re-run usually clears it. The readable report gives it its own block and table row, *Resolution did not complete (error or timeout)*, and the console summary counts it as unresolved and says how many timed out.
+
+**How much to trust it:** nothing was checked, in either direction. It is a fact about the run, not about the claim or its source.
+
 ### Content mismatch — `verification: "content_mismatch"`
 
 A distinct failure mode, and the highest-information outcome in the section: the source URL fetched and checksummed fine, but the relevance check came back saying the page does **not** support the claim. These are the only entries where a document was genuinely retrieved, read, and found not to back the claim it was cited for, so the readable report gives them their own block (*Read, and does NOT support the claim*) directly under the confirmed ones. They previously rendered inside *Unresolved*, indistinguishable from claims nothing had ever been fetched for. The entry records the verdict (`contradicts`, `not_addressed`, or `inconclusive`) and the model's one-sentence reason, and the report separates them: `contradicts` means the source says otherwise and the draft may be factually wrong, while `not_addressed`/`inconclusive` far more often means the wrong URL was checked or the relevant passage did not extract — a citation problem, not a factual one. All nine mismatches in the motivating run were `not_addressed`.
@@ -123,6 +129,20 @@ The source URL fetched and checksummed fine, but no judgement about it was possi
 `resolved` stays `true` — a real document was fetched, and it is still archived and shown to you for manual checking. But nothing was confirmed and, importantly, **nothing was refuted**.
 
 **How much to trust it:** treat it exactly like *Pointer only* — a lead to check by hand. The one thing it never means is that the source failed to support the claim. That distinction is the point of the tier: an honest "we couldn't read this" is useful, while a wrong "this source doesn't back you up" is actively misleading.
+
+### Paginated sources
+
+A claim that is true but sits on page 2 of an archive, a listing or a multi-page article used to be reported *Read, and does NOT support the claim*, because the resolver judged it against the one page it fetched. For a source it reached directly, it now reads on, in this order:
+
+1. **WordPress REST totals.** `X-WP-Total` and `X-WP-TotalPages` arrive on the response already in hand and give an exact count of a collection. They are stated to the relevance check as a line of text, so a count claim ("the site has 11 posts") can be settled without fetching every page.
+2. **`rel=next`.** The `Link` response header (WordPress REST sends it too, so a REST collection walks without any special case), then `<link>` or `<a>` carrying `rel="next"`.
+3. **A numbered page the page itself links to**: `/page/N/`, `?page=N` or `?paged=N`, only where the current page contains an anchor to exactly the next number. It is never guessed, because a single article would answer a made-up `/page/2/` with a 404 for every citation in the report.
+
+At most five pages are read for one citation (the first included). A link to another site or scheme, or to a page already read, is not followed, and a page that fails to fetch or yields no text stops the walk and keeps what was read. A bot-check interstitial is never walked.
+
+The entry records `pages_read` and a `pagination` block (the URLs followed, the WordPress totals if any, and `stopped`: `page cap`, `fetch failed (...)` or `unreadable page`). The checksum, the content summary and the drift comparison still describe **page one only**: hashing the extra pages would report every paginated source as changed against every earlier run. When the walk stopped at the cap and the source still did not support the claim, the note says only the first five pages were read, so the claim may sit further on.
+
+Checked on `mikehammett.net`, 2026-10-06: the homepage listing now reaches `/page/2/` (a post title the first page does not carry becomes visible to the check), a REST collection `?per_page=3` reports 11 posts in 4 pages and walks all four, and a single article still costs one fetch.
 
 ---
 
@@ -178,8 +198,9 @@ Three mechanisms now sit in front of it, because no one of them is sufficient:
 ```
 > **Archive status is unknown for 65 of these citations.** archive.org
 > rate-limited this run (HTTP 429). `archived: null` means the lookup did not
-> complete, **not** that the page is unarchived — and nothing was submitted for
-> archiving on that basis. Re-run to find out.
+> complete, **not** that the page is unarchived, and nothing was submitted for
+> archiving on that basis. To retry just the archive lookups, with no review and
+> no model calls, run `ci-review --archive-only` on the draft.
 ```
 
 An `archived: false` entry is untouched by all of this: that is an answer, and only `null` means the run never found out.

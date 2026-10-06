@@ -38,6 +38,7 @@ from ci_core import redact
 from ci_core import llm
 
 from . import seo as seo_analysis
+from . import seo_style
 from ci_core.llm import cost
 
 log = logging.getLogger(__name__)
@@ -115,7 +116,8 @@ _SYSTEM_PROMPT = (
     f"{', '.join(_KNOWN_SCHEMA_TYPES)}: NewsArticle for reporting tied to a "
     "current event, Article for reference or explanatory writing, BlogPosting "
     "for commentary and opinion in a personal voice. Give a one-line "
-    "schema_type_rationale saying which kind of piece this is."
+    "schema_type_rationale saying which kind of piece this is.\n"
+    f"{seo_style.SYSTEM_RULE}"
 )
 
 
@@ -144,6 +146,9 @@ def _build_user_prompt(
         parts.append(f"PUBLICATION: {pub_config['publication_description']}")
     if pub_config.get("audience"):
         parts.append(f"PUBLICATION AUDIENCE: {pub_config['audience']}")
+    rules = seo_style.style_block(pub_config)
+    if rules:
+        parts.append(rules)
 
     outline = _outline(text)
     if outline:

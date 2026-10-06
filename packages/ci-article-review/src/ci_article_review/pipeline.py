@@ -2347,6 +2347,12 @@ def _capture_could_have_searched(model_name, result):
     return bool(result.get("grounding_available"))
 
 
+#: The ``reasons`` entry for an attempt that answered but was set aside because
+#: its answer was empty where siblings' were not (see ``_empty_despite_siblings``).
+#: Not an exception class: the call succeeded.
+_EMPTY_RESULT_REASON = "EmptyResult"
+
+
 def _keep_earlier_billing(failed, fresh):
     """Carry what a failed dispatch was billed for into the result replacing it.
 
@@ -2368,9 +2374,13 @@ def _keep_earlier_billing(failed, fresh):
     in any checkout shows a fallback, to 2026-09-18 — and would differ only if
     a capacity fallback answered one of the two calls and not the other.
 
-    Recovery only replaces failed results, so ``failed`` always is one. Not
-    applied to ``--retry-failed``: a capture's attempts were billed in the
-    report of the run that made them.
+    Recovery replaces failed results, so ``failed`` is nearly always one. The
+    exception is an empty ``fact_check`` answer that was asked again: that
+    attempt succeeded and was billed like any other, and is recorded under
+    ``_EMPTY_RESULT_REASON``. The same function folds the retry into the
+    original when the retry is the one set aside. Not applied to
+    ``--retry-failed``: a capture's attempts were billed in the report of the
+    run that made them.
     """
     if not isinstance(failed, dict) or not isinstance(fresh, dict):
         return
@@ -2378,7 +2388,11 @@ def _keep_earlier_billing(failed, fresh):
     last_attempt = {
         "count": 1,
         "costed": 1 if tokens.get("prompt") or tokens.get("completion") else 0,
-        "reasons": [_failure_reason(failed.get("error"))],
+        "reasons": [
+            _failure_reason(failed.get("error"))
+            if failed.get("failed")
+            else _EMPTY_RESULT_REASON
+        ],
         "tokens": tokens,
     }
     # A malformed-JSON failure on a grounded call searched before it failed,
@@ -2410,6 +2424,47 @@ def _keep_earlier_billing(failed, fresh):
         fresh["discarded_attempts"]["searches"] = searches
 
 
+#: Domains where a schema-valid answer with every bucket empty is missing
+#: coverage and not a result. ``fact_check`` files each claim it reviews into
+#: one of its seven buckets, so an all-empty answer says no claim was reviewed.
+#: The other domains return flags, where "no flags" is an ordinary answer, and
+#: asking again there would spend money on every clean draft.
+_EMPTY_IS_MISSING_COVERAGE = ("fact_check",)
+
+
+def _empty_despite_siblings(raw_results):
+    """Calls that answered with nothing where another model's answer had items.
+
+    A call ``failed`` neither recovery nor substitution looks at: it is
+    ``failed: False`` with a truthy ``data`` dict, which both read as a good
+    result (issue #342). In ``_EMPTY_IS_MISSING_COVERAGE`` domains, when at
+    least one *other* model in the same domain returned something, the empty
+    answer is the odd one out, and is worth one more call. When every model is
+    empty, or the model has the domain to itself, nothing says the answer is
+    wrong and this returns nothing for it.
+    """
+
+    def _answered(result):
+        return not result.get("failed") and not result.get("skipped")
+
+    out = []
+    for name, result in raw_results.items():
+        domain = result.get("_domain") or name.partition(":")[2]
+        if domain not in _EMPTY_IS_MISSING_COVERAGE:
+            continue
+        if not _answered(result) or not consolidation.result_is_empty(result):
+            continue
+        if any(
+            other_name != name
+            and (other.get("_domain") or other_name.partition(":")[2]) == domain
+            and _answered(other)
+            and not consolidation.result_is_empty(other)
+            for other_name, other in raw_results.items()
+        ):
+            out.append(name)
+    return out
+
+
 def _recover_failed_calls(
     raw_results, runners, pipeline_cfg, model_configs, task_timeout
 ):
@@ -2422,45 +2477,87 @@ def _recover_failed_calls(
     whole passes, not a per-socket backoff. Calls ``_looks_permanent`` flags
     are skipped: retrying a dead account identically every pass spends money
     to learn nothing new.
+
+    An empty ``fact_check`` answer beside siblings that found items is retried
+    too, once whatever ``recovery_passes`` says (``_empty_despite_siblings``).
+    The earlier answer stays if the retry does no better, and either way both
+    attempts are billed.
     """
     recovery_passes = pipeline_cfg.get("recovery_passes", 1)
     recovery_delay = pipeline_cfg.get("recovery_delay_seconds", 30)
     originally_failed = {name for name, r in raw_results.items() if r.get("failed")}
-    if not originally_failed or recovery_passes <= 0:
+    empty_to_retry = (
+        set(_empty_despite_siblings(raw_results)) if recovery_passes > 0 else set()
+    )
+    if (not originally_failed and not empty_to_retry) or recovery_passes <= 0:
         return raw_results
 
+    empty_retried, empty_recovered = [], []
     for pass_num in range(1, recovery_passes + 1):
-        names_to_retry = [
+        failed_names = [
             name
             for name, r in raw_results.items()
             if r.get("failed") and not _looks_permanent(r.get("error", ""))
         ]
+        empty_names = sorted(empty_to_retry)
+        empty_to_retry = set()
+        names_to_retry = failed_names + empty_names
         if not names_to_retry:
             break
-        log.info(
-            "Recovery pass %d/%d: retrying %d failed call(s): %s",
-            pass_num,
-            recovery_passes,
-            len(names_to_retry),
-            ", ".join(sorted(names_to_retry)),
-        )
+        if failed_names:
+            log.info(
+                "Recovery pass %d/%d: retrying %d failed call(s): %s",
+                pass_num,
+                recovery_passes,
+                len(failed_names),
+                ", ".join(sorted(failed_names)),
+            )
+        if empty_names:
+            log.info(
+                "Recovery pass %d/%d: retrying %d empty fact_check call(s) whose "
+                "siblings found items: %s",
+                pass_num,
+                recovery_passes,
+                len(empty_names),
+                ", ".join(empty_names),
+            )
         time.sleep(recovery_delay)
         retried = _run_reviews_for_names(
             names_to_retry, runners, pipeline_cfg, model_configs, task_timeout
         )
         for name, fresh in retried.items():
-            _keep_earlier_streams(raw_results.get(name), fresh)
-            _keep_earlier_billing(raw_results.get(name), fresh)
-        raw_results.update(retried)
+            earlier = raw_results.get(name)
+            if name in empty_names:
+                empty_retried.append(name)
+                if fresh.get("failed") or consolidation.result_is_empty(fresh):
+                    # The earlier answer was real, only empty, and the retry did
+                    # no better. Keep the answer and charge it for the attempt.
+                    # The retry's streams are not carried over: they would be
+                    # marked ``before_recovery``, which they were not.
+                    _keep_earlier_billing(fresh, earlier)
+                    continue
+                empty_recovered.append(name)
+            _keep_earlier_streams(earlier, fresh)
+            _keep_earlier_billing(earlier, fresh)
+            raw_results[name] = fresh
+
+    if empty_retried:
+        log.info(
+            "Empty-result retry: %d of %d returned items on the second ask%s.",
+            len(empty_recovered),
+            len(empty_retried),
+            f" ({', '.join(sorted(empty_recovered))})" if empty_recovered else "",
+        )
 
     still_failed = [name for name, r in raw_results.items() if r.get("failed")]
     recovered = len(originally_failed) - len(still_failed)
-    log.info(
-        "Recovery summary: %d recovered, %d still failing out of %d originally failed.",
-        recovered,
-        len(still_failed),
-        len(originally_failed),
-    )
+    if originally_failed:
+        log.info(
+            "Recovery summary: %d recovered, %d still failing out of %d originally failed.",
+            recovered,
+            len(still_failed),
+            len(originally_failed),
+        )
     return raw_results
 
 
@@ -2534,6 +2631,13 @@ def _domains_with_nothing_usable(raw_results, expected_domains=None):
     and ``voice_style`` has no reviewer at all — the edge case documented under
     "Drafting model" in docs/CONFIGURATION.md — so there is no result key, and
     the domain was invisible to the pass meant to repair exactly that.
+
+    An all-empty ``fact_check`` payload counts as usable here, deliberately. A
+    model that is alone in its domain, or beside models that are empty too, has
+    given no sign its answer is wrong, and a substitute would be a paid call
+    that a draft with nothing to check gets for nothing. The case with evidence,
+    one empty model beside siblings that found items, is
+    ``_empty_despite_siblings``, and it retries the same model once (#342).
     """
     covered: dict[str, bool] = {d: False for d in (expected_domains or ())}
     for name, result in raw_results.items():
@@ -4929,7 +5033,12 @@ def _print_draft_summary(
         pointer = by_disposition["pointer"]
         # Every citation is in exactly one bucket, so this is a true remainder
         # and the printed numbers always add up to the total.
-        unresolved = by_disposition["fetch_failed"] + by_disposition["no_source"]
+        resolution_errors = by_disposition["resolution_error"]
+        unresolved = (
+            by_disposition["fetch_failed"]
+            + by_disposition["no_source"]
+            + resolution_errors
+        )
         not_archived = [
             c for c in resolved if c.get("wayback", {}).get("archived") is False
         ]
@@ -4959,6 +5068,15 @@ def _print_draft_summary(
             f"verified), {len(unverifiable)} could not be read, "
             f"{len(unresolved)} unresolved"
         )
+        if resolution_errors:
+            timed_out = sum(
+                1 for c in resolution_errors if c.get("error_kind") == "timeout"
+            )
+            print(
+                f"  {len(resolution_errors)} citation(s) did not finish resolving "
+                f"({timed_out} timed out, {len(resolution_errors) - timed_out} "
+                "raised) — nothing was checked for them; a re-run usually clears it"
+            )
         if refuted:
             print(
                 f"  {len(refuted)} citation(s) were fetched and read, and the "
