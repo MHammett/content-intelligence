@@ -185,6 +185,7 @@
     "discarded_calls": 0,
     "incurred_usd": 0.0315,
     "pricing_known": false,
+    "refused_calls": 0,
     "replayed_usd": 0.0,
     "search_units": 0,
     "total_input_usd": 0.0175,

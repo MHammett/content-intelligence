@@ -519,6 +519,65 @@ class TestRecoverFailedCalls:
             "tokens": {"prompt": 6107, "completion": 7000},
         }
 
+    def _refused_twice(self):
+        """Both attempts refused at the door: 2026-10-05, Perplexity's 429s.
+
+        The SDK's error text names no class, so ``_failure_reason`` reads
+        "unknown" for the last attempt; the client's flag is what says it
+        generated nothing.
+        """
+        return {
+            "failed": True,
+            "error": "Error code: 429 - request_rate_limit_exceeded",
+            "model": "gpt-5.6-sol",
+            "tokens": dict(self._NO_TOKENS),
+            "unbilled": True,
+            "discarded_attempts": {
+                "count": 1,
+                "costed": 0,
+                "unbilled": 1,
+                "reasons": ["RateLimitError"],
+                "tokens": dict(self._NO_TOKENS),
+            },
+        }
+
+    def test_refused_attempts_do_not_make_the_total_a_floor(self):
+        """Issue #331: five 429s, "at least - 5 retried attempt(s) were billed
+        by the provider with no usage reported". Recovery carried the last
+        attempt over as unknown because it could not tell it from a stall."""
+        recovered = self._recover(self._refused_twice(), self._answer())
+
+        discarded = recovered["discarded_attempts"]
+        assert (discarded["count"], discarded["costed"], discarded["unbilled"]) == (
+            2,
+            0,
+            2,
+        )
+        summary = self._cost(recovered)
+        assert (summary["discarded_calls"], summary["uncosted_calls"]) == (2, 0)
+
+    def test_a_stall_beside_a_refusal_still_counts_as_unknown(self):
+        failed = self._refused_twice()
+        failed["discarded_attempts"] = self._stalled_twice()["discarded_attempts"]
+
+        recovered = self._recover(failed, self._answer())
+
+        # The stall first, then the refusal: only the stall may have been billed.
+        assert recovered["discarded_attempts"]["unbilled"] == 1
+        summary = self._cost(recovered)
+        assert (summary["discarded_calls"], summary["uncosted_calls"]) == (2, 1)
+
+    def test_an_unflagged_failure_is_still_counted_as_unknown(self):
+        """No flag, no claim: a failure whose attempt we cannot place stays in
+        the floor, as before."""
+        failed = self._refused_twice()
+        del failed["unbilled"]
+
+        recovered = self._recover(failed, self._answer())
+
+        assert recovered["discarded_attempts"]["unbilled"] == 1
+        assert self._cost(recovered)["uncosted_calls"] == 1
+
     def test_billing_accumulates_across_recovery_passes(self):
         recovered = self._recover(
             self._stalled_twice(),
