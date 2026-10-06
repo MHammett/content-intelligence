@@ -2292,6 +2292,39 @@ def _note_confirmed_siblings(results):
         ).lstrip()
 
 
+def _resolution_error_result(claim, known_urls, error):
+    """The entry for a claim whose resolution job timed out or raised.
+
+    Its own tier, ``resolution_error``, so it is neither "No source identified"
+    (a source may well have been named) nor "fetch refused" (the origin never
+    got to answer). The URL it was working on is kept when one was known: with
+    several, ``_resolve_one`` tries them in order and a timeout does not say
+    which was in flight, so the first is recorded and the note says how many.
+    """
+    timed_out = isinstance(error, TimeoutError)
+    result = {
+        "claim": claim,
+        "resolved": False,
+        "verification": "resolution_error",
+        "error_kind": "timeout" if timed_out else "error",
+    }
+    note = (
+        f"Resolution did not finish ({error}), so nothing about this claim's "
+        "source was checked. A re-run usually clears a timeout."
+        if timed_out
+        else f"Resolution error: {type(error).__name__}: {error}. Nothing about "
+        "this claim's source was checked. A re-run may clear it."
+    )
+    if known_urls:
+        result["url"] = known_urls[0]
+        if len(known_urls) > 1:
+            note += (
+                f" {len(known_urls)} source URLs were being tried; the first is shown."
+            )
+    result["note"] = note
+    return result
+
+
 def resolve_citations(
     claims,
     citation_sources,
@@ -2382,11 +2415,9 @@ def resolve_citations(
             ordered[idx] = value
         else:
             log.warning(f"Citation resolution raised for claim index {idx}: {error}")
-            ordered[idx] = {
-                "claim": normalized[idx][0],
-                "resolved": False,
-                "note": f"Resolution error: {error}",
-            }
+            ordered[idx] = _resolution_error_result(
+                normalized[idx][0], normalized[idx][1], error
+            )
 
     resolved_results = []
     for i in range(len(normalized)):
