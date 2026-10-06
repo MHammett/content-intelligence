@@ -598,6 +598,322 @@ class TestModelClassification:
         assert out["out_of_scope"] == []
 
 
+def _verdict(claim, model, url, bucket="confirmed"):
+    return {
+        "claim": claim,
+        "source_model": model,
+        "source": f"{model} source",
+        "source_url": url,
+        "bucket": bucket,
+    }
+
+
+def _scope_call(claim, model, claim_type="first_person", reason="r"):
+    return {
+        "claim": claim,
+        "claim_type": claim_type,
+        "reason": reason,
+        "source_model": model,
+    }
+
+
+def _by_bucket(*verdicts):
+    """`_fc` buckets from verdict dicts, each filed under its own `bucket`."""
+    buckets = {}
+    for verdict in verdicts:
+        verdict = dict(verdict)
+        buckets.setdefault(verdict.pop("bucket"), []).append(verdict)
+    return buckets
+
+
+class TestSourcedVerdictsOutvoteALoneScopeCall:
+    """One model's scope label must not erase other models' sourced verdicts (#336).
+
+    Option 2 of the issue, K=2: two or more distinct sourced verdicts outvote a
+    scope call made by a single model. One does not, because the case PR #167
+    was written for is a single false `confirmed` that carried a real URL.
+    """
+
+    CLAIM = "Accuracy is the entire premise of this project."
+
+    def _apply(self, verdicts, calls, pub_config=None):
+        rules = ScopeRules.from_run("", {}, pub_config or {})
+        return rules.apply(_fc(**_by_bucket(*verdicts), out_of_scope=list(calls)))
+
+    @pytest.mark.parametrize(
+        "claim_type", sorted(fact_check_scope.DEFAULT_HONOURED_TYPES)
+    )
+    def test_two_sourced_verdicts_keep_the_claim_in_verification(self, claim_type):
+        out = self._apply(
+            [
+                _verdict(self.CLAIM, "perplexity", "https://example.com/a"),
+                _verdict(self.CLAIM, "mistral", "https://example.org/b"),
+            ],
+            [_scope_call(self.CLAIM, "gemini", claim_type)],
+        )
+        entry = out["out_of_scope"][0]
+        assert entry["excluded"] is False
+        assert entry["withdrawn_verdicts"] == []
+        assert [v["source_model"] for v in out["confirmed"]] == [
+            "perplexity",
+            "mistral",
+        ]
+        # Still reported, so the disagreement is visible and says why.
+        assert entry["classified_by"] == ["gemini"]
+        assert entry["claim_type"] == claim_type
+        assert "outvote" in entry["reason"]
+        assert "https://example.com/a" in entry["reason"]
+        assert "https://example.org/b" in entry["reason"]
+        assert "does not exclude on a model's say-so" not in entry["reason"]
+
+    def test_the_verdicts_may_sit_in_different_buckets(self):
+        out = self._apply(
+            [
+                _verdict(self.CLAIM, "perplexity", "https://example.com/a"),
+                _verdict(
+                    self.CLAIM,
+                    "mistral",
+                    "https://example.org/b",
+                    bucket="contradicted",
+                ),
+            ],
+            [_scope_call(self.CLAIM, "gemini", "subjective_judgment")],
+        )
+        assert out["out_of_scope"][0]["excluded"] is False
+        assert len(out["confirmed"]) == 1 and len(out["contradicted"]) == 1
+
+    def test_one_sourced_verdict_does_not_outvote_the_case_pr_167_was_for(self):
+        """A false `confirmed` with a real URL, for a claim about the author's life."""
+        claim = "I have a side job."
+        out = self._apply(
+            [_verdict(claim, "openai", "https://fd-ix.com/about/team/")],
+            [_scope_call(claim, "gemini", "first_person")],
+        )
+        entry = out["out_of_scope"][0]
+        assert entry["excluded"] is True
+        assert out["confirmed"] == []
+        assert entry["withdrawn_verdicts"][0]["source_url"].startswith("https://fd-ix")
+
+    def test_two_models_citing_one_page_count_once(self):
+        out = self._apply(
+            [
+                _verdict(self.CLAIM, "perplexity", "https://example.com/a#intro"),
+                _verdict(self.CLAIM, "mistral", "HTTPS://Example.com/a/"),
+            ],
+            [_scope_call(self.CLAIM, "gemini", "subjective_judgment")],
+        )
+        assert out["out_of_scope"][0]["excluded"] is True
+
+    def test_one_model_citing_two_pages_counts_once(self):
+        out = self._apply(
+            [
+                _verdict(self.CLAIM, "perplexity", "https://example.com/a"),
+                _verdict(
+                    self.CLAIM,
+                    "perplexity",
+                    "https://example.org/b",
+                    bucket="outdated",
+                ),
+            ],
+            [_scope_call(self.CLAIM, "gemini", "subjective_judgment")],
+        )
+        assert out["out_of_scope"][0]["excluded"] is True
+
+    def test_a_verdict_with_no_real_url_is_not_a_sourced_verdict(self):
+        out = self._apply(
+            [
+                _verdict(self.CLAIM, "perplexity", ""),
+                _verdict(self.CLAIM, "mistral", "Manual Calculation"),
+                _verdict(
+                    self.CLAIM,
+                    "openai",
+                    "https://example.com/a",
+                    bucket="primary_source_needed",
+                ),
+                _verdict(
+                    self.CLAIM, "claude", "https://example.org/b", bucket="unverifiable"
+                ),
+            ],
+            [_scope_call(self.CLAIM, "gemini", "subjective_judgment")],
+        )
+        assert out["out_of_scope"][0]["excluded"] is True
+
+    def test_two_models_making_the_scope_call_is_not_a_lone_call(self):
+        out = self._apply(
+            [
+                _verdict(self.CLAIM, "perplexity", "https://example.com/a"),
+                _verdict(self.CLAIM, "mistral", "https://example.org/b"),
+            ],
+            [
+                _scope_call(self.CLAIM, "gemini", "subjective_judgment"),
+                _scope_call(self.CLAIM, "openai", "subjective_judgment"),
+            ],
+        )
+        entry = out["out_of_scope"][0]
+        assert entry["excluded"] is True
+        assert entry["classified_by"] == ["gemini", "openai"]
+        assert {w["model"] for w in entry["withdrawn_verdicts"]} == {
+            "perplexity",
+            "mistral",
+        }
+
+    def test_a_call_that_is_not_honoured_does_not_count_towards_the_quorum(self):
+        """`other` is reported, not obeyed; it cannot help a lone honoured call."""
+        out = self._apply(
+            [
+                _verdict(self.CLAIM, "perplexity", "https://example.com/a"),
+                _verdict(self.CLAIM, "mistral", "https://example.org/b"),
+            ],
+            [
+                _scope_call(self.CLAIM, "gemini", "subjective_judgment"),
+                _scope_call(self.CLAIM, "openai", "other"),
+            ],
+        )
+        assert out["out_of_scope"][0]["excluded"] is False
+
+    def test_an_author_marking_is_never_outvoted(self):
+        rules = ScopeRules.from_run(
+            f"<!-- ci:no-verify: my own view -->{self.CLAIM}<!-- /ci:no-verify -->",
+            {},
+            {},
+        )
+        out = rules.apply(
+            _fc(
+                confirmed=[
+                    _verdict(self.CLAIM, "perplexity", "https://example.com/a"),
+                    _verdict(self.CLAIM, "mistral", "https://example.org/b"),
+                    _verdict(self.CLAIM, "openai", "https://example.net/c"),
+                ],
+                out_of_scope=[_scope_call(self.CLAIM, "gemini", "subjective_judgment")],
+            )
+        )
+        entry = out["out_of_scope"][0]
+        assert entry["excluded"] is True
+        assert entry["excluded_by"] == fact_check_scope.ORIGIN_INLINE
+        assert out["confirmed"] == []
+
+    def test_the_threshold_is_configurable(self):
+        verdicts = [
+            _verdict(self.CLAIM, "perplexity", "https://example.com/a"),
+            _verdict(self.CLAIM, "mistral", "https://example.org/b"),
+        ]
+        call = [_scope_call(self.CLAIM, "gemini", "subjective_judgment")]
+        strict = self._apply(
+            verdicts, call, {"fact_check_scope": {"min_sources_to_overrule": 3}}
+        )
+        assert strict["out_of_scope"][0]["excluded"] is True
+        loose = self._apply(
+            verdicts[:1], call, {"fact_check_scope": {"min_sources_to_overrule": 1}}
+        )
+        assert loose["out_of_scope"][0]["excluded"] is False
+
+    @pytest.mark.parametrize("bad", [0, -1, True, "two", 2.5])
+    def test_an_unusable_threshold_is_warned_about_and_defaults(self, bad, caplog):
+        with caplog.at_level(logging.WARNING):
+            rules = ScopeRules.from_run(
+                "", {}, {"fact_check_scope": {"min_sources_to_overrule": bad}}
+            )
+        assert rules.min_sources_to_overrule == (
+            fact_check_scope.DEFAULT_MIN_SOURCES_TO_OVERRULE
+        )
+        assert "min_sources_to_overrule" in caplog.text
+
+    def test_trust_model_classification_false_still_excludes_nothing(self):
+        out = self._apply(
+            [_verdict(self.CLAIM, "perplexity", "https://example.com/a")],
+            [_scope_call(self.CLAIM, "gemini", "subjective_judgment")],
+            {"fact_check_scope": {"trust_model_classification": False}},
+        )
+        entry = out["out_of_scope"][0]
+        assert entry["excluded"] is False
+        assert len(out["confirmed"]) == 1
+        assert "does not exclude on a model's say-so" in entry["reason"]
+
+    def test_exclude_types_still_bounds_what_a_lone_call_can_do(self):
+        pub = {"fact_check_scope": {"exclude_types": ["first_person"]}}
+        out = self._apply(
+            [_verdict(self.CLAIM, "perplexity", "https://example.com/a")],
+            [_scope_call(self.CLAIM, "gemini", "subjective_judgment")],
+            pub,
+        )
+        assert out["out_of_scope"][0]["excluded"] is False
+        narrow = self._apply(
+            [_verdict("I have a side job.", "openai", "https://example.com/a")],
+            [_scope_call("I have a side job.", "gemini", "first_person")],
+            pub,
+        )
+        assert narrow["out_of_scope"][0]["excluded"] is True
+
+    def test_another_claims_verdicts_are_not_counted(self):
+        out = self._apply(
+            [
+                _verdict(
+                    "A different claim entirely.", "perplexity", "https://e.com/a"
+                ),
+                _verdict(
+                    "Another unrelated sentence here.", "mistral", "https://e.org/b"
+                ),
+            ],
+            [_scope_call(self.CLAIM, "gemini", "subjective_judgment")],
+        )
+        assert out["out_of_scope"][0]["excluded"] is True
+
+
+class TestTheReasonFollowsTheDecision:
+    """An excluded claim must not carry text saying it stayed in verification (#337)."""
+
+    CLAIM = "Citations get checked against primary sources."
+
+    def _entry(self, *calls):
+        rules = ScopeRules.from_run("", {}, {})
+        return rules.apply(_fc(out_of_scope=list(calls)))["out_of_scope"][0]
+
+    def test_a_later_honoured_call_replaces_the_stayed_in_verification_text(self):
+        entry = self._entry(
+            _scope_call(self.CLAIM, "openai", "other", "arguably checkable"),
+            _scope_call(self.CLAIM, "gemini", "future_prediction", "no source yet"),
+        )
+        assert entry["excluded"] is True
+        assert "stayed in verification" not in entry["reason"]
+        assert entry["reason"] == "no source yet"
+        # The category shown is the one that decided it, not the first writer's.
+        assert entry["claim_type"] == "future_prediction"
+        assert entry["classified_by"] == ["openai", "gemini"]
+
+    def test_an_honoured_call_arriving_first_keeps_its_own_reason(self):
+        entry = self._entry(
+            _scope_call(self.CLAIM, "gemini", "future_prediction", "no source yet"),
+            _scope_call(self.CLAIM, "openai", "other", "arguably checkable"),
+        )
+        assert entry["excluded"] is True
+        assert entry["reason"] == "no source yet"
+        assert entry["claim_type"] == "future_prediction"
+
+    def test_a_claim_nobody_honoured_still_says_it_stayed_in_verification(self):
+        entry = self._entry(_scope_call(self.CLAIM, "openai", "other", "arguable"))
+        assert entry["excluded"] is False
+        assert entry["reason"].startswith("arguable")
+        assert "stayed in verification" in entry["reason"]
+
+    def test_an_author_marking_arriving_over_an_unhonoured_call(self):
+        rules = ScopeRules.from_run(
+            f"<!-- ci:no-verify -->{self.CLAIM}<!-- /ci:no-verify -->", {}, {}
+        )
+        entry = rules.apply(
+            _fc(out_of_scope=[_scope_call(self.CLAIM, "openai", "other", "arguable")])
+        )["out_of_scope"][0]
+        assert entry["excluded"] is True
+        assert "stayed in verification" not in entry["reason"]
+
+    def test_an_excluded_entry_without_a_reason_gets_none_invented(self):
+        entry = self._entry(
+            _scope_call(self.CLAIM, "openai", "other", "arguable"),
+            _scope_call(self.CLAIM, "gemini", "future_prediction", ""),
+        )
+        assert entry["excluded"] is True
+        assert entry["reason"] == ""
+
+
 class TestConsolidationWiring:
     """`build_report` has to hand the rules down, or none of the above runs."""
 
@@ -935,6 +1251,24 @@ class TestRendering:
         )
         assert "still checked" in out
         assert "1 more was classified" in out
+
+    def test_the_not_excluded_note_allows_for_an_outvote(self):
+        """A first_person call outvoted by sources was not held back by its category."""
+        out = "\n".join(
+            report_markdown._render_out_of_scope(
+                [
+                    self._entry(
+                        excluded=False,
+                        excluded_by=fact_check_scope.ORIGIN_MODEL,
+                        claim_type="first_person",
+                        reason="r [two sourced verdicts outvote a single model's call]",
+                    )
+                ]
+            )
+        )
+        assert "1 more was classified" in out
+        assert "outvoted the call" in out
+        assert "- Reason: r [two sourced verdicts outvote" in out
 
     def test_the_category_is_explained_not_just_named(self):
         out = "\n".join(
