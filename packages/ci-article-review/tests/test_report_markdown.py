@@ -886,6 +886,7 @@ class TestSection9Citations:
             {"claim": "c", "resolved": True, "verification": "unverifiable"},
             {"claim": "d", "resolved": True, "verification": "pointer"},
             {"claim": "e", "resolved": False},
+            {"claim": "g", "resolved": False, "verification": "resolution_error"},
             # resolved:True but no tier — still "no source retrieved", because
             # nothing was fetched to read.
             {"claim": "f", "resolved": True},
@@ -894,8 +895,9 @@ class TestSection9Citations:
 
         counts = [int(n) for n in re.findall(r"^\| .+ \| (\d+) \|$", md, re.M)]
         assert sum(counts) == len(citations)
-        # checksum, mismatch, unverifiable, fetch_failed, pointer, no_source
-        assert counts == [1, 1, 1, 0, 1, 2]
+        # checksum, mismatch, unverifiable, fetch_failed, resolution_error,
+        # pointer, no_source
+        assert counts == [1, 1, 1, 0, 1, 1, 2]
 
     def test_content_mismatch_is_not_buried_with_never_looked_up_claims(self):
         """A source fetched, read, and found not to support the claim is the
@@ -1229,6 +1231,7 @@ class TestSection9Citations:
             {"claim": "d", "resolved": False, "url": "https://example.gov/403"},
             {"claim": "e", "resolved": True, "verification": "pointer"},
             {"claim": "f", "resolved": False},
+            {"claim": "g", "resolved": False, "verification": "resolution_error"},
         ]
         md = render_report_markdown(_base_report(section_9_citations=citations))
         section = md.split("## SECTION 9")[1]
