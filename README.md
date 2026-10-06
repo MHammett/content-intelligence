@@ -650,9 +650,10 @@ at each package's root switches both off before anything can import it — in
 this process, where the guard would otherwise fail collection, and in any child
 process, which inherits the environment but not the guard.
 `LITELLM_LOCAL_MODEL_COST_MAP=True` skips the model-cost-map fetch, and
-`CUSTOM_TIKTOKEN_CACHE_DIR` points tiktoken at a byte-exact `cl100k_base`
-vendored in `packages/ci-core/tests/fixtures/tiktoken_cache/`. litellm bundles
-that file too, but its Windows wheel ships it with CRLF line endings that fail
+`CUSTOM_TIKTOKEN_CACHE_DIR` points tiktoken at a byte-exact `cl100k_base`,
+rebuilt at conftest import from litellm's own bundled copy by
+`pytest_plugins/offline_tiktoken.py` (the file is not kept in this repository).
+That copy, in litellm's Windows wheel, has CRLF line endings that fail
 tiktoken's hash check, so a fresh Windows venv downloads it again on first
 import — or, under the guard, fails collection and every test that touches
 litellm. `packages/ci-core/conftest.py` has the details, including why those
