@@ -42,6 +42,15 @@ model reaching for the catch-all is *reported* rather than *obeyed*. A claim
 classified but not honoured stays in verification and is visible as a
 disagreement.
 
+**One model cannot erase two sources.** A claim one model calls out of scope
+while two or more others gave it a sourced verdict (a real URL, a distinct page
+each) stays in verification: the call is reported, the verdicts are left where
+they are, and the entry says who outvoted whom. A single sourced verdict does
+not outvote it, because the case this exists for is one false ``confirmed``
+that carried a real URL. A call two models agree on stands, and an author
+marking is never outvoted. ``fact_check_scope.min_sources_to_overrule`` sets
+the number.
+
 **Nothing is ever dropped.** Exclusion is a move into an ``out_of_scope`` bucket
 the report renders in full, carrying the reason, who decided it, and — when a
 model had already reached a verdict the exclusion overrides — that verdict too.
@@ -64,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import re
+from urllib.parse import urlsplit
 
 from . import passage_match
 
@@ -101,6 +111,17 @@ SWEPT_BUCKETS = (
     "unverifiable",
     "primary_source_needed",
 )
+
+#: How many sourced verdicts outvote a scope call that one model made on its
+#: own. See :meth:`ScopeRules.apply`. Two, not one: the case the model path was
+#: built for is a single false ``confirmed`` that carried a real URL, so a lone
+#: sourced verdict has to lose to a scope call.
+DEFAULT_MIN_SOURCES_TO_OVERRULE = 2
+
+#: The buckets whose items are verdicts a source backed. ``unverifiable`` and
+#: ``primary_source_needed`` can name a page, but only as somewhere the model
+#: looked or might look, so they never count as a sourced verdict.
+SOURCED_BUCKETS = ("confirmed", "outdated", "contradicted")
 
 #: Where an exclusion came from, in the words the report uses.
 ORIGIN_INLINE = "author marker in the draft"
@@ -399,10 +420,12 @@ class ScopeRules:
         exclusions=(),
         honoured_types=DEFAULT_HONOURED_TYPES,
         trust_model_classification=True,
+        min_sources_to_overrule=DEFAULT_MIN_SOURCES_TO_OVERRULE,
     ):
         self.exclusions = list(exclusions)
         self.honoured_types = frozenset(honoured_types)
         self.trust_model_classification = bool(trust_model_classification)
+        self.min_sources_to_overrule = int(min_sources_to_overrule)
 
     def __bool__(self):
         return bool(self.exclusions) or self.trust_model_classification
@@ -424,6 +447,7 @@ class ScopeRules:
             exclusions=exclusions,
             honoured_types=_honoured_types(cfg),
             trust_model_classification=cfg.get("trust_model_classification", True),
+            min_sources_to_overrule=_min_sources_to_overrule(cfg),
         )
 
     def author_exclusion_for(self, claim):
@@ -480,12 +504,25 @@ class ScopeRules:
         ``exclude_types``, and either way stay visible. The verdict an exclusion
         overrides travels with it as ``withdrawn_verdicts`` rather than being
         discarded — that disagreement is the reader's to judge.
+
+        **A lone model's scope call can be outvoted.** When exactly one model
+        made an honoured call about a claim and at least
+        ``min_sources_to_overrule`` models gave it a sourced verdict (a real
+        URL, a distinct page each), the call is reported but not acted on: the
+        claim stays in verification and those verdicts stay where they are. A
+        call two models agree on stands, and author markings are never
+        outvoted.
         """
         if not fact_check:
             return fact_check
 
         entries = []
         by_key = {}
+        # Models whose own honoured scope call is behind a model-origin
+        # exclusion, by entry key. Not stored on the entry: "classified_by"
+        # also lists models whose call was not honoured, and this is the set
+        # that decides whether a call is lone.
+        honoured_by = {}
 
         def record(claim, origin, reason, claim_type, model, excluded):
             """Fold one model's line about ``claim`` into a single entry.
@@ -520,9 +557,18 @@ class ScopeRules:
                 ):
                     entry["excluded_by"] = origin
                     entry["reason"] = reason or entry["reason"]
+                elif origin == ORIGIN_MODEL and excluded and not entry["excluded"]:
+                    # A call that is honoured, arriving after one that was not
+                    # (`other`, say), is what decides the claim, so its category
+                    # and reason are the ones to show. Keeping the first
+                    # writer's would label an excluded claim `other`.
+                    entry["claim_type"] = claim_type or entry["claim_type"]
+                    entry["reason"] = reason or ""
                 entry["excluded"] = entry["excluded"] or excluded
                 if claim_type and not entry["claim_type"]:
                     entry["claim_type"] = claim_type
+            if excluded and origin == ORIGIN_MODEL:
+                honoured_by.setdefault(key, set()).add(model or "")
             if claim_type and model and model not in entry["classified_by"]:
                 entry["classified_by"].append(model)
             return entry
@@ -544,22 +590,23 @@ class ScopeRules:
                     True,
                 )
                 continue
-            honoured = self.honours(claim_type)
-            reason = item.get("reason", "")
-            if not honoured:
-                reason = (
-                    f"{reason} [Classified {claim_type or 'out of scope'}, which "
-                    f"this publication does not exclude on a model's say-so, so "
-                    f"the claim stayed in verification.]"
-                ).strip()
+            # The raw reason, with no note about the outcome: an entry can still
+            # change hands (a second model's honoured call, an outvote below), so
+            # what the claim's fate was is written once, at the end.
             record(
                 claim,
                 ORIGIN_MODEL,
-                reason,
+                item.get("reason", ""),
                 claim_type,
                 item.get("source_model", ""),
-                honoured,
+                self.honours(claim_type),
             )
+
+        # 1b. Which model calls are outvoted.
+        outvoted = {}
+        for entry, sources in self._outvoted(fact_check, entries, honoured_by):
+            entry["excluded"] = False
+            outvoted[id(entry)] = sources
 
         # 2. Sweep the verdict buckets.
         #
@@ -575,14 +622,16 @@ class ScopeRules:
         # ruled this out of scope; perplexity had it confirmed citing <url>" is
         # one legible finding where two contradictory ones used to sit.
         #
-        # One dissenting model can therefore pull a claim several models
-        # verified. That is the intended direction: an evidence-first rule —
-        # "any real source_url overrules a scope call" — was the alternative,
-        # and it fails on exactly the case this exists for, because the false
-        # `confirmed` for "I have a side job" carried a real, openable URL to a
-        # page about somebody else. Nothing is lost either way: the verdict and
-        # its source are printed, and `trust_model_classification: false` or a
-        # narrower `exclude_types` turns the whole path off.
+        # One dissenting model could therefore pull a claim several models
+        # verified, so step 1b lets sourced verdicts outvote a lone call. A
+        # single sourced verdict does not, and that is deliberate: "any real
+        # source_url overrules a scope call" fails on exactly the case this
+        # exists for, because the false `confirmed` for "I have a side job"
+        # carried a real, openable URL to a page about somebody else. Two
+        # independent sources is the line (#336). Nothing is lost either way:
+        # the verdict and its source are printed, and
+        # `trust_model_classification: false` or a narrower `exclude_types`
+        # turns the whole path off.
         result = dict(fact_check)
         honoured = [
             (_exclusion(entry["claim"], entry["reason"], entry["excluded_by"]), entry)
@@ -633,6 +682,23 @@ class ScopeRules:
                 )
             result[bucket] = kept
 
+        # 3. Say what became of every claim that was not excluded, now that
+        # nothing can change it. An excluded entry's reason is left exactly as
+        # its deciding call wrote it.
+        for entry in entries:
+            if entry["excluded"]:
+                continue
+            sources = outvoted.get(id(entry))
+            if sources is not None:
+                note = _outvote_note(entry, sources)
+            else:
+                note = (
+                    f"[Classified {entry['claim_type'] or 'out of scope'}, which "
+                    f"this publication does not exclude on a model's say-so, so "
+                    f"the claim stayed in verification.]"
+                )
+            entry["reason"] = f"{entry['reason']} {note}".strip()
+
         # Unconditionally, even when nothing was recorded: the raw model output
         # is not the shape the report and the citation collector read, so
         # leaving it in place would let a malformed item — one with no claim
@@ -653,6 +719,102 @@ class ScopeRules:
         )
         return result
 
+    def _outvoted(self, fact_check, entries, honoured_by):
+        """The model-origin exclusions that sourced verdicts outvote.
+
+        Returns ``(entry, sources)`` pairs, ``sources`` being the
+        ``(model, url, bucket)`` verdicts that did the outvoting.
+
+        A call is outvoted when it is lone (one model made an honoured call
+        about the claim) and at least ``min_sources_to_overrule`` models gave
+        it a sourced verdict: an item in ``confirmed``, ``outdated`` or
+        ``contradicted`` that names a real URL. Each model counts once, however
+        many pages it cites, and a page counts once, however many models cite
+        it, so the threshold measures independent sources and not volume.
+
+        Only model-origin exclusions are candidates. An author marking is the
+        author speaking, and no number of verdicts outvotes that.
+        """
+        threshold = self.min_sources_to_overrule
+        candidates = {
+            id(e): e
+            for e in entries
+            if e["excluded"]
+            and e["excluded_by"] == ORIGIN_MODEL
+            and e["claim"]
+            and len(honoured_by.get(_normalise(e["claim"]), ())) <= 1
+        }
+        if not candidates:
+            return []
+
+        # Matched against every exclusion, in the order the sweep will use, so
+        # that an item counted here for one entry is the item the sweep would
+        # have withdrawn into that same entry.
+        pool = [
+            (_exclusion(e["claim"], "", e["excluded_by"]), e)
+            for e in entries
+            if e["excluded"] and e["claim"]
+        ]
+        found = {}
+        for bucket in SOURCED_BUCKETS:
+            for item in _items(fact_check, bucket):
+                claim = item.get("claim", "")
+                url = _real_url(item.get("source_url"))
+                if not claim or not url or self.author_exclusion_for(claim):
+                    continue
+                entry = _first_match(claim, pool)
+                if entry is None or id(entry) not in candidates:
+                    continue
+                by_model = found.setdefault(id(entry), {})
+                by_model.setdefault(item.get("source_model", "") or "", (url, bucket))
+
+        outvoted = []
+        for entry_id, by_model in found.items():
+            pages = {}
+            for model, (url, bucket) in by_model.items():
+                pages.setdefault(_url_key(url), (model, url, bucket))
+            if len(pages) >= threshold:
+                outvoted.append((candidates[entry_id], list(pages.values())))
+        return outvoted
+
+
+def _real_url(value):
+    """``value`` when it is an http(s) URL, else None.
+
+    ``source_url`` is not always one: a model with no page to name writes
+    "Manual Calculation" or an empty string, and neither is a source.
+    """
+    text = str(value or "").strip()
+    return text if text.lower().startswith(("http://", "https://")) else None
+
+
+def _url_key(url):
+    """A URL reduced to what names the page, so two spellings of one compare equal.
+
+    Case in the scheme and host, a fragment and a trailing slash say nothing
+    about which page it is. The query stays, since it can.
+    """
+    parts = urlsplit(url)
+    return (
+        parts.scheme.lower(),
+        parts.netloc.lower(),
+        parts.path.rstrip("/"),
+        parts.query,
+    )
+
+
+def _outvote_note(entry, sources):
+    """The sentence that tells a reader why a scope call was not acted on."""
+    cited = "; ".join(
+        f"{model or 'a model'} ({bucket}) at {url}" for model, url, bucket in sources
+    )
+    by = ", ".join(entry["classified_by"]) or "one model"
+    return (
+        f"[Classified {entry['claim_type'] or 'out of scope'} by {by}, but "
+        f"{len(sources)} sourced verdicts outvote a single model's scope call, "
+        f"so the claim stayed in verification: {cited}.]"
+    )
+
 
 def _first_match(claim, candidates):
     """The entry whose claim ``claim`` restates, or None.
@@ -668,6 +830,29 @@ def _first_match(claim, candidates):
         if _matches(normalised, words, exclusion):
             return entry
     return None
+
+
+def _min_sources_to_overrule(cfg):
+    """``min_sources_to_overrule`` from the config, or the default.
+
+    A value that is not a whole number of at least one is warned about and
+    ignored, not obeyed: ``0`` would read as "never outvote" to some people and
+    "always" to others, and a bool is an int in Python. ``1`` is accepted but is
+    the evidence-first rule this module rejects (see ``ScopeRules.apply``), so
+    a single false ``confirmed`` with a real URL will win against a scope call.
+    """
+    declared = cfg.get("min_sources_to_overrule")
+    if declared is None:
+        return DEFAULT_MIN_SOURCES_TO_OVERRULE
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 1:
+        return declared
+    log.warning(
+        "fact_check_scope.min_sources_to_overrule is %r, which is not a whole "
+        "number of at least 1; using the default of %d.",
+        declared,
+        DEFAULT_MIN_SOURCES_TO_OVERRULE,
+    )
+    return DEFAULT_MIN_SOURCES_TO_OVERRULE
 
 
 def _honoured_types(cfg):
