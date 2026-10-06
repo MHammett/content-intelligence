@@ -178,8 +178,9 @@ Three mechanisms now sit in front of it, because no one of them is sufficient:
 ```
 > **Archive status is unknown for 65 of these citations.** archive.org
 > rate-limited this run (HTTP 429). `archived: null` means the lookup did not
-> complete, **not** that the page is unarchived — and nothing was submitted for
-> archiving on that basis. Re-run to find out.
+> complete, **not** that the page is unarchived, and nothing was submitted for
+> archiving on that basis. To retry just the archive lookups, with no review and
+> no model calls, run `ci-review --archive-only` on the draft.
 ```
 
 An `archived: false` entry is untouched by all of this: that is an answer, and only `null` means the run never found out.

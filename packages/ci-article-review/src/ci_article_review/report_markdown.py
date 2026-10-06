@@ -17,6 +17,7 @@ a leaf: a tuple, a lookup and a pure function, importing nothing itself.
 """
 
 from .adapters.citation.disposition import DISPOSITIONS, disposition
+from .adapters.citation.wayback import lookup_was_rate_limited
 
 # ``worklist`` is a second exempt import, for the same reason: it reads the same
 # plain report dict, imports only the stdlib and the leaf module above, and so
@@ -2406,19 +2407,26 @@ def _render_section_9(citations, out_of_scope=()):
         and c.get("url")
     ]
     if unchecked:
-        rate_limited = sum(1 for c in unchecked if c["wayback"].get("rate_limited"))
+        rate_limited = sum(
+            1 for c in unchecked if lookup_was_rate_limited(c["wayback"])
+        )
+        # A sentence of its own, ended once, so a run with no known reason does
+        # not render ``citations.**.``.
         reason = (
-            " archive.org rate-limited this run (HTTP 429)"
+            " archive.org rate-limited this run (HTTP 429)."
             if rate_limited == len(unchecked)
-            else f" {rate_limited} of them to archive.org rate limiting"
+            else f" {rate_limited} of them were refused by archive.org's rate "
+            "limit (HTTP 429)."
             if rate_limited
             else ""
         )
         lines.append(
             f"> **Archive status is unknown for {len(unchecked)} of these "
-            f"citations.**{reason}. `archived: null` means the lookup did not "
-            f"complete, **not** that the page is unarchived — and nothing was "
-            f"submitted for archiving on that basis. Re-run to find out."
+            f"citations.**{reason} `archived: null` means the lookup did not "
+            f"complete, **not** that the page is unarchived, and nothing was "
+            f"submitted for archiving on that basis. To retry just the archive "
+            f"lookups, with no review and no model calls, run `ci-review "
+            f"--archive-only` on the draft."
         )
         lines.append("")
 

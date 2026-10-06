@@ -69,6 +69,7 @@ __all__ = [
     "fallback_reason_for_exception",
     "fallback_reason_for_status",
     "format_summary",
+    "lookup_was_rate_limited",
     "rate_limited_out",
     "reset_rate_limit_state",
     "service_health_note",
@@ -196,6 +197,33 @@ FALLBACK_REASON_LABELS = {
     "tls_untrusted": "origin's TLS certificate could not be verified",
     "unreachable": "origin unreachable",
 }
+
+
+#: The two texts spn-client's ``check()`` puts in ``error`` when archive.org's
+#: rate limit is why a lookup came back ``archived: None``: the last 429 of a
+#: lookup that exhausted its attempts ("429 Client Error: Too Many Requests for
+#: url: ..."), and the circuit breaker's skip ("skipped: archive.org rate limit
+#: tripped earlier this run ..."). ``check()`` sets no field for either; only
+#: ``submit()`` sets ``rate_limited``. Matched on the words, lower-cased, so a
+#: change of status-line casing does not hide it.
+_RATE_LIMIT_ERROR_MARKERS = ("too many requests", "rate limit tripped")
+
+
+def lookup_was_rate_limited(result):
+    """True if a Wayback lookup returned no answer because archive.org refused it.
+
+    Only an ``archived: None`` result can be one: ``True`` and ``False`` are
+    archive.org's answer. An explicit ``rate_limited`` flag wins, in case a
+    newer spn-client sets one on ``check()``; otherwise the ``error`` text is
+    read, which is all 0.4.0 provides. ``TestLookupWasRateLimited`` feeds this
+    the real ``check()`` output so a reworded message fails there.
+    """
+    if not isinstance(result, dict) or result.get("archived") is not None:
+        return False
+    if result.get("rate_limited"):
+        return True
+    error = str(result.get("error") or "").lower()
+    return any(marker in error for marker in _RATE_LIMIT_ERROR_MARKERS)
 
 
 def fallback_reason_for_status(status):
