@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 import requests
 import urllib3
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from ci_article_review.adapters.citation import wayback
 
@@ -399,6 +399,69 @@ class TestReExports:
         public = {n for n in dir(spn_client) if not n.startswith("_") and n != "client"}
         missing = sorted(n for n in public if not hasattr(wayback, n))
         assert missing == [], f"not re-exported from spn_client: {missing}"
+
+
+class TestLookupWasRateLimited:
+    """Whether an ``archived: None`` answer was archive.org's rate limit.
+
+    spn-client 0.4.0 does not say so in a field: ``check()`` returns only
+    ``{"archived": None, "error": <text>}``, and ``submit()`` alone sets
+    ``rate_limited``. The report's "(HTTP 429)" branch read that field, so it
+    never fired on a real run. These tests take their inputs from ``check()``
+    itself, the producer, so a library that rewords either message fails here
+    and not silently in a banner.
+    """
+
+    def setup_method(self):
+        wayback.reset_rate_limit_state()
+
+    def teardown_method(self):
+        wayback.reset_rate_limit_state()
+
+    def test_the_breaker_skip_is_a_rate_limit(self):
+        from spn_client import client as engine
+
+        engine._rate_limited_lookups = engine._CIRCUIT_TRIP_AFTER
+        result = wayback.check("https://example.org/page")
+        assert result["archived"] is None
+        assert wayback.lookup_was_rate_limited(result) is True
+
+    def test_a_lookup_that_exhausted_its_attempts_on_429_is_a_rate_limit(self):
+        from spn_client import client as engine
+
+        resp = MagicMock(status_code=429, headers={}, url="https://archive.org/x")
+        with (
+            patch.object(engine.requests, "get", return_value=resp),
+            patch.object(engine.time, "sleep"),
+        ):
+            result = wayback.check("https://example.org/page")
+        assert result["archived"] is None
+        assert "429" in result["error"]
+        assert wayback.lookup_was_rate_limited(result) is True
+
+    def test_a_timeout_is_not_a_rate_limit(self):
+        from spn_client import client as engine
+
+        with (
+            patch.object(
+                engine.requests,
+                "get",
+                side_effect=requests.exceptions.ConnectTimeout("timed out"),
+            ),
+            patch.object(engine.time, "sleep"),
+        ):
+            result = wayback.check("https://example.org/page")
+        assert result["archived"] is None
+        assert wayback.lookup_was_rate_limited(result) is False
+
+    def test_an_explicit_flag_is_honoured(self):
+        assert wayback.lookup_was_rate_limited({"archived": None, "rate_limited": True})
+
+    def test_an_answer_is_never_a_rate_limit(self):
+        """``archived: False`` is archive.org's answer, whatever else is on the dict."""
+        assert not wayback.lookup_was_rate_limited({"archived": False})
+        assert not wayback.lookup_was_rate_limited({})
+        assert not wayback.lookup_was_rate_limited(None)
 
 
 class TestCaptureOptions:

@@ -28,6 +28,7 @@ from ci_core import redact
 from ci_core import llm
 
 from . import seo as seo_analysis
+from . import seo_style
 from ci_core.llm import cost
 
 log = logging.getLogger(__name__)
@@ -79,7 +80,8 @@ _SYSTEM_PROMPT = (
     "- Every suggestion must be concrete enough to act on: an actual "
     "replacement heading, not 'make it more descriptive'.\n"
     "- Quote 'target' exactly as it appears in the article so the author can "
-    "find it."
+    "find it.\n"
+    f"{seo_style.SYSTEM_RULE}"
 )
 
 
@@ -111,13 +113,17 @@ def _clean_findings(raw):
     return findings
 
 
-def _build_user_prompt(text, handoff, keyword_candidates):
+def _build_user_prompt(text, handoff, keyword_candidates, pub_config=None):
     handoff = handoff or {}
     parts = [f"ARTICLE TITLE: {handoff.get('title', '')}"]
     if handoff.get("primary_claim"):
         parts.append(f"PRIMARY CLAIM: {handoff['primary_claim']}")
     if handoff.get("target_audience"):
         parts.append(f"TARGET AUDIENCE: {handoff['target_audience']}")
+
+    rules = seo_style.style_block(pub_config)
+    if rules:
+        parts.append(rules)
 
     if keyword_candidates:
         phrases = ", ".join(
@@ -162,7 +168,7 @@ def review(text, handoff=None, pub_config=None, api_keys=None, suggestions=None)
         return {"status": "skipped", "reason": reason}, None
 
     candidates = (suggestions or {}).get("keyword_candidates") or []
-    user_prompt = _build_user_prompt(text, handoff, candidates)
+    user_prompt = _build_user_prompt(text, handoff, candidates, pub_config)
 
     try:
         result = llm.call_provider(
