@@ -17,6 +17,7 @@ a leaf: a tuple, a lookup and a pure function, importing nothing itself.
 """
 
 from .adapters.citation.disposition import DISPOSITIONS, disposition
+from .adapters.citation.wayback import lookup_was_rate_limited
 
 # ``worklist`` is a second exempt import, for the same reason: it reads the same
 # plain report dict, imports only the stdlib and the leaf module above, and so
@@ -2330,6 +2331,7 @@ def _render_section_9(citations, out_of_scope=()):
     mismatch = grouped["content_mismatch"]
     unverifiable = grouped["unverifiable"]
     fetch_failed = grouped["fetch_failed"]
+    resolution_error = grouped["resolution_error"]
     pointer = grouped["pointer"]
     no_source = grouped["no_source"]
     total = len(citations)
@@ -2406,19 +2408,26 @@ def _render_section_9(citations, out_of_scope=()):
         and c.get("url")
     ]
     if unchecked:
-        rate_limited = sum(1 for c in unchecked if c["wayback"].get("rate_limited"))
+        rate_limited = sum(
+            1 for c in unchecked if lookup_was_rate_limited(c["wayback"])
+        )
+        # A sentence of its own, ended once, so a run with no known reason does
+        # not render ``citations.**.``.
         reason = (
-            " archive.org rate-limited this run (HTTP 429)"
+            " archive.org rate-limited this run (HTTP 429)."
             if rate_limited == len(unchecked)
-            else f" {rate_limited} of them to archive.org rate limiting"
+            else f" {rate_limited} of them were refused by archive.org's rate "
+            "limit (HTTP 429)."
             if rate_limited
             else ""
         )
         lines.append(
             f"> **Archive status is unknown for {len(unchecked)} of these "
-            f"citations.**{reason}. `archived: null` means the lookup did not "
-            f"complete, **not** that the page is unarchived — and nothing was "
-            f"submitted for archiving on that basis. Re-run to find out."
+            f"citations.**{reason} `archived: null` means the lookup did not "
+            f"complete, **not** that the page is unarchived, and nothing was "
+            f"submitted for archiving on that basis. To retry just the archive "
+            f"lookups, with no review and no model calls, run `ci-review "
+            f"--archive-only` on the draft."
         )
         lines.append("")
 
@@ -2619,6 +2628,31 @@ def _render_section_9(citations, out_of_scope=()):
                 c,
                 exclude=("claim", "resolved", "url", "final_url")
                 + _PAIR_RENDERED_FIELDS,
+            ):
+                lines.append(kv)
+        lines.append("")
+
+    if resolution_error:
+        # Its own block (issue #340). It used to be filed under "No source
+        # identified" and described as "no URL was found", which is false for a
+        # claim whose source was named and whose fetch simply did not finish.
+        lines.append(
+            f"### Resolution did not complete (error or timeout) "
+            f"({len(resolution_error)}) — re-run to retry"
+        )
+        lines.append(
+            "_The job that resolves each of these claims timed out or raised "
+            "before it finished, so nothing about the source was checked. That "
+            "is a fact about this run, not about the claim or its source, and "
+            "it is not the same as no URL being found: where a URL was named it "
+            "is listed. A re-run usually clears a timeout, and each entry says "
+            "which it was. Nothing here is evidence either way._"
+        )
+        lines.append("")
+        for c in resolution_error:
+            lines.append(f'- "{c.get("claim", "")}"')
+            for kv in _kv_lines(
+                c, exclude=("claim", "resolved", "final_url", "verification")
             ):
                 lines.append(kv)
         lines.append("")

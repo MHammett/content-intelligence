@@ -101,6 +101,12 @@ The readable report splits this in two, because the two halves call for differen
 
 **How much to trust it:** nothing to trust — this is a to-do.
 
+### Resolution did not complete — `verification: "resolution_error"`
+
+The job that resolves each claim has a 90 second safety net and can also raise. When it does either, the claim used to be written with no URL and no tier, which filed it under *No source identified* and described it as "no URL was found, so nothing was fetched": false for a claim whose source was named and whose fetch had not finished. It now has its own tier, `error_kind` (`timeout` or `error`), the URL it was working on when one was known (with several, the first, and the note says how many), and a `note` saying which happened and that a re-run usually clears it. The readable report gives it its own block and table row, *Resolution did not complete (error or timeout)*, and the console summary counts it as unresolved and says how many timed out.
+
+**How much to trust it:** nothing was checked, in either direction. It is a fact about the run, not about the claim or its source.
+
 ### Content mismatch — `verification: "content_mismatch"`
 
 A distinct failure mode, and the highest-information outcome in the section: the source URL fetched and checksummed fine, but the relevance check came back saying the page does **not** support the claim. These are the only entries where a document was genuinely retrieved, read, and found not to back the claim it was cited for, so the readable report gives them their own block (*Read, and does NOT support the claim*) directly under the confirmed ones. They previously rendered inside *Unresolved*, indistinguishable from claims nothing had ever been fetched for. The entry records the verdict (`contradicts`, `not_addressed`, or `inconclusive`) and the model's one-sentence reason, and the report separates them: `contradicts` means the source says otherwise and the draft may be factually wrong, while `not_addressed`/`inconclusive` far more often means the wrong URL was checked or the relevant passage did not extract — a citation problem, not a factual one. All nine mismatches in the motivating run were `not_addressed`.
@@ -178,8 +184,9 @@ Three mechanisms now sit in front of it, because no one of them is sufficient:
 ```
 > **Archive status is unknown for 65 of these citations.** archive.org
 > rate-limited this run (HTTP 429). `archived: null` means the lookup did not
-> complete, **not** that the page is unarchived — and nothing was submitted for
-> archiving on that basis. Re-run to find out.
+> complete, **not** that the page is unarchived, and nothing was submitted for
+> archiving on that basis. To retry just the archive lookups, with no review and
+> no model calls, run `ci-review --archive-only` on the draft.
 ```
 
 An `archived: false` entry is untouched by all of this: that is an answer, and only `null` means the run never found out.

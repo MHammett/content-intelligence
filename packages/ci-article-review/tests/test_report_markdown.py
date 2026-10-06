@@ -886,6 +886,7 @@ class TestSection9Citations:
             {"claim": "c", "resolved": True, "verification": "unverifiable"},
             {"claim": "d", "resolved": True, "verification": "pointer"},
             {"claim": "e", "resolved": False},
+            {"claim": "g", "resolved": False, "verification": "resolution_error"},
             # resolved:True but no tier — still "no source retrieved", because
             # nothing was fetched to read.
             {"claim": "f", "resolved": True},
@@ -894,8 +895,9 @@ class TestSection9Citations:
 
         counts = [int(n) for n in re.findall(r"^\| .+ \| (\d+) \|$", md, re.M)]
         assert sum(counts) == len(citations)
-        # checksum, mismatch, unverifiable, fetch_failed, pointer, no_source
-        assert counts == [1, 1, 1, 0, 1, 2]
+        # checksum, mismatch, unverifiable, fetch_failed, resolution_error,
+        # pointer, no_source
+        assert counts == [1, 1, 1, 0, 1, 1, 2]
 
     def test_content_mismatch_is_not_buried_with_never_looked_up_claims(self):
         """A source fetched, read, and found not to support the claim is the
@@ -1229,6 +1231,7 @@ class TestSection9Citations:
             {"claim": "d", "resolved": False, "url": "https://example.gov/403"},
             {"claim": "e", "resolved": True, "verification": "pointer"},
             {"claim": "f", "resolved": False},
+            {"claim": "g", "resolved": False, "verification": "resolution_error"},
         ]
         md = render_report_markdown(_base_report(section_9_citations=citations))
         section = md.split("## SECTION 9")[1]
@@ -1282,7 +1285,74 @@ class TestSection9Citations:
         ]
         md = render_report_markdown(_base_report(section_9_citations=citations))
         assert "unknown for 2 of these citations" in md
-        assert "1 of them to archive.org rate limiting" in md
+        assert "1 of them were refused by archive.org's rate limit (HTTP 429)" in md
+
+    def _unchecked(self, wayback):
+        return render_report_markdown(
+            _base_report(
+                section_9_citations=[
+                    {
+                        "claim": "a",
+                        "resolved": True,
+                        "verification": "checksum",
+                        "url": "https://example.gov/a",
+                        "wayback": wayback,
+                    }
+                ]
+            )
+        )
+
+    @staticmethod
+    def _banner(md):
+        return next(
+            line for line in md.splitlines() if "Archive status is unknown" in line
+        )
+
+    def test_the_bold_run_ends_cleanly_when_no_reason_is_known(self):
+        """The line was built as ``citations.**{reason}. ...``, so an empty
+        reason left ``citations.**. `` in 10 of the saved reports."""
+        banner = self._banner(self._unchecked({"archived": None, "error": "boom"}))
+        assert "citations.**." not in banner
+        assert "citations.** `archived: null`" in banner
+
+    def test_a_429_in_the_error_text_is_named_without_a_flag(self):
+        """What spn-client's ``check()`` returns on a refused lookup: text only,
+        no ``rate_limited`` key."""
+        banner = self._banner(
+            self._unchecked(
+                {
+                    "archived": None,
+                    "error": "429 Client Error: Too Many Requests for url: "
+                    "https://archive.org/wayback/available?url=x",
+                }
+            )
+        )
+        assert "rate-limited this run (HTTP 429)" in banner
+        assert "citations.**." not in banner
+
+    def test_the_breaker_skip_is_named_as_rate_limiting(self):
+        wayback.reset_rate_limit_state()
+        _spn_client_engine._rate_limited_lookups = (
+            _spn_client_engine._CIRCUIT_TRIP_AFTER
+        )
+        try:
+            result = wayback.check("https://example.gov/a")
+        finally:
+            wayback.reset_rate_limit_state()
+        banner = self._banner(self._unchecked(result))
+        assert "rate-limited this run (HTTP 429)" in banner
+
+    def test_a_failure_that_was_not_rate_limiting_is_not_called_429(self):
+        banner = self._banner(
+            self._unchecked({"archived": None, "error": "Connection timed out"})
+        )
+        assert "429" not in banner
+
+    def test_the_advice_points_at_archive_only_not_a_blind_rerun(self):
+        """``--archive-only`` makes no model calls; a full re-run costs a review."""
+        banner = self._banner(self._unchecked({"archived": None}))
+        assert "--archive-only" in banner
+        assert "Re-run to find out" not in banner
 
     def test_a_known_unarchived_page_is_not_called_unknown(self):
         """archived:False is an answer. Only null is "we did not find out"."""
