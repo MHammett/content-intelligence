@@ -3740,6 +3740,22 @@ def run_draft_pipeline(
         results, expected_domains, drafting_model
     )
 
+    # Read the page behind every fact-check verdict's quote (issue #344), before
+    # consolidation so Sections 1, 2 and 9 and the contradiction list all see
+    # the same buckets. Skipped offline: it is a network pass, and an empty
+    # answer changes nothing downstream. Best-effort for the same reason as the
+    # reproducibility pass below: it must never take down a run that has
+    # already paid for its findings.
+    quote_checks, quote_summary = {}, None
+    if not offline and pipeline_cfg.get("quote_check", True):
+        from .adapters.citation import quote_check
+
+        try:
+            quote_checks, quote_summary = quote_check.check_quotes(results)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Quote check unavailable: %s", exc)
+            quote_checks = {}
+
     log.info("Consolidating review report")
     report = consolidation.build_report(
         article_title=article_title,
@@ -3757,7 +3773,10 @@ def run_draft_pipeline(
         domains_not_run=domains_not_run,
         drafted_with=_declared_drafter(handoff, pipeline_cfg),
         own_site_url=(pub_config.get("wordpress") or {}).get("site_url"),
+        quote_checks=quote_checks,
     )
+    if quote_summary:
+        report["quote_check"] = quote_summary
 
     # A replay is a code test over captured results, and it lands in the
     # _replay/ quarantine tree rather than the article's real history (see

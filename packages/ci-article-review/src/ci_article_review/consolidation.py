@@ -609,7 +609,7 @@ def _verdict_detail(bucket, item):
     return ""
 
 
-def _demote_unevidenced_verdict(bucket, item, own_host):
+def _demote_unevidenced_verdict(bucket, item, own_host, quote_checks=None):
     """Where a verdict belongs under the prompt's evidence rules.
 
     Returns ``None`` when it stays where it is, or ``(bucket, finding)`` for the
@@ -632,6 +632,13 @@ def _demote_unevidenced_verdict(bucket, item, own_host):
        Section 9 would resolve the same page and confirm it a second time.
        Narrow on purpose: a quote from your own earlier article that is not this
        sentence is still a quote.
+    4. The quote is not on the page. ``quote_checks`` is what
+       :mod:`ci_article_review.adapters.citation.quote_check` found by reading
+       each cited page (issue #344); this function never fetches. Only a page
+       that was read and did not hold the quote (``found is False``) demotes.
+       A page that could not be read, or no check at all (``--offline``, a
+       disabled check), leaves the verdict where it is. Kept in
+       `sources_checked`, so Section 9 reads the same page against the claim.
     """
     origin = "confirmed" if bucket == "confirmed" else f"{bucket} (as a verdict)"
     detail = _verdict_detail(bucket, item)
@@ -693,10 +700,28 @@ def _demote_unevidenced_verdict(bucket, item, own_host):
             ),
             "demoted_from": bucket,
         }
+
+    check = (quote_checks or {}).get((url, quote))
+    if check and check.get("found") is False:
+        return "unverifiable", {
+            "claim": item.get("claim", ""),
+            "checked": source or url,
+            "sources_checked": [url],
+            "reason": (
+                f"Reported as {origin} on the strength of a quote that does not "
+                f"appear in the page at {url} as fetched. The page was read; the "
+                "quote may be paraphrased or reconstructed, or sit in a part of "
+                "the page the fetch did not see (a script-rendered table, a later "
+                "page of a paginated listing). Either way the verdict has not "
+                f"been shown against the page.{detail}"
+            ),
+            "demoted_from": bucket,
+            "quote_check": "not_found",
+        }
     return None
 
 
-def _demote_unevidenced_verdicts(data, own_site_url=None):
+def _demote_unevidenced_verdicts(data, own_site_url=None, quote_checks=None):
     """Move verdicts that lack the evidence the prompt requires out of their bucket.
 
     Returns a new data dict, or ``data`` itself when nothing moved; the input is
@@ -717,7 +742,7 @@ def _demote_unevidenced_verdicts(data, own_site_url=None):
         items = data.get(bucket) or []
         kept = []
         for item in items:
-            outcome = _demote_unevidenced_verdict(bucket, item, own_host)
+            outcome = _demote_unevidenced_verdict(bucket, item, own_host, quote_checks)
             if outcome is None:
                 kept.append(item)
             else:
@@ -729,8 +754,8 @@ def _demote_unevidenced_verdicts(data, own_site_url=None):
 
     log.info(
         "Fact check: %d verdict(s) lacked the evidence the prompt requires (a "
-        "direct URL and a verbatim quote, not from this article's own page) and "
-        "were moved (%s).",
+        "direct URL and a verbatim quote that is on that page, not from this "
+        "article's own page) and were moved (%s).",
         sum(len(v) for v in moved.values()),
         ", ".join(f"{len(v)} to {k}" for k, v in sorted(moved.items())),
     )
@@ -886,7 +911,7 @@ def _describe_malformed_bucket(note):
     return f"{where}: {', '.join(parts)}"
 
 
-def _normalise_fact_check_results(results, own_site_url=None):
+def _normalise_fact_check_results(results, own_site_url=None, quote_checks=None):
     """Make every fact-check payload safe to consolidate, before anything reads it.
 
     Returns ``(results, degradations)``. ``results`` is the same object when
@@ -903,7 +928,8 @@ def _normalise_fact_check_results(results, own_site_url=None):
     (:func:`_demote_unevidenced_verdicts`), for the same reason: every reader
     has to see the same buckets. ``own_site_url`` is the publication's
     ``wordpress.site_url``, used to recognise a draft confirmed against its own
-    published copy.
+    published copy. ``quote_checks`` is the page-reading pass's answer for each
+    ``(url, quote)`` pair (see :func:`_demote_unevidenced_verdict`).
     """
     notes, cleaned = [], {}
     for key, result in results.items():
@@ -912,7 +938,7 @@ def _normalise_fact_check_results(results, own_site_url=None):
             continue
         data, result_notes = _coerce_fact_check_buckets(result["data"], model_name)
         notes.extend(result_notes)
-        data = _demote_unevidenced_verdicts(data, own_site_url)
+        data = _demote_unevidenced_verdicts(data, own_site_url, quote_checks)
         # Identity, not ``result_notes``: a present-but-null bucket is rewritten
         # and deliberately not reported, and gating the replacement on the notes
         # would drop exactly that repair on the floor.
@@ -2015,6 +2041,7 @@ def build_report(
     domains_not_run=None,
     drafted_with="",
     own_site_url=None,
+    quote_checks=None,
 ):
     """Merge ensemble results into a structured report.
 
@@ -2039,6 +2066,11 @@ def build_report(
         quotes the claim back from a page on this site is the draft confirmed
         against its own published copy, and is not kept as a verdict. None
         skips that one check; the other evidence rules still apply.
+    quote_checks:
+        ``{(url, quote): {"found": bool | None}}`` from
+        :func:`ci_article_review.adapters.citation.quote_check.check_quotes`.
+        A verdict whose quote was looked for on its page and not found is not
+        kept as a verdict. None or empty changes nothing.
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -2055,7 +2087,7 @@ def build_report(
     # wrote one — which would report a bucket as delivered that was lost.
     received = results
     results, fact_check_degradations = _normalise_fact_check_results(
-        results, own_site_url
+        results, own_site_url, quote_checks
     )
     results, flags_degradations = _normalise_flags_results(results)
 

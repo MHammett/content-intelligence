@@ -53,6 +53,7 @@ import pytest
 import ci_article_review.pipeline as pipeline
 from ci_article_review import ensemble_capture
 from ci_article_review import report_markdown
+from ci_article_review.adapters.citation import quote_check
 
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "draft_run_report.json"
@@ -407,6 +408,18 @@ def _stubbed_run(tmp_path, extra_patches=(), sleeps=None, **run_kwargs):
                 side_effect=_fake_resolve_citations,
             )
         )
+        # The quote check fetches every cited page. Stubbed to "could not read
+        # it" so the suite never reaches the network and the golden stays what
+        # it was: an unchecked quote changes nothing. `TestQuoteCheckIsWired`
+        # overrides it with real pages.
+        stack.enter_context(
+            patch(
+                "ci_article_review.adapters.citation.quote_check.fetch_page",
+                side_effect=lambda url, timeout=15: quote_check.PageRead(
+                    status="failed", detail="stubbed: no network in tests"
+                ),
+            )
+        )
         stack.enter_context(
             patch(
                 "ci_article_review.analysis.seo_suggest.generate",
@@ -471,6 +484,88 @@ class TestGoldenReport:
             "  CI_REGENERATE_GOLDEN=1 uv run pytest "
             "packages/ci-article-review/tests/test_pipeline_end_to_end.py\n"
         )
+
+
+class TestQuoteCheckIsWired:
+    """Issue #344: the page behind a verdict's quote is read before consolidation.
+
+    The fixture's `confirmed` verdict cites https://example.org/eia-profile and
+    quotes "Nuclear: 41% of net generation."
+    """
+
+    _URL = "https://example.org/eia-profile"
+    _PAGE = "State profile. Nuclear: 41% of net generation. " * 12
+
+    def _serve(self, text):
+        return patch(
+            "ci_article_review.adapters.citation.quote_check.fetch_page",
+            side_effect=lambda url, timeout=15: quote_check.PageRead(
+                status="read", texts=[text]
+            ),
+        )
+
+    def _config(self, **pipeline_cfg):
+        config = dict(_CONFIG)
+        config["pipeline"] = {**_CONFIG["pipeline"], **pipeline_cfg}
+        return patch("ci_article_review.pipeline.merge_configs", return_value=config)
+
+    def test_a_quote_on_the_page_keeps_the_verdict(self, tmp_path):
+        with _stubbed_run(tmp_path, extra_patches=[self._serve(self._PAGE)]) as report:
+            assert len(report["section_2_fact_check"]["confirmed"]) == 1
+            assert report["quote_check"]["found"] == 1
+
+    def test_a_quote_not_on_the_page_demotes_it_in_the_report(self, tmp_path):
+        page = "A different page about hydro. " * 12
+        with _stubbed_run(tmp_path, extra_patches=[self._serve(page)]) as report:
+            assert report["section_2_fact_check"]["confirmed"] == []
+            moved = [
+                u
+                for u in report["section_2_fact_check"]["unverifiable"]
+                if u.get("quote_check") == "not_found"
+            ]
+            assert [m["claim"] for m in moved] == [
+                "The grid served 41 percent of load from nuclear."
+            ]
+            assert report["quote_check"]["not_found"] == 1
+
+    def test_the_markdown_says_so(self, tmp_path):
+        page = "A different page about hydro. " * 12
+        with _stubbed_run(tmp_path, extra_patches=[self._serve(page)]) as report:
+            md = render_report_markdown(report)
+        assert "quoted text that is not on the page they cite" in md
+        assert "Quote check: 0 of 1 verdict quote(s) were found" in md
+
+    def test_unreadable_pages_leave_every_verdict_alone(self, tmp_path):
+        """The suite's default stub: every fetch fails."""
+        with _stubbed_run(tmp_path) as report:
+            assert len(report["section_2_fact_check"]["confirmed"]) == 1
+            assert report["quote_check"]["unchecked"] == 1
+
+    def test_offline_fetches_nothing(self, tmp_path):
+        with patch(
+            "ci_article_review.adapters.citation.quote_check.fetch_page"
+        ) as fetch:
+            with _stubbed_run(tmp_path, extra_patches=[], offline=True) as report:
+                assert len(report["section_2_fact_check"]["confirmed"]) == 1
+                assert "quote_check" not in report
+        fetch.assert_not_called()
+
+    def test_the_config_switch_turns_it_off(self, tmp_path):
+        page = "A different page about hydro. " * 12
+        with _stubbed_run(
+            tmp_path,
+            extra_patches=[self._config(quote_check=False), self._serve(page)],
+        ) as report:
+            assert len(report["section_2_fact_check"]["confirmed"]) == 1
+            assert "quote_check" not in report
+
+    def test_a_crash_in_the_check_does_not_cost_the_run_its_report(self, tmp_path):
+        boom = patch(
+            "ci_article_review.adapters.citation.quote_check.check_quotes",
+            side_effect=RuntimeError("boom"),
+        )
+        with _stubbed_run(tmp_path, extra_patches=[boom]) as report:
+            assert len(report["section_2_fact_check"]["confirmed"]) == 1
 
 
 class TestLiveModelCheckIsAdvisoryOnly:
