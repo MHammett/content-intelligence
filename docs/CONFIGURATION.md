@@ -812,6 +812,54 @@ model, so there is nobody to hand it back to and it is skipped.
 
 ---
 
+### Quote check
+
+```yaml
+pipeline:
+  quote_check: true             # default; false skips the page reads
+```
+
+A fact-check verdict (`confirmed`, `outdated`, `contradicted`) has to carry a
+`source_url` and a `supporting_quote` "copied verbatim from that page". Before
+consolidation, every distinct cited page is fetched once (eight at a time) and
+each verdict's quote is looked for on it. A verdict whose quote was **not on a
+page that was read** moves to `unverifiable`, with the page kept in
+`sources_checked` so Section 9 reads it against the claim, `demoted_from` naming
+the bucket it left, and `quote_check: "not_found"` on the entry. Section 2 says
+how many moved and, separately, the tally: quotes found, not found, unchecked.
+
+**What counts as a miss.** Only a page that was fetched, was readable text, and
+did not contain the quote. A 404, a refusal, a timeout, a bot wall, a near-empty
+page, a PDF over 400 pages, or a run over 200 distinct URLs is *unchecked*, and
+an unchecked quote leaves its verdict where it was.
+
+**How loosely it matches.** On letters and digits only, after Unicode NFKC and
+case folding, so curly quotes, dashes, non-breaking spaces, markdown, table
+pipes and PDF hyphenation breaks do not make a real quote a miss. An ellipsis
+(`...`, the character, `[...]`) or a line break splits a quote into passages that
+must each be on the page, in any order and not necessarily adjacent: models
+stitch non-adjacent paragraphs onto separate lines. The page is searched in two
+views, the extracted article text and every visible text node (sidebars and
+tables included). The resolver's own `_quote_is_grounded` stays strict
+(whitespace and case only), because it guards a verdict a hostile page wants to
+steer; this check has the opposite cost, a correct verdict demoted on the
+strength of an extraction miss.
+
+**Measured, 2026-10-06,** on one saved capture (16 verdict quotes, 8 pages): 12
+found, 4 not found, each of the four read by hand. Two were paraphrases of an
+about page, one was a list of ten post titles whose last item is not on the
+first page of the homepage listing (the pagination gap, issue #339), and one was
+a GitHub profile rendering the model saw and the page source does not hold. A
+fifth, two real paragraphs of an about page quoted on separate lines with text
+between them left out, was a miss under contiguous matching and is why a line
+break splits a quote.
+
+**Cost.** Fetches, no model calls. Section 9 reads the same pages again for its
+own purposes. Not run with `--offline`, so a replay with `--offline` keeps every
+verdict where the capture had it.
+
+---
+
 ### Reproducibility context
 
 Every run compares itself against earlier runs of the same draft and reports what

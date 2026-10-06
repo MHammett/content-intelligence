@@ -549,7 +549,7 @@ def _render_section_1(consensus_flags, comparable_runs=0):
 _VERDICT_BUCKETS = ("confirmed", "outdated", "contradicted")
 
 
-def _render_evidence_coverage(fact_check):
+def _render_evidence_coverage(fact_check, quote_check=None):
     """A line saying how many verdicts arrived with checkable evidence.
 
     Section 9 exists because "a model asserts this" and "a document was read"
@@ -564,6 +564,12 @@ def _render_evidence_coverage(fact_check):
     `demoted_from` (``consolidation._demote_unevidenced_verdicts``). So on a
     current report the counts below are full, and the line that matters is how
     many were moved; a report built before then still shows the shortfall.
+
+    Since issue #344 a verdict is also moved when its quote was looked for on its
+    cited page and not found (`quote_check: "not_found"` on the moved entry), and
+    ``quote_check`` is the run's tally of that pass. The two kinds of move are
+    counted apart: the first sentence below is about what the model failed to
+    supply, the second about what the page did not say.
     """
     items = [i for b in _VERDICT_BUCKETS for i in (fact_check.get(b) or [])]
     demoted = [
@@ -573,6 +579,19 @@ def _render_evidence_coverage(fact_check):
         if i.get("demoted_from")
     ]
     lines = []
+    missed = [i for i in demoted if i.get("quote_check") == "not_found"]
+    demoted = [i for i in demoted if i.get("quote_check") != "not_found"]
+    if missed:
+        lines += [
+            f"**{len(missed)} verdict(s) quoted text that is not on the page they "
+            "cite, and are listed under Unverifiable instead.** The page was "
+            "fetched and read. A quote can be missing because it was paraphrased "
+            "or reconstructed, or because it sits somewhere the fetch could not "
+            "see (a script-rendered table, a later page of a listing), so open "
+            "the page before treating the verdict as wrong. Each says which page "
+            "in its own reason.",
+            "",
+        ]
     if demoted:
         lines += [
             f"**{len(demoted)} verdict(s) came back without the evidence the "
@@ -580,6 +599,16 @@ def _render_evidence_coverage(fact_check):
             "a page other than this article's own — and are listed under "
             "Unverifiable or Primary source resolution required instead.** Each "
             "says why in its own reason.",
+            "",
+        ]
+    if quote_check and quote_check.get("verdicts"):
+        lines += [
+            f"**Quote check: {quote_check.get('found', 0)} of "
+            f"{quote_check['verdicts']} verdict quote(s) were found on the page "
+            f"they cite, {quote_check.get('not_found', 0)} were not, and "
+            f"{quote_check.get('unchecked', 0)} could not be checked (page not "
+            "readable, or over the run's limit).** An unchecked quote leaves its "
+            "verdict where it is.",
             "",
         ]
     if not items:
@@ -1086,7 +1115,9 @@ def _render_section_2(fact_check, report=None):
     # Above the counts it qualifies, so a reader meets the shortfall before the
     # numbers it applies to rather than after.
     lines.extend(_skipped_note(dropped))
-    lines.extend(_render_evidence_coverage(fact_check))
+    lines.extend(
+        _render_evidence_coverage(fact_check, (report or {}).get("quote_check"))
+    )
     for key, label in labels.items():
         items = fact_check.get(key, [])
         if not items:

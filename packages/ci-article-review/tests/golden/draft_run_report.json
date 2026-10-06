@@ -473,6 +473,13 @@
     "status": "unknown"
   },
   "publication": "testpub",
+  "quote_check": {
+    "found": 0,
+    "not_found": 0,
+    "unchecked": 1,
+    "urls": 1,
+    "verdicts": 1
+  },
   "reproducibility": {
     "calibration": {
       "distinct_findings": 259,
