@@ -13,4 +13,6 @@ packages/ci-core/tests/fixtures/tiktoken_cache/* binary
 # test_llm_perplexity_agent.py. Its bytes are the point: it is how the
 # `"truncation": ""` that crashes litellm 1.96.2's route was found, and a stream
 # built from the docs does not carry it. Byte for byte, like the cache above.
+# The search-result snippets (text from third-party pages) were replaced with a
+# placeholder; the rest is as recorded.
 packages/ci-core/tests/fixtures/perplexity_agent/* binary
