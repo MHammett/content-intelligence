@@ -1673,6 +1673,12 @@ rank for, so the candidates are yours to pick from. (Older configs carried
 `derive_meta_description_if_missing`; no code ever read them, and they have
 been removed rather than wired up to write values on your behalf.)
 
+**Style rules.** The prompt carries the publication's writing rules, so what it proposes can be used as written: the
+`style_profile` text (or the older `voice_profile`) and `style_rules.banned_words`, `banned_phrases` and
+`positive_rules`, the same keys the voice review reads. A publication with none of them sends none. This asks the
+model; it does not check its answer, and a rule written as free text in a profile (a punctuation ban, say) has no
+list to check against.
+
 **Cost and failure behavior.** One call to a small fast model
 (`mistral-small-latest`, the same model the citation relevance verifier uses),
 roughly $0.0002 per run, tracked in the report's `cost_summary` under the
@@ -1756,6 +1762,9 @@ arguments, factual doubts, and tone alone — the `completeness`, `argument_inte
 `fact_check`, and `voice_style` ensemble domains already cover those, and
 repeating them here would bury the structural findings. Findings that come
 back outside the three categories are dropped rather than passed through.
+
+It is given the same writing rules as the suggestion pass (see above) for the replacement headings and
+openings it proposes. Those rules cover what it writes; they do not widen what it may flag.
 
 Cost is tracked separately from the suggestion pass, under the
 `seo_content_review` entry in `cost_summary`. To turn off only this one:
