@@ -306,3 +306,17 @@ class TestPendingModels:
             "litellm's bundled map now lists every model in "
             "litellm_pending_models.json; remove the shim"
         )
+
+    def test_the_copied_entries_carry_litellms_license_notice(self):
+        """The file is litellm's data, copied verbatim, and MIT asks that the
+        copyright and permission notice travel with a copy. JSON cannot hold a
+        comment, so the notice is the file beside it; it goes when the file does."""
+        notice = client._PENDING_MODELS.with_name(
+            client._PENDING_MODELS.stem + ".NOTICE.md"
+        )
+        text = notice.read_text(encoding="utf-8")
+        assert "Copyright (c) 2023 Berri AI" in text
+        assert "Permission is hereby granted, free of charge" in text
+        assert "BerriAI/litellm" in text
+        for model in self._pending():
+            assert model in text, f"the notice does not name {model}"
