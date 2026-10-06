@@ -22,8 +22,7 @@ per capability (see [docs/NAMING.md](docs/NAMING.md) for the naming convention):
 > the fact-check models' own quoted evidence is checked for being present but is not
 > checked against the page it cites; the citation resolver reads only the first page of
 > a source and does not follow pagination; publishing can only create a post, never
-> update one; and a scope call by a single model can still withdraw verdicts from
-> other models. The open issues list is the current record.
+> update one. The open issues list is the current record.
 
 
 - **ci-core** (`ci_core`) — the shared foundation both application packages build on.
@@ -809,6 +808,16 @@ pronoun, so a role a bio page states stays in the normal buckets.
 That last row is the point. A first-person claim can still be an argumentative
 weakness or a credibility risk, and hiding it from every reviewer to spare it from
 one would cost more findings than it saves.
+
+**One model cannot erase two sources.** A model's scope call is acted on unless it
+is alone and two or more other models gave the claim a sourced verdict (`confirmed`,
+`outdated` or `contradicted`, each naming a real URL; a page counts once however
+many models cite it). Then the claim stays in verification, the verdicts stay in
+their buckets, and the entry says who outvoted whom. One sourced verdict is not
+enough: the case this exists for is a single false `confirmed` whose URL was a real
+page about somebody else. Change the number with `min_sources_to_overrule`; an
+author marking is never outvoted, and `trust_model_classification: false` or a
+narrower `exclude_types` still switches the model path off.
 
 **Nothing disappears.** Section 2 gets an *Out of scope for verification* block
 listing every excluded claim, who decided it, the category, and the reason. Where an
