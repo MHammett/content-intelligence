@@ -24,6 +24,7 @@ from ci_core import llm
 from ci_article_review import history_analytics
 
 from . import draft_citations
+from . import pagination
 from . import wayback
 from ci_core.llm import cost
 
@@ -399,6 +400,13 @@ def _impersonation_fallback_content(url, timeout):
     if len(content.strip()) < _MIN_VERIFIABLE_CHARS:
         return None
     return final_url, content, kind
+
+
+def _fetch_following_page(url, timeout=15):
+    """``safe_get`` for a further page of a source, raising on an HTTP error."""
+    resp = safe_get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp
 
 
 def _wayback_fallback_content(url, timeout):
@@ -897,7 +905,6 @@ def _resolve_known_url(
         "checksum_basis": "extracted_text",
         "wayback": wb,
     }
-
     if verified_via == "tls_impersonation":
         # Read from the live page, but only after presenting a browser TLS
         # fingerprint. Recorded as reader-facing friction rather than as a
@@ -964,12 +971,41 @@ def _resolve_known_url(
         )
         return _check_drift(result, checksum_index)
 
+    # Read on past page one when the live page says there is more (issue #339).
+    # Only the direct path (a fallback copy is one snapshot, and the escalated
+    # fetch has no response to read links from), and only for a page worth
+    # verifying: a bot wall's "next" link is not a reason to fetch. `content`
+    # stays page one, which is what the checksum, the summary and the readability
+    # checks above describe (a checksum over several pages would report every
+    # paginated source as changed against every earlier run); `verify_content`
+    # is what the verifier reads.
+    followed = None
+    verify_content = content
+    if verified_via == "direct":
+        followed = pagination.follow(
+            resp, known_url, content, _fetch_following_page, _extract_fetched, timeout
+        )
+        if followed.text:
+            verify_content = content + "\n\n" + followed.text
+    if followed is not None and followed.noteworthy:
+        result["pages_read"] = followed.pages_read
+        result["pagination"] = {
+            key: value
+            for key, value in (
+                ("pages_read", followed.pages_read),
+                ("followed", followed.urls),
+                ("stopped", followed.stopped),
+                ("totals", followed.totals),
+            )
+            if value
+        }
+
     # ``verify_claim`` is the claim minus date parentheticals the fact-check
     # model copied from its own source label (``pipeline._claim_for_verifier``).
     # The result keeps ``claim`` as the model wrote it; the verifier is shown
     # the cleaned text, and ``verified_as`` records what that was.
     verdict_info, verification_call_log = _verify_relevance(
-        verify_claim or claim, content, api_keys, author
+        verify_claim or claim, verify_content, api_keys, author
     )
     if call_log is not None and verification_call_log is not None:
         call_log.append(verification_call_log)
@@ -1006,6 +1042,11 @@ def _resolve_known_url(
             f"checked, but content verification found it does not support this "
             f"specific claim ({verdict_info['verdict']}): {verdict_info['reason']}"
         )
+        if followed is not None and followed.stopped == "page cap":
+            result["note"] += (
+                f" Only the first {followed.pages_read} pages of a longer source "
+                "were read, so the claim may sit further on."
+            )
 
     return _check_drift(result, checksum_index)
 

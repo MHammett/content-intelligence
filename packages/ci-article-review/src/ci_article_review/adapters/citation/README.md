@@ -6,6 +6,7 @@ confidence tiers rather than as a flat resolved/unresolved. Results are saved in
 pipeline_history/ as Section 9 of the report.
 
 - `resolver.py` — resolution, checksums, the relevance check that gates the top tier
+- `pagination.py` — reads past page one of a paginated source (WordPress REST totals, `rel=next`, numbered pages)
 - `wayback.py` — archive availability check and Save Page Now submission
 - `topic_match.py` — keyword gating shared by the pointer-only adapters
 - `sources/` — the individual source adapters (see sources/README.md)

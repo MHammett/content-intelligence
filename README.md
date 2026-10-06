@@ -882,6 +882,7 @@ content-intelligence/
 │   │   │   │       ├── disposition.py        the one vocabulary for what happened to a citation
 │   │   │   │       ├── draft_citations.py    traces a claim to the citation the draft cites for it
 │   │   │   │       ├── reask.py             hands a refuted citation back to the model that asserted it
+│   │   │   │       ├── pagination.py         reads past page one of a paginated source
 │   │   │   │       ├── wayback.py            Wayback archive check + Save Page Now submission
 │   │   │   │       ├── topic_match.py        keyword gating for pointer-only adapters
 │   │   │   │       └── sources/              10 adapters: census, crossref, eia, epa, ferc,
