@@ -916,6 +916,7 @@ class _StreamTiming:
         self._budgets = (first_byte_budget, gap_budget)
         self._started = False
         self._finished = False
+        self._chunks = 0
         self._first_byte = 0.0
         self._max_gap = 0.0
         self._first_output = None
@@ -942,10 +943,20 @@ class _StreamTiming:
 
     def arrived(self, first_output=False):
         """A chunk arrived; ``first_output`` when it is the first real output."""
+        self._chunks += 1
         now = self._end_silence()
         if first_output and not self._started:
             self._started = True
             self._first_output = now - self._sent
+
+    @property
+    def received_chunks(self):
+        """Whether anything at all came back, reasoning and keepalives included.
+
+        The provider answered a request that failed before this was True with
+        an error, so it had generated nothing. See ``_refused_before_generation``.
+        """
+        return self._chunks > 0
 
     def completed(self):
         """The stream ended normally. Waiting for its end was a silence too."""
@@ -2374,6 +2385,59 @@ def _error_body(exc):
     return redact.truncate_excerpt(redact.redact_url_keys(body)) if body else ""
 
 
+# HTTP statuses that say nothing about whether the model kept generating: a
+# request timeout, and a gateway that gave up on a call still running behind it.
+_UNDECIDED_STATUS = (408, 504)
+
+
+def _refused_before_generation(exc, timing=None):
+    """True when the provider answered with an HTTP error and generated nothing.
+
+    That is a 429 or a 5xx that arrived before any chunk of a response: the
+    request was refused at the door, so there is no usage to read because there
+    was no usage. A stalled stream and an unparseable response are not this:
+    both had begun generating, and they are billed whether or not their usage
+    came back. So is anything after a chunk has arrived, which is what a
+    mid-stream failure is (``MidStreamFallbackError`` synthesises a 503), and a
+    timeout or gateway status, which cannot say the model stopped.
+
+    Decided from what the attempt did and not from the error's text or class,
+    which an SDK is free to word as it likes: Perplexity's reads "Error code:
+    429 - ..." and names no class at all (issue #331).
+    """
+    if isinstance(exc, (StreamStalled, MalformedJSONError)):
+        return False
+    if type(exc).__name__.startswith("MidStream"):
+        return False
+    if timing is not None and timing.received_chunks:
+        return False
+    status = _status_of(exc)
+    return (
+        isinstance(status, int)
+        and 400 <= status < 600
+        and status not in _UNDECIDED_STATUS
+    )
+
+
+def _mark_refusal(exc, timing):
+    """Note on ``exc`` that its attempt was refused, for whoever records it.
+
+    The exception travels from ``_invoke``, which knows how the stream went,
+    through ``_with_retry`` to ``_record_discarded`` and the failed result, which
+    do not. Best effort: an exception type that takes no attributes reads as
+    not refused, which keeps the attempt in the floor.
+    """
+    if _refused_before_generation(exc, timing):
+        try:
+            exc.ci_refused = True
+        except (AttributeError, TypeError):
+            pass
+
+
+def _was_refused(exc):
+    return getattr(exc, "ci_refused", False) is True
+
+
 def _record_discarded(discarded, exc):
     """Note an attempt that was thrown away, and its usage if we have it.
 
@@ -2392,6 +2456,8 @@ def _record_discarded(discarded, exc):
     assembled = getattr(exc, "assembled", None)
     usage = assembled.get("usage") if isinstance(assembled, dict) else None
     attempt = {"reason": exc.__class__.__name__, "usage": usage}
+    if _was_refused(exc):
+        attempt["unbilled"] = True
     # Its searches were billed too. Only an attempt that produced a response
     # has a count; a stall has neither usage nor searches, and is already
     # counted as uncosted.
@@ -2473,6 +2539,9 @@ def _summarise_discarded(discarded):
     searches = [a["searches"] for a in discarded if "searches" in a]
     if searches:
         summary["searches"] = searches
+    unbilled = sum(1 for a in discarded if a.get("unbilled"))
+    if unbilled:
+        summary["unbilled"] = unbilled
     return summary
 
 
@@ -2658,6 +2727,7 @@ def _attempt(
             # timing out while waiting for the response — so nothing below
             # recorded how it ended. A no-op when _iter_with_gap already did.
             timing.cut_short(exc)
+            _mark_refusal(exc, timing)
             raise
         if searchable:
             # Read per stream, so an attempt a retry throws away carries its
@@ -2875,6 +2945,10 @@ def _attempt(
             # reaches the report.
             "_status": _status_of(exc),
             "_terminal": _is_terminal_quota_error(exc),
+            # Kept in the report, unlike the two above: recovery replaces this
+            # result, and the cost line has to know this last attempt was
+            # refused and not billed. Absent unless it was.
+            **({"unbilled": True} if _was_refused(exc) else {}),
             **_discarded_field(discarded),
             **_stream_timing_field(streams),
         }
