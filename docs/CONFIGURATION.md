@@ -555,6 +555,8 @@ pipeline:
 
 **`recovery_passes`/`recovery_delay_seconds`** re-attempt only the (model, domain) calls still marked failed after the main ensemble batch — a run that comes back 28/30 calls otherwise costs the same as a clean one, and the only way to fill the gap was a full re-run. A call whose error text looks permanent (bad key, archived account, quota exhausted) is skipped rather than retried every pass: it will fail the same way each time and only spends money to learn that again. Set `recovery_passes: 0` to disable. Not run for `--replay`, which makes no model calls at all.
 
+**An empty `fact_check` answer is retried once too**, whatever `recovery_passes` is above zero, when another model in that domain found items. `fact_check` files every claim it reviews into one of its seven buckets, so an all-empty answer says no claim was reviewed; in the saved runs it was always a short answer (167 to 1,080 completion tokens, against 3,870 to 27,567 for the full ones) from one model while the others found 9 to 61 items. The earlier answer is kept if the retry is empty again or fails, and both attempts are billed (the earlier one under `discarded_attempts` with reason `EmptyResult`). Nothing is retried when every model in the domain is empty or the model is alone in it, because then nothing says the answer is wrong, and the flag domains (`voice_style`, `red_team` and the rest) are left alone, because "no flags" is a normal answer there and a retry would spend money on every clean draft. The log says `Empty-result retry: N of M returned items on the second ask`.
+
 **`--retry-failed RESULTS_JSON`** is the manual counterpart to `recovery_passes`, for when the gap surfaces after the fact — the automatic passes exhausted their budget, or a run predates them. It loads a prior run's `run_N_results.json`, makes model calls only for the entries marked failed in it, and merges the new attempts onto everything that already succeeded, then continues through consolidation/citations/report as normal — a new, distinct `run_N` is written, nothing is overwritten in place. Its cost is what it bought: the results it carried over are marked `replayed` in the report's `api_call_log`, so `cost_summary.incurred_usd` and the printed `Estimated cost:` cover only the calls this run made, while `replayed_usd` is what the capture's own run already paid for the rest. The report names the capture in `retry_failed_from`. Requires the same draft-loading flags (`--draft`/`--url`/`--raw-draft`) as the original run, so the same runners and prompts can be rebuilt; mutually exclusive with `--replay`, which makes no model calls at all.
 
 ```powershell
@@ -1673,6 +1675,12 @@ rank for, so the candidates are yours to pick from. (Older configs carried
 `derive_meta_description_if_missing`; no code ever read them, and they have
 been removed rather than wired up to write values on your behalf.)
 
+**Style rules.** The prompt carries the publication's writing rules, so what it proposes can be used as written: the
+`style_profile` text (or the older `voice_profile`) and `style_rules.banned_words`, `banned_phrases` and
+`positive_rules`, the same keys the voice review reads. A publication with none of them sends none. This asks the
+model; it does not check its answer, and a rule written as free text in a profile (a punctuation ban, say) has no
+list to check against.
+
 **Cost and failure behavior.** One call to a small fast model
 (`mistral-small-latest`, the same model the citation relevance verifier uses),
 roughly $0.0002 per run, tracked in the report's `cost_summary` under the
@@ -1756,6 +1764,9 @@ arguments, factual doubts, and tone alone — the `completeness`, `argument_inte
 `fact_check`, and `voice_style` ensemble domains already cover those, and
 repeating them here would bury the structural findings. Findings that come
 back outside the three categories are dropped rather than passed through.
+
+It is given the same writing rules as the suggestion pass (see above) for the replacement headings and
+openings it proposes. Those rules cover what it writes; they do not widen what it may flag.
 
 Cost is tracked separately from the suggestion pass, under the
 `seo_content_review` entry in `cost_summary`. To turn off only this one:
