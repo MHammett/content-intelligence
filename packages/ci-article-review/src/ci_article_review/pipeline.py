@@ -4910,7 +4910,12 @@ def _print_draft_summary(
         pointer = by_disposition["pointer"]
         # Every citation is in exactly one bucket, so this is a true remainder
         # and the printed numbers always add up to the total.
-        unresolved = by_disposition["fetch_failed"] + by_disposition["no_source"]
+        resolution_errors = by_disposition["resolution_error"]
+        unresolved = (
+            by_disposition["fetch_failed"]
+            + by_disposition["no_source"]
+            + resolution_errors
+        )
         not_archived = [
             c for c in resolved if c.get("wayback", {}).get("archived") is False
         ]
@@ -4940,6 +4945,15 @@ def _print_draft_summary(
             f"verified), {len(unverifiable)} could not be read, "
             f"{len(unresolved)} unresolved"
         )
+        if resolution_errors:
+            timed_out = sum(
+                1 for c in resolution_errors if c.get("error_kind") == "timeout"
+            )
+            print(
+                f"  {len(resolution_errors)} citation(s) did not finish resolving "
+                f"({timed_out} timed out, {len(resolution_errors) - timed_out} "
+                "raised) — nothing was checked for them; a re-run usually clears it"
+            )
         if refuted:
             print(
                 f"  {len(refuted)} citation(s) were fetched and read, and the "
