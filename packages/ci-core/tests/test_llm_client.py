@@ -4786,3 +4786,85 @@ class TestGeminiRoutesOnTheWire:
         with pytest.raises(ValueError, match="'vertex'"):
             self._gemini(_vertex_config(provider="vertex"))
         assert wire["requests"] == []
+
+
+# ---------------------------------------------------------------------------
+# How long a refused request waits before its one retry
+# ---------------------------------------------------------------------------
+
+
+def _rate_limited(retry_after=None):
+    exc = _http_error(429, "rate limited")
+    exc.response.headers = {} if retry_after is None else {"retry-after": retry_after}
+    return exc
+
+
+class TestRateLimitedRetriesAreSpreadOut:
+    """Issue #332: three Perplexity calls got a 429 in one second on the
+    2026-10-05 `maximum` run and each waited a flat 10s, so all three retried
+    in one second again, and two were refused a second time.
+
+    Perplexity's Agent API limit is requests per second on a rolling one-second
+    window, shared by the whole organisation, and its 429 carries a
+    ``Retry-After``. A fixed wait puts every refused call back in the same
+    window. A call that is waiting should wait as long as it is told to and
+    not in step with the others.
+    """
+
+    def _waits(self, exc, retry_delay=10, uniform=None):
+        """What ``_with_retry`` slept for before its one retry of ``exc``."""
+        slept = []
+        attempts = []
+
+        def _fn():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise exc
+            return "answer"
+
+        with patch.object(client.time, "sleep", side_effect=slept.append):
+            if uniform is None:
+                result = client._with_retry(_fn, True, retry_delay, "x")
+            else:
+                with patch.object(client.random, "uniform", side_effect=uniform):
+                    result = client._with_retry(_fn, True, retry_delay, "x")
+        assert result == "answer"
+        (wait,) = slept
+        return wait
+
+    def test_the_wait_is_jittered_around_the_configured_delay(self):
+        low = self._waits(_rate_limited(), uniform=lambda a, b: a)
+        high = self._waits(_rate_limited(), uniform=lambda a, b: b)
+        assert (low, high) == (5, 15)
+
+    def test_simultaneous_refusals_do_not_wait_the_same_time(self):
+        waits = {round(self._waits(_rate_limited()), 3) for _ in range(12)}
+        assert len(waits) > 1
+        assert all(5 <= w <= 15 for w in waits)
+
+    def test_a_retry_after_is_honoured_and_never_undercut(self):
+        for _ in range(12):
+            assert 20 <= self._waits(_rate_limited("20")) <= 25
+
+    def test_a_retry_after_header_is_read_whatever_its_case(self):
+        exc = _http_error(429)
+        exc.response.headers = {"Retry-After": "20"}
+        assert 20 <= self._waits(exc) <= 25
+
+    def test_a_long_retry_after_is_capped_inside_the_calls_budget(self):
+        """The batch's ceiling leaves one retry_delay plus 30s of slack, so a
+        provider asking for an hour cannot be waited out in place."""
+        assert self._waits(_rate_limited("3600")) == 30
+
+    @pytest.mark.parametrize(
+        "junk", ["", "soon", "-3", "Wed, 21 Oct 2026 07:28:00 GMT"]
+    )
+    def test_an_unreadable_retry_after_falls_back_to_the_jittered_delay(self, junk):
+        assert 5 <= self._waits(_rate_limited(junk)) <= 15
+
+    def test_a_server_error_keeps_the_flat_wait(self):
+        """The dropped-keepalive retry needs a new socket, not a spread."""
+        assert self._waits(_http_error(500)) == 10
+
+    def test_a_zero_delay_stays_zero(self):
+        assert self._waits(_rate_limited("20"), retry_delay=0) == 0
