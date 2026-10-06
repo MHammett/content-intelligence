@@ -893,6 +893,7 @@ content-intelligence/
 │   │   │   │   ├── seo.py             title length, heading structure, meta description
 │   │   │   │   ├── seo_suggest.py     proposes the whole SEO METADATA block (advisory)
 │   │   │   │   ├── seo_content.py     structure review from a search reader's side
+│   │   │   │   ├── seo_style.py       the publication's writing rules, as a block for the two SEO prompts
 │   │   │   │   └── webpage.py         webpage fetch/extraction helpers
 │   │   │   │
 │   │   │   ├── prompts/               system prompts for each review domain
