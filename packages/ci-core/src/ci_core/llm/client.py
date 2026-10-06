@@ -121,6 +121,7 @@ import json
 import logging
 import os
 import queue
+import random
 import re
 import threading
 import time
@@ -2475,6 +2476,54 @@ def _summarise_discarded(discarded):
     return summary
 
 
+def _retry_after_seconds(exc):
+    """The ``Retry-After`` a refusal carried, in seconds, or None.
+
+    Delta-seconds only, which is what Perplexity documents ("retry after the
+    indicated interval"). An HTTP date, a negative number or anything unreadable
+    reads as absent, so a header we cannot parse falls back to the configured
+    delay and not to a guess.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = next(
+            (v for k, v in headers.items() if str(k).lower() == "retry-after"), None
+        )
+        seconds = float(str(raw).strip()) if raw is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return seconds if seconds is not None and seconds >= 0 else None
+
+
+def _retry_wait(exc, retry_delay):
+    """Seconds to wait before the one retry of a request that failed with ``exc``.
+
+    A rate limit gets a spread, not ``retry_delay``: calls refused together and
+    told to wait the same fixed time come back together and are refused again.
+    That is what happened to three Perplexity calls on 2026-10-05 (#332); its
+    Agent API limits requests per second, organisation-wide, so three retries
+    inside one second were one too many for the tier. Told when to come back
+    (``Retry-After``), a call waits at least that long, plus up to half a
+    ``retry_delay`` so calls told the same number still part; otherwise the delay
+    is jittered from half to one and a half times itself.
+
+    Never longer than three ``retry_delay``: the batch's ceiling leaves one
+    ``retry_delay`` and 30s of slack for a retry (``pipeline._global_ceiling``),
+    so a provider asking for an hour is not waited out in place. Other statuses
+    keep the flat wait: a dropped keepalive needs a new socket and no spacing.
+    """
+    if _status_of(exc) != 429 or not retry_delay:
+        return retry_delay
+    said = _retry_after_seconds(exc)
+    if said is None:
+        wait = retry_delay * random.uniform(0.5, 1.5)
+    else:
+        wait = said + random.uniform(0, retry_delay * 0.5)
+    return min(wait, retry_delay * 3)
+
+
 def _with_retry(fn, retry, retry_delay, label, discarded=None):
     """Run ``fn``, retrying once on a genuinely transient failure.
 
@@ -2528,8 +2577,10 @@ def _with_retry(fn, retry, retry_delay, label, discarded=None):
             )
             raise
         _record_discarded(discarded, exc)
-        log.warning(f"{label} HTTP {status}. Waiting {retry_delay}s before one retry.")
-        time.sleep(retry_delay)
+        wait = _retry_wait(exc, retry_delay)
+        shown = retry_delay if wait == retry_delay else f"{wait:.1f}"
+        log.warning(f"{label} HTTP {status}. Waiting {shown}s before one retry.")
+        time.sleep(wait)
         return fn()
 
 
