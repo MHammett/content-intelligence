@@ -110,6 +110,11 @@ fact_check_scope:
   # Set false to ignore model classification entirely and honour only passages
   # you marked yourself.
   trust_model_classification: true
+  # How many sourced verdicts (confirmed, outdated or contradicted, each with a
+  # real URL, one page each) outvote a scope call that only one model made. Two
+  # means a single false "confirmed" still loses to the call, which is the case
+  # the model path exists for. An author marking is never outvoted.
+  min_sources_to_overrule: 2
   # Standing exclusions for every article in this publication. An author marking
   # outranks any model classification, whatever exclude_types says.
   # exclude_passages:

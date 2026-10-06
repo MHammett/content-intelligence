@@ -1036,9 +1036,11 @@ def _render_out_of_scope(items):
         was_were = "was" if len(reported) == 1 else "were"
         lines.append(
             f"_{len(reported)} more {was_were} classified out of scope by a model "
-            f"but NOT excluded — this publication does not act on that category "
-            f"unprompted, so the claim stayed in verification. It is listed so "
-            f"you can see the judgment that was made and overruled._"
+            f"but NOT excluded, so the claim stayed in verification: either this "
+            f"publication does not act on that category unprompted, or other "
+            f"models' sourced verdicts outvoted the call. Its Reason line says "
+            f"which. It is listed so you can see the judgment that was made and "
+            f"overruled._"
         )
     lines.append("")
 
