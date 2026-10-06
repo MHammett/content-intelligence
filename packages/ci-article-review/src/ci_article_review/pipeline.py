@@ -2395,6 +2395,11 @@ def _keep_earlier_billing(failed, fresh):
         ],
         "tokens": tokens,
     }
+    # The client marks a failure it refused before generating, which is not
+    # something this text can say: Perplexity's 429 reads "Error code: 429 - ..."
+    # and names no class, so its reason above is "unknown" (issue #331).
+    if failed.get("unbilled") is True:
+        last_attempt["unbilled"] = 1
     # A malformed-JSON failure on a grounded call searched before it failed,
     # and those searches were billed like its tokens.
     if "searches" in failed:
@@ -2422,6 +2427,10 @@ def _keep_earlier_billing(failed, fresh):
     searches = [n for s in summaries for n in s.get("searches") or ()]
     if searches:
         fresh["discarded_attempts"]["searches"] = searches
+    # Only where something was, so a record with none keeps the shape it had.
+    unbilled = sum(s.get("unbilled", 0) for s in summaries)
+    if unbilled:
+        fresh["discarded_attempts"]["unbilled"] = unbilled
 
 
 #: Domains where a schema-valid answer with every bucket empty is missing
@@ -4127,11 +4136,17 @@ def run_draft_pipeline(
             cost_summary["search_units"],
         )
     if cost_summary.get("discarded_calls"):
+        refused = cost_summary.get("refused_calls", 0)
         log.info(
             "Retries: %d attempt(s) discarded and re-run; %d of them had usage "
-            "the cost above includes.",
+            "the cost above includes%s.",
             cost_summary["discarded_calls"],
-            cost_summary["discarded_calls"] - cost_summary.get("uncosted_calls", 0),
+            cost_summary["discarded_calls"]
+            - cost_summary.get("uncosted_calls", 0)
+            - refused,
+            f", and {refused} refused before generating, so cost nothing"
+            if refused
+            else "",
         )
 
     # Attach pre-analysis

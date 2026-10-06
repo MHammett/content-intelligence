@@ -551,6 +551,122 @@ class TestDiscardedAttemptsAreBilled:
         assert summary["uncosted_calls"] == 0
 
 
+class TestRefusedAttemptsAreNotUncosted:
+    """An attempt refused before generation is discarded, but it is not spend.
+
+    Issue #331: five Perplexity 429s made a ``maximum`` run call its total a
+    floor, "billed by the provider with no usage reported". A refusal reports no
+    usage because there was none.
+    """
+
+    def _entry(self, discarded):
+        return {
+            "pass": "perplexity:fact_check",
+            "model": "gpt-5.4",
+            "tokens": {"prompt": 1000, "completion": 1000},
+            "discarded_attempts": discarded,
+        }
+
+    def test_an_unbilled_attempt_is_discarded_but_not_uncosted(self):
+        summary = calculate(
+            [
+                self._entry(
+                    {
+                        "count": 2,
+                        "costed": 0,
+                        "unbilled": 2,
+                        "reasons": ["RateLimitError"],
+                        "tokens": {"prompt": 0, "completion": 0},
+                    }
+                )
+            ]
+        )
+        assert summary["discarded_calls"] == 2
+        assert summary["uncosted_calls"] == 0
+
+    def test_only_the_attempts_that_may_have_generated_stay_uncosted(self):
+        summary = calculate(
+            [
+                self._entry(
+                    {
+                        "count": 3,
+                        "costed": 1,
+                        "unbilled": 1,
+                        "reasons": [
+                            "MalformedJSONError",
+                            "RateLimitError",
+                            "StreamStalled",
+                        ],
+                        "tokens": {"prompt": 1000, "completion": 1000},
+                    }
+                )
+            ]
+        )
+        assert summary["discarded_calls"] == 3
+        # One was priced, one was refused, so one stall is what is unknown.
+        assert summary["uncosted_calls"] == 1
+
+    def test_a_record_written_before_the_field_is_read_by_its_reasons(self):
+        """The two 2026-10-05 captures that prompted #331 carry only reasons.
+        Where every one is a class litellm raises for a refused request, the
+        attempts were refused. A stall in the mix means they cannot be split."""
+        refused = {
+            "count": 1,
+            "costed": 0,
+            "reasons": ["RateLimitError"],
+            "tokens": {"prompt": 0, "completion": 0},
+        }
+        assert calculate([self._entry(refused)])["uncosted_calls"] == 0
+
+        mixed = {**refused, "count": 2, "reasons": ["RateLimitError", "StreamStalled"]}
+        assert calculate([self._entry(mixed)])["uncosted_calls"] == 2
+
+        stalled = {**refused, "reasons": ["StreamStalled"]}
+        assert calculate([self._entry(stalled)])["uncosted_calls"] == 1
+
+    def test_a_legacy_unknown_reason_is_placed_by_its_stream_record(self):
+        """The recovered attempts in the capture read "unknown", the SDK's text
+        naming no class, but the stream each was cut short by names it."""
+        entry = self._entry(
+            {
+                "count": 2,
+                "costed": 0,
+                "reasons": ["RateLimitError", "unknown"],
+                "tokens": {"prompt": 0, "completion": 0},
+            }
+        )
+        entry["stream_timing"] = [
+            {"cut_short_by": "RateLimitError", "before_recovery": True},
+            {"cut_short_by": "RateLimitError", "before_recovery": True},
+            {"first_byte_s": 13.77},
+        ]
+        summary = calculate([entry])
+        assert (summary["discarded_calls"], summary["refused_calls"]) == (2, 2)
+        assert summary["uncosted_calls"] == 0
+
+        # A stall's stream record is not a refusal's.
+        entry["stream_timing"][1] = {"cut_short_by": "StreamStalled"}
+        summary = calculate([entry])
+        assert (summary["refused_calls"], summary["uncosted_calls"]) == (1, 1)
+
+    def test_a_flag_is_never_read_past_the_attempts_without_usage(self):
+        summary = calculate(
+            [
+                self._entry(
+                    {
+                        "count": 2,
+                        "costed": 1,
+                        "unbilled": 2,
+                        "reasons": ["RateLimitError"],
+                        "tokens": {"prompt": 1000, "completion": 1000},
+                    }
+                )
+            ]
+        )
+        assert summary["refused_calls"] == 1
+        assert summary["uncosted_calls"] == 0
+
+
 class TestReplayedSpendIsSeparated:
     """A replay re-reports the captured run's tokens; they were not spent here."""
 

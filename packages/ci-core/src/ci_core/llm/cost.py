@@ -228,6 +228,45 @@ def _search_cost(model_id, searches):
     return units * usd_per_1000 / 1000, units, 0
 
 
+# The exception classes a discarded attempt's ``reasons`` can name when the
+# provider refused the request before generating anything: litellm's 429 and
+# 5xx. Read only for records written before an attempt carried its own
+# ``unbilled`` flag, which is what decides it now (ci_core.llm.client,
+# ``_refused_before_generation``). A mid-stream failure is a
+# MidStreamFallbackError, not one of these, and a stall has its own class.
+_LEGACY_REFUSAL_REASONS = frozenset(
+    {
+        "RateLimitError",
+        "ServiceUnavailableError",
+        "BadGatewayError",
+        "InternalServerError",
+    }
+)
+
+
+def _unbilled_attempts(discarded, stream_timing=None):
+    """How many of a record's attempts were refused before generating anything.
+
+    A record says so itself (``unbilled``). One written before that, such as the
+    two 2026-10-05 captures behind #331, is read from what it kept: all its
+    reasons being refusal classes, or else the call's per-attempt stream records,
+    which name the class each stream was cut short by even where the record's
+    own reason is "unknown". Never more than the attempts with no usage.
+    """
+    unpriced = max(discarded.get("count", 0) - discarded.get("costed", 0), 0)
+    if "unbilled" in discarded:
+        return min(discarded["unbilled"] or 0, unpriced)
+    reasons = discarded.get("reasons") or []
+    if reasons and all(r in _LEGACY_REFUSAL_REASONS for r in reasons):
+        return unpriced
+    refused = sum(
+        1
+        for s in stream_timing or ()
+        if isinstance(s, dict) and s.get("cut_short_by") in _LEGACY_REFUSAL_REASONS
+    )
+    return min(refused, unpriced)
+
+
 def calculate(api_call_log):
     """Return a cost summary dict from the api_call_log list.
 
@@ -245,7 +284,13 @@ def calculate(api_call_log):
                                  if any of its attempts' counts is unknown
       pricing_known     bool   — False when any model fell back to unknown pricing
       discarded_calls   int    — retried attempts whose output was thrown away
-      uncosted_calls    int    — of those, how many carried no usage to price
+      uncosted_calls    int    — of those, how many may have been billed and
+                                 carried no usage to price. Attempts the
+                                 provider refused before generating (a 429)
+                                 are not among them: nothing was billed
+      refused_calls     int    — of the discarded ones, how many the provider
+                                 refused before generating: not spend, so not
+                                 uncosted either
       search_units      int    — billed search units priced into total_search_usd
       unmeasured_search_calls int — attempts that could search whose response
                                  did not say how many times, retried ones
@@ -271,8 +316,10 @@ def calculate(api_call_log):
     response is complete, merely unparseable — it is priced here against the same
     model. Where it did not, a stalled stream having no usage to read, it is
     counted in ``uncosted_calls`` so the caller can say the total is a floor
-    rather than an exact figure. Seven attempts were discarded unrecorded on
-    2026-09-03 under a summary line reading "(exact)".
+    rather than an exact figure. An attempt refused at the door, an HTTP 429 or
+    5xx before any output, also reports no usage, but generated nothing to bill
+    and is left out of that count (issue #331). Seven attempts were discarded
+    unrecorded on 2026-09-03 under a summary line reading "(exact)".
     """
     by_pass = []
     total_in = 0.0
@@ -281,6 +328,7 @@ def calculate(api_call_log):
     pricing_known = True
     discarded_calls = 0
     uncosted_calls = 0
+    refused_calls = 0
     search_units = 0
     unmeasured_search_calls = 0
     unpriced_searches = 0
@@ -302,7 +350,11 @@ def calculate(api_call_log):
         discarded = entry.get("discarded_attempts") or {}
         if discarded:
             discarded_calls += discarded.get("count", 0)
-            uncosted_calls += discarded.get("count", 0) - discarded.get("costed", 0)
+            refused = _unbilled_attempts(discarded, entry.get("stream_timing"))
+            refused_calls += refused
+            uncosted_calls += (
+                discarded.get("count", 0) - discarded.get("costed", 0) - refused
+            )
             d_in, d_out = _entry_cost(
                 {
                     "model": entry.get("model", ""),
@@ -364,6 +416,7 @@ def calculate(api_call_log):
         "pricing_known": pricing_known,
         "discarded_calls": discarded_calls,
         "uncosted_calls": uncosted_calls,
+        "refused_calls": refused_calls,
         "search_units": search_units,
         "unmeasured_search_calls": unmeasured_search_calls,
         "unpriced_searches": unpriced_searches,

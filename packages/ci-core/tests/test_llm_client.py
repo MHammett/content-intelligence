@@ -409,6 +409,138 @@ class TestRetryPolicy:
 
 
 # ---------------------------------------------------------------------------
+# Attempts the provider refused
+# ---------------------------------------------------------------------------
+
+
+class TestRefusedAttemptsAreNotBilled:
+    """A request refused at the door generated nothing, so nothing was billed.
+
+    Issue #331: a ``maximum`` run's cost line read "at least - 5 retried
+    attempt(s) were billed by the provider with no usage reported", and all five
+    were Perplexity HTTP 429s. The floor was only ever meant for attempts that
+    reached generation and then lost their usage, which is what a stall is.
+    """
+
+    _NO_TOKENS = {"prompt": 0, "completion": 0}
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503])
+    def test_a_refusal_the_retry_got_past_is_recorded_as_unbilled(self, status):
+        attempts = []
+
+        def _refuse_once(**kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise _http_error(status)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_refuse_once):
+            result = _call("mistral", retry=True, retry_delay=0)
+
+        assert result["failed"] is False
+        discarded = result["discarded_attempts"]
+        assert (discarded["count"], discarded["costed"]) == (1, 0)
+        assert discarded["unbilled"] == 1
+
+    def test_a_refusal_on_both_attempts_marks_the_failed_result(self):
+        """The last attempt's own record: recovery reads it off the failure."""
+        with patch.object(client.litellm, "completion", side_effect=_http_error(429)):
+            result = _call("mistral", retry=True, retry_delay=0)
+
+        assert result["failed"] is True
+        assert result["unbilled"] is True
+        assert result["discarded_attempts"]["unbilled"] == 1
+
+    def test_a_stalled_stream_is_still_billed_unknown(self):
+        """Generation may have begun, and no usage came back: that is the case
+        the floor is for. Nothing here marks it unbilled."""
+        attempts = []
+
+        def _stall_once(**kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return _slow_stream([_chunk(content="late")], first_delay=5.0)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_stall_once):
+            result = _call(
+                "mistral",
+                retry=True,
+                retry_delay=0,
+                provider_config={"stream_read_timeout": 0.2},
+            )
+
+        assert result["discarded_attempts"]["reasons"] == ["StreamStalled"]
+        assert "unbilled" not in result["discarded_attempts"]
+
+    def test_an_error_after_chunks_arrived_is_not_a_refusal(self):
+        """A 503 mid-stream (litellm's MidStreamFallbackError synthesises one)
+        comes after the provider began generating."""
+        attempts = []
+
+        def _break_midway():
+            yield _chunk(content="{")
+            raise _http_error(503)
+
+        def _flaky(**kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return _break_midway()
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_flaky):
+            result = _call("mistral", retry=True, retry_delay=0)
+
+        assert result["discarded_attempts"]["count"] == 1
+        assert "unbilled" not in result["discarded_attempts"]
+
+    def test_litellms_mid_stream_error_is_not_a_refusal_even_before_a_chunk(self):
+        """It is a mid-stream failure by name, and the grok one in the 2026-10-05
+        capture had been streaming for over a minute without real output."""
+
+        class MidStreamFallbackError(Exception):
+            status_code = 503
+
+        assert client._refused_before_generation(MidStreamFallbackError("x")) is False
+        assert client._refused_before_generation(_http_error(503)) is True
+
+    @pytest.mark.parametrize("status", [408, 504])
+    def test_a_timeout_status_is_not_a_refusal(self, status):
+        """A gateway that gave up says nothing about whether the model kept
+        generating behind it."""
+        with patch.object(
+            client.litellm, "completion", side_effect=_http_error(status)
+        ):
+            result = _call("mistral", retry=True, retry_delay=0)
+
+        assert result["failed"] is True
+        assert "unbilled" not in result
+        assert "unbilled" not in result.get("discarded_attempts", {})
+
+    def test_a_malformed_response_is_billed_in_full(self):
+        with patch.object(
+            client.litellm,
+            "completion",
+            return_value=_completion_stream("I'd be happy to help!"),
+        ):
+            result = _call("mistral", retry=True, retry_delay=0)
+
+        assert "unbilled" not in result
+        assert "unbilled" not in result["discarded_attempts"]
+
+    def test_the_summary_counts_unbilled_attempts_only_when_there_are_some(self):
+        """Absent otherwise, so every record written before this field, and
+        every test that pins one, keeps its exact shape."""
+        stalled = {"reason": "StreamStalled", "usage": None}
+        refused = {"reason": "RateLimitError", "usage": None, "unbilled": True}
+
+        assert "unbilled" not in client._summarise_discarded([stalled])
+        summary = client._summarise_discarded([stalled, refused, refused])
+        assert summary["count"] == 3
+        assert summary["unbilled"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Result contract
 # ---------------------------------------------------------------------------
 
