@@ -3,6 +3,11 @@ name = "ci-style-profile"
 version = "0.1.0"
 description = "Synthesize a writing-style profile from a multi-source corpus"
 requires-python = ">=3.10"
+license = "MIT"
+# PEP 639 globs cannot leave the package directory, so each package carries a
+# copy of the root LICENSE; packages/ci-core/tests/test_license_metadata.py keeps
+# them identical.
+license-files = ["LICENSE"]
 dependencies = [
     "ci-core",
     "requests>=2.31",
@@ -23,7 +28,7 @@ style-profile-bootstrap = "ci_style_profile.bootstrap:main"
 ci-core = { workspace = true }
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]

@@ -3,6 +3,11 @@ name = "ci-core"
 version = "0.1.0"
 description = "Shared library for CI tools"
 requires-python = ">=3.10"
+license = "MIT"
+# PEP 639 globs cannot leave the package directory, so each package carries a
+# copy of the root LICENSE; packages/ci-core/tests/test_license_metadata.py keeps
+# them identical.
+license-files = ["LICENSE"]
 # Runtime dependencies of the modules that actually run today. The
 # persistence/settings/logging cluster (ci_core.config, .db, .models, .logging)
 # moved to the [persistence] extra below — see audit finding 13.
@@ -111,7 +116,7 @@ persistence = [
 vertex = ["google-auth>=2.0"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
