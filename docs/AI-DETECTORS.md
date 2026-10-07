@@ -228,9 +228,9 @@ Integration is mechanically possible. Both leading APIs return span-level output
 
 ### The cost is disqualifying on its own
 
-Ground it in this repo's own numbers. `draft_submission.filled-example.md` is
-**10,073 words** (measured 2026-09-07; it drifts as the example is edited), and
-the README puts a `maximum`-preset run against it at **$3–5** — that is five
+Ground it in this repo's own numbers. The long worked example this repo used to
+ship was **10,073 words** (measured 2026-09-07; it has since been replaced by a
+short one), and the README then put a `maximum`-preset run against it at **$3 to $5**, which is five
 domains × up to six models, ~30 LLM calls. A `standard` run is **under $1.00**.
 
 One Pangram 4 call on that same draft: 101 × $0.05 = **$5.05** ($4.04 bulk).

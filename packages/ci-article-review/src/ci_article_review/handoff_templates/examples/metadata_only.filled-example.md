@@ -1,15 +1,21 @@
 DRAFT SUBMISSION HANDOFF
-Generated: 2026-06-08
+Generated: 2026-10-07
 Pipeline run: 1
-Article: Data Centers Don't Have an Environmental Record. They Have Eight of Them.
+Article: Congress Fixed the Wrong Half of the Clock Problem
 Publication: mikehammett
 
 PRIMARY CLAIM
-Environmental claims about data centers are not fabricated — they are geographically and operationally decontextualized, and applying conditions from Virginia, Phoenix, or Oregon to a proposal in DeKalb County, Illinois, is not analysis.
+The 2022 Sunshine Protection Act would have locked the country into permanent
+daylight saving time, but the strongest peer-reviewed evidence on circadian
+health points the other way, toward permanent standard time, and neither the
+bill nor the public debate around it ever engaged that conflict.
 
 TARGET AUDIENCE
-Primary: Municipal officials, city council members, county board members, planning and zoning staff, and local journalists in Northern Illinois and comparable geographies who are evaluating data center proposals using environmental claims they cannot independently verify.
-Secondary: Technically literate practitioners — ISP operators, network engineers, data center professionals, utility analysts, environmental engineers, and policy researchers — who will check the primary source citations and notice if anything is off.
+Primary: General-interest readers who follow the recurring "stop changing the
+clocks" debate each March and November and have heard of the Sunshine
+Protection Act but not the sleep-medicine objection to it.
+Secondary: State legislative staff tracking or drafting daylight-saving bills,
+who need the sleep-medicine position summarized correctly before citing it.
 
 PRE-DRAFT ANALYSIS SUMMARY
 Steelmanned position: [...]
