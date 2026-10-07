@@ -14,6 +14,8 @@ Three layers, like the rest of the client's tests:
 * a real stream, captured from the live API on 2026-09-19, replayed through
   both. It carries ``"truncation": ""``, which a stream built from the docs
   does not, and which crashes the litellm this repo pins at its last event.
+  The 45 search-result ``snippet`` strings (excerpts of other people's pages)
+  were replaced with a placeholder; every other byte is as recorded.
 """
 
 import json
@@ -46,6 +48,32 @@ _CAPTURE_SCHEMA = {
         "additionalProperties": False,
     },
 }
+
+
+def _snippets(node):
+    """Every ``snippet`` value anywhere under a decoded event."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "snippet":
+                yield value
+            else:
+                yield from _snippets(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _snippets(value)
+
+
+def test_the_capture_holds_no_text_from_other_peoples_pages():
+    """The capture is committed to a public repository, and a search result's
+    snippet is an excerpt of someone else's page. A fresh capture must have them
+    replaced before it is checked in, not only the one that is there now."""
+    found = []
+    for block in _CAPTURE.read_text(encoding="utf-8").split("\n\n"):
+        lines = block.split("\n")
+        if len(lines) > 1 and lines[0].startswith("event:"):
+            found.extend(_snippets(json.loads(lines[1].removeprefix("data: "))))
+    assert found, "the capture has no search results left to check"
+    assert set(found) == {"[third-party snippet removed]"}
 
 
 def _call(model="perplexity/sonar", retry=False, **provider_config):

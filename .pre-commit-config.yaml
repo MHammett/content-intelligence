@@ -5,7 +5,10 @@ repos:
         name: gitleaks secret scan
         # No Go toolchain on dev machines, so we can't use gitleaks' own
         # golang-language pre-commit hook — call the installed binary directly.
-        entry: C:/Users/mhammett.HAMMETT/Claude/tools/gitleaks/gitleaks.exe git --staged --pre-commit --redact --no-banner --verbose
+        # It must be on PATH (https://github.com/gitleaks/gitleaks/releases).
+        # Without it the hook fails; `SKIP=gitleaks git commit` skips it, and the
+        # gitleaks workflow scans every pull request regardless.
+        entry: gitleaks git --staged --pre-commit --redact --no-banner --verbose
         language: system
         pass_filenames: false
   - repo: https://github.com/astral-sh/ruff-pre-commit

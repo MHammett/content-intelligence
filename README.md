@@ -650,9 +650,10 @@ at each package's root switches both off before anything can import it — in
 this process, where the guard would otherwise fail collection, and in any child
 process, which inherits the environment but not the guard.
 `LITELLM_LOCAL_MODEL_COST_MAP=True` skips the model-cost-map fetch, and
-`CUSTOM_TIKTOKEN_CACHE_DIR` points tiktoken at a byte-exact `cl100k_base`
-vendored in `packages/ci-core/tests/fixtures/tiktoken_cache/`. litellm bundles
-that file too, but its Windows wheel ships it with CRLF line endings that fail
+`CUSTOM_TIKTOKEN_CACHE_DIR` points tiktoken at a byte-exact `cl100k_base`,
+rebuilt at conftest import from litellm's own bundled copy by
+`pytest_plugins/offline_tiktoken.py` (the file is not kept in this repository).
+That copy, in litellm's Windows wheel, has CRLF line endings that fail
 tiktoken's hash check, so a fresh Windows venv downloads it again on first
 import — or, under the guard, fails collection and every test that touches
 litellm. `packages/ci-core/conftest.py` has the details, including why those
@@ -838,6 +839,7 @@ others are early-stage.
 content-intelligence/
 ├── pyproject.toml                workspace root — [tool.uv.workspace] members, dev deps, mypy config
 ├── uv.lock                       resolved lockfile for the whole workspace
+├── LICENSE                       MIT license, Copyright (c) 2026 Mike Hammett
 ├── Makefile                      common dev tasks
 ├── requirements.txt              runtime dependencies
 ├── requirements-dev.txt          adds pytest and other dev tooling
@@ -1014,3 +1016,11 @@ content-intelligence/
 - **[docs/AI-DETECTORS.md](docs/AI-DETECTORS.md)** — Why this pipeline does not call a commercial AI-text detector (GPTZero, Originality.ai, Pangram, Turnitin). Evidence on detector accuracy for LLM-assisted-then-edited prose, false positives on technical writing, API cost against this repo's own per-run numbers, and the specific findings that would reverse the decision.
 
 - **[docs/NAMING.md](docs/NAMING.md)** / **[docs/TERMINOLOGY.md](docs/TERMINOLOGY.md)** — Package naming convention, and the deliberate "voice" vs. "style" distinction.
+
+## License
+
+Released under the [MIT License](LICENSE). Copyright (c) 2026 Mike Hammett.
+
+Dependencies keep their own licenses. Data copied from litellm carries its
+notice in
+`packages/ci-core/src/ci_core/configs/litellm_pending_models.NOTICE.md`.

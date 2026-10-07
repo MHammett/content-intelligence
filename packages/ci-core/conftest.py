@@ -12,12 +12,13 @@ that touches ``client.litellm``. Linux wheels are unaffected, which is why CI
 never saw it; a venv that has downloaded the file once passes too, which is why
 only fresh worktrees did.
 
-So this points litellm at a byte-exact copy vendored in
-``tests/fixtures/tiktoken_cache/``, named the way tiktoken names cache entries
-(the SHA-1 of its download URL). ``CUSTOM_TIKTOKEN_CACHE_DIR`` is the one
-override litellm honours: setting ``TIKTOKEN_CACHE_DIR`` does nothing, because
-litellm overwrites it on import. ``.gitattributes`` marks the file ``binary`` so
-that a Windows checkout cannot give it the CRLF endings that broke litellm's.
+So this points litellm at a byte-exact copy of that same file, built at
+conftest import from litellm's own bundled one with the line endings put back
+and checked against the sha256 tiktoken pins (``pytest_plugins/offline_tiktoken.py``,
+which also says why the file is not simply kept in this repository). It is
+named the way tiktoken names cache entries (the SHA-1 of its download URL).
+``CUSTOM_TIKTOKEN_CACHE_DIR`` is the one override litellm honours: setting
+``TIKTOKEN_CACHE_DIR`` does nothing, because litellm overwrites it on import.
 
 ``LITELLM_LOCAL_MODEL_COST_MAP`` closes the other network call the same import
 makes: without it, every ``import litellm`` fetches the model cost map from
@@ -43,9 +44,10 @@ Python package, so pytest names it after its path and the three cannot collide.
 """
 
 import os
-from pathlib import Path
 
-os.environ["CUSTOM_TIKTOKEN_CACHE_DIR"] = str(
-    Path(__file__).resolve().parents[1] / "ci-core/tests/fixtures/tiktoken_cache"
-)
+import offline_tiktoken
+
+_cache = offline_tiktoken.prepare_cache()
+if _cache is not None:
+    os.environ["CUSTOM_TIKTOKEN_CACHE_DIR"] = str(_cache)
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"

@@ -7,9 +7,10 @@ which sets the same two variables.
 """
 
 import os
-from pathlib import Path
 
-os.environ["CUSTOM_TIKTOKEN_CACHE_DIR"] = str(
-    Path(__file__).resolve().parents[1] / "ci-core/tests/fixtures/tiktoken_cache"
-)
+import offline_tiktoken
+
+_cache = offline_tiktoken.prepare_cache()
+if _cache is not None:
+    os.environ["CUSTOM_TIKTOKEN_CACHE_DIR"] = str(_cache)
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
