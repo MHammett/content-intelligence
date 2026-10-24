@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from ci_core.concurrency import run_all_bounded
 from ci_core.http import (
+    _MAX_REDIRECTS,
     HOST_NON_PUBLIC,
     HOST_PUBLIC,
     UnsafeURLError,
@@ -166,12 +167,56 @@ _VERIFY_SEMAPHORE = threading.Semaphore(_MAX_VERIFY_PARALLEL)
 #: after the main resolution completes, rather than inline per-claim.
 _MAX_SUBMIT_PARALLEL = 2
 
-#: Per-call safety-net timeout for one claim resolution (fetch + adapters +
-#: Wayback check + relevance call). Generous on purpose — the real bound on
-#: each of those steps is the timeout already inside it (safe_get,
-#: wayback.check); this one exists only to catch whatever those don't, e.g. a
-#: DNS resolution that hangs past what requests' own timeout covers.
-_RESOLVE_TIMEOUT_SECONDS = 90
+#: The request timeout every fetch in this module is made with: ``safe_get``'s
+#: default, and the ``timeout`` ``_resolve_known_url`` hands down.
+_FETCH_TIMEOUT_SECONDS = 15
+
+#: The budgets one claim can spend, in sequence, before its own cap below. Each
+#: is the timeout already inside the step; they are named here, and summed,
+#: because the cap used to be a constant (90s) chosen on the premise that those
+#: inner timeouts were the real bound and the cap "exists only to catch
+#: whatever those don't". That premise is false for a chain: the steps run one
+#: after another, so their budgets add, and on a 190K-character draft 80-117
+#: claims out of 255-267 ran past 90s and were reported as
+#: ``resolution_error`` while their threads finished the work (issue #389).
+#:
+#: * The direct fetch: ``safe_get`` follows redirects one validated hop at a
+#:   time, each hop with its own timeout. A page-cache waiter spends one
+#:   timeout on the leader before fetching for itself.
+#: * Escalation, 403 only: ``impersonating_get`` with the same timeout.
+#: * The archive: ``wayback.check`` (spn_client's 10s default) and, on the
+#:   fallback path, the snapshot fetch. archive.org pacing (a 3s shared clock,
+#:   5s backoff base, shared by every worker) sits on top and is not budgeted.
+#: * Pagination: up to ``MAX_PAGES - 1`` further fetches.
+#: * The relevance call: mistral-small answers in ~1-2s, but the call queues
+#:   behind ``_MAX_VERIFY_PARALLEL`` others and the token meter, and a 429
+#:   puts up to three waits of up to 30s before it. Measured on the first
+#:   live replay of a 267-claim draft: median 18.7s, p90 81s, max 166s.
+#:
+#: Not every claim walks the whole chain, and a claim citing several URLs
+#: walks it once per URL (``_resolve_candidates``), so this is neither a
+#: minimum nor a hard maximum. It is the point past which a claim stops holding
+#: one of the ``_MAX_PARALLEL`` slots: ``run_all_bounded`` releases the slot
+#: then, logs it (``on_overrun``), and still keeps the claim's result if it
+#: finishes before the batch ceiling, so a cap that is somewhat low costs
+#: concurrency, not findings.
+_FETCH_CHAIN_SECONDS = _FETCH_TIMEOUT_SECONDS * (_MAX_REDIRECTS + 1)
+_ESCALATION_SECONDS = _FETCH_TIMEOUT_SECONDS
+_ARCHIVE_CHECK_SECONDS = 10
+_ARCHIVE_SECONDS = _ARCHIVE_CHECK_SECONDS + _FETCH_TIMEOUT_SECONDS
+_PAGINATION_SECONDS = _FETCH_TIMEOUT_SECONDS * (pagination.MAX_PAGES - 1)
+_RELEVANCE_SECONDS = 120
+
+#: Per-claim budget for one resolution job: the chain above, summed (310s at
+#: the values this was written with). ``batch_ceiling`` sizes the whole batch
+#: from it, so raising a step's timeout raises both.
+_RESOLVE_TIMEOUT_SECONDS = (
+    _FETCH_CHAIN_SECONDS
+    + _ESCALATION_SECONDS
+    + _ARCHIVE_SECONDS
+    + _PAGINATION_SECONDS
+    + _RELEVANCE_SECONDS
+)
 
 #: Per-call safety-net timeout for one Wayback submission, above wayback.submit's
 #: own 30s default for the same reason as _RESOLVE_TIMEOUT_SECONDS.
@@ -204,6 +249,89 @@ _SUBMIT_TIMEOUT_SECONDS = 45
 #: credentials the unauthenticated path already answers synchronously, off the
 #: redirect, so there is nothing here to wait for either way.
 _CAPTURE_POLL_BUDGET_SECONDS = 45
+
+
+class _StepClock:
+    """Wall time per step of one claim's resolution, readable from another thread.
+
+    The counterpart of ``stream_timing`` on a model call. ``enter(step)`` closes
+    the step in progress and opens ``step``; a step entered twice (a claim
+    citing three URLs walks the chain three times) accumulates. ``report()`` is
+    what a result carries as ``resolution_timing``, and what the overrun hook
+    reads while the claim is still running: each step's seconds so far, the
+    total, and ``in_progress`` naming the step it is in. A timeout can then say
+    where the claim died instead of only that it did (issue #389: 117 timeouts,
+    all logged in one lump after the batch, none naming a step).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # Set on the first step, not here: the batch makes every clock up
+        # front and a claim in wave 30 waits half an hour for a slot. Measured
+        # on the first live run of this: "total" read 1,048s at the median
+        # while the steps summed to 24s. Queue time is not the claim's.
+        self.started = None
+        self._steps = {}
+        self._current = None
+        self._since = None
+
+    def enter(self, step):
+        with self._lock:
+            now = time.monotonic()
+            if self.started is None:
+                self.started = now
+            self._close(now)
+            self._current = step
+            self._since = now
+
+    def done(self):
+        with self._lock:
+            self._close(time.monotonic())
+            self._current = None
+
+    def _close(self, now):
+        if self._current is not None:
+            self._steps[self._current] = self._steps.get(self._current, 0.0) + (
+                now - self._since
+            )
+
+    def report(self):
+        with self._lock:
+            now = time.monotonic()
+            steps = dict(self._steps)
+            if self._current is not None:
+                steps[self._current] = steps.get(self._current, 0.0) + (
+                    now - self._since
+                )
+            current = self._current
+        out = {step: round(seconds, 1) for step, seconds in steps.items()}
+        out["total"] = round(now - self.started, 1) if self.started is not None else 0.0
+        if current is not None:
+            out["in_progress"] = current
+        return out
+
+
+#: The clock of the claim this thread is resolving, if any. Set by
+#: ``_resolve_one`` for the duration of a claim; the steps below read it rather
+#: than carrying a parameter through every helper and the pagination callback.
+_clock = threading.local()
+
+
+def _step(name):
+    """Mark that the current claim's resolution has entered step ``name``."""
+    clock = getattr(_clock, "current", None)
+    if clock is not None:
+        clock.enter(name)
+
+
+def _format_timing(timing):
+    """``fetch 1.0s, extract 1.9s, relevance 39.0s; 44.2s total`` from a report."""
+    parts = [
+        f"{step} {seconds}s"
+        for step, seconds in timing.items()
+        if step not in ("total", "in_progress")
+    ]
+    return f"{', '.join(parts) or 'no step entered'}; {timing.get('total', 0)}s total"
 
 
 #: Adapter names already warned about, so a 40-claim run logs each once rather
@@ -437,6 +565,7 @@ def _get_page(url, timeout=15, page_cache=None):
 
 def _escalate(url, timeout, page_cache=None):
     """``_impersonation_fallback_content``, taken from ``page_cache`` when it holds one."""
+    _step("escalate")
     if page_cache is None:
         return _impersonation_fallback_content(url, timeout)
     return page_cache.get_escalated(
@@ -474,6 +603,7 @@ def _wayback_fallback_content(url, timeout):
     for the same URL, and carries the snapshot's own staleness flags onto the
     citation that was satisfied by it.
     """
+    _step("archive_fallback")
     wb = wayback.check(url, timeout=timeout)
     snapshot_url = wb.get("snapshot_url")
     if not wb.get("archived") or not snapshot_url:
@@ -803,7 +933,9 @@ def _resolve_known_url(
     # off ``known_url`` — see where it is reassigned below.
     archive_lookup_url = known_url
     try:
+        _step("fetch")
         resp = _get_page(known_url, timeout, page_cache)
+        _step("extract")
         content, content_kind = _extract_fetched(resp, known_url)
         # Where the fetch actually landed. `safe_get` follows redirects one
         # validated hop at a time and returns the last hop's response, so this
@@ -921,6 +1053,7 @@ def _resolve_known_url(
 
     # The fallback path already asked archive.org; don't ask twice.
     if wb is None:
+        _step("archive_check")
         wb = wayback.check(archive_lookup_url)
     result = {
         "claim": claim,
@@ -1016,6 +1149,7 @@ def _resolve_known_url(
     followed = None
     verify_content = content
     if verified_via == "direct":
+        _step("pagination")
         followed = pagination.follow(
             resp,
             known_url,
@@ -1043,6 +1177,7 @@ def _resolve_known_url(
     # model copied from its own source label (``pipeline._claim_for_verifier``).
     # The result keeps ``claim`` as the model wrote it; the verifier is shown
     # the cleaned text, and ``verified_as`` records what that was.
+    _step("relevance")
     verdict_info, verification_call_log = _verify_relevance(
         verify_claim or claim, verify_content, api_keys, author
     )
@@ -1238,6 +1373,7 @@ def _resolve_one(
     author=None,
     verify_claim=None,
     page_cache=None,
+    clock=None,
 ):
     """Resolve a single claim against the configured sources, in order.
 
@@ -1249,7 +1385,45 @@ def _resolve_one(
     points at a publication for manual retrieval) are reported with
     ``verification: "pointer"`` so the report does not imply the claim was
     checksummed against retrieved data.
+
+    ``clock`` (a ``_StepClock``) times the steps for the duration of this call
+    and the result carries its report as ``resolution_timing``. The caller
+    keeps a reference, which is how a claim that never returns still gets its
+    timing read.
     """
+    _clock.current = clock
+    try:
+        result = _resolve_one_steps(
+            claim,
+            citation_sources,
+            known_urls,
+            api_keys,
+            call_log,
+            checksum_index,
+            author,
+            verify_claim,
+            page_cache,
+        )
+    finally:
+        _clock.current = None
+        if clock is not None:
+            clock.done()
+    if clock is not None and isinstance(result, dict):
+        result["resolution_timing"] = clock.report()
+    return result
+
+
+def _resolve_one_steps(
+    claim,
+    citation_sources,
+    known_urls,
+    api_keys,
+    call_log,
+    checksum_index,
+    author,
+    verify_claim,
+    page_cache,
+):
     checksum_index = checksum_index if checksum_index is not None else {}
 
     if known_urls:
@@ -1275,10 +1449,12 @@ def _resolve_one(
             continue
         source_name = source_config.get("name", adapter_name)
         try:
+            _step("adapter")
             adapter = _load_adapter(adapter_name)
             result = adapter.resolve(claim)
             if result and result.get("found"):
                 resolved_url = result.get("url")
+                _step("archive_check")
                 wb = wayback.check(resolved_url) if resolved_url else {"archived": None}
                 pointer_only = bool(result.get("pointer_only"))
                 return _check_drift(
@@ -2347,7 +2523,7 @@ def _note_confirmed_siblings(results):
         ).lstrip()
 
 
-def _resolution_error_result(claim, known_urls, error):
+def _resolution_error_result(claim, known_urls, error, timing=None):
     """The entry for a claim whose resolution job timed out or raised.
 
     Its own tier, ``resolution_error``, so it is neither "No source identified"
@@ -2355,6 +2531,10 @@ def _resolution_error_result(claim, known_urls, error):
     got to answer). The URL it was working on is kept when one was known: with
     several, ``_resolve_one`` tries them in order and a timeout does not say
     which was in flight, so the first is recorded and the note says how many.
+
+    ``timing`` is the claim's ``_StepClock.report()`` taken as it was written
+    off. It goes on the entry as ``resolution_timing``, the step it was in as
+    ``timed_out_in``, and the note says both, so a timeout names its cause.
     """
     timed_out = isinstance(error, TimeoutError)
     result = {
@@ -2363,9 +2543,17 @@ def _resolution_error_result(claim, known_urls, error):
         "verification": "resolution_error",
         "error_kind": "timeout" if timed_out else "error",
     }
+    where = ""
+    if timing:
+        timing = dict(timing)
+        step = timing.pop("in_progress", None)
+        result["resolution_timing"] = timing
+        if step:
+            result["timed_out_in"] = step
+            where = f" It was in the {step} step ({_format_timing(timing)})."
     note = (
         f"Resolution did not finish ({error}), so nothing about this claim's "
-        "source was checked. A re-run usually clears a timeout."
+        f"source was checked.{where} A re-run usually clears a timeout."
         if timed_out
         else f"Resolution error: {type(error).__name__}: {error}. Nothing about "
         "this claim's source was checked. A re-run may clear it."
@@ -2445,10 +2633,16 @@ def resolve_citations(
     # never a ThreadPoolExecutor — see _submit_missing_archives just above for
     # why that distinction is the whole point: an abandoned call here must not
     # be able to hold the run open the way a pool's atexit join would.
+    #
+    # One clock per claim, held here and not only inside the job, so a claim
+    # that runs past its budget can be asked what it is doing while it is
+    # still doing it, and a claim written off at the ceiling still reports the
+    # step it died in.
+    clocks = [_StepClock() for _ in normalized]
     jobs = [
         (
             str(idx),
-            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim: (
+            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim, clock=clock: (
                 _resolve_one(
                     claim,
                     citation_sources,
@@ -2459,26 +2653,64 @@ def resolve_citations(
                     author,
                     verify_claim,
                     page_cache,
+                    clock=clock,
                 )
             ),
             _RESOLVE_TIMEOUT_SECONDS,
         )
-        for idx, ((claim, known_urls, _bucket), verify_claim) in enumerate(
-            zip(normalized, verify_claims)
+        for idx, ((claim, known_urls, _bucket), verify_claim, clock) in enumerate(
+            zip(normalized, verify_claims, clocks)
         )
     ]
-    outcomes = run_all_bounded(jobs, max_parallel=_MAX_PARALLEL)
+
+    overran = set()
+
+    def _log_overrun(name, timeout):
+        # Logged the moment it happens, from the batch's own thread, naming the
+        # step: the 117 timeouts of run 26 were logged in one lump after the
+        # batch, all at one timestamp, saying nothing about where each had
+        # spent its time.
+        idx = int(name)
+        overran.add(idx)
+        urls = normalized[idx][1]
+        timing = clocks[idx].report()
+        log.warning(
+            f"Citation resolution for claim {idx} ({urls[0] if urls else 'no URL'}) "
+            f"is past its {timeout}s budget, still in {timing.get('in_progress', '?')} "
+            f"({_format_timing(timing)}). Its slot is released; its result is kept "
+            f"if it finishes before the batch ceiling."
+        )
+
+    outcomes = run_all_bounded(
+        jobs, max_parallel=_MAX_PARALLEL, on_overrun=_log_overrun
+    )
 
     ordered: dict[int, dict] = {}
+    written_off = 0
     for idx_str, (value, error) in outcomes.items():
         idx = int(idx_str)
         if error is None:
             ordered[idx] = value
+            continue
+        timing = clocks[idx].report()
+        if isinstance(error, TimeoutError):
+            written_off += 1
+            log.warning(
+                f"Citation resolution for claim {idx} was written off at the batch "
+                f"ceiling in {timing.get('in_progress', '?')} ({_format_timing(timing)})."
+            )
         else:
             log.warning(f"Citation resolution raised for claim index {idx}: {error}")
-            ordered[idx] = _resolution_error_result(
-                normalized[idx][0], normalized[idx][1], error
-            )
+        ordered[idx] = _resolution_error_result(
+            normalized[idx][0], normalized[idx][1], error, timing
+        )
+    if overran:
+        log.info(
+            f"{len(overran)} of {len(normalized)} claim(s) ran past the "
+            f"{_RESOLVE_TIMEOUT_SECONDS}s per-claim budget; "
+            f"{len(overran) - written_off} finished before the batch ceiling and "
+            f"were kept, {written_off} written off."
+        )
 
     resolved_results = []
     for i in range(len(normalized)):
