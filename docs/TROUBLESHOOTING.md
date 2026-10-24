@@ -169,6 +169,8 @@ Not the wall-clock budget above: raising `timeout_seconds` does nothing for eith
 **A model pass came back PARTIAL (truncated)**  
 The call hit its output-token ceiling. Everything it finished writing is kept; whatever it had not reached yet is lost, and the report says which buckets those were — in the *Truncated model passes* block at the top and above the affected section. The ceiling includes reasoning, and on a grounded Claude call each search iteration gets the full ceiling while the reported output is their sum — so an output count *above* the ceiling can still be a truncation. Claude's and Mistral's reasoning passes are sized per call by ci-core's `output_tokens.yaml`; if one still truncates, measure the real length with `--no-timeout --only-model PROVIDER --only-domain DOMAIN` (it lifts the ceiling too) and raise the table from that number. Set `max_tokens` on the model in `user.yaml` to override it for one provider.
 
+A cut that lost whole buckets gets one follow-up call to the same model for just those buckets (see [Continuing a pass cut off at its output ceiling](CONFIGURATION.md#continuing-a-pass-cut-off-at-its-output-ceiling)), and the report then says what it recovered. The bucket the cut fell inside is not asked for again and may be short. On a saved run, `--retry-failed` does the same for each truncated pass in the capture.
+
 **All model passes failed**  
 By default the pipeline produces a partial report rather than aborting. To make it abort when all calls fail, set `abort_if_all_provider_calls_fail: true` in the pipeline config.
 

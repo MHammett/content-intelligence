@@ -16,8 +16,29 @@ no comment syntax and nothing is stripped. Do not add editorial notes, rationale
 or TODOs inside a `.txt` prompt; they become tokens on every call in that domain,
 on every run. Notes go in this file or in `docs/`.
 
-Nothing globs this directory — only the five filenames named in `_DOMAIN_PROMPTS`
-are ever read — so sibling files like this one are safe.
+Nothing globs this directory — only the filenames named in `_DOMAIN_PROMPTS`, and
+`continuation.txt` (`pipeline._CONTINUATION_PROMPT`), are ever read — so sibling
+files like this one are safe.
+
+## Notes on `continuation.txt`
+
+- Not a domain. It is appended to a domain's own rendered prompt for the one
+  follow-up call a pass cut off at its output ceiling gets
+  (`pipeline._continue_truncated_passes`), with `{delivered_buckets}` (each
+  bucket the first call wrote, with its entry count) and `{missing_buckets}`
+  filled in. The call's schema holds only the missing buckets
+  (`schemas.subset`), so the text asks for them and the schema enforces it.
+- Domain-neutral on purpose: every domain with a schema can be continued.
+
+## Bucket order in `fact_check.txt`
+
+The RETURN FORMAT lists `contradicted`, `outdated`, `unverifiable`,
+`primary_source_needed`, `out_of_scope`, `confirmed`, `additional_observations`,
+in that order, and `schemas.FACT_CHECK` must match it (`test_schemas.py` checks
+the order, not just the set). A cutoff loses everything after the bucket it hit,
+so the verdicts that ask the author to change something come first and the long
+tail of confirmations last. `confirmed` was first until 2026-10-23, when a
+`maximum` run's mistral pass wrote 154 confirmations and nothing else.
 
 ## Notes on `ai_speak.txt`
 
