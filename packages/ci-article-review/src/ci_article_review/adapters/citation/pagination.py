@@ -19,8 +19,10 @@ that costs least and trusts most:
    the next number. Never guessed: a single article would answer a made-up
    ``/page/2/`` with a 404 for every citation in a report.
 
-A hard cap (``MAX_PAGES``, the first page included) bounds the fetches, and a
-link to another site, another scheme or an already-seen page is not followed. A
+A hard cap (``MAX_PAGES``, the first page included) bounds the fetches, a size
+budget (``MAX_FOLLOWED_CHARS``, for pages that are not HTML) bounds what is held,
+and a link to another site, another scheme or an already-seen page is not
+followed. A
 page that fails stops the walk and keeps what was read. Everything is
 best-effort: nothing here may cost a citation the resolution it would have had.
 
@@ -45,6 +47,23 @@ log = logging.getLogger(__name__)
 #: needs more than that is a source to open by hand (the result says so).
 MAX_PAGES = 5
 
+#: Most characters of followed pages held for one citation when those pages are
+#: not HTML (#357). A WordPress REST collection is JSON carrying every post's
+#: full body, and ``extract_response_text`` hands JSON on unstripped, so four
+#: pages of ``?per_page=3`` were ~167,000 characters after page one, against a
+#: verifier that windows the whole lot to 20,000. Three of those windows is
+#: enough candidates for the excerpt search to pick from. HTML is reduced to its
+#: article text before it is held, so it is not charged: a long paginated
+#: article reads exactly as it did. The page that crosses the budget is cut, and
+#: the walk ends there, so the bytes held are bounded by this and the bytes
+#: fetched by this plus one page (a response is fetched whole before its size is
+#: known).
+MAX_FOLLOWED_CHARS = 60_000
+
+#: Ends a page cut at the budget, so the verifier does not read the break as the
+#: end of the source. Not charged to the budget.
+_CUT_MARKER = "\n[Page truncated here: the size limit for followed pages was reached.]"
+
 _NUMBERED_PATH = re.compile(r"^(?P<head>.*/page/)(?P<n>\d+)(?P<tail>/?)$")
 _PAGE_PARAMS = ("page", "paged")
 
@@ -56,8 +75,9 @@ class Followed:
     ``text`` is only the *additional* material (a totals line, then the text of
     each following page), to be appended to what was already read; empty when
     there was nothing more. ``pages_read`` counts the first page. ``stopped``
-    says why the walk ended early (``"page cap"``, ``"fetch failed (...)"``,
-    ``"unreadable page"``) and is None when it ran out of next pages.
+    says why the walk ended early (``"page cap"``, ``"byte budget"``,
+    ``"fetch failed (...)"``, ``"unreadable page"``) and is None when it ran out
+    of next pages.
     """
 
     text: str = ""
@@ -236,6 +256,7 @@ def follow(first_resp, first_url, first_text, fetch, extract, timeout):
 
     seen = {_key(first_url)}
     resp, url = first_resp, first_url
+    budget = MAX_FOLLOWED_CHARS
     while True:
         try:
             following = next_url(resp, url)
@@ -247,6 +268,9 @@ def follow(first_resp, first_url, first_text, fetch, extract, timeout):
         if out.pages_read >= MAX_PAGES:
             out.stopped = "page cap"
             break
+        if budget <= 0:
+            out.stopped = "byte budget"
+            break
         seen.add(_key(following))
         try:
             resp = fetch(following, timeout=timeout)
@@ -254,16 +278,26 @@ def follow(first_resp, first_url, first_text, fetch, extract, timeout):
             out.stopped = f"fetch failed ({type(exc).__name__})"
             break
         try:
-            text, _kind = extract(resp, following)
+            text, kind = extract(resp, following)
         except Exception:  # noqa: BLE001
             text = ""
+            kind = None
         if not (text or "").strip():
             out.stopped = "unreadable page"
             break
+        cut = False
+        if kind != "html":
+            cut = len(text) > budget
+            if cut:
+                text = text[:budget] + _CUT_MARKER
+            budget -= min(len(text), budget)
         parts.append(f"[Next page of this source: {following}]\n{text}")
         out.pages_read += 1
         out.urls.append(following)
         url = following
+        if cut:
+            out.stopped = "byte budget"
+            break
 
     out.text = "\n\n".join(parts)
     return out
