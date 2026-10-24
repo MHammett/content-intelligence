@@ -1002,7 +1002,7 @@ def _affected_sections(notes):
     return f"Sections {', '.join(numbers[:-1])} and {numbers[-1]} are"
 
 
-def _build_fact_check(results, ensemble_cfg, scope=None):
+def _build_fact_check(results, ensemble_cfg, scope=None, quote_checks=None):
     """Merge fact_check results from all models that ran the domain.
 
     ``scope`` is the run's :class:`~ci_article_review.fact_check_scope.ScopeRules`.
@@ -1011,7 +1011,17 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
     model puts out of scope has to be reconciled with another model's verdict on
     it. Both are cross-model questions, and this is the only place the whole set
     exists at once.
+
+    ``quote_checks`` is only read for ``final_url``: the page a cited URL led to
+    once its redirects were followed. A Gemini verdict cites a
+    ``grounding-api-redirect`` wrapper whose token differs per citation, so the
+    scope vote counts pages by where the wrapper landed, not by the token (#359).
     """
+    landed = {
+        url: check["final_url"]
+        for (url, _quote), check in (quote_checks or {}).items()
+        if isinstance(check, dict) and check.get("final_url")
+    }
     domain_results = [
         (model, r)
         for (model, d), r in results.items()
@@ -1044,7 +1054,7 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
                 model_name: {"weight": round(weight, 2), "grounding": grounding}
             },
         }
-        return _apply_scope(merged, scope)
+        return _apply_scope(merged, scope, landed)
 
     # Multiple sources — merge all lists, tag each item with source model and weight
     merged: dict = {
@@ -1099,10 +1109,10 @@ def _build_fact_check(results, ensemble_cfg, scope=None):
     ):
         merged[key].sort(key=lambda x: x.get("source_weight", 1.0), reverse=True)
 
-    return _apply_scope(merged, scope)
+    return _apply_scope(merged, scope, landed)
 
 
-def _apply_scope(merged, scope):
+def _apply_scope(merged, scope, landed=None):
     """Hand the merged section to the run's scope rules, if there are any.
 
     A run with no rules object — an older captured report replayed, a caller
@@ -1113,7 +1123,7 @@ def _apply_scope(merged, scope):
     if scope is None:
         merged.setdefault("out_of_scope", [])
         return merged
-    return scope.apply(merged)
+    return scope.apply(merged, landed)
 
 
 def _build_flags_section(domain, results, ensemble_cfg):
@@ -2194,7 +2204,9 @@ def build_report(
     )
 
     # Sections 2-6 — Domain sections
-    section_2_fact_check = _build_fact_check(results, ensemble_cfg, fact_check_scope)
+    section_2_fact_check = _build_fact_check(
+        results, ensemble_cfg, fact_check_scope, quote_checks
+    )
     section_3_voice = _build_flags_section("voice_style", results, ensemble_cfg)
     section_4_argument = _build_flags_section(
         "argument_integrity", results, ensemble_cfg
