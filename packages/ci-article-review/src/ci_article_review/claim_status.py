@@ -50,6 +50,7 @@ __all__ = [
     "author_hosts",
     "build_claim_ledger",
     "label_for",
+    "status_by_claim",
     "summary_line",
 ]
 
@@ -312,6 +313,23 @@ def build_claim_ledger(report, author_hosts=()):
     }
 
 
+def status_by_claim(ledger):
+    """``{claim text: status}`` for every claim text the ledger saw.
+
+    Each entry's representative text and every variant quotation grouped under
+    it map to the same status, so a reader holding the text a citation or a
+    verdict carries can look its claim up without grouping again.
+    """
+    by_text = {}
+    for entry in (ledger or {}).get("claims") or []:
+        if not isinstance(entry, dict) or not entry.get("claim"):
+            continue
+        by_text[entry["claim"]] = entry["status"]
+        for variant in (entry.get("evidence") or {}).get("variants") or []:
+            by_text[variant] = entry["status"]
+    return by_text
+
+
 def annotate_fact_check(fact_check, ledger):
     """Stamp each Section 2 entry with its claim's ``net_status``.
 
@@ -321,11 +339,7 @@ def annotate_fact_check(fact_check, ledger):
     """
     if not isinstance(fact_check, dict):
         return
-    by_text = {}
-    for entry in ledger.get("claims") or []:
-        by_text[entry["claim"]] = entry["status"]
-        for variant in entry["evidence"].get("variants") or []:
-            by_text[variant] = entry["status"]
+    by_text = status_by_claim(ledger)
     for bucket in _VERDICT_BUCKETS + ("out_of_scope",):
         for entry in _records(fact_check.get(bucket)):
             status = by_text.get(entry.get("claim"))
