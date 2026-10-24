@@ -68,6 +68,7 @@ from .handoff_parser import (
 from . import history as hist
 from .history_analytics import resolve_history_root
 from . import consolidation
+from . import claim_status
 from . import handoff_gaps
 from . import reproducibility
 from ci_core import redact
@@ -4434,6 +4435,19 @@ def run_draft_pipeline(
         )
     report["section_9_citations"] = citation_results
 
+    # One net status per claim, built here and only here: after consolidation
+    # (Section 2 is final) and after citation resolution and re-ask (Section 9
+    # is final). Every reader — the Section 2 entries, the console line below,
+    # and later the worklist — takes it from the report rather than deriving its
+    # own, which is how four places came to disagree about one claim (#338).
+    report["claim_ledger"] = claim_status.build_claim_ledger(
+        report, author_hosts=claim_status.author_hosts(pub_config)
+    )
+    claim_status.annotate_fact_check(
+        report.get("section_2_fact_check"), report["claim_ledger"]
+    )
+    log.info(claim_status.summary_line(report["claim_ledger"]))
+
     # Every URL the expansion pass proposed, checked. Cheap (HEAD requests, no
     # model calls) and it runs whenever the pass ran.
     expansion = report.get("section_10_expansion") or {}
@@ -5103,6 +5117,10 @@ def _print_draft_summary(
             f"({_held} also held out of Section 9) — see 'Out of scope for "
             f"verification' in the review"
         )
+    # The per-claim rollup. A report saved before the ledger existed has none,
+    # and this summary also prints saved reports, so the line is conditional.
+    if report.get("claim_ledger") is not None:
+        print(f"  {claim_status.summary_line(report['claim_ledger'])}")
     print(f"Section 3 — Voice flags: {len(report['section_3_voice'])}")
     print(f"Section 4 — Argument flags: {len(report['section_4_argument'])}")
     print(f"Section 5 — Completeness flags: {len(report['section_5_completeness'])}")
