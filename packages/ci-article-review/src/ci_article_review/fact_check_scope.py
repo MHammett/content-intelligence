@@ -496,7 +496,7 @@ class ScopeRules:
 
     # -- enforcement --------------------------------------------------------
 
-    def apply(self, fact_check):
+    def apply(self, fact_check, landed=None):
         """Separate out-of-scope claims from the merged fact-check section.
 
         Returns a new dict. Author markings pull matching claims out of all five
@@ -604,7 +604,7 @@ class ScopeRules:
 
         # 1b. Which model calls are outvoted.
         outvoted = {}
-        for entry, sources in self._outvoted(fact_check, entries, honoured_by):
+        for entry, sources in self._outvoted(fact_check, entries, honoured_by, landed):
             entry["excluded"] = False
             outvoted[id(entry)] = sources
 
@@ -719,7 +719,7 @@ class ScopeRules:
         )
         return result
 
-    def _outvoted(self, fact_check, entries, honoured_by):
+    def _outvoted(self, fact_check, entries, honoured_by, landed=None):
         """The model-origin exclusions that sourced verdicts outvote.
 
         Returns ``(entry, sources)`` pairs, ``sources`` being the
@@ -731,6 +731,15 @@ class ScopeRules:
         ``contradicted`` that names a real URL. Each model counts once, however
         many pages it cites, and a page counts once, however many models cite
         it, so the threshold measures independent sources and not volume.
+
+        ``landed`` maps a cited URL to the page it led to once redirects were
+        followed (the quote check records it). A page is counted by where a
+        citation landed: Gemini cites ``grounding-api-redirect/<token>``
+        wrappers, a different token for each citation, so keyed by the URL as
+        written one wrapper and another model's real URL for the same page
+        counted as two sources (#359). A wrapper nothing followed, offline or
+        refused, still counts as a page of its own, which can only keep a claim
+        in verification.
 
         Only model-origin exclusions are candidates. An author marking is the
         author speaking, and no number of verdicts outvotes that.
@@ -766,7 +775,10 @@ class ScopeRules:
                 if entry is None or id(entry) not in candidates:
                     continue
                 by_model = found.setdefault(id(entry), {})
-                by_model.setdefault(item.get("source_model", "") or "", (url, bucket))
+                by_model.setdefault(
+                    item.get("source_model", "") or "",
+                    ((landed or {}).get(url, url), bucket),
+                )
 
         outvoted = []
         for entry_id, by_model in found.items():

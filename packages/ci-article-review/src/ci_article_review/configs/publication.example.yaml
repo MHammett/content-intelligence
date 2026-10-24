@@ -159,6 +159,11 @@ wordpress:
   application_password: your_app_password
   default_status: draft
   rest_api_endpoint: /wp-json/wp/v2
+  # The last item of the checklist printed before a publish. Left out it reads
+  # "Site backup is current (host or plugin)"; name your own tool here
+  # ("UpdraftPlus backup is current"), or set it to "" to drop the item.
+  # Nothing checks that a backup exists.
+  # backup_check: Site backup is current (host or plugin)
 
 rank_math:
   # What Rank Math's own default schema is set to (Rank Math SEO > Titles &
