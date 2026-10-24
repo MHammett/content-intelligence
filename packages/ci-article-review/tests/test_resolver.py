@@ -519,7 +519,7 @@ class TestMultipleCitedSources:
             seen.append(url)
             return _page_response()
 
-        def _fake_call(_provider, _system, user_prompt, _api_key, model=None):
+        def _fake_call(_provider, _system, user_prompt, _api_key, model=None, **_kw):
             verdict = table[seen[-1]]
             return {
                 "failed": False,
@@ -698,7 +698,7 @@ class TestVerifierSeesReadableContent:
     def _run(self, html, verdict="supports"):
         captured = {}
 
-        def fake_call(provider, system, user, api_key, model=None):
+        def fake_call(provider, system, user, api_key, model=None, **_kw):
             captured["user"] = user
             return {
                 "failed": False,
@@ -775,7 +775,7 @@ class TestPdfCitations:
     def _run(self, extracted_text):
         captured = {}
 
-        def fake_call(provider, system, user, api_key, model=None):
+        def fake_call(provider, system, user, api_key, model=None, **_kw):
             captured["user"] = user
             return {
                 "failed": False,

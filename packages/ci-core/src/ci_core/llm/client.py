@@ -2572,8 +2572,8 @@ def _retry_after_seconds(exc):
     return seconds if seconds is not None and seconds >= 0 else None
 
 
-def _retry_wait(exc, retry_delay):
-    """Seconds to wait before the one retry of a request that failed with ``exc``.
+def _retry_wait(exc, retry_delay, attempt=1):
+    """Seconds to wait before retry ``attempt`` of a request that failed with ``exc``.
 
     A rate limit gets a spread, not ``retry_delay``: calls refused together and
     told to wait the same fixed time come back together and are refused again.
@@ -2582,7 +2582,9 @@ def _retry_wait(exc, retry_delay):
     inside one second were one too many for the tier. Told when to come back
     (``Retry-After``), a call waits at least that long, plus up to half a
     ``retry_delay`` so calls told the same number still part; otherwise the delay
-    is jittered from half to one and a half times itself.
+    is jittered from half to one and a half times itself, and grows with each
+    further attempt (``attempt`` 2 waits twice as long as attempt 1), because a
+    second refusal says the window is fuller than the first wait assumed.
 
     Never longer than three ``retry_delay``: the batch's ceiling leaves one
     ``retry_delay`` and 30s of slack for a retry (``pipeline._global_ceiling``),
@@ -2593,14 +2595,37 @@ def _retry_wait(exc, retry_delay):
         return retry_delay
     said = _retry_after_seconds(exc)
     if said is None:
-        wait = retry_delay * random.uniform(0.5, 1.5)
+        wait = retry_delay * max(1, attempt) * random.uniform(0.5, 1.5)
     else:
         wait = said + random.uniform(0, retry_delay * 0.5)
     return min(wait, retry_delay * 3)
 
 
+def _retries_allowed(retry):
+    """How many retries ``retry`` asks for: a bool is one or none, an int is itself.
+
+    ``retry=True`` has always meant "one retry" and still does. A count is for a
+    call cheap enough that a second refusal should not end it: the citation
+    relevance check on mistral-small costs well under a cent and a 429 on its
+    one retry cost the claim its verdict (#389). The count stays small on
+    purpose; the limiter in ``ratelimit`` is what keeps a run from needing it.
+    """
+    if retry is True:
+        return 1
+    if retry is False or retry is None:
+        return 0
+    try:
+        return max(0, int(retry))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _with_retry(fn, retry, retry_delay, label, discarded=None):
-    """Run ``fn``, retrying once on a genuinely transient failure.
+    """Run ``fn``, retrying on a genuinely transient failure.
+
+    ``retry`` is how many times: ``True`` once (the default everywhere), ``False``
+    never, an integer that many (see ``_retries_allowed``). Each retry waits
+    ``_retry_wait``, which honours ``Retry-After`` on a 429.
 
     ``num_retries=0`` is set on the litellm call itself, so this is the only
     retry in the stack. That is deliberate: litellm reports credit exhaustion as
@@ -2625,38 +2650,45 @@ def _with_retry(fn, retry, retry_delay, label, discarded=None):
     succeeded; only the JSON parse failed), so without this branch it would
     never retry.
     """
-    try:
-        return fn()
-    except (StreamStalled, MalformedJSONError) as exc:
-        if not retry:
-            raise
-        _record_discarded(discarded, exc)
-        log.warning(
-            f"{label} {exc.__class__.__name__}. Waiting {retry_delay}s before one retry."
-        )
-        time.sleep(retry_delay)
-        return fn()
-    except Exception as exc:
-        status = _status_of(exc)
-        if not retry or status not in _RETRYABLE_STATUS:
-            raise
-        # Checked against every retryable status, not just 429. An exhausted
-        # account reaches us as a 429 directly, but mid-stream it arrives
-        # wrapped in MidStreamFallbackError, which synthesises 503 — same dead
-        # wallet, different number. The test is what the provider said, not
-        # which status code the wrapper picked.
-        if _is_terminal_quota_error(exc):
-            log.error(
-                f"{label} reported HTTP {status}, but the account is exhausted. "
-                f"Not retrying — a wait will not refill it."
+    allowed = _retries_allowed(retry)
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except (StreamStalled, MalformedJSONError) as exc:
+            if attempt >= allowed:
+                raise
+            attempt += 1
+            _record_discarded(discarded, exc)
+            log.warning(
+                f"{label} {exc.__class__.__name__}. Waiting {retry_delay}s before "
+                f"retry {attempt} of {allowed}."
             )
-            raise
-        _record_discarded(discarded, exc)
-        wait = _retry_wait(exc, retry_delay)
-        shown = retry_delay if wait == retry_delay else f"{wait:.1f}"
-        log.warning(f"{label} HTTP {status}. Waiting {shown}s before one retry.")
-        time.sleep(wait)
-        return fn()
+            time.sleep(retry_delay)
+        except Exception as exc:
+            status = _status_of(exc)
+            if attempt >= allowed or status not in _RETRYABLE_STATUS:
+                raise
+            # Checked against every retryable status, not just 429. An
+            # exhausted account reaches us as a 429 directly, but mid-stream it
+            # arrives wrapped in MidStreamFallbackError, which synthesises 503
+            # — same dead wallet, different number. The test is what the
+            # provider said, not which status code the wrapper picked.
+            if _is_terminal_quota_error(exc):
+                log.error(
+                    f"{label} reported HTTP {status}, but the account is exhausted. "
+                    f"Not retrying — a wait will not refill it."
+                )
+                raise
+            attempt += 1
+            _record_discarded(discarded, exc)
+            wait = _retry_wait(exc, retry_delay, attempt)
+            shown = retry_delay if wait == retry_delay else f"{wait:.1f}"
+            log.warning(
+                f"{label} HTTP {status}. Waiting {shown}s before retry {attempt} "
+                f"of {allowed}."
+            )
+            time.sleep(wait)
 
 
 def _is_reasoning_param_error(body_text):
@@ -3057,7 +3089,8 @@ def call(
 
     Walks the fallback chain on capacity errors, except on Azure (see
     ``ROUTES``), and retries once without reasoning parameters when a model
-    rejects them.
+    rejects them. ``retry`` is a bool (one retry or none) or a count; see
+    ``_with_retry``.
     """
     if provider not in _PROVIDERS:
         raise KeyError(
