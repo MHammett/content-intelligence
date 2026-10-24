@@ -861,6 +861,9 @@ content-intelligence/
 │   │   │   ├── ensemble_capture.py    saves/loads raw ensemble output for --replay
 │   │   │   ├── fact_check_scope.py    claims no source can settle — author markings,
 │   │   │   │                          model classification, and what they exclude
+│   │   │   ├── claim_status.py        one net status per claim across Sections 1, 2
+│   │   │   │                          and 9 (the claim ledger), built once after
+│   │   │   │                          citation resolution
 │   │   │   ├── handoff_parser.py      parses Template A and Template C documents
 │   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
