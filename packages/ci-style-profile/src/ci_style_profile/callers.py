@@ -231,8 +231,12 @@ def call_all(
     jobs = [(name, _job(name, cfg), budgets[name]) for name, cfg in active.items()]
 
     results: dict[str, dict] = {}
+    # keep_late=False: a model past its backstop is written off at the
+    # backstop, not waited for until the batch ceiling. Someone is at a prompt
+    # watching this fan-out, and the ceiling for a one-model batch is the
+    # backstop plus a minute of slack.
     for name, (value, error) in run_all_bounded(
-        jobs, max_parallel=max_parallel
+        jobs, max_parallel=max_parallel, keep_late=False
     ).items():
         if error is None:
             results[name] = value
