@@ -19,6 +19,7 @@ from ci_article_review import consolidation
 from ci_article_review.adapters.citation import quote_check as qc
 
 _URL = "https://www.example.org/report"
+_WRAPPER = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
 _QUOTE = "The plant operates nine generating units across two sites."
 _PAGE = (
     "Annual report. The plant operates nine generating units across two sites, "
@@ -243,6 +244,47 @@ class TestFetchPage:
         assert page.status == "read"
         assert qc.quote_found(_QUOTE, page.texts) is True
 
+    def test_where_a_forwarder_landed_is_recorded(self, monkeypatch):
+        """``safe_get`` follows a grounding wrapper; the landing page is the source."""
+        resp = _Resp(_PAGE)
+        resp.url = _URL
+        self._patch(monkeypatch, resp)
+        page = qc.fetch_page(_WRAPPER + "AUZ1")
+        assert page.status == "read"
+        assert page.final_url == _URL
+
+    def test_where_a_refused_forwarder_landed_is_still_recorded(self, monkeypatch):
+        """A publisher that refuses us still told us which page the wrapper named."""
+        import requests
+
+        refused = _Resp("no", status=403)
+        refused.url = _URL
+        self._patch(monkeypatch, exc=requests.HTTPError("403", response=refused))
+        monkeypatch.setattr(
+            qc.resolver, "_impersonation_fallback_content", lambda url, timeout: None
+        )
+        page = qc.fetch_page(_WRAPPER + "AUZ1")
+        assert page.status == "failed"
+        assert page.final_url == _URL
+
+    def test_a_fingerprinted_retry_records_where_it_landed(self, monkeypatch):
+        import requests
+
+        self._patch(
+            monkeypatch,
+            exc=requests.HTTPError("403", response=_Resp("no", status=403)),
+        )
+        monkeypatch.setattr(
+            qc.resolver,
+            "_impersonation_fallback_content",
+            lambda url, timeout: (_URL + "/landed", _PAGE, "html"),
+        )
+        assert qc.fetch_page(_WRAPPER + "AUZ1").final_url == _URL + "/landed"
+
+    def test_an_exception_with_no_response_has_no_landing_page(self, monkeypatch):
+        self._patch(monkeypatch, exc=TimeoutError("slow"))
+        assert qc.fetch_page(_WRAPPER + "AUZ1").final_url == ""
+
 
 class TestCheckQuotes:
     def test_a_quote_on_the_page_is_found(self):
@@ -385,6 +427,48 @@ class TestCheckQuotes:
             c["found"] for c in checks.values() if c["found"] is not None
         ) == [True]
         assert summary["unchecked"] == 2
+
+    def test_a_forwarder_records_the_page_it_landed_on(self):
+        wrapper = _WRAPPER + "AUZ1"
+        checks, _ = qc.check_quotes(
+            _results(_verdict(url=wrapper)),
+            fetch=_fetch_from(
+                {wrapper: qc.PageRead(status="read", texts=[_PAGE], final_url=_URL)}
+            ),
+        )
+        assert checks[(wrapper, _QUOTE)]["final_url"] == _URL
+
+    def test_a_page_that_landed_on_itself_records_nothing(self):
+        checks, _ = qc.check_quotes(
+            _results(_verdict()),
+            fetch=_fetch_from(
+                {_URL: qc.PageRead(status="read", texts=[_PAGE], final_url=_URL)}
+            ),
+        )
+        assert "final_url" not in checks[(_URL, _QUOTE)]
+
+    def test_an_expired_forwarder_that_landed_on_another_forwarder_records_nothing(
+        self,
+    ):
+        wrapper = _WRAPPER + "AUZ1"
+        checks, _ = qc.check_quotes(
+            _results(_verdict(url=wrapper)),
+            fetch=_fetch_from(
+                {wrapper: qc.PageRead(status="failed", final_url=_WRAPPER + "expired")}
+            ),
+        )
+        assert "final_url" not in checks[(wrapper, _QUOTE)]
+
+    def test_the_landing_page_is_kept_when_the_page_could_not_be_read(self):
+        wrapper = _WRAPPER + "AUZ1"
+        checks, _ = qc.check_quotes(
+            _results(_verdict(url=wrapper)),
+            fetch=_fetch_from(
+                {wrapper: qc.PageRead(status="failed", detail="403", final_url=_URL)}
+            ),
+        )
+        assert checks[(wrapper, _QUOTE)]["found"] is None
+        assert checks[(wrapper, _QUOTE)]["final_url"] == _URL
 
 
 class TestDemotion:
