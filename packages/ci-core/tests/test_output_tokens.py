@@ -5,6 +5,17 @@ claude:fact_check on both maximum runs of the honda-navigation article and
 mistral:fact_check on four of its last seven runs — on drafts as small as 2,182
 characters. The overflow was reasoning, not findings. These tests pin the
 formula to that evidence.
+
+Two more findings reshaped it on 2026-10-24. The answer term stopped growing at
+the size table's 1.8x while fact_check's output did not: on a 190,170-char
+draft at `maximum`, mistral:fact_check wrote 154 `confirmed` entries (109,656
+chars of JSON) and hit its 50,000 ceiling before any other bucket, so the
+answer term is now also a line through the origin (0.25 tokens per character)
+and the larger of the two wins. And a no-effort pass kept client.py's flat
+8000, which cut claude-haiku-4-5:argument_integrity off at exactly 8000 tokens
+twice at `wide` (2026-09-28, 2026-10-04; 38,021 chars of flags written), so
+every capped pass is sized here now, with the reasoning term 0 when nothing
+reasons.
 """
 
 import pytest
@@ -26,16 +37,41 @@ def _no_model_map(monkeypatch):
     Each test that cares about the model's own limit patches its own value in.
     """
     monkeypatch.setattr(ot, "model_output_limit", lambda provider, model: None)
+    monkeypatch.setattr(ot, "model_context_limit", lambda provider, model: None)
 
 
 def _size_mult(chars):
     return tm._size_mult(chars, tm._CONFIG["size_multipliers"])
 
 
+def _answer(domain, chars, table=None):
+    """The answer term as the yaml defines it: table, line, floor; largest wins."""
+    cfg = table or ot._CONFIG
+    scaled = cfg["answer_tokens"].get(domain, cfg["answer_tokens"]["default"])
+    rate = cfg.get("answer_tokens_per_char", {}).get(domain, 0)
+    return max(scaled * _size_mult(chars), rate * chars, cfg["answer_floor_tokens"])
+
+
+def _no_effort_ceiling(domain, chars):
+    import math
+
+    return math.ceil(_answer(domain, chars))
+
+
 class TestFormula:
     def test_reasoning_plus_answer_scaled_by_the_timeout_size_table(self):
         cfg = ot._CONFIG
         for chars in (2182, 18167, 27113, 62000, 135514, 400000):
+            expected = cfg["reasoning_tokens"]["high"] + _answer("fact_check", chars)
+            got = ot.compute_max_tokens("claude", OPUS_HIGH, "fact_check", chars)
+            assert got == pytest.approx(expected, abs=1), chars
+
+    def test_the_table_decides_below_the_crossover(self):
+        """Up to the size where the per-character line overtakes it, the answer
+        term is the table's figure exactly; nothing under that size moved when
+        the line was added."""
+        cfg = ot._CONFIG
+        for chars in (6000, 18167, 27113, 62000):
             expected = cfg["reasoning_tokens"]["high"] + cfg["answer_tokens"][
                 "fact_check"
             ] * _size_mult(chars)
@@ -44,18 +80,18 @@ class TestFormula:
 
     def test_the_size_table_is_the_timeout_models_own(self):
         """Not a copy that could drift: change the timeout buckets and the
-        ceiling follows."""
-        before = ot.compute_max_tokens("claude", OPUS_HIGH, "fact_check", 62000)
+        ceiling follows. At 27,113 chars the table is the deciding term."""
+        before = ot.compute_max_tokens("claude", OPUS_HIGH, "fact_check", 27113)
         buckets = tm._CONFIG["size_multipliers"]
         original = [dict(b) for b in buckets]
         try:
             for b in buckets:
                 b["mult"] = float(b["mult"]) * 2
-            after = ot.compute_max_tokens("claude", OPUS_HIGH, "fact_check", 62000)
+            after = ot.compute_max_tokens("claude", OPUS_HIGH, "fact_check", 27113)
         finally:
             buckets[:] = original
         answer = ot._CONFIG["answer_tokens"]["fact_check"]
-        assert after - before == pytest.approx(answer * _size_mult(62000), abs=1)
+        assert after - before == pytest.approx(answer * _size_mult(27113), abs=1)
 
     def test_fact_check_gets_more_room_than_a_flag_domain(self):
         """It writes one entry per claim; the other domains a handful of flags."""
@@ -127,24 +163,33 @@ class TestWhoGetsACeiling:
         cfg = {"model": "whatever", "reasoning_effort": "high", "effort": "high"}
         assert ot.compute_max_tokens(provider, cfg, "fact_check", 27113) is None
 
-    def test_a_pass_with_no_reasoning_keeps_the_client_default(self):
+    def test_a_pass_with_no_reasoning_gets_the_answer_term_alone(self):
+        """No reasoning, no reasoning term — but a ceiling, sized for the answer.
+        Until 2026-10-24 these returned None and the client sent a flat 8000."""
+        expected = _no_effort_ceiling("fact_check", 27113)
+        assert expected > 8000
         assert (
             ot.compute_max_tokens(
                 "claude", {"model": "claude-haiku-4-5-20251001"}, "fact_check", 27113
             )
-            is None
+            == expected
         )
         assert (
             ot.compute_max_tokens(
                 "mistral", {"model": "mistral-small-latest"}, "fact_check", 27113
             )
-            is None
+            == expected
+        )
+        assert expected < ot.compute_max_tokens(
+            "mistral", MISTRAL_HIGH, "fact_check", 27113
         )
 
     def test_mistral_reasoning_effort_none_is_no_reasoning(self):
         """A real value mistral-medium-3-5 accepts, meaning reasoning off."""
         cfg = {"model": "mistral-medium-3-5", "reasoning_effort": "none"}
-        assert ot.compute_max_tokens("mistral", cfg, "fact_check", 27113) is None
+        assert ot.compute_max_tokens(
+            "mistral", cfg, "fact_check", 27113
+        ) == _no_effort_ceiling("fact_check", 27113)
 
     def test_each_provider_reads_the_key_its_request_is_built_from(self):
         """client._provider_params reads `effort` for claude and
@@ -152,6 +197,7 @@ class TestWhoGetsACeiling:
         model that thinks only when asked it must not buy a reasoning-sized
         ceiling either. (claude-opus-5 thinks anyway — see
         TestAnUnsetEffortIsTheModelsDefault.)"""
+        no_reasoning = _no_effort_ceiling("fact_check", 27113)
         assert (
             ot.compute_max_tokens(
                 "claude",
@@ -159,7 +205,7 @@ class TestWhoGetsACeiling:
                 "fact_check",
                 27113,
             )
-            is None
+            == no_reasoning
         )
         assert (
             ot.compute_max_tokens(
@@ -168,7 +214,129 @@ class TestWhoGetsACeiling:
                 "fact_check",
                 27113,
             )
-            is None
+            == no_reasoning
+        )
+
+
+class TestTheAnswerGrowsWithTheDraft:
+    """fact_check writes one entry per claim, and claims grow with the draft
+    past where the size table stops growing.
+
+    Measured 2026-10-23, `maximum`, run 24 of a 169,940-char article (190,170
+    chars as sent): mistral:fact_check wrote 154 `confirmed` entries, 109,656
+    chars of JSON, and hit its 50,000 ceiling before `outdated`, `contradicted`,
+    `unverifiable`, `primary_source_needed`, `out_of_scope` or
+    `additional_observations`. The table gave it 32,000 + 10,000 x 1.8.
+    """
+
+    RUN_24_CHARS = 190170
+    RUN_24_CEILING = 50000
+
+    def test_run_24s_pass_would_have_had_room(self):
+        got = ot.compute_max_tokens(
+            "mistral", MISTRAL_HIGH, "fact_check", self.RUN_24_CHARS
+        )
+        # ~27,400 tokens written for 154 entries while still in the first bucket;
+        # finishing all seven at that rate is ~44,500 of answer, plus reasoning.
+        assert got >= 32000 + 44500, got
+        assert got > self.RUN_24_CEILING
+
+    def test_the_line_is_per_character_through_the_origin(self):
+        rate = ot._CONFIG["answer_tokens_per_char"]["fact_check"]
+        for chars in (150000, 190170, 300000):
+            got = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", chars)
+            assert got == pytest.approx(32000 + rate * chars, abs=1), chars
+
+    def test_the_line_only_ever_lifts(self):
+        """Whichever term is larger wins, so adding the line lowered nothing."""
+        for chars in (500, 2182, 27113, 62000, 135514, 190170):
+            for domain in ("fact_check", "red_team"):
+                got = ot.compute_max_tokens("mistral", MISTRAL_HIGH, domain, chars)
+                table_only = 32000 + max(
+                    ot._CONFIG["answer_tokens"].get(
+                        domain, ot._CONFIG["answer_tokens"]["default"]
+                    )
+                    * _size_mult(chars),
+                    ot._CONFIG["answer_floor_tokens"],
+                )
+                assert got >= table_only - 1, (domain, chars)
+
+    def test_only_fact_check_has_a_line(self):
+        """The flag domains return a handful of findings whatever the claim
+        count; they keep the table."""
+        for chars in (190170, 400000):
+            flags = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "red_team", chars)
+            assert flags == 32000 + ot._CONFIG["answer_tokens"]["default"] * _size_mult(
+                chars
+            )
+
+    def test_fact_check_stays_the_largest_domain_at_every_size(self):
+        """The wall-clock budget sizes off the largest ceiling and assumes it is
+        fact_check's; the anchors are chosen so that stays true."""
+        for chars in (500, 2182, 9456, 27113, 62000, 135514, 190170):
+            for cfg, provider in (
+                (MISTRAL_HIGH, "mistral"),
+                ({"model": "m"}, "mistral"),
+            ):
+                fact = ot.compute_max_tokens(provider, cfg, "fact_check", chars)
+                for domain in ("red_team", "voice_style", "argument_integrity", "x"):
+                    assert fact >= ot.compute_max_tokens(provider, cfg, domain, chars)
+
+
+class TestNoEffortPassesAreCapped:
+    """claude-haiku-4-5:argument_integrity was cut off at exactly 8000 tokens,
+    the client's no-effort default, on 2026-09-28 and 2026-10-04 — both `wide`
+    runs of the 9,456-char smoke-test draft, 38,021 chars of flags written and
+    the rest lost. The flat default never saw the domain or the draft."""
+
+    HAIKU = {"model": "claude-haiku-4-5-20251001"}
+    TRUNCATED_AT = 8000
+    SMOKE_TEST_CHARS = 9456
+
+    def test_the_recorded_truncations_get_room(self):
+        got = ot.compute_max_tokens(
+            "claude", self.HAIKU, "argument_integrity", self.SMOKE_TEST_CHARS
+        )
+        # ~9,500 tokens were written before the cut (38,021 chars / 4), censored.
+        assert got >= 12000, got
+        assert got > self.TRUNCATED_AT
+
+    def test_never_below_the_default_it_replaces(self):
+        for chars in (100, 2182, 9456, 27113):
+            for domain in ("fact_check", "red_team", "argument_integrity"):
+                got = ot.compute_max_tokens("claude", self.HAIKU, domain, chars)
+                assert got >= ot._CONFIG["answer_floor_tokens"] == 8000, (domain, chars)
+
+    def test_sized_from_the_domain_and_the_draft_like_any_pass(self):
+        small = ot.compute_max_tokens(
+            "mistral", {"model": "mistral-small-latest"}, "fact_check", 2182
+        )
+        large = ot.compute_max_tokens(
+            "mistral", {"model": "mistral-small-latest"}, "fact_check", 190170
+        )
+        assert large > small
+        assert large >= 0.25 * 190170, "the per-character line applies here too"
+
+    def test_a_thinking_budget_stands_in_for_the_reasoning_term(self):
+        """The client sends the budget in place of any effort, and the thinking
+        spends from the same ceiling, so the budget is added as the table's
+        figure would be."""
+        budget = 16000
+        with_budget = ot.compute_max_tokens(
+            "claude", dict(self.HAIKU, thinking_budget=budget), "red_team", 27113
+        )
+        without = ot.compute_max_tokens("claude", self.HAIKU, "red_team", 27113)
+        assert with_budget == without + budget
+        assert with_budget > budget + 4096, "the client's own fallback for a budget"
+
+    def test_a_mistral_thinking_budget_is_not_a_thing(self):
+        """Only claude's request reads a budget; mistral's does not, so one in a
+        mistral config buys nothing here either."""
+        cfg = {"model": "mistral-small-latest", "thinking_budget": 16000}
+        assert ot.compute_max_tokens(
+            "mistral", cfg, "red_team", 27113
+        ) == ot.compute_max_tokens(
+            "mistral", {"model": "mistral-small-latest"}, "red_team", 27113
         )
 
 
@@ -204,11 +372,12 @@ class TestAnUnsetEffortIsTheModelsDefault:
                 assert unset == high, (model, chars, domain)
 
     @pytest.mark.parametrize("model", THINK_WHEN_ASKED)
-    def test_a_model_that_thinks_only_when_asked_keeps_the_client_default(self, model):
+    def test_a_model_that_thinks_only_when_asked_gets_no_reasoning_term(self, model):
         assert ot.effort_of("claude", {"model": model}) is None
-        assert (
-            ot.compute_max_tokens("claude", {"model": model}, "fact_check", 27113)
-            is None
+        got = ot.compute_max_tokens("claude", {"model": model}, "fact_check", 27113)
+        assert got == _no_effort_ceiling("fact_check", 27113)
+        assert got < ot.compute_max_tokens(
+            "claude", {"model": model, "effort": "high"}, "fact_check", 27113
         )
 
     def test_an_explicit_effort_still_wins(self):
@@ -832,6 +1001,55 @@ class TestTheModelsOwnLimit:
         assert ot.model_output_limit("claude", None) is None
 
 
+class TestTheContextWindowClamp:
+    """Mistral rejects prompt + max_tokens over its context window, and its map
+    entry reports the window (262,144) as the output limit too, so the output
+    clamp alone would let a long draft ask for more than the window has left."""
+
+    def test_the_prompt_is_estimated_dense_and_padded(self):
+        """2.5 chars per token (mistral measured 2.9-3.7) plus 10,000 for the
+        prompt's non-draft parts (measured 1,400-10,000): the estimate errs high
+        so the clamp errs low."""
+        assert ot._prompt_estimate(190170) == 76068 + 10000
+        assert ot._prompt_estimate(0) == 10000
+
+    def test_a_ceiling_past_the_room_left_is_clamped_to_it(self, monkeypatch):
+        monkeypatch.setattr(ot, "model_output_limit", lambda p, m: 262144)
+        monkeypatch.setattr(ot, "model_context_limit", lambda p, m: 262144)
+        chars = 400000
+        got = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", chars)
+        assert got == 262144 - ot._prompt_estimate(chars) == 92144
+
+    def test_it_does_not_bind_at_run_24s_size(self, monkeypatch):
+        monkeypatch.setattr(ot, "model_output_limit", lambda p, m: 262144)
+        monkeypatch.setattr(ot, "model_context_limit", lambda p, m: 262144)
+        unclamped = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", 190170)
+        monkeypatch.setattr(ot, "model_context_limit", lambda p, m: None)
+        assert (
+            ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", 190170)
+            == unclamped
+        )
+
+    def test_no_room_at_all_leaves_the_output_clamp(self, monkeypatch):
+        """A prompt that overfills the window fails at the provider whatever is
+        sent; a zero or negative ceiling would only hide that behind a 400 of
+        this module's making."""
+        monkeypatch.setattr(ot, "model_output_limit", lambda p, m: 262144)
+        monkeypatch.setattr(ot, "model_context_limit", lambda p, m: 20000)
+        got = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", 400000)
+        assert got == ot.compute_max_tokens(
+            "mistral", MISTRAL_HIGH, "fact_check", 400000, config=ot._CONFIG
+        )
+        assert got > 0
+
+    def test_lookup_goes_through_litellms_model_map(self, monkeypatch):
+        monkeypatch.undo()
+        ot.model_context_limit.cache_clear()
+        assert ot.model_context_limit("mistral", "mistral-medium-3-5") == 262144
+        assert ot.model_context_limit("claude", "claude-haiku-4-5-20251001") == 200000
+        assert ot.model_context_limit("mistral", None) is None
+
+
 class TestCalibrationCeiling:
     """--no-timeout exists to measure a call's real length. A ceiling that cuts
     the call off records the ceiling instead."""
@@ -884,22 +1102,29 @@ class TestWallClockCoversTheCeiling:
             largest / rate
         )
 
+    def test_a_model_with_no_computed_ceiling_keeps_the_formula(self):
+        cfg = {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}
+        formula = tm.compute_timeout(27113, cfg["model"], "xhigh", CEILING)
+        assert tm.compute_budget(27113, "openai", cfg, CEILING) == formula
+
     @pytest.mark.parametrize(
         "provider,cfg",
         [
-            ("openai", {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}),
             ("claude", {"model": "claude-haiku-4-5-20251001"}),
             ("mistral", {"model": "mistral-medium-3-5", "reasoning_effort": "none"}),
         ],
     )
-    def test_a_model_with_no_computed_ceiling_keeps_the_formula(self, provider, cfg):
-        formula = tm.compute_timeout(
-            27113,
-            cfg["model"],
-            cfg.get("reasoning_effort") or cfg.get("effort"),
-            CEILING,
-        )
-        assert tm.compute_budget(27113, provider, cfg, CEILING) == formula
+    def test_a_no_effort_capped_pass_gets_the_time_its_ceiling_needs(
+        self, provider, cfg
+    ):
+        """These now carry a computed ceiling too, so the budget covers it:
+        claude-haiku-4-5 at `wide` had 120s for a 12,000-token answer it writes
+        at 55-73 tokens a second."""
+        formula = tm.compute_timeout(27113, cfg["model"], None, CEILING)
+        need = ot.seconds_to_fill(provider, cfg, 27113)
+        budget = tm.compute_budget(27113, provider, cfg, CEILING)
+        assert need > formula, "the case this exists for"
+        assert budget >= need
 
     def test_still_clamped_to_the_task_ceiling(self):
         assert tm.compute_budget(27113, "claude", OPUS_HIGH, 300) == 300 - 15

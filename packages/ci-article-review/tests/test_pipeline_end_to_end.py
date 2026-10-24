@@ -281,6 +281,7 @@ def _fake_run_domain(model_name, domain, *a, **kw):
         "data": _DOMAIN_DATA[domain],
         "model": f"{model_name}-test-model",
         "tokens": {"prompt": 1000, "completion": 200},
+        "finish_reason": "stop",
         "elapsed_seconds": 1.0,
         "grounding_available": domain == "fact_check" and model_name == "gemini",
         "_model": model_name,
@@ -1415,6 +1416,7 @@ class TestATruncatedPassIsReportedAsIncomplete:
             result["data"] = {k: full[k] for k in ("confirmed", "outdated")}
             result["truncated"] = True
             result["max_tokens"] = 16000
+            result["finish_reason"] = "length"
             result["tokens"] = {"prompt": 1000, "completion": 16000}
             # Stopped inside the first `contradicted` entry, as run 3 did.
             result["raw"] = (
@@ -1437,6 +1439,7 @@ class TestATruncatedPassIsReportedAsIncomplete:
         entry = next(e for e in report["api_call_log"] if e["pass"] == self._PASS)
         assert entry["status"] == "partial"
         assert entry["max_tokens"] == 16000
+        assert entry["finish_reason"] == "length"
         assert "against a 16000-token ceiling" in caplog.text
         line = next(
             ln for ln in _calibration_lines(caplog) if "domain=fact_check" in ln
