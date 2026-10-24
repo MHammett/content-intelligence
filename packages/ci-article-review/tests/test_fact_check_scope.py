@@ -859,6 +859,103 @@ class TestSourcedVerdictsOutvoteALoneScopeCall:
         assert out["out_of_scope"][0]["excluded"] is True
 
 
+_WRAPPER = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+_PAGE = "https://www.example.org/report"
+
+
+class TestGroundingWrappersCountByTheirPage:
+    """A Gemini wrapper is a forwarder, not a page (#359).
+
+    ``grounding-api-redirect/<token>`` names a different token per citation,
+    whatever the page behind it. Keyed by that token, a wrapper plus the same
+    page's real URL from another model counted as two independent sources and
+    outvoted a lone scope call on the strength of one page.
+
+    These go through ``build_report``, because the wrappers are only followed
+    by the quote check, which runs before it and hands over what its fetches
+    landed on. A test that gave ``ScopeRules.apply`` the answer directly would
+    pass whether or not anything upstream ever produced it.
+    """
+
+    CLAIM = "Accuracy is the entire premise of this project."
+    QUOTE = "Accuracy is the entire premise of this project, said the author."
+
+    def _verdict(self, model, url):
+        return {
+            "claim": self.CLAIM,
+            "source": f"{model} source",
+            "source_url": url,
+            "supporting_quote": self.QUOTE,
+        }
+
+    def _report(self, urls_by_model, landed):
+        """The scope section for models citing ``urls_by_model``.
+
+        ``landed`` maps a cited URL to where the quote check's fetch ended up.
+        """
+        results = {
+            ("mistral", "fact_check"): {
+                "failed": False,
+                "data": _fc(
+                    out_of_scope=[
+                        _scope_call(self.CLAIM, "mistral", "subjective_judgment")
+                    ]
+                ),
+            }
+        }
+        checks = {}
+        for model, url in urls_by_model.items():
+            results[(model, "fact_check")] = {
+                "failed": False,
+                "data": _fc(confirmed=[self._verdict(model, url)]),
+            }
+            checks[(url, self.QUOTE)] = {"found": True, "reason": ""}
+            if url in landed:
+                checks[(url, self.QUOTE)]["final_url"] = landed[url]
+        report = consolidation.build_report(
+            article_title="T",
+            publication_name="p",
+            run_number=1,
+            corrected_draft="",
+            lt_result=None,
+            results=results,
+            ensemble_cfg={},
+            api_call_log=[],
+            fact_check_scope=ScopeRules.from_run("", {}, {}),
+            quote_checks=checks,
+        )
+        return report["section_2_fact_check"]["out_of_scope"][0]
+
+    def test_a_wrapper_and_the_real_url_of_the_same_page_are_one_source(self):
+        entry = self._report(
+            {"gemini": _WRAPPER + "AUZ1", "perplexity": _PAGE},
+            {_WRAPPER + "AUZ1": _PAGE},
+        )
+        assert entry["excluded"] is True
+
+    def test_two_wrappers_to_one_page_are_one_source(self):
+        entry = self._report(
+            {"gemini": _WRAPPER + "AUZ1", "gemini-b": _WRAPPER + "AUZ2"},
+            {_WRAPPER + "AUZ1": _PAGE, _WRAPPER + "AUZ2": _PAGE + "/"},
+        )
+        assert entry["excluded"] is True
+
+    def test_wrappers_to_two_pages_still_outvote(self):
+        """The control: resolving must not stop real corroboration counting."""
+        entry = self._report(
+            {"gemini": _WRAPPER + "AUZ1", "perplexity": "https://example.com/b"},
+            {_WRAPPER + "AUZ1": _PAGE},
+        )
+        assert entry["excluded"] is False
+        assert _PAGE in entry["reason"]
+        assert _WRAPPER not in entry["reason"]
+
+    def test_a_wrapper_that_was_not_followed_still_counts_as_a_page(self):
+        """No landing page recorded (offline, a refusal): behaviour as before."""
+        entry = self._report({"gemini": _WRAPPER + "AUZ1", "perplexity": _PAGE}, {})
+        assert entry["excluded"] is False
+
+
 class TestTheReasonFollowsTheDecision:
     """An excluded claim must not carry text saying it stayed in verification (#337)."""
 

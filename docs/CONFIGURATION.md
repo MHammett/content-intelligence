@@ -903,6 +903,16 @@ fifth, two real paragraphs of an about page quoted on separate lines with text
 between them left out, was a miss under contiguous matching and is why a line
 break splits a quote.
 
+**Where a Gemini citation led.** Gemini cites `vertexaisearch.cloud.google.com/
+grounding-api-redirect/<token>` wrappers, a different token for every citation,
+so the fetch records the page each one landed on (`final_url` on the check). The
+scope vote that lets sourced verdicts outvote a lone model scope call
+(`fact_check_scope.min_sources_to_overrule`) counts pages by that address, so a
+wrapper and another model's real URL for the same page are one source, not two.
+A wrapper that was not followed (`--offline`, a fetch that failed before
+redirecting, an expired wrapper) still counts as a page of its own, which can
+only keep a claim in verification.
+
 **Cost.** Fetches, no model calls. Section 9 reads the same pages for its own
 purposes, and the two share one per-run page cache (issue #356): a page that was
 fetched successfully is fetched once, however many claims cite it, and the log
