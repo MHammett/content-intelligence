@@ -47,14 +47,11 @@ While performing your fact-check, you may notice issues outside your primary sco
 
 RETURN FORMAT (JSON only, no other text):
 {
-  "confirmed": [
-    {"claim": "exact quote from draft", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page establishing the claim", "confidence": "high|medium|low", "note": "optional"}
+  "contradicted": [
+    {"claim": "exact quote from draft", "contradiction": "what contradicts it", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page that conflicts with the claim", "confidence": "high|medium|low"}
   ],
   "outdated": [
     {"claim": "exact quote from draft", "current_value": "what it should be", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page giving the current value", "confidence": "high|medium|low"}
-  ],
-  "contradicted": [
-    {"claim": "exact quote from draft", "contradiction": "what contradicts it", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page that conflicts with the claim", "confidence": "high|medium|low"}
   ],
   "unverifiable": [
     {"claim": "exact quote from draft", "checked": "what sources were searched", "sources_checked": ["https://... every page you actually opened, [] if none"], "reason": "why it could not be verified"}
@@ -64,6 +61,9 @@ RETURN FORMAT (JSON only, no other text):
   ],
   "out_of_scope": [
     {"claim": "exact quote from draft", "claim_type": "first_person|author_hypothesis|internal_arithmetic|subjective_judgment|future_prediction|other", "reason": "why no source can settle this"}
+  ],
+  "confirmed": [
+    {"claim": "exact quote from draft", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page establishing the claim", "confidence": "high|medium|low", "note": "optional"}
   ],
   "additional_observations": [
     {
