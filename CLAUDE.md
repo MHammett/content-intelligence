@@ -112,12 +112,14 @@ Measured 2026-09-05 over 12 live runs: `wide` beat the retired `standard` preset
 |------------|------------------------:|----------------:|----------------:|--------------------:|
 | `wide`     | $0.38      | $0.63–0.94 | 6.8%            | 0.0%                |
 | `balanced` | $1.28      | —          | 6.4%            | 1.1%                |
-| `thorough` (claude-sonnet-5) | $1.74 | $1.84 | 16.9% | 22.1%      |
+| `thorough` (claude-sonnet-5) | $1.74 | **$3.21** § | 16.9% | 22.1%      |
 | `maximum`  | $10.27 †   | $7.79      | 20.0%           | 29.6%               |
 
 † Priced with the stale `gpt-5.6-sol` rate — see above; re-priced it is $9.60. The other three rows do not use sol and are unaffected, so the *ratios* this table was built to compare still hold; `maximum` is ~25x `wide`, not 27x.
 
-‡ Tokens only, **derived not measured**: real captures of this draft re-priced call by call under today's line-up (2026-10-03). `wide`'s is the one measured figure, and it is measured on the 9,456-char smoke test rather than this draft — four GPT-6-era runs, 2026-09-30 and 10-04; see the `wide` section above for why its spread is this wide. Add search fees on top: $0.45–0.9 at `thorough`, $1.5–2.8 at `maximum` — see the all-in paragraph above, which is why the `maximum` row is not the saving it looks like. `balanced` has no capture of this draft to re-price.
+‡ Tokens only, **derived not measured**: real captures of this draft re-priced call by call under today's line-up (2026-10-03). `wide`'s is the one measured figure, and it is measured on the 9,456-char smoke test rather than this draft — four GPT-6-era runs, 2026-09-30 and 10-04; see the `wide` section above for why its spread is this wide. Add search fees on top: $1.5–2.8 at `maximum` — see the all-in paragraph above, which is why the `maximum` row is not the saving it looks like. `balanced` has no capture of this draft to re-price.
+
+§ `thorough` is **measured, all-in**, and it is the one row here that replaced a derived figure with a live one: one full run on this draft, 2026-10-05, **$3.2067** ($2.39 tokens + $0.817 search, 60 Gemini units, 105 calls, all 12 ensemble passes `ok`; capture `pipeline_history/gpt6-repro-thorough-1/`). It had been quoted here as $1.84 tokens plus $0.45–0.9 search, i.e. $2.3–2.7 — **understated by about 20–40%.** The derivation re-priced `run_21`, which was a *degraded* capture with several failed ensemble passes, so it carried fewer output tokens than a healthy run does. **Re-pricing a partly-failed capture under-states a healthy run** — check a capture's failed passes before using it as a cost basis. Still n=1, so the repro columns beside it remain 5.6-era (issue MHammett/content-intelligence#287).
 
 Two conclusions came out of this and are now reflected in `configs/presets.yaml`:
 
