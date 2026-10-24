@@ -162,3 +162,31 @@ class TestRehearsalEndToEnd:
         # Said, so a rehearsal that ran on dummies does not look like one that
         # read the real keys.
         assert UNSET in done.stdout and UNSET_TOO in done.stdout
+
+
+class TestSplitForward:
+    """Flags after a bare ``--`` are forwarded, split before argparse sees them.
+
+    CPython 3.12.3, which CI runs, rejects ``-- --flag`` after the options when
+    argparse is left to do it (3.13 accepts it), and the end-to-end tests above
+    were the first thing to put it in front of that version.
+    """
+
+    def test_flags_after_a_bare_double_dash_are_forwarded(self):
+        own, forward = rehearsal.split_forward(
+            ["h.md", "--publication", "p", "--", "--no-seo-suggestions", "--x", "y"]
+        )
+        assert own == ["h.md", "--publication", "p"]
+        assert forward == ["--no-seo-suggestions", "--x", "y"]
+
+    def test_without_one_nothing_is_forwarded(self):
+        own, forward = rehearsal.split_forward(["h.md", "--publication", "p"])
+        assert (own, forward) == (["h.md", "--publication", "p"], [])
+
+    def test_only_the_first_double_dash_splits(self):
+        own, forward = rehearsal.split_forward(["h.md", "--", "--a", "--", "--b"])
+        assert (own, forward) == (["h.md"], ["--a", "--", "--b"])
+
+    def test_a_trailing_double_dash_forwards_nothing(self):
+        own, forward = rehearsal.split_forward(["h.md", "--"])
+        assert (own, forward) == (["h.md"], [])

@@ -111,9 +111,26 @@ def _block_sockets():
     socket.create_connection = refuse
 
 
+def split_forward(argv):
+    """Split ``argv`` at its first bare ``--``: ``(this tool's own args, forwarded)``.
+
+    argparse is not asked to do it. With ``nargs="*"`` for the forwarded flags,
+    CPython 3.12.3 (what CI runs) answers "unrecognized arguments: -- --flag" when
+    the options come before the ``--``, and 3.13 does not; splitting first gives
+    the same answer on every version.
+    """
+    argv = list(argv)
+    if "--" not in argv:
+        return argv, []
+    at = argv.index("--")
+    return argv[:at], argv[at + 1 :]
+
+
 def main(argv=None):
+    own, forward = split_forward(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
+        usage="%(prog)s HANDOFF --publication NAME [options] [-- ci-review flags ...]",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("handoff", help="path to a publication handoff")
@@ -128,12 +145,8 @@ def main(argv=None):
         "--out-dir",
         help="where to write the bytes of each upload (default: alongside the handoff)",
     )
-    parser.add_argument(
-        "forward",
-        nargs="*",
-        help="flags to forward to ci-review, after a bare --",
-    )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(own)
+    args.forward = forward
 
     handoff = pathlib.Path(args.handoff).resolve()
     out_dir = pathlib.Path(args.out_dir) if args.out_dir else handoff.parent
