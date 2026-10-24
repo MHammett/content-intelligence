@@ -39,8 +39,8 @@ The fetch reuses the resolver's: SSRF-guarded ``safe_get``, the same text
 extraction, and the same TLS-fingerprint retry on a 403. It does not use the
 archive.org fallback (a quote found in a year-old snapshot is not a quote on the
 page the draft cites, and the lookups would multiply with the number of URLs).
-Section 9 fetches the same pages again for its own purposes; sharing one fetch
-between them is possible and not done here.
+Section 9 reads the same pages for its own purposes. The pipeline hands both one
+``page_cache.PageCache`` so each page is fetched once per run (#356).
 """
 
 import html
@@ -235,17 +235,29 @@ def _classify(texts, partial):
     return PageRead(status="read", texts=texts, partial=partial)
 
 
-def fetch_page(url, timeout=_FETCH_TIMEOUT):
-    """Fetch ``url`` and return what a quote can be looked for in. Never raises."""
+def _get_checked(url, timeout):
+    resp = safe_get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+
+def fetch_page(url, timeout=_FETCH_TIMEOUT, cache=None):
+    """Fetch ``url`` and return what a quote can be looked for in. Never raises.
+
+    ``cache`` is the run's ``page_cache.PageCache``: the response is kept in it
+    for Section 9, and a page another caller already fetched is not fetched again.
+    """
     try:
-        resp = safe_get(url, timeout=timeout)
-        resp.raise_for_status()
+        if cache is None:
+            resp = _get_checked(url, timeout)
+        else:
+            resp = cache.get_page(url, lambda: _get_checked(url, timeout), timeout)
         return _read_response(resp, url)
     except UnsafeURLError:
         return PageRead(status="unsafe", detail="a non-public address")
     except Exception as exc:  # noqa: BLE001 - any failure is "could not read"
         if wayback.fallback_reason_for_exception(exc) == "blocked":
-            escalated = resolver._impersonation_fallback_content(url, timeout)
+            escalated = resolver._escalate(url, timeout, cache)
             if escalated is not None:
                 _final, content, _kind = escalated
                 return _classify([content], False)
@@ -286,18 +298,21 @@ def _targets(results):
     return list(targets)
 
 
-def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL):
+def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL, cache=None):
     """Look for each fact-check verdict's quote on the page it cites.
 
     ``results`` is the ensemble's ``{(model, domain): result}`` dict, untouched.
-    ``fetch`` is for tests: ``fetch(url, timeout) -> PageRead``.
+    ``fetch`` is for tests: ``fetch(url, timeout) -> PageRead``. ``cache`` is the
+    run's ``page_cache.PageCache``, handed on to ``fetch_page`` so Section 9 can
+    reuse these fetches; it is not used when ``fetch`` is given.
 
     Returns ``(checks, summary)``. ``checks`` maps ``(url, quote)`` to
     ``{"found": True | False | None, "reason": str, "chars": int}``; ``found`` is
     ``None`` whenever nothing was established. ``summary`` counts the outcomes
     for the report.
     """
-    fetch = fetch or fetch_page
+    if fetch is None:
+        fetch = lambda url, timeout: fetch_page(url, timeout, cache=cache)  # noqa: E731
     pairs = _targets(results)
     urls = list(dict.fromkeys(url for url, _quote in pairs))
     fetched_urls, over_limit = urls[:_MAX_URLS], set(urls[_MAX_URLS:])

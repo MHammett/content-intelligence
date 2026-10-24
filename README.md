@@ -894,6 +894,7 @@ content-intelligence/
 │   │   │   │       ├── draft_citations.py    traces a claim to the citation the draft cites for it
 │   │   │   │       ├── reask.py             hands a refuted citation back to the model that asserted it
 │   │   │   │       ├── quote_check.py        looks for a fact-check verdict's quote on the page it cites
+│   │   │   │       ├── page_cache.py         one fetch per page per run, shared by the quote check and Section 9
 │   │   │   │       ├── pagination.py         reads past page one of a paginated source
 │   │   │   │       ├── wayback.py            Wayback archive check + Save Page Now submission
 │   │   │   │       ├── topic_match.py        keyword gating for pointer-only adapters

@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import importlib
 import logging
@@ -409,6 +410,29 @@ def _fetch_following_page(url, timeout=15):
     return resp
 
 
+def _get_page(url, timeout=15, page_cache=None):
+    """The direct fetch of a source page, taken from ``page_cache`` when it holds one.
+
+    Raises on an HTTP error, as ``_fetch_following_page`` does. Only a fetch that
+    succeeded is kept (see ``page_cache``), so a failure reaches the caller's
+    fallback ladder exactly as an uncached one would.
+    """
+    if page_cache is None:
+        return _fetch_following_page(url, timeout=timeout)
+    return page_cache.get_page(
+        url, lambda: _fetch_following_page(url, timeout=timeout), timeout
+    )
+
+
+def _escalate(url, timeout, page_cache=None):
+    """``_impersonation_fallback_content``, taken from ``page_cache`` when it holds one."""
+    if page_cache is None:
+        return _impersonation_fallback_content(url, timeout)
+    return page_cache.get_escalated(
+        url, lambda: _impersonation_fallback_content(url, timeout), timeout
+    )
+
+
 def _wayback_fallback_content(url, timeout):
     """When the origin won't (or can't) serve the page, read archive.org's
     snapshot as the content source instead.
@@ -700,6 +724,7 @@ def _resolve_known_url(
     timeout=15,
     author=None,
     verify_claim=None,
+    page_cache=None,
 ):
     """Resolve a claim whose source URL is already known (e.g. supplied by the
     fact-check model itself), bypassing the narrow adapter matching entirely.
@@ -766,8 +791,7 @@ def _resolve_known_url(
     # off ``known_url`` — see where it is reassigned below.
     archive_lookup_url = known_url
     try:
-        resp = safe_get(known_url, timeout=timeout)
-        resp.raise_for_status()
+        resp = _get_page(known_url, timeout, page_cache)
         content, content_kind = _extract_fetched(resp, known_url)
         # Where the fetch actually landed. `safe_get` follows redirects one
         # validated hop at a time and returns the last hop's response, so this
@@ -823,9 +847,7 @@ def _resolve_known_url(
         # archive still gets its turn immediately below and that trade is made
         # explicit in ``archive_provenance``.
         escalated = (
-            _impersonation_fallback_content(known_url, timeout)
-            if reason == "blocked"
-            else None
+            _escalate(known_url, timeout, page_cache) if reason == "blocked" else None
         )
         if escalated is not None:
             final_url, content, content_kind = escalated
@@ -983,7 +1005,12 @@ def _resolve_known_url(
     verify_content = content
     if verified_via == "direct":
         followed = pagination.follow(
-            resp, known_url, content, _fetch_following_page, _extract_fetched, timeout
+            resp,
+            known_url,
+            content,
+            functools.partial(_get_page, page_cache=page_cache),
+            _extract_fetched,
+            timeout,
         )
         if followed.text:
             verify_content = content + "\n\n" + followed.text
@@ -1051,7 +1078,9 @@ def _resolve_known_url(
     return _check_drift(result, checksum_index)
 
 
-def verify_source_supports(claim, url, api_keys=None, call_log=None, timeout=15):
+def verify_source_supports(
+    claim, url, api_keys=None, call_log=None, timeout=15, page_cache=None
+):
     """Does the page at ``url`` actually support ``claim``? One URL, one answer.
 
     ``resolve_citations`` is the Pass 3 entry point and does considerably more:
@@ -1068,7 +1097,12 @@ def verify_source_supports(claim, url, api_keys=None, call_log=None, timeout=15)
     "does not support".
     """
     return _resolve_known_url(
-        claim, url, api_keys=api_keys, call_log=call_log, timeout=timeout
+        claim,
+        url,
+        api_keys=api_keys,
+        call_log=call_log,
+        timeout=timeout,
+        page_cache=page_cache,
     )
 
 
@@ -1107,6 +1141,7 @@ def _resolve_candidates(
     checksum_index=None,
     author=None,
     verify_claim=None,
+    page_cache=None,
 ):
     """Check a claim against the sources cited for it, best candidate first.
 
@@ -1131,6 +1166,7 @@ def _resolve_candidates(
             checksum_index=checksum_index,
             author=author,
             verify_claim=verify_claim,
+            page_cache=page_cache,
         )
         if verify_claim:
             result["verified_as"] = verify_claim
@@ -1184,6 +1220,7 @@ def _resolve_one(
     checksum_index=None,
     author=None,
     verify_claim=None,
+    page_cache=None,
 ):
     """Resolve a single claim against the configured sources, in order.
 
@@ -1207,6 +1244,7 @@ def _resolve_one(
             checksum_index=checksum_index,
             author=author,
             verify_claim=verify_claim,
+            page_cache=page_cache,
         )
 
     for source_config in citation_sources:
@@ -2333,6 +2371,7 @@ def resolve_citations(
     history_root=None,
     author=None,
     capture_settings=None,
+    page_cache=None,
 ):
     """
     For each claim, resolve a primary source. If the claim entry carries
@@ -2367,6 +2406,10 @@ def resolve_citations(
     the on-disk history, so a caller that doesn't opt in never pays for a
     history scan.
 
+    ``page_cache`` (a ``page_cache.PageCache``, one per run) lets the claims of
+    this call, and the quote check that ran before it, share one fetch per cited
+    URL. Without it every claim fetches its own copy.
+
     Returns a list of resolution results in the original claim order.
     """
     if not claims:
@@ -2398,6 +2441,7 @@ def resolve_citations(
                     checksum_index,
                     author,
                     verify_claim,
+                    page_cache,
                 )
             ),
             _RESOLVE_TIMEOUT_SECONDS,
