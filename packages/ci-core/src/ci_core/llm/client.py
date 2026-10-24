@@ -133,6 +133,7 @@ from .. import redact
 from .. import text_repair
 from . import cache as cache_mod
 from . import output_tokens
+from . import ratelimit
 from . import schema as schema_mod
 from . import vertex
 from .json_utils import extract_json_with_salvage
@@ -2720,6 +2721,13 @@ def _attempt(
         routing = _route_kwargs(provider, api_key, cfg, model)
         if spec["surface"] == "responses":
             _refuse_fake_stream(_qualified(provider, model, cfg))
+        # Wait for room under the provider's tokens-per-minute limit, if one is
+        # configured (ratelimit.py). Ahead of the timing record on purpose: the
+        # wait is ours, not the provider's, and must not count as a first-byte
+        # silence. A no-op, returning None, where no limit is set.
+        ticket = ratelimit.reserve(
+            provider, ratelimit.estimate_tokens(system_prompt, user_prompt)
+        )
         # Started before litellm is called, so no wait for the provider goes
         # unmeasured — including the one inside completion() itself, which is
         # bounded by the socket timeout rather than by _iter_with_gap.
@@ -2733,7 +2741,14 @@ def _attempt(
             # recorded how it ended. A no-op when _iter_with_gap already did.
             timing.cut_short(exc)
             _mark_refusal(exc, timing)
+            # A refused request was not counted by the provider, so give its
+            # tokens back. Anything else (a stream that died part-way) may have
+            # been, and keeps its reservation.
+            if _status_of(exc) == 429:
+                ratelimit.release(ticket)
             raise
+        used = _read_tokens(assembled.get("usage"))
+        ratelimit.settle(ticket, used["prompt"], used["completion"])
         if searchable:
             # Read per stream, so an attempt a retry throws away carries its
             # own count into the discarded record with its usage.

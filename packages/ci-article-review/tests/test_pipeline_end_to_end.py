@@ -2372,3 +2372,36 @@ class TestHistoryRootOverride:
         assert not (tmp_path / "replay" / "history").exists()
         # Quarantined like any replay: nothing at the article's own level.
         assert not [p for p in shared.glob("*/run_*_report.json")]
+
+
+class TestRateLimitsReachTheMeter:
+    """``rate_limits:`` in the user config is what tells the meter the account's limit.
+
+    Without this wiring the meter in ``ci_core.llm.ratelimit`` is never given a
+    limit and waits for nothing (#361).
+    """
+
+    def _configured(self, tmp_path, rate_limits):
+        config = dict(_CONFIG)
+        if rate_limits is not None:
+            config["rate_limits"] = rate_limits
+        with patch("ci_core.llm.ratelimit.configure") as configure:
+            with _stubbed_run(
+                tmp_path,
+                extra_patches=[
+                    patch(
+                        "ci_article_review.pipeline.merge_configs", return_value=config
+                    )
+                ],
+            ):
+                pass
+        return configure
+
+    def test_the_configured_limits_are_handed_to_the_meter(self, tmp_path):
+        limits = {"mistral": {"tokens_per_minute": 100000}}
+        configure = self._configured(tmp_path, limits)
+        configure.assert_called_once_with(limits)
+
+    def test_a_config_with_no_limits_still_resets_the_meter(self, tmp_path):
+        configure = self._configured(tmp_path, None)
+        configure.assert_called_once_with(None)

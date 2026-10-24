@@ -3195,6 +3195,7 @@ def run_draft_pipeline(
         user_config.setdefault("pipeline", {})["cost_preset"] = cost_preset
         log.info(f"cost_preset overridden via --cost-preset: {cost_preset}")
     config = merge_configs(user_config, pub_config_raw)
+    llm.ratelimit.configure(config.get("rate_limits"))
     if api_key_overrides:
         config = apply_api_key_overrides(config, api_key_overrides)
         log.info(
@@ -5734,6 +5735,7 @@ def run_publish_pipeline(
     user_config = load_user_config(config_dir)
     pub_config_raw = load_publication_config(publication_name, config_dir)
     config = merge_configs(user_config, pub_config_raw)
+    llm.ratelimit.configure(config.get("rate_limits"))
     if api_key_overrides:
         config = apply_api_key_overrides(config, api_key_overrides)
         log.info(

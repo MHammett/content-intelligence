@@ -536,6 +536,15 @@ pipeline:
 #       voice_style: 1.1
 
 
+# Account limits that a provider enforces across everything on one key. Optional.
+# With a limit set, a call whose tokens would not fit under it waits for the last
+# minute's usage to age out, instead of being refused with a 429. Leave a
+# provider out and nothing is metered for it. Find the figure in the provider's
+# console (Mistral: Admin > Limits); a paid key's differs from the free tier's.
+# rate_limits:
+#   mistral:
+#     tokens_per_minute: 100000
+
 # Delta assessment thresholds for re-run recommendation
 delta:
   word_change_threshold_pct: 15

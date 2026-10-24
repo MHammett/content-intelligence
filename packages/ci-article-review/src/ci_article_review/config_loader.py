@@ -866,6 +866,10 @@ def merge_configs(user_config, pub_config):
             },
         ),
         "ensemble": user_config.get("ensemble", {}),
+        # Each provider's account limits, read by ci_core.llm.ratelimit. A block
+        # of its own because the cost presets rewrite ``models:`` and the limit
+        # belongs to the account, not to a model.
+        "rate_limits": user_config.get("rate_limits", {}),
         "models": models,
         "publication": pub_config,
     }

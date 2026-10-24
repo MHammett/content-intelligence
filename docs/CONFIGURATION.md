@@ -909,6 +909,22 @@ verdict where the capture had it.
 
 ---
 
+### Provider token limits (rate_limits)
+
+A provider limits the tokens one key may use in a minute, across every model on it. Mistral's is 100,000 a minute on the key measured on 2026-10-24, and a review of a 135,514-character draft spent an estimated 140,000 of them in the ensemble (42,000 output tokens logged, the rest an estimate of the prompts) before its citation relevance checks began, so five of those checks were refused with HTTP 429 and lost (issue #361). A cap on how many calls run at once does not help; the budget is tokens, and whatever ran in the last minute has spent it.
+
+```yaml
+rate_limits:
+  mistral:
+    tokens_per_minute: 100000
+```
+
+With a limit set, each call to that provider reserves an estimate of its prompt (characters divided by three, so a little high) before it is sent and waits until the last minute's usage leaves room under 90% of the limit. When the call ends, the reservation is replaced with the real prompt and completion counts. A call refused with a 429 gives its reservation back; one that failed some other way keeps it, because the provider may have counted it. No call waits more than 70 seconds, and a call larger than the whole budget goes once the window is empty. A provider you leave out is not metered, and with no `rate_limits` block nothing changes.
+
+The figure is your account's, which this code cannot see: read it from the provider's console (Mistral: Admin > Limits). It is shared with anything else using the same key at the same time, such as another review running in another window, so set it a little under what the console says if you run several at once.
+
+Mistral does send `x-ratelimit-remaining-tokens-minute`, but litellm drops the response headers of a streamed Mistral call, so the meter counts from the usage each call reports instead. Whether Mistral counts a streamed call's tokens when it starts or when it ends is not documented; the 90% headroom is there to absorb the difference.
+
 ### Reproducibility context
 
 Every run compares itself against earlier runs of the same draft and reports what
