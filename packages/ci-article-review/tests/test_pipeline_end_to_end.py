@@ -1424,14 +1424,26 @@ class TestATruncatedPassIsReportedAsIncomplete:
         return result
 
     def _stub(self):
-        return patch(
-            "ci_article_review.pipeline._run_domain", side_effect=self._truncated
-        )
+        """The truncated pass, and no continuation call for it.
+
+        Continuing is on by default and would repair the pass this class is
+        about; ``TestATruncatedPassIsContinued`` covers that. This is the report
+        of a cut nothing followed up, which is what a run with
+        ``continue_truncated_passes: false``, or an older capture, produces.
+        """
+        config = copy.deepcopy(_CONFIG)
+        config["pipeline"]["continue_truncated_passes"] = False
+        return [
+            patch(
+                "ci_article_review.pipeline._run_domain", side_effect=self._truncated
+            ),
+            patch("ci_article_review.pipeline.merge_configs", return_value=config),
+        ]
 
     def test_the_call_log_records_the_ceiling_it_hit(self, tmp_path, caplog):
         with caplog.at_level("INFO"):
             with _stubbed_run(
-                tmp_path, extra_patches=[self._stub()], offline=True
+                tmp_path, extra_patches=self._stub(), offline=True
             ) as report:
                 pass
         entry = next(e for e in report["api_call_log"] if e["pass"] == self._PASS)
@@ -1444,9 +1456,7 @@ class TestATruncatedPassIsReportedAsIncomplete:
         assert line.endswith(" max_tokens=16000"), line
 
     def test_the_report_says_which_buckets_never_arrived(self, tmp_path):
-        with _stubbed_run(
-            tmp_path, extra_patches=[self._stub()], offline=True
-        ) as report:
+        with _stubbed_run(tmp_path, extra_patches=self._stub(), offline=True) as report:
             pass
         (detail,) = report["truncated_result_details"]
         assert detail == {
@@ -1462,7 +1472,7 @@ class TestATruncatedPassIsReportedAsIncomplete:
         }
 
     def test_section_2_and_the_worklist_say_it_on_disk(self, tmp_path):
-        with _stubbed_run(tmp_path, extra_patches=[self._stub()], offline=True):
+        with _stubbed_run(tmp_path, extra_patches=self._stub(), offline=True):
             pass
         (review,) = (tmp_path / "history").rglob("run_1_*_review.md")
         section = review.read_text(encoding="utf-8").split("## SECTION 2")[1]
@@ -1475,7 +1485,7 @@ class TestATruncatedPassIsReportedAsIncomplete:
         )
 
     def test_the_end_of_run_summary_warns(self, tmp_path, capsys):
-        with _stubbed_run(tmp_path, extra_patches=[self._stub()], offline=True):
+        with _stubbed_run(tmp_path, extra_patches=self._stub(), offline=True):
             pass
         out = capsys.readouterr().out
         assert "model pass(es) were cut off at their output-token ceiling" in out
@@ -1489,6 +1499,185 @@ class TestATruncatedPassIsReportedAsIncomplete:
             pass
         assert report["truncated_result_details"] == []
         assert "cut off at their output-token ceiling" not in capsys.readouterr().out
+
+
+class TestATruncatedPassIsContinued:
+    """The cut above, followed up: one more call for the buckets that never came.
+
+    The stub cuts gemini:fact_check inside `unverifiable` and answers the
+    continuation call with the fixture's own buckets for what was asked, so the
+    merged pass holds exactly what an uncut call would have.
+    """
+
+    _PASS = "gemini:fact_check"
+
+    @staticmethod
+    def _first_call(result):
+        full = _DOMAIN_DATA["fact_check"]
+        result["data"] = {
+            "contradicted": full["contradicted"],
+            "outdated": full["outdated"],
+        }
+        result["truncated"] = True
+        result["max_tokens"] = 16000
+        result["tokens"] = {"prompt": 1000, "completion": 16000}
+        result["raw"] = (
+            json.dumps(result["data"])[:-1] + ', "unverifiable": [{"claim": "Ten'
+        )
+        return result
+
+    @classmethod
+    def _stub_run_domain(cls, model_name, domain, *a, continuation=None, **kw):
+        result = _fake_run_domain(model_name, domain, *a, **kw)
+        if domain != "fact_check":
+            return result
+        if continuation is None:
+            return cls._first_call(result)
+        full = _DOMAIN_DATA["fact_check"]
+        result["data"] = {b: full.get(b, []) for b in continuation["missing"]}
+        result["tokens"] = {"prompt": 1100, "completion": 700}
+        return result
+
+    def _patches(self, calls=None, **pipeline_cfg):
+        config = copy.deepcopy(_CONFIG)
+        config["pipeline"].update(pipeline_cfg)
+
+        def run_domain(*a, **kw):
+            if calls is not None:
+                calls.append((a[0], a[1], kw.get("continuation")))
+            return self._stub_run_domain(*a, **kw)
+
+        return [
+            patch("ci_article_review.pipeline._run_domain", side_effect=run_domain),
+            patch("ci_article_review.pipeline.merge_configs", return_value=config),
+        ]
+
+    def _run(self, tmp_path, calls=None, **run_kwargs):
+        with _stubbed_run(
+            tmp_path, extra_patches=self._patches(calls), offline=True, **run_kwargs
+        ) as report:
+            pass
+        return report
+
+    def test_one_follow_up_call_is_made_for_the_cut_pass_only(self, tmp_path):
+        calls = []
+        self._run(tmp_path, calls)
+        follow_ups = [(m, d, c) for m, d, c in calls if c is not None]
+        assert [(m, d) for m, d, _ in follow_ups] == [("gemini", "fact_check")]
+        (_, _, continuation) = follow_ups[0]
+        assert continuation["missing"] == [
+            "unverifiable",
+            "primary_source_needed",
+            "out_of_scope",
+            "confirmed",
+            "additional_observations",
+        ]
+
+    def test_the_merged_pass_reaches_section_2(self, tmp_path):
+        report = self._run(tmp_path)
+        confirmed = report["section_2_fact_check"]["confirmed"]
+        assert confirmed, "the follow-up's `confirmed` never reached Section 2"
+        (detail,) = report["truncated_result_details"]
+        assert detail["continued"] is True
+        assert detail["still_missing"] == detail["missing_buckets"] == []
+        assert detail["cut_in"] == "unverifiable"
+
+    def test_the_call_log_and_cost_count_both_calls(self, tmp_path):
+        report = self._run(tmp_path)
+        entry = next(e for e in report["api_call_log"] if e["pass"] == self._PASS)
+        # The first call's figures: it was cut off.
+        assert entry["status"] == "partial"
+        assert entry["tokens"] == {"prompt": 1000, "completion": 16000}
+        (record,) = entry["continuations"]
+        assert record["tokens"] == {"prompt": 1100, "completion": 700}
+
+        summary = report["cost_summary"]
+        assert summary["continuation_calls"] == 1
+        row = next(r for r in summary["by_pass"] if r["pass"] == self._PASS)
+        alone = cost.calculate([{**entry, "continuations": []}])["total_usd"]
+        follow_up = cost.calculate(
+            [{"model": record["model"], "tokens": record["tokens"]}]
+        )["total_usd"]
+        assert row["total_usd"] == pytest.approx(alone + follow_up, abs=1e-4)
+        assert row["continuation_usd"] == pytest.approx(follow_up, abs=1e-4)
+        assert summary["incurred_usd"] == summary["total_usd"]
+
+    def test_the_report_and_the_end_of_run_block_say_it_was_recovered(
+        self, tmp_path, capsys
+    ):
+        self._run(tmp_path)
+        out = capsys.readouterr().out
+        assert (
+            "Recovered by a follow-up call: unverifiable, primary_source_needed, "
+            "out_of_scope, confirmed, additional_observations." in out
+        )
+        assert "Never arrived" not in out
+        (review,) = (tmp_path / "history").rglob("run_1_*_review.md")
+        md = review.read_text(encoding="utf-8")
+        assert "a follow-up call delivered `unverifiable`" in md
+
+    def test_a_replay_of_it_makes_no_call_and_bills_it_as_history(self, tmp_path):
+        self._run(tmp_path / "live")
+        capture = next((tmp_path / "live" / "history").rglob("*_results.json"))
+        assert ensemble_capture.load(capture)[self._PASS]["continuations"]
+
+        calls = []
+        report = self._run(tmp_path / "replay", calls, replay_results=str(capture))
+        assert calls == [], "a replay made a model call"
+        summary = report["cost_summary"]
+        assert summary["continuation_calls"] == 1
+        assert summary["incurred_usd"] == 0.0
+        assert summary["replayed_usd"] == summary["total_usd"] > 0
+        (detail,) = report["truncated_result_details"]
+        assert detail["continued"] is True
+
+    def _uncontinued_capture(self, tmp_path):
+        """A capture with the cut pass and no continuation, as an older run or
+        `continue_truncated_passes: false` leaves it."""
+        with _stubbed_run(
+            tmp_path / "original",
+            extra_patches=self._patches(continue_truncated_passes=False),
+            offline=True,
+        ):
+            pass
+        capture = next((tmp_path / "original" / "history").rglob("*_results.json"))
+        assert ensemble_capture.load(capture)[self._PASS]["truncated"] is True
+        assert "continued" not in ensemble_capture.load(capture)[self._PASS]
+        return capture
+
+    def test_a_replay_never_continues_a_cut_it_finds(self, tmp_path):
+        """Replayed results are history: the cut is reported, not repaired."""
+        capture = self._uncontinued_capture(tmp_path)
+        calls = []
+        report = self._run(tmp_path / "replay", calls, replay_results=str(capture))
+        assert calls == [], "a replay made a model call"
+        assert report["cost_summary"]["continuation_calls"] == 0
+        (detail,) = report["truncated_result_details"]
+        assert "continued" not in detail
+        assert detail["missing_buckets"][0] == "unverifiable"
+
+    def test_retry_failed_continues_a_truncated_pass_and_bills_only_that(
+        self, tmp_path
+    ):
+        capture = self._uncontinued_capture(tmp_path)
+
+        calls = []
+        report = self._run(tmp_path / "retry", calls, retry_failed_results=str(capture))
+        assert [(m, d) for m, d, c in calls] == [("gemini", "fact_check")]
+        assert calls[0][2] is not None, "re-ran the pass instead of continuing it"
+
+        entry = next(e for e in report["api_call_log"] if e["pass"] == self._PASS)
+        assert entry["replayed"] is True, "the first call is the capture's spend"
+        (record,) = entry["continuations"]
+        assert record["replayed"] is False
+        follow_up = cost.calculate(
+            [{"model": record["model"], "tokens": record["tokens"]}]
+        )["total_usd"]
+        assert report["cost_summary"]["incurred_usd"] == pytest.approx(
+            follow_up, abs=1e-4
+        )
+        (detail,) = report["truncated_result_details"]
+        assert detail["recovered_buckets"] and detail["still_missing"] == []
 
 
 class TestNoTimeoutLiftsTheOutputCeiling:

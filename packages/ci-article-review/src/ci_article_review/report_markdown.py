@@ -837,6 +837,8 @@ def _cut_description(detail):
     arrived short, or cut inside the first entry of the next one, which salvage
     then dropped whole. The parsed data alone cannot tell them apart.
     """
+    if detail.get("continued"):
+        return _continued_description(detail)
     missing = detail.get("missing_buckets") or []
     last = detail.get("last_bucket")
     cut_in = detail.get("cut_in")
@@ -858,6 +860,70 @@ def _cut_description(detail):
     if last:
         return f"only its last bucket, `{last}`, was cut short"
     return ""
+
+
+def _cut_partway(detail):
+    """True when the first call was cut inside a bucket it had started filling.
+
+    That bucket arrived short and is not asked for again by a continuation
+    call: re-asking would re-send every entry already delivered.
+    """
+    cut_in = detail.get("cut_in")
+    return bool(cut_in) and cut_in == detail.get("last_bucket")
+
+
+def _continued_description(detail):
+    """``_cut_description`` for a pass a continuation call followed up.
+
+    Says where the first call stopped, what the follow-up delivered, what
+    neither did, and that the bucket the cut fell inside may still be short —
+    the one loss a follow-up cannot repair.
+    """
+    cut_in = detail.get("cut_in")
+    last = detail.get("last_bucket")
+    recovered = detail.get("recovered_buckets") or []
+    still = detail.get("still_missing") or []
+    if _cut_partway(detail):
+        entries = detail.get("cut_in_entries")
+        after = (
+            f" after {entries:,} entr{'y' if entries == 1 else 'ies'}"
+            if isinstance(entries, int)
+            else ""
+        )
+        parts = [f"cut off partway through `{cut_in}`{after}"]
+    elif cut_in:
+        parts = [f"cut off inside `{cut_in}` before a single entry of it was complete"]
+    elif last:
+        parts = [f"cut off after `{last}`"]
+    else:
+        parts = ["cut off before any bucket was complete"]
+    if recovered:
+        parts.append(f"a follow-up call delivered {_code_list(recovered)}")
+    if still:
+        why = {
+            "failed": "the follow-up call failed",
+            "truncated": "the follow-up call was cut off too",
+        }.get(
+            detail.get("continuation_outcome"), "the follow-up call did not return them"
+        )
+        parts.append(f"{_code_list(still)} never arrived ({why})")
+    if _cut_partway(detail):
+        parts.append(f"`{cut_in}` may be incomplete")
+    elif not cut_in and last:
+        # No raw text to place the cut, so the last bucket written may be short.
+        parts.append(f"`{last}` may be incomplete")
+    return "; ".join(parts)
+
+
+def _still_short(detail):
+    """Whether anything of a truncated pass is still known to be missing."""
+    if not detail.get("continued"):
+        return True
+    return bool(
+        detail.get("still_missing")
+        or _cut_partway(detail)
+        or (not detail.get("cut_in") and detail.get("last_bucket"))
+    )
 
 
 def _render_truncations(report):
@@ -888,6 +954,13 @@ def _render_truncations(report):
         "Each of these hit its output-token ceiling before it finished. Every "
         "complete finding it wrote is in the sections below; whatever it had not "
         "written yet is not, and nothing in those sections marks where."
+        + (
+            " Where a follow-up call is named, the pipeline asked the same model "
+            "again for the buckets the first call never reached, and what it "
+            "delivered is in those sections too."
+            if any(d.get("continued") for d in details)
+            else ""
+        )
     )
     lines.append("")
     for detail in details:
@@ -914,10 +987,15 @@ def _render_truncations(report):
         )
         cut = _cut_description(detail)
         lines.append(f"{line} — {cut}." if cut else f"{line}.")
-        if detail.get("section"):
+        if detail.get("section") and _still_short(detail):
             lines.append(
                 f"  - {detail['section']} is missing anything only this model "
                 f"would have added there."
+            )
+        elif detail.get("section"):
+            lines.append(
+                f"  - {detail['section']} has the rest of this model's output, "
+                f"from the follow-up call."
             )
     lines.append("")
     return lines
@@ -930,8 +1008,20 @@ def _truncated_models_note(report, domain):
         if detail.get("domain") != domain:
             continue
         cut = _cut_description(detail)
+        who = detail.get("model") or detail.get("pass")
+        if not _still_short(detail):
+            # Repaired in full: a follow-up delivered every bucket the cut
+            # lost, and the cut fell where no entry had been written yet.
+            lines.append(
+                f"> **Cut off, then continued: {who} hit its output-token ceiling**"
+                + (f" — {cut}" if cut else "")
+                + ". Nothing from that model is known to be missing here (see "
+                "*Truncated model passes* above)."
+            )
+            lines.append("")
+            continue
         lines.append(
-            f"> **Incomplete: {detail.get('model') or detail.get('pass')} hit its "
+            f"> **Incomplete: {who} hit its "
             f"output-token ceiling before it finished**"
             + (f" — {cut}" if cut else "")
             + ". Anything only that model would have put there is missing here, "
