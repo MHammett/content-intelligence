@@ -12,11 +12,13 @@ It now has its own disposition, keeps the URL it was trying, says whether it
 timed out or raised, and the report words the section by what happened.
 """
 
+import functools
 import time
 
 
 from ci_article_review import report_markdown
 from ci_article_review.adapters.citation import resolver
+from ci_core.concurrency import run_all_bounded
 from ci_article_review.adapters.citation.disposition import (
     DISPOSITIONS,
     disposition,
@@ -34,6 +36,14 @@ def _resolve(monkeypatch, one, entries, timeout=None):
     monkeypatch.setattr(resolver, "_resolve_one", one)
     if timeout is not None:
         monkeypatch.setattr(resolver, "_RESOLVE_TIMEOUT_SECONDS", timeout)
+        # A job past its budget is kept until the batch's group deadline (#389),
+        # which run_all_bounded sizes with a minute of slack. Shrink it, so a
+        # job that never finishes is written off within the test's patience.
+        monkeypatch.setattr(
+            resolver,
+            "run_all_bounded",
+            functools.partial(run_all_bounded, global_timeout=timeout * 4),
+        )
     # Nothing past the resolution jobs is under test, and none of it may reach
     # the network.
     monkeypatch.setattr(resolver, "_submit_missing_archives", lambda *a, **k: None)
@@ -48,7 +58,7 @@ class TestTheResolverRecordsWhatHappened:
         self, monkeypatch
     ):
         def slow(*args, **kwargs):
-            time.sleep(0.5)
+            time.sleep(5)
 
         (result,) = _resolve(monkeypatch, slow, [_entry()], timeout=0.05)
         assert result["resolved"] is False

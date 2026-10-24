@@ -154,6 +154,16 @@ def run_with_timeout(fn, timeout):
     Anything ``fn`` raises is re-raised here, so callers see provider failures
     exactly as if the call had been made inline.
     """
+    worker, outcome = _start_worker(fn, "ci-backstopped-call")
+    worker.join(timeout)
+
+    if worker.is_alive():
+        raise TimeoutError(f"Timed out after {timeout}s")
+    return _unwrap(outcome)
+
+
+def _start_worker(fn, name):
+    """Run ``fn`` on a new daemon thread; return it with the dict its outcome lands in."""
     outcome = {}
 
     def _target():
@@ -162,12 +172,13 @@ def run_with_timeout(fn, timeout):
         except BaseException as exc:  # noqa: BLE001 — relayed to the caller
             outcome["error"] = exc
 
-    worker = threading.Thread(target=_target, name="ci-backstopped-call", daemon=True)
+    worker = threading.Thread(target=_target, name=name, daemon=True)
     worker.start()
-    worker.join(timeout)
+    return worker, outcome
 
-    if worker.is_alive():
-        raise TimeoutError(f"Timed out after {timeout}s")
+
+def _unwrap(outcome):
+    """What a finished worker's ``fn`` returned, or re-raise what it raised."""
     if "error" in outcome:
         raise outcome["error"]
     return outcome.get("value")
@@ -280,7 +291,14 @@ def batch_ceiling(job_count, max_parallel, per_call_timeout, slack=60):
     return waves * per_call_timeout + slack
 
 
-def run_all_bounded(jobs, max_parallel, global_timeout=None, slack=60):
+def run_all_bounded(
+    jobs,
+    max_parallel,
+    global_timeout=None,
+    slack=60,
+    on_overrun=None,
+    keep_late=True,
+):
     """:func:`run_all_with_timeout` with at most ``max_parallel`` calls in flight.
 
     This is the replacement for ``ThreadPoolExecutor(max_workers=N)``. The two
@@ -326,6 +344,39 @@ def run_all_bounded(jobs, max_parallel, global_timeout=None, slack=60):
     ``max_parallel`` calls can be in flight. That is the deliberate side of the
     trade — the alternative is a wedged call holding a slot for the rest of the
     batch, which is how one stuck citation stalls the other thirty-nine.
+
+    **A job that outlives its budget is not thrown away.** Its slot is, at once;
+    its *result* is kept if it arrives before the group deadline. The budget
+    bounds how long a job may hold a slot, not whether an answer that arrives
+    late is usable — the same contract :func:`run_all_with_timeout` states for
+    its own stragglers, and until 2026-10-24 the one place it did not hold.
+    Here the per-job budget went through :func:`run_with_timeout`, which raises
+    on expiry and drops whatever the worker returns afterwards, while the
+    worker — a daemon, never killed — ran on to the end: on a 267-claim
+    citation batch, 117 claims were reported as timed out although their
+    threads completed every fetch and every model call, paid for, with nobody
+    left to read the answers (issue #389). So on expiry the wrapper leaves the
+    semaphore and keeps joining the same worker until the group deadline. A
+    job still running *then* is reported as a ``TimeoutError`` naming both
+    budgets. The group deadline is therefore the batch's true ceiling: a job
+    that never finishes holds the batch open until it, where before the batch
+    could end a budget after its last wave started. That is the ceiling
+    :func:`batch_ceiling` was always sized to allow.
+
+    ``keep_late=False`` restores the old contract: a job past its budget is
+    written off there and then, its eventual result dropped. For a batch of a
+    few jobs the default ceiling is one wave plus a minute of slack, so a
+    wedged job costs the caller that minute; a caller whose user is waiting at
+    a prompt (ci-style-profile's model fan-out, its WordPress page fetches)
+    would rather lose the straggler than wait for it, and says so.
+
+    ``on_overrun(name, timeout)``, if given, is called in the job's own wrapper
+    thread the moment its budget expires — while the work is still running and
+    the slot has just been released — so a caller can log *which* job is late
+    and what it was doing, instead of discovering the timeouts in a lump when
+    the batch returns. It is not called again if the job later finishes or is
+    written off; the returned mapping says which. Whatever it raises is logged
+    and swallowed: it must not become the job's result.
     """
     jobs = list(jobs)
     if not jobs:
@@ -338,7 +389,26 @@ def run_all_bounded(jobs, max_parallel, global_timeout=None, slack=60):
     )
     semaphore = threading.Semaphore(limit)
 
-    def _bounded(fn, timeout):
+    if global_timeout is None:
+        budgeted = [t for _, _, t in jobs if t is not None]
+        global_timeout = batch_ceiling(
+            len(jobs), limit, max(budgeted) if budgeted else None, slack=slack
+        )
+    group_deadline = time.monotonic() + global_timeout
+    #: name -> budget, for every job whose budget expired. Read after the join
+    #: loop: a late job still running at the deadline is reported there as a
+    #: group-ceiling cancellation, because its wrapper and the join loop wake
+    #: on the same instant and the loop sees a thread still alive. The record
+    #: is what lets the result name the budget the job actually overran.
+    overran = {}
+
+    def _written_off(timeout):
+        return TimeoutError(
+            f"Timed out after {timeout}s and still running at the group "
+            f"deadline of {global_timeout}s"
+        )
+
+    def _bounded(name, fn, timeout):
         def _run():
             with semaphore:
                 # The budget starts here, on acquire — see the docstring for
@@ -346,21 +416,40 @@ def run_all_bounded(jobs, max_parallel, global_timeout=None, slack=60):
                 # charge this job for every wave that ran ahead of it.
                 if timeout is None:
                     return fn()
-                return run_with_timeout(fn, timeout)
+                worker, outcome = _start_worker(fn, f"ci-bounded-call-{name}")
+                worker.join(timeout)
+                if not worker.is_alive():
+                    return _unwrap(outcome)
+            # Budget spent and slot released; the worker runs on. Wait for it
+            # outside the gate, so the next queued job starts now, for as long
+            # as the group deadline allows.
+            overran[name] = timeout
+            if on_overrun is not None:
+                try:
+                    on_overrun(name, timeout)
+                except Exception:  # noqa: BLE001 — a logging hook, never the result
+                    logging.getLogger(__name__).exception(
+                        f"on_overrun hook raised for job {name!r}"
+                    )
+            if not keep_late:
+                raise TimeoutError(f"Timed out after {timeout}s")
+            worker.join(max(0.0, group_deadline - time.monotonic()))
+            if worker.is_alive():
+                raise _written_off(timeout)
+            return _unwrap(outcome)
 
         return _run
-
-    if global_timeout is None:
-        budgeted = [t for _, _, t in jobs if t is not None]
-        global_timeout = batch_ceiling(
-            len(jobs), limit, max(budgeted) if budgeted else None, slack=slack
-        )
 
     # Per-job budgets are already applied inside _bounded, so what is handed
     # down here is None: the group ceiling is the only bound left for this layer
     # to enforce. A TimeoutError raised inside a job surfaces through the normal
     # error channel, so the returned shape is unchanged either way.
-    return run_all_with_timeout(
-        [(name, _bounded(fn, timeout), None) for name, fn, timeout in jobs],
+    results = run_all_with_timeout(
+        [(name, _bounded(name, fn, timeout), None) for name, fn, timeout in jobs],
         global_timeout,
     )
+    if keep_late:
+        for name, timeout in overran.items():
+            if isinstance(results[name][1], TimeoutError):
+                results[name] = (None, _written_off(timeout))
+    return results
