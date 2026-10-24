@@ -798,8 +798,17 @@ class TestPdfCitations:
             ),
             patch(
                 "ci_article_review.adapters.citation.resolver.extract"
-                ".extract_response_text",
-                return_value=(extracted_text, "pdf"),
+                ".extract_response_text_with_coverage",
+                return_value=(
+                    extracted_text,
+                    "pdf",
+                    {
+                        "kind": "pdf",
+                        "pages_total": 1,
+                        "pages_read": 1,
+                        "partial": False,
+                    },
+                ),
             ),
             patch(
                 "ci_article_review.adapters.citation.resolver.wayback.check",

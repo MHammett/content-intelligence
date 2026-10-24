@@ -61,7 +61,9 @@ The other URLs checked are recorded on the entry as `alternates_checked`, so "on
 
 ## Confidence tiers
 
-Every entry carries a `verification` field. Four values reach the report — `checksum`, `pointer`, `unverifiable`, `content_mismatch` — plus the entries that never reached a tier at all, which the readable report splits by whether a URL was tried. Six blocks in all; the table at the top of Section 9 lists them in this order and every claim appears under exactly one.
+Every entry carries a `verification` field. Five values reach the report — `checksum`, `content_mismatch`, `partial_read`, `pointer`, `unverifiable` — plus the entries that never reached a tier at all, which the readable report splits by whether a URL was tried. Seven blocks in all; the table at the top of Section 9 lists them in this order and every claim appears under exactly one.
+
+Every entry that reached a verdict also carries `read_coverage`, rendered as a `Read:` line: how many of a PDF's pages were read, how many web pages a paginated source yielded, how many characters the verifier was shown out of how many extracted, and which of the pipeline's own limits, if any, left part of the document unread. It exists so that "the source does not say this" and "the part of the source we read does not say this" are never the same line.
 
 ### Read, and supports the claim — `verification: "checksum"`
 
@@ -79,7 +81,7 @@ This tier is only reachable two ways:
 
 > **If the relevance check can't run,** the entry does not stay here — it moves to *Fetched, but could not be read* below. Reaching this tier always means a model read the extracted content and affirmed it. With no Mistral key configured, expect no verified `known_url` entries at all.
 
-**What the model actually reads.** The fetched body is reduced to readable text before verification: main-article extraction for HTML (nav, header, footer, script and style blocks stripped) and `pypdf` text extraction for PDFs. The excerpt sent to the model is then centred on the passage containing the claim's distinctive terms and figures, rather than the first N characters of the document — in a long PDF the supporting sentence is rarely near the top.
+**What the model actually reads.** The fetched body is reduced to readable text before verification: main-article extraction for HTML (nav, header, footer, script and style blocks stripped) and `pypdf` text extraction for PDFs, up to `extract.PDF_MAX_PAGES` (400) pages — the same cap the quote check uses; the verifier used to stop at 40, which is how a claim cited to page 120 of a council packet came back "not supported". The excerpt sent to the model is then a 20,000-character window centred on the passage containing the claim's distinctive terms and figures, rather than the first N characters of the document — in a long PDF the supporting sentence is rarely near the top. A document at or under 20,000 characters is sent whole. Both limits are recorded on the entry (`read_coverage`), and a negative verdict formed under either one is reported as *Read in part only*, never as a mismatch.
 
 ### Pointer only — `verification: "pointer"`
 
@@ -115,7 +117,17 @@ This is worth more attention than an ordinary unresolved entry. An ordinary one 
 
 **Every source cited for the claim failed**, not just one. When the draft cites several, all of them are checked before the entry lands here, and `alternates_checked` lists the ones that are not shown. Reporting a mismatch after checking one of three cited sources would say something false about a draft that cited the right source second.
 
-This tier asserts something about the source, so it is only ever reached when the document was genuinely read. If the content could not be extracted, or the check could not run, the entry becomes *Fetched, but could not be read* instead — never this.
+This tier asserts something about the source, so it is only ever reached when the document was genuinely read **in full**: every page of a PDF, every page of a paginated source, and the whole extracted text shown to the verifier. If the content could not be extracted, or the check could not run, the entry becomes *Fetched, but could not be read* instead; if part of the document was left unread, it becomes *Read in part only* — never this. The one exception is a `contradicts` verdict whose quoted sentence was found on the page: text that was found is evidence whatever was left unread, so that stays a mismatch.
+
+### Read in part only — `verification: "partial_read"`
+
+The document was fetched, part of it was read, and the claim was not in that part. **This is not evidence against the claim.** One of the pipeline's own limits stopped the read — the PDF page cap (`extract.PDF_MAX_PAGES`, 400 pages), the pagination cap or size budget for a multi-page web source, or the 20,000-character excerpt window the verifier is shown — and the entry's `read_coverage` says which, with the counts: pages read of pages total, characters shown of characters extracted. The relevance verdict and reason are kept, because they describe the part that was read, but the readable report renders these entries under their own heading, *Read in part only — not found in the part read*, apart from the mismatches, and the claim ledger gives them their own status (*Source read in part, claim not found in the part read*) rather than *Source read, does not support the claim*. The worklist lists each such document once, under *Open a document the run read only in part*, with the coverage line, so the author can go straight to the pages the pipeline never saw.
+
+This tier exists because the two readings had been one. On the 2026-10-24 run of a 267-claim draft, 111 entries read "does NOT support the claim"; 65 of them were PDFs and 40 were council packets the verifier had stopped reading at page 40 — the claims were cited to pages it never opened (issue #395). A reader shown "not supported" cannot tell that from a refutation, and the revision that follows treats a reading limit as a factual error.
+
+`resolved` is `false`, as for a mismatch, so nothing here is counted as verified. The entry is never handed back to the asserting model for a re-ask (that pass exists for refutations) and never counts as a contradiction in the ledger.
+
+**How much to trust it:** as an open item. The claim is neither confirmed nor refuted; the one thing that settles it is opening the document at the cited page.
 
 ### Fetched, but could not be read — `verification: "unverifiable"`
 

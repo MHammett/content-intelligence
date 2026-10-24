@@ -84,6 +84,15 @@ _GROUPS = (
         "reads these in seconds. Nothing here is evidence against the source.",
     ),
     (
+        "read_further",
+        "Open a document the run read only in part",
+        "The fetch succeeded and the reader got real text, but a limit of the "
+        "pipeline's own — the PDF page cap, the pagination cap, or the window "
+        "the verifier is shown — left part of the document unread, and the "
+        "claim was not in the part read. That is not a finding against the "
+        "claim. Open the document at the page the draft cites and look there.",
+    ),
+    (
         "find_copy",
         "Find a readable copy — the fetch was refused, or the page is gone",
         "A specific URL was named and did not yield the document. A 403 is a "
@@ -428,6 +437,61 @@ def _open_page_items(citations):
                 'SECTION 9, "Fetched, but could not be read"',
                 [c.get("claim", "") for c in slot["citations"]],
                 gap=gap,
+            )
+        )
+    return items
+
+
+def _read_further_items(citations):
+    """Documents read in part with the claim not found in that part, by URL.
+
+    One item per document, however many claims cite it: a council packet the
+    reader stopped at page 400 of 612 is one errand, and listing it once per
+    claim would misstate the work. The coverage line says what was read, so
+    the author can go straight to the pages the pipeline never saw.
+    """
+    from .adapters.citation.resolver import _LIMIT_NAMES, _coverage_sentence
+
+    by_url = {}
+    for c in citations:
+        if _disposition(c) != "partial_read":
+            continue
+        url, provenance = _real_url(c)
+        if not url:
+            continue
+        slot = by_url.setdefault(url, {"citations": [], "provenance": provenance})
+        slot["citations"].append(c)
+
+    items = []
+    for url, slot in by_url.items():
+        here = slot["citations"]
+        read = next(
+            (c.get("read_coverage") for c in here if c.get("read_coverage")), {}
+        )
+        limits = [_LIMIT_NAMES.get(limit, limit) for limit in read.get("limits") or ()]
+        why = (
+            f"The document was fetched and read in part: {_coverage_sentence(read)} "
+            f"Left unread by {', '.join(limits) if limits else 'a limit of the read'}. "
+            "The claim was not in the part read, which says nothing about the "
+            "rest of the document."
+        )
+        items.append(
+            _item(
+                "read_further",
+                HUMAN,
+                "Open at the cited page and look",
+                url,
+                why,
+                "Open the document and go to the page or section the draft "
+                "cites. If the claim is there, the citation stands and the "
+                "pipeline simply stopped short; if it is not, treat it as a "
+                "citation to re-source.",
+                'SECTION 9, "Read in part only — not found in the part read"',
+                [c.get("claim", "") for c in here],
+                gap=(
+                    "Read every page of a long PDF, or show the verifier more than "
+                    "one window of it, so a claim deep in a document is reached"
+                ),
             )
         )
     return items
@@ -811,6 +875,7 @@ def build_worklist(report, limit=DEFAULT_LIMIT):
 
     items = (
         _open_page_items(citations)
+        + _read_further_items(citations)
         + _find_copy_items(citations)
         + _find_document_items(fact_check)
         + _stand_behind_items(fact_check, citations)

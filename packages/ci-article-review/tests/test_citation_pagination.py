@@ -370,11 +370,18 @@ class TestTheResolverUsesIt:
             for i, url in enumerate(urls, start=1)
         }
 
-    def test_a_refutation_from_a_cut_off_walk_says_the_claim_may_sit_further_on(self):
+    def test_a_negative_verdict_from_a_cut_off_walk_is_a_partial_read(self):
+        """It used to stay a ``content_mismatch`` with "may sit further on"
+        appended to the note, which a reader of the mismatch block never saw.
+        A walk the page cap stopped is a read the pipeline cut short, so the
+        entry now says so in its tier, not in a trailing clause (issue #395)."""
         result, _ = self._resolve(self._long_chain(9), verdict="not_addressed")
-        assert result["verification"] == "content_mismatch"
+        assert result["verification"] == "partial_read"
         assert result["pagination"]["stopped"] == "page cap"
-        assert f"first {pagination.MAX_PAGES} pages" in result["note"]
+        assert result["note"].startswith("Read in part only.")
+        assert f"{pagination.MAX_PAGES} web page(s) were read" in result["note"]
+        assert "pagination cap stopped it" in result["note"]
+        assert result["read_coverage"]["limits"] == ["pagination_cap"]
 
     def test_a_refutation_from_a_complete_walk_does_not_say_that(self):
         result, _ = self._resolve(self._two_pages(), verdict="not_addressed")

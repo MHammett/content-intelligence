@@ -242,6 +242,7 @@
       "excluded_by_author": 0,
       "excluded_by_model": 0,
       "source_does_not_support": 0,
+      "source_read_in_part": 0,
       "unverified": 0
     }
   },

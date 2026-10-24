@@ -783,6 +783,7 @@ class TestDispositionComesFromTheOneSharedVocabulary:
     CASES = [
         {"verification": "checksum", "url": "u"},
         {"verification": "content_mismatch", "url": "u"},
+        {"verification": "partial_read", "url": "u"},
         {"verification": "unverifiable", "url": "u"},
         {"verification": "pointer", "url": "u"},
         {"url": "u"},
@@ -801,7 +802,14 @@ class TestDispositionComesFromTheOneSharedVocabulary:
         assert worklist._disposition(citation) in {k for k, _ in DISPOSITIONS}
 
     @pytest.mark.parametrize(
-        "bucket", ["unverifiable", "fetch_failed", "no_source", "content_mismatch"]
+        "bucket",
+        [
+            "unverifiable",
+            "fetch_failed",
+            "no_source",
+            "content_mismatch",
+            "partial_read",
+        ],
     )
     def test_the_buckets_this_module_branches_on_still_exist(self, bucket):
         assert bucket in {k for k, _ in DISPOSITIONS}, (

@@ -399,7 +399,17 @@ class TestTheResolversLadderStillDecides:
 
         def escalate(url, timeout):
             calls.append(url)
-            return (url, quote_check.resolver._extract_fetched(_Resp(), url)[0], "html")
+            return (
+                url,
+                quote_check.resolver._extract_fetched(_Resp(), url)[0],
+                "html",
+                {
+                    "kind": "html",
+                    "pages_total": None,
+                    "pages_read": None,
+                    "partial": False,
+                },
+            )
 
         monkeypatch.setattr(resolver, "_impersonation_fallback_content", escalate)
         return calls
@@ -431,6 +441,7 @@ class TestTheResolversLadderStillDecides:
             "https://web.archive.org/web/2026/" + _PAGE_A,
             resolver._extract_fetched(_Resp(), _PAGE_A)[0],
             "html",
+            {"kind": "html", "pages_total": None, "pages_read": None, "partial": False},
         )
         monkeypatch.setattr(
             resolver,

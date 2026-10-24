@@ -62,6 +62,11 @@ STATUSES = (
     ("contradicted", "Contradicted"),
     ("source_does_not_support", "Source read, does not support the claim"),
     ("confirmed_source_read", "Confirmed, source read"),
+    # Above "source not read" because more is known — the document was opened
+    # and part of it read — and below "source read" because that part did not
+    # hold the claim. It is an open item, not a refutation: the pipeline's own
+    # page cap or excerpt window is what stopped the read.
+    ("source_read_in_part", "Source read in part, claim not found in the part read"),
     ("confirmed_source_not_read", "Confirmed by a model, source not read"),
     ("unverified", "Unverified"),
 )
@@ -82,7 +87,9 @@ _VERDICT_BUCKETS = (
 #: rather than imported because this module must not depend on a renderer.
 _REASK_CONCEDES = frozenset({"correct_claim", "withdraw"})
 
-#: Section 9 dispositions in which a page was fetched and its text read.
+#: Section 9 dispositions in which a page was fetched and its text read in full.
+#: ``partial_read`` is deliberately not here: part of the text was read, and the
+#: claim was not in it, which settles nothing.
 _READ = ("content_mismatch", "checksum")
 
 
@@ -141,13 +148,13 @@ def _strongest_citation(citations):
     A read page beats an unread one, and within the read pages a refutation
     beats a confirmation: that is the same ordering the statuses carry.
     """
-    rank = {"content_mismatch": 0, "checksum": 1}
+    rank = {"content_mismatch": 0, "checksum": 1, "partial_read": 2}
     return min(
         citations,
         key=lambda c: (
             0 if (c.get("relevance_verdict") == "contradicts") else 1,
             0 if (c.get("reask") or {}).get("action") in _REASK_CONCEDES else 1,
-            rank.get(disposition(c), 2),
+            rank.get(disposition(c), 3),
         ),
         default=None,
     )
@@ -211,6 +218,15 @@ def _decide(buckets, exclusion, citation, hosts):
             else f"the source was read and supports it ({where})"
         )
         return "confirmed_source_read", why, extra
+    if disp == "partial_read":
+        why = (
+            f"the source was read in part and the claim was not in the part "
+            f"read ({_where(citation)}); a limit of the read, not evidence "
+            f"against the claim"
+        )
+        if confirmers:
+            why = f"{confirmers} confirmed it; " + why
+        return "source_read_in_part", why, extra
     if confirmers:
         why = f"{confirmers} confirmed it; no source was read"
         if citation is not None:

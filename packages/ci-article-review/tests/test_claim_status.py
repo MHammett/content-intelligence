@@ -69,6 +69,7 @@ class TestVocabulary:
             "contradicted",
             "source_does_not_support",
             "confirmed_source_read",
+            "source_read_in_part",
             "confirmed_source_not_read",
             "unverified",
         ]

@@ -4384,19 +4384,28 @@ def run_draft_pipeline(
         refuted_count = sum(
             1 for r in citation_results if r.get("verification") == "content_mismatch"
         )
+        # Read in part, claim not found in that part. Counted on its own line
+        # so it is never mistaken for a refutation: the number here is a
+        # reading limit, not a finding.
+        partial_count = sum(
+            1 for r in citation_results if r.get("verification") == "partial_read"
+        )
         log.info(
             "Citations: %d claim(s), %d verified, %d read but NOT supporting "
-            "the claim, %d pointer-only, %d could not be read, %d unresolved",
+            "the claim, %d read in part with the claim not found in the part "
+            "read, %d pointer-only, %d could not be read, %d unresolved",
             len(claims),
             verified_count,
             refuted_count,
+            partial_count,
             pointer_count,
             unverifiable_count,
             len(claims)
             - verified_count
             - pointer_count
             - unverifiable_count
-            - refuted_count,
+            - refuted_count
+            - partial_count,
         )
 
         # Pass 3b — hand each refutation back to the model that asserted it.
@@ -5479,6 +5488,7 @@ def _print_draft_summary(
             by_disposition[citation_disposition(c)].append(c)
         verified = by_disposition["checksum"]
         refuted = by_disposition["content_mismatch"]
+        partial = by_disposition["partial_read"]
         unverifiable = by_disposition["unverifiable"]
         pointer = by_disposition["pointer"]
         # Every citation is in exactly one bucket, so this is a true remainder
@@ -5514,9 +5524,10 @@ def _print_draft_summary(
         print(
             f"\nSection 9 — Citations: {len(citations)} claim(s) — "
             f"{len(verified)} verified, {len(refuted)} read but NOT supporting "
-            f"the claim, {len(pointer)} pointer-only (not independently "
-            f"verified), {len(unverifiable)} could not be read, "
-            f"{len(unresolved)} unresolved"
+            f"the claim, {len(partial)} read in part only (claim not found in "
+            f"the part read — a reading limit, not a finding), {len(pointer)} "
+            f"pointer-only (not independently verified), {len(unverifiable)} "
+            f"could not be read, {len(unresolved)} unresolved"
         )
         if resolution_errors:
             timed_out = sum(

@@ -21,6 +21,8 @@ from ci_article_review.adapters.citation import quote_check as qc
 _URL = "https://www.example.org/report"
 _WRAPPER = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
 _QUOTE = "The plant operates nine generating units across two sites."
+#: What ``_impersonation_fallback_content`` reports for a page read whole.
+_WHOLE = {"kind": "html", "pages_total": None, "pages_read": None, "partial": False}
 _PAGE = (
     "Annual report. The plant operates nine generating units across two sites, "
     "and a tenth is under construction. " * 4
@@ -238,7 +240,7 @@ class TestFetchPage:
         monkeypatch.setattr(
             qc.resolver,
             "_impersonation_fallback_content",
-            lambda url, timeout: (url, _PAGE, "html"),
+            lambda url, timeout: (url, _PAGE, "html", _WHOLE),
         )
         page = qc.fetch_page(_URL)
         assert page.status == "read"
@@ -277,7 +279,7 @@ class TestFetchPage:
         monkeypatch.setattr(
             qc.resolver,
             "_impersonation_fallback_content",
-            lambda url, timeout: (_URL + "/landed", _PAGE, "html"),
+            lambda url, timeout: (_URL + "/landed", _PAGE, "html", _WHOLE),
         )
         assert qc.fetch_page(_WRAPPER + "AUZ1").final_url == _URL + "/landed"
 

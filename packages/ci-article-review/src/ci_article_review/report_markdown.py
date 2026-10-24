@@ -139,12 +139,31 @@ def _kv_lines(d, exclude=()):
         if key == "wayback" and isinstance(value, dict):
             lines.append(f"  - Wayback: {_wayback_summary(value)}")
             continue
+        if key == "read_coverage" and isinstance(value, dict):
+            # On every entry that reached a verdict, so "not there" and "not
+            # found in the part read" are never the same line.
+            lines.append(f"  - Read: {_coverage_summary(value)}")
+            continue
         if key == "alternates_checked" and isinstance(value, (list, tuple)):
             lines.extend(_render_alternates(value))
             continue
         label = key.replace("_", " ").capitalize()
         lines.append(f"  - {label}: {value}")
     return lines
+
+
+def _coverage_summary(read):
+    """``read_coverage`` as one line: what was read, and what stopped it."""
+    from .adapters.citation.resolver import _LIMIT_NAMES, _coverage_sentence
+
+    sentence = _coverage_sentence(read)
+    limits = [_LIMIT_NAMES.get(limit, limit) for limit in read.get("limits") or ()]
+    if limits:
+        return (
+            f"IN PART — {sentence} Left unread by {', '.join(limits)}; a claim not "
+            f"found here may still be in the document."
+        )
+    return f"in full — {sentence}"
 
 
 def _dicts(entries):
@@ -2195,6 +2214,11 @@ def _render_reask(reask):
         elif verification == "content_mismatch":
             verdict = check.get("relevance_verdict") or "does not support"
             outcome = f"fetched and read, and it does NOT support the claim ({verdict})"
+        elif verification == "partial_read":
+            outcome = (
+                "fetched and read in part, and the claim was not in the part read "
+                "— a limit of the read, not a finding against the source"
+            )
         elif verification == "unverifiable":
             outcome = "fetched, but its content could not be read or assessed"
         else:
@@ -2537,6 +2561,7 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
 
     verified = grouped["checksum"]
     mismatch = grouped["content_mismatch"]
+    partial = grouped["partial_read"]
     unverifiable = grouped["unverifiable"]
     fetch_failed = grouped["fetch_failed"]
     resolution_error = grouped["resolution_error"]
@@ -2556,10 +2581,21 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
     # says so" and "a document was read" that the tiers below exist to separate.
     lines.append(
         f"**{checked} of {total} claim(s) ({round(100 * checked / total)}%) were "
-        f"checked against a document the pipeline fetched and read** — "
+        f"checked against a document the pipeline fetched and read in full** — "
         f"{len(verified)} where the document supported the claim, "
         f"{len(mismatch)} where it did not."
     )
+    if partial:
+        # Its own sentence, in bold, because this is the number a reader most
+        # easily mistakes for refutations. It is the opposite: these claims
+        # are open, and the reading stopped before them.
+        lines.append(
+            f"**A further {len(partial)} had a document fetched and read IN PART, "
+            f"and the claim was not in the part read.** Those are not "
+            f"refutations: the pipeline's page cap or excerpt window stopped the "
+            f"read, and each entry below says where. Open the document at the "
+            f"cited page."
+        )
     lines.append("")
     lines.append(
         f"For the other {total - checked}, no document was read. What stands "
@@ -2590,14 +2626,21 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
     if confirmed:
         supported = sum(1 for c in confirmed if _disposition(c) == "checksum")
         refuted = sum(1 for c in confirmed if _disposition(c) == "content_mismatch")
-        unread = len(confirmed) - supported - refuted
+        in_part = sum(1 for c in confirmed if _disposition(c) == "partial_read")
+        unread = len(confirmed) - supported - refuted - in_part
+        part_clause = (
+            f" {in_part} had one read in part with the claim not found in that part,"
+            if in_part
+            else ""
+        )
         lines.append(
             f"> **The fact-check pass called {len(confirmed)} of these claims "
             f'"confirmed." Of those, {supported} had a document fetched and read '
-            f"here that supports the claim, {refuted} had one that does not, and "
-            f"for {unread} no document was read at all.** A `confirmed` bucket is "
-            "that pass's judgment about the claim, not a retrieval result. Where "
-            "the two disagree, this section is the one that opened the document."
+            f"here that supports the claim, {refuted} had one that does not,"
+            f"{part_clause} and for {unread} no document was read at all.** A "
+            "`confirmed` bucket is that pass's judgment about the claim, not a "
+            "retrieval result. Where the two disagree, this section is the one "
+            "that opened the document."
         )
         lines.append("")
 
@@ -2782,6 +2825,32 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
             )
         lines.append("")
         for c in mismatch:
+            lines.extend(_render_mismatch_entry(c))
+        lines.append("")
+
+    if partial:
+        # Deliberately not folded into the block above. A reader who sees a
+        # verdict and a reason beside a claim reads them as a finding; these
+        # carry the same two fields and mean something weaker, so they get
+        # their own heading that says so before any entry is read.
+        lines.append(
+            f"### Read in part only — not found in the part read ({len(partial)}) "
+            "— open these at the cited page (NOT evidence against the claim)"
+        )
+        from ci_core.extract import PDF_MAX_PAGES
+
+        lines.append(
+            "_The document was fetched and part of it read, and the claim was "
+            "not in that part. Each entry's `Read:` line says what was read and "
+            "which limit stopped it: the PDF page cap "
+            f"({PDF_MAX_PAGES} pages), the pagination cap, or the excerpt "
+            "window the verifier is shown. A verdict here is a verdict about the "
+            "part read. The claim may sit further on in the document, and the "
+            "only way to settle it is to open the document at the page the "
+            "draft cites._"
+        )
+        lines.append("")
+        for c in partial:
             lines.extend(_render_mismatch_entry(c))
         lines.append("")
 
