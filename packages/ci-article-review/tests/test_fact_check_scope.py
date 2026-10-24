@@ -1424,3 +1424,175 @@ class TestRendering:
         )
         assert "Out of scope for verification" in out
         assert "never entered resolution" in out
+
+
+class TestOverlappingEntriesResolveToTheClosest:
+    """A verdict attaches to the entry that is closest to it, not the first (#360).
+
+    Models classify overlapping spans: one quotes a sentence, two others quote
+    the paragraph around it. Both spans become `out_of_scope` entries, and a
+    verdict that matches both used to land in whichever came first. The sweep
+    and the outvote count share one rule, so they cannot disagree about it.
+    """
+
+    SENT = "I have a side job."
+    PARA = "I have a side job. It pays for the hosting, and I never mention it to my employer."
+
+    def _para_calls(self):
+        return [
+            _scope_call(self.PARA, "openai", "first_person"),
+            _scope_call(self.PARA, "mistral", "first_person"),
+        ]
+
+    def _sent_call(self):
+        return _scope_call(self.SENT, "gemini", "first_person")
+
+    def _apply(self, verdicts, calls, pub_config=None, draft="", handoff=None):
+        rules = ScopeRules.from_run(draft, handoff or {}, pub_config or {})
+        return rules.apply(_fc(**_by_bucket(*verdicts), out_of_scope=list(calls)))
+
+    @staticmethod
+    def _entry(out, claim):
+        (entry,) = [e for e in out["out_of_scope"] if e["claim"] == claim]
+        return entry
+
+    @pytest.mark.parametrize("sentence_first", [True, False])
+    def test_a_sentences_sourced_verdicts_outvote_its_own_lone_call(
+        self, sentence_first
+    ):
+        """The #360 repro: the paragraph entry must not swallow the sentence's votes."""
+        calls = [self._sent_call(), *self._para_calls()]
+        if not sentence_first:
+            calls = [*self._para_calls(), self._sent_call()]
+        out = self._apply(
+            [
+                _verdict(self.SENT, "perplexity", "https://example.com/a"),
+                _verdict(self.SENT, "claude", "https://example.org/b"),
+            ],
+            calls,
+        )
+        sentence = self._entry(out, self.SENT)
+        paragraph = self._entry(out, self.PARA)
+        assert sentence["excluded"] is False
+        assert "outvote" in sentence["reason"]
+        assert paragraph["excluded"] is True
+        assert paragraph["withdrawn_verdicts"] == []
+        assert len(out["confirmed"]) == 2
+
+    @pytest.mark.parametrize("sentence_first", [True, False])
+    def test_a_paragraph_verdict_is_not_attached_to_a_sentence_inside_it(
+        self, sentence_first
+    ):
+        calls = [self._sent_call(), *self._para_calls()]
+        if not sentence_first:
+            calls = [*self._para_calls(), self._sent_call()]
+        out = self._apply(
+            [_verdict(self.PARA, "perplexity", "https://example.com/a")],
+            calls,
+        )
+        assert self._entry(out, self.SENT)["withdrawn_verdicts"] == []
+        withdrawn = self._entry(out, self.PARA)["withdrawn_verdicts"]
+        assert [w["model"] for w in withdrawn] == ["perplexity"]
+        assert out["confirmed"] == []
+
+    @pytest.mark.parametrize("sentence_first", [True, False])
+    def test_a_single_sourced_verdict_for_the_sentence_is_still_excluded(
+        self, sentence_first
+    ):
+        """PR #167 with an overlapping paragraph entry in the way."""
+        calls = [self._sent_call(), *self._para_calls()]
+        if not sentence_first:
+            calls = [*self._para_calls(), self._sent_call()]
+        out = self._apply(
+            [_verdict(self.SENT, "openai", "https://fd-ix.com/about/team/")],
+            calls,
+        )
+        sentence = self._entry(out, self.SENT)
+        assert sentence["excluded"] is True
+        assert [w["model"] for w in sentence["withdrawn_verdicts"]] == ["openai"]
+        assert self._entry(out, self.PARA)["withdrawn_verdicts"] == []
+        assert out["confirmed"] == []
+
+    def test_a_verdict_wider_than_every_entry_takes_the_widest_one_it_contains(self):
+        """Closest, not narrowest: a paragraph-plus verdict is not about the sentence."""
+        out = self._apply(
+            [_verdict(self.PARA + " Truly.", "perplexity", "https://example.com/a")],
+            [self._sent_call(), *self._para_calls()],
+        )
+        assert self._entry(out, self.SENT)["withdrawn_verdicts"] == []
+        assert len(self._entry(out, self.PARA)["withdrawn_verdicts"]) == 1
+
+    def test_a_verdict_inside_several_entries_takes_the_narrowest_one(self):
+        """No exact entry: the narrowest entry that holds the verdict wins."""
+        out = self._apply(
+            [_verdict("I have a side job", "perplexity", "https://example.com/a")],
+            [*self._para_calls(), self._sent_call()],
+        )
+        assert self._entry(out, self.PARA)["withdrawn_verdicts"] == []
+        assert len(self._entry(out, self.SENT)["withdrawn_verdicts"]) == 1
+
+    def test_a_verdict_for_a_sentence_with_no_entry_of_its_own_uses_the_paragraph(self):
+        out = self._apply(
+            [
+                _verdict(
+                    "I never mention it to my employer.",
+                    "perplexity",
+                    "https://e.com/a",
+                )
+            ],
+            [self._sent_call(), *self._para_calls()],
+        )
+        assert self._entry(out, self.SENT)["withdrawn_verdicts"] == []
+        assert len(self._entry(out, self.PARA)["withdrawn_verdicts"]) == 1
+
+    def test_overlapping_author_markings_resolve_to_the_closest_too(self):
+        """The paragraph is marked in the draft, the sentence in the config."""
+        out = self._apply(
+            [_verdict(self.SENT, "perplexity", "https://example.com/a")],
+            [],
+            {
+                "fact_check_scope": {
+                    "exclude_passages": [
+                        {"passage": self.SENT, "reason": "sentence reason"}
+                    ]
+                }
+            },
+            draft=(
+                f"<!-- ci:no-verify: paragraph reason -->{self.PARA}"
+                "<!-- /ci:no-verify -->"
+            ),
+        )
+        entry = self._entry(out, self.SENT)
+        assert entry["excluded_by"] == fact_check_scope.ORIGIN_CONFIG
+        assert entry["reason"] == "sentence reason"
+
+    def test_author_exclusion_for_prefers_the_closest_marking(self):
+        rules = ScopeRules.from_run(
+            f"<!-- ci:no-verify -->{self.PARA}<!-- /ci:no-verify -->",
+            {},
+            {"fact_check_scope": {"exclude_passages": [self.SENT]}},
+        )
+        assert rules.author_exclusion_for(self.SENT)["origin"] == (
+            fact_check_scope.ORIGIN_CONFIG
+        )
+        assert rules.author_exclusion_for(self.PARA)["origin"] == (
+            fact_check_scope.ORIGIN_INLINE
+        )
+
+    def test_trust_model_classification_false_still_excludes_nothing(self):
+        out = self._apply(
+            [_verdict(self.SENT, "perplexity", "https://example.com/a")],
+            [self._sent_call(), *self._para_calls()],
+            {"fact_check_scope": {"trust_model_classification": False}},
+        )
+        assert all(not e["excluded"] for e in out["out_of_scope"])
+        assert len(out["confirmed"]) == 1
+
+    def test_exclude_types_still_bounds_each_entry(self):
+        out = self._apply(
+            [_verdict(self.SENT, "perplexity", "https://example.com/a")],
+            [self._sent_call(), *self._para_calls()],
+            {"fact_check_scope": {"exclude_types": ["subjective_judgment"]}},
+        )
+        assert all(not e["excluded"] for e in out["out_of_scope"])
+        assert len(out["confirmed"]) == 1
