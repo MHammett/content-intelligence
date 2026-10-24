@@ -5025,3 +5025,95 @@ class TestRateLimitedRetriesAreSpreadOut:
 
     def test_a_zero_delay_stays_zero(self):
         assert self._waits(_rate_limited("20"), retry_delay=0) == 0
+
+
+class TestRetriesAreCounted:
+    """``retry`` is a count as well as a switch (#389).
+
+    The citation relevance check on mistral-small costs well under a cent, and
+    Mistral limits that model to 100 requests a minute on the account measured
+    2026-10-24, so a burst of three concurrent checks draws 429s. With one
+    retry, a second refusal cost the claim its verdict. A count lets a cheap
+    call try a few more times; ``True`` still means exactly one, so nothing
+    else changes.
+    """
+
+    def _run(self, retry, failures, exc_factory=lambda: _rate_limited(), delay=0):
+        attempts = []
+        slept = []
+
+        def _fn():
+            attempts.append(1)
+            if len(attempts) <= failures:
+                raise exc_factory()
+            return "answer"
+
+        with patch.object(client.time, "sleep", side_effect=slept.append):
+            result = client._with_retry(_fn, retry, delay, "x")
+        return result, len(attempts), slept
+
+    def test_true_is_still_exactly_one_retry(self):
+        assert self._run(True, failures=1)[:2] == ("answer", 2)
+        with pytest.raises(Exception, match="HTTP 429"):
+            self._run(True, failures=2)
+
+    def test_false_is_none(self):
+        with pytest.raises(Exception, match="HTTP 429"):
+            self._run(False, failures=1)
+
+    def test_a_count_allows_that_many_and_no_more(self):
+        result, attempts, slept = self._run(3, failures=3)
+        assert (result, attempts, len(slept)) == ("answer", 4, 3)
+        with pytest.raises(Exception, match="HTTP 429"):
+            self._run(3, failures=4)
+
+    @pytest.mark.parametrize("value, expected", [(0, 0), (2, 2), (None, 0), ("x", 1)])
+    def test_how_a_value_reads(self, value, expected):
+        assert client._retries_allowed(value) == expected
+
+    def test_later_refusals_wait_longer_without_a_retry_after(self):
+        """A second 429 says the window is fuller than the first wait assumed."""
+        with patch.object(client.random, "uniform", side_effect=lambda a, b: b):
+            _, _, slept = self._run(3, failures=3, delay=10)
+        # 1.5x, then 2 x 1.5x, then capped at three delays.
+        assert slept == [15, 30, 30]
+
+    def test_a_retry_after_is_honoured_on_every_attempt(self):
+        _, _, slept = self._run(
+            3, failures=3, exc_factory=lambda: _rate_limited("20"), delay=10
+        )
+        assert all(20 <= wait <= 25 for wait in slept)
+
+    def test_a_server_error_is_retried_the_same_number_of_times(self):
+        result, attempts, slept = self._run(
+            2, failures=2, exc_factory=lambda: _http_error(500), delay=10
+        )
+        assert (result, attempts, slept) == ("answer", 3, [10, 10])
+
+    def test_an_exhausted_account_is_not_retried_however_many_are_allowed(self):
+        with pytest.raises(Exception, match="HTTP 429"):
+            self._run(
+                5,
+                failures=1,
+                exc_factory=lambda: _http_error(429, "insufficient_quota"),
+            )
+
+    def test_a_count_reaches_the_call_and_the_discarded_record(self):
+        """End to end: two refusals, then an answer, and the record says so."""
+        outcomes = [_rate_limited(), _rate_limited(), _completion_stream()]
+
+        def completion(**kwargs):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with (
+            patch.object(client.litellm, "completion", side_effect=completion),
+            patch.object(client.time, "sleep"),
+        ):
+            result = _call("mistral", retry=3, retry_delay=10)
+
+        assert result["failed"] is False
+        assert result["discarded_attempts"]["count"] == 2
+        assert result["discarded_attempts"]["unbilled"] == 2
