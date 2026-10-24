@@ -5857,7 +5857,7 @@ def run_publish_pipeline(
         _suggest_seo_for_publish(pub_handoff, pub_config, config["api_keys"])
 
     wp.print_image_plan(image_plan)
-    confirmed = wp.print_checklist_and_confirm()
+    confirmed = wp.print_checklist_and_confirm(wp_config)
     if not confirmed:
         sys.exit(0)
 

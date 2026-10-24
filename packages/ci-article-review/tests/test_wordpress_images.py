@@ -1377,7 +1377,7 @@ class TestPublishCommand:
             "api_keys": {},
         }
 
-        def checklist():
+        def checklist(*_args):
             order.append(capsys.readouterr().out)
             return True
 
@@ -2645,7 +2645,7 @@ class TestPublishCommandPostFields:
     ):
         seen = []
 
-        def confirm():
+        def confirm(*_args):
             seen.append(capsys.readouterr().out)
             return True
 

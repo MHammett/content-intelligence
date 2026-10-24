@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 #: publish over an upload that was merely slow.
 _UPLOAD_TIMEOUT = 120
 
-CHECKLIST = """
+_CHECKLIST_BODY = """
 PRE-PUBLICATION CHECKLIST
 ==========================
 CONTENT
@@ -51,8 +51,36 @@ PUBLICATION
 [ ] Slug and excerpt are what you want (the handoff's "Slug:" and "Excerpt:"
     lines; WordPress makes both up when they are left out)
 [ ] Status is draft (default) -- confirm before switching to live
-[ ] UpdraftPlus backup is current
 """
+
+#: The last PUBLICATION item unless ``wordpress.backup_check`` says otherwise.
+#: It names no plugin: this used to read "UpdraftPlus backup is current" for every
+#: publication, and on a site without that plugin it sent the author after a
+#: backup that did not exist (issue #327). Nothing here checks that a backup is
+#: there; the REST API cannot see a host's.
+DEFAULT_BACKUP_CHECK = "Site backup is current (host or plugin)"
+
+
+def checklist_text(wp_config=None):
+    """The pre-publication checklist, with the backup item the publication asks for.
+
+    ``wordpress.backup_check`` in the publication config is the text of that item.
+    Absent, it is ``DEFAULT_BACKUP_CHECK``. Set to nothing (``backup_check: ""``,
+    or the key left empty) the item is dropped, for a site whose backups are not
+    the author's to confirm.
+    """
+    wp_config = wp_config or {}
+    if "backup_check" in wp_config:
+        text = " ".join(str(wp_config["backup_check"] or "").split())
+    else:
+        text = DEFAULT_BACKUP_CHECK
+    if not text:
+        return _CHECKLIST_BODY
+    return f"{_CHECKLIST_BODY}[ ] {text}\n"
+
+
+#: The checklist for a publication that sets nothing.
+CHECKLIST = checklist_text()
 
 
 def _auth_header(username, application_password):
@@ -1315,8 +1343,8 @@ def push(
         return {"success": False, "error": str(e) + _left_behind(image_uploads)}
 
 
-def print_checklist_and_confirm():
-    print(CHECKLIST)
+def print_checklist_and_confirm(wp_config=None):
+    print(checklist_text(wp_config))
     answer = (
         input("Have you reviewed the checklist and confirmed all items? [yes/no]: ")
         .strip()
