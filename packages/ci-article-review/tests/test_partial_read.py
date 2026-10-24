@@ -192,6 +192,37 @@ class TestOneCapForEveryReader:
         assert quote_check._PDF_MAX_PAGES == extract.PDF_MAX_PAGES
 
 
+class TestADocumentIsExtractedOncePerRun:
+    """The page cache hands every claim on a URL the same response; the text
+    must not be re-parsed for each. On the 2026-10-24 replay one 14-times-cited
+    PDF was extracted 14 times, and PDF extraction was 3,777 s of the run."""
+
+    def test_the_same_response_is_not_parsed_twice(self):
+        resp = _response("application/pdf")
+        with patch(
+            "ci_article_review.adapters.citation.resolver.extract"
+            ".extract_response_text_with_coverage",
+            return_value=("text", "pdf", WHOLE_PDF),
+        ) as parse:
+            first = resolver._extract_fetched_with_coverage(resp, URL)
+            second = resolver._extract_fetched_with_coverage(resp, URL)
+            short = resolver._extract_fetched(resp, URL)
+        assert parse.call_count == 1
+        assert first is second
+        assert short == ("text", "pdf")
+
+    def test_another_url_on_the_same_response_is_read_afresh(self):
+        resp = _response("application/pdf")
+        with patch(
+            "ci_article_review.adapters.citation.resolver.extract"
+            ".extract_response_text_with_coverage",
+            return_value=("text", "pdf", WHOLE_PDF),
+        ) as parse:
+            resolver._extract_fetched_with_coverage(resp, URL)
+            resolver._extract_fetched_with_coverage(resp, URL + "/other")
+        assert parse.call_count == 2
+
+
 def _partial_citation(claim=CLAIM, url=URL, **extra):
     return {
         "claim": claim,

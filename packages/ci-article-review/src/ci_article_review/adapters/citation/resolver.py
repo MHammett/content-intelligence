@@ -388,12 +388,17 @@ def _extract_fetched(resp, url):
     document use ``_extract_fetched_with_coverage`` instead, so the verdict can
     say how much of the document it rests on.
     """
-    return extract.extract_response_text(
-        resp.content,
-        content_type=resp.headers.get("Content-Type"),
-        url=url,
-        encoding=resp.encoding or "utf-8",
-    )
+    text, kind, _coverage = _extract_fetched_with_coverage(resp, url)
+    return text, kind
+
+
+#: Where an extraction is kept on the response it came from. The page cache
+#: hands every claim citing one URL the same response object, so the text is
+#: extracted once per document per run instead of once per claim. Measured on
+#: the 2026-10-24 replay that raised the PDF page cap to 400: 3,777 s of pypdf
+#: time over 90 PDF claims, 83 of them on 20 documents each cited by several
+#: claims (one 14 times) — the same packet parsed again for every claim.
+_EXTRACTED_ATTR = "_ci_extracted"
 
 
 def _extract_fetched_with_coverage(resp, url):
@@ -403,13 +408,25 @@ def _extract_fetched_with_coverage(resp, url):
     for a PDF, how many of its pages were read and whether the extractor's page
     cap stopped short. A verdict formed on a partial read has to say so — see
     ``_resolve_known_url``.
+
+    Memoised on ``resp`` (see ``_EXTRACTED_ATTR``), keyed by ``url`` so a
+    response reused under another address is read afresh.
     """
-    return extract.extract_response_text_with_coverage(
+    kept = getattr(resp, _EXTRACTED_ATTR, None)
+    if kept is not None and kept[0] == url:
+        return kept[1]
+    extracted = extract.extract_response_text_with_coverage(
         resp.content,
         content_type=resp.headers.get("Content-Type"),
         url=url,
         encoding=resp.encoding or "utf-8",
     )
+    try:
+        setattr(resp, _EXTRACTED_ATTR, (url, extracted))
+    except (AttributeError, TypeError):
+        # A response type that refuses new attributes just loses the memo.
+        pass
+    return extracted
 
 
 def build_checksum_index(history_root=None):
