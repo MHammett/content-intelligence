@@ -116,6 +116,14 @@ class FakeWordPress:
         #: Without ``post-thumbnails`` support WordPress drops ``featured_media``
         #: from a create without an error, and answers ``0``.
         self.thumbnails_supported = True
+        #: Login (nicename) to user id, what ``/users?slug=`` looks up. The default
+        #: site has the one account the rehearsal and the author tests name.
+        self.users = {"admin": 2}
+        #: How the users endpoint answers, when it is not the lookup: a 401 for a
+        #: request with no Authorization header is the real behaviour and is
+        #: always on; this overrides the rest (a 403 for an account that may not
+        #: list users, say).
+        self.users_response = None
 
     def post(self, url, **kw):
         self.requests.append(("POST", url))
@@ -131,6 +139,25 @@ class FakeWordPress:
         self.created.append(kw["json"])
         if self.post_response is not None:
             return self.post_response
+        # WordPress validates ``author`` as an integer user id before it looks at
+        # anything else, and answers 400 with this body. The fake used to take any
+        # value, which is how a login name went through a rehearsal and failed on
+        # the live site (issue #369).
+        author = kw["json"].get("author")
+        if "author" in kw["json"] and (
+            isinstance(author, bool) or not isinstance(author, int)
+        ):
+            return Resp(
+                400,
+                {
+                    "code": "rest_invalid_param",
+                    "message": "Invalid parameter(s): author",
+                    "data": {
+                        "status": 400,
+                        "params": {"author": "author is not of type integer."},
+                    },
+                },
+            )
         return self._created(url, kw["json"])
 
     def _created(self, url, payload):
@@ -168,7 +195,31 @@ class FakeWordPress:
 
     def get(self, url, **kw):
         self.requests.append(("GET", url))
+        if url.endswith("/users"):
+            return self._users(**kw)
         return Resp(200, [{"id": 3, "slug": "s"}])
+
+    def _users(self, **kw):
+        """``GET /users?slug=<login>``: needs credentials, and matches the nicename.
+
+        WordPress sanitises ``slug`` with ``sanitize_title`` before it matches, so
+        ``Admin`` finds the account whose nicename is ``admin``.
+        """
+        if "Authorization" not in (kw.get("headers") or {}):
+            return Resp(
+                401,
+                {
+                    "code": "rest_not_logged_in",
+                    "message": "You are not currently logged in.",
+                    "data": {"status": 401},
+                },
+            )
+        if self.users_response is not None:
+            return self.users_response
+        slug = _sanitize_title((kw.get("params") or {}).get("slug", ""))
+        if slug in self.users:
+            return Resp(200, [{"id": self.users[slug], "slug": slug, "name": "N"}])
+        return Resp(200, [])
 
     def _upload(self, **kw):
         self.upload_attempts += 1

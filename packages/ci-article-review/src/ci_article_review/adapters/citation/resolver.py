@@ -1047,6 +1047,11 @@ def _resolve_known_url(
                 f" Only the first {followed.pages_read} pages of a longer source "
                 "were read, so the claim may sit further on."
             )
+        elif followed is not None and followed.stopped == "byte budget":
+            result["note"] += (
+                f" Reading stopped at a size limit after {followed.pages_read} "
+                "pages of a longer source, so the claim may sit further on."
+            )
 
     return _check_drift(result, checksum_index)
 
