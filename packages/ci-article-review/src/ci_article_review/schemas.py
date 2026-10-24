@@ -99,26 +99,29 @@ ARGUMENT_INTEGRITY = _obj(
     additional_observations=_ADDITIONAL_OBSERVATIONS,
 )
 
+#: Bucket order is the order the model writes them in, so it decides what an
+#: output-token cutoff loses: everything after the bucket the response was in.
+#: ``confirmed`` used to come first, and on a long draft it is by far the
+#: largest bucket: the 2026-10-23 ``maximum`` run's mistral:fact_check wrote
+#: 154 confirmations and hit its 50,000-token ceiling before a single
+#: contradiction, outdated figure or unverifiable claim — the verdicts that ask
+#: the author to change something. Verdicts that need action now come first and
+#: the long tail of confirmations last, so a cutoff costs confirmations instead.
+#: ``prompts/fact_check.txt`` lists them in the same order (``test_schemas.py``
+#: holds the two together), and ``LEGACY_ORDER`` keeps the old order readable
+#: for captures written under it.
 FACT_CHECK = _obj(
-    confirmed=_array_of(
+    contradicted=_array_of(
         claim=_STR,
+        contradiction=_STR,
         source=_STR,
         source_url=_STR,
         supporting_quote=_STR,
         confidence=_CONFIDENCE,
-        note=_NULLABLE_STR,
     ),
     outdated=_array_of(
         claim=_STR,
         current_value=_STR,
-        source=_STR,
-        source_url=_STR,
-        supporting_quote=_STR,
-        confidence=_CONFIDENCE,
-    ),
-    contradicted=_array_of(
-        claim=_STR,
-        contradiction=_STR,
         source=_STR,
         source_url=_STR,
         supporting_quote=_STR,
@@ -159,6 +162,14 @@ FACT_CHECK = _obj(
     # than a sixth flavour of "unverifiable". No URL fields here for the
     # same reason the bucket exists: there is no page to name.
     out_of_scope=_array_of(claim=_STR, claim_type=_CLAIM_TYPE, reason=_STR),
+    confirmed=_array_of(
+        claim=_STR,
+        source=_STR,
+        source_url=_STR,
+        supporting_quote=_STR,
+        confidence=_CONFIDENCE,
+        note=_NULLABLE_STR,
+    ),
     additional_observations=_ADDITIONAL_OBSERVATIONS,
 )
 
@@ -215,6 +226,58 @@ BY_DOMAIN = {
     "red_team": RED_TEAM,
     "expansion": EXPANSION,
 }
+
+
+#: Bucket orders a domain's schema used to have, newest first. A saved capture
+#: was written in the order its run asked for, and the truncation report works
+#: out what was lost from that order (``consolidation._truncation_extent``), so
+#: reading an old capture in today's order would call five lost buckets
+#: "skipped". Only ever appended to.
+LEGACY_ORDER = {
+    # Until 2026-10-23.
+    "fact_check": (
+        (
+            "confirmed",
+            "outdated",
+            "contradicted",
+            "unverifiable",
+            "primary_source_needed",
+            "out_of_scope",
+            "additional_observations",
+        ),
+    ),
+}
+
+
+def subset(domain, buckets):
+    """``domain``'s schema cut down to ``buckets``, or None for a custom domain.
+
+    For a continuation call (``pipeline._continue_truncated_passes``): a pass
+    that hit its output ceiling is asked again for only the buckets it never
+    delivered. ``properties`` and ``required`` hold exactly those, in schema
+    order, and ``additionalProperties`` stays false, so a provider that enforces
+    the schema cannot spend the second ceiling re-writing a bucket it already
+    sent. The bucket definitions themselves are the full schema's, unchanged.
+
+    Raises ``ValueError`` on a bucket the domain does not have, or on none at
+    all: an empty strict object would be a request for nothing.
+    """
+    schema = BY_DOMAIN.get(domain)
+    if schema is None:
+        return None
+    wanted = set(buckets)
+    unknown = sorted(wanted - set(schema["properties"]))
+    if unknown:
+        raise ValueError(f"{domain} has no bucket(s) {unknown}")
+    keep = [name for name in schema["properties"] if name in wanted]
+    if not keep:
+        raise ValueError(f"no buckets asked for from {domain}")
+    return {
+        "type": "object",
+        "properties": {name: schema["properties"][name] for name in keep},
+        "required": keep,
+        "additionalProperties": False,
+    }
 
 
 def for_domain(domain):

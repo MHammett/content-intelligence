@@ -666,6 +666,52 @@ loss, not a partial one.
 
 ---
 
+### Continuing a pass cut off at its output ceiling
+
+```yaml
+pipeline:
+  continue_truncated_passes: true   # default; false disables the pass
+```
+
+A pass that hits its output-token ceiling keeps the findings it finished and
+loses every bucket it had not reached. When that loses whole buckets, the
+pipeline makes **one** follow-up call to the same model: the same prompt, draft
+and ceiling, told which buckets the first call delivered and how many entries
+each held, and asked for only the missing ones under a schema that contains
+nothing else — so a provider that enforces the schema cannot spend the second
+ceiling re-writing `confirmed`. The answer's buckets are merged under the
+original's. It runs after recovery and substitution, so a recovered or substitute
+call that was cut off is covered too, and adds nothing to a run with no cut.
+
+**Why.** On 2026-10-23 a `maximum` run on a 169,940-character draft cut
+`mistral:fact_check` at its 50,000-token ceiling after 154 `confirmed` entries,
+and it never wrote `contradicted`, `outdated`, `unverifiable`,
+`primary_source_needed`, `out_of_scope` or `additional_observations`. The run
+reported the loss and did nothing about it: recovery retries failed calls, and a
+truncated pass succeeded. The same change moved `confirmed` to second-last in
+fact_check's bucket order, so a cut now costs confirmations rather than the
+verdicts that ask for a change.
+
+**What it cannot repair.** The bucket the first call was cut *inside* is not asked
+for again — asking would re-send every entry already delivered — so it may be
+short, and the report says so ("cut off partway through `confirmed` after 154
+entries; a follow-up call delivered …; `confirmed` may be incomplete"). A
+follow-up that is cut off too keeps only the buckets it finished, and one that
+fails keeps the original; either way the report names what never arrived. It is
+never recursive.
+
+**What it costs.** One more call per cut pass, reading the whole prompt again.
+Each follow-up is recorded under the pass in `continuations` and priced as a call
+of its own in `cost_summary` (`continuation_calls`, `continuation_usd`); one that
+reported no usage is counted in `uncosted_calls` and makes the total a floor, as a
+stalled retry does.
+
+**On a saved run.** `--retry-failed` gives each truncated pass in the capture a
+continuation instead of a re-run, billed as that run's spend while the first call
+stays the capture's. A replay never makes one: replayed results are history.
+
+---
+
 ### Ensemble width, and backfilling a narrowed domain
 
 ```yaml

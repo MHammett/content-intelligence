@@ -189,6 +189,8 @@
         "total_usd": 0.0045
       }
     ],
+    "continuation_calls": 0,
+    "continuation_usd": 0.0,
     "discarded_calls": 0,
     "incurred_usd": 0.0315,
     "pricing_known": false,
@@ -200,6 +202,7 @@
     "total_search_usd": 0.0,
     "total_usd": 0.0315,
     "uncosted_calls": 0,
+    "uncosted_continuation_calls": 0,
     "unmeasured_search_calls": 0,
     "unpriced_searches": 0
   },

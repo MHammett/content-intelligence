@@ -132,6 +132,11 @@ _DOMAIN_PROMPTS: dict[str, str] = {
     "expansion": "expansion.txt",
 }
 
+#: Appended to a domain's own prompt for a continuation call: the follow-up a
+#: pass cut off at its output ceiling gets for the buckets it never delivered
+#: (``_continue_truncated_passes``). Not a domain, so not in the table above.
+_CONTINUATION_PROMPT = "continuation.txt"
+
 #: The one domain that proposes material instead of judging it.
 #:
 #: Kept out of the default ensemble and gated behind ``--expand``. The review
@@ -1453,12 +1458,20 @@ def _run_domain(
     prompt_str: str | None = None,
     scope=None,
     review_context: str = "",
+    continuation: dict | None = None,
 ) -> dict:
     """Call one model on one domain and return the adapter result dict.
 
     The result is tagged with ``_model`` and ``_domain`` so the caller can
     build the keyed results dict without re-parsing the runner name string.
     prompt_str overrides the built-in prompt file for custom publication domains.
+
+    ``continuation`` (``{"delivered": {bucket: count}, "missing": [bucket]}``)
+    makes this the follow-up to a pass cut off at its output ceiling: the same
+    prompt, draft, ceiling and provider settings, plus a block naming what the
+    earlier response delivered, under a schema of only the missing buckets.
+    Built here rather than beside its caller so the follow-up cannot drift from
+    the call it continues. See ``_continue_truncated_passes``.
     """
     template = (
         prompt_str if prompt_str is not None else _load_prompt(_DOMAIN_PROMPTS[domain])
@@ -1484,6 +1497,15 @@ def _run_domain(
         # actually holds when a model ignores it.
         out_of_scope_passages=scope.prompt_block() if scope is not None else "",
     )
+    response_schema = schemas.for_domain(domain)
+    if continuation:
+        # Appended to the domain instruction, before the cache layout moves
+        # that instruction, so the two always travel together.
+        system += _continuation_block(continuation)
+        response_schema = {
+            "name": f"{domain}_continuation",
+            "schema": schemas.subset(domain, continuation["missing"]),
+        }
     user = _build_user_prompt(draft, handoff, review_context)
 
     # Off by default: it relocates the domain instruction from before the
@@ -1568,7 +1590,7 @@ def _run_domain(
         # Let the provider enforce the shape the prompt asks for. None for a
         # custom domain, which has a prompt but no declared schema — and for
         # gemini while grounded, which the LLM layer drops on its own.
-        response_schema=schemas.for_domain(domain),
+        response_schema=response_schema,
         # Where the shared article ends and this domain's task begins.
         # None unless the cache layout is on — without it there is no
         # shared prefix to point at.
@@ -2570,6 +2592,253 @@ def _recover_failed_calls(
     return raw_results
 
 
+# ---------------------------------------------------------------------------
+# Continuing a pass cut off at its output ceiling
+# ---------------------------------------------------------------------------
+#
+# Checked before building, 2026-10-23: no provider in the ensemble and no
+# library offers "continue a truncated structured output". litellm has no such
+# primitive. OpenAI's `previous_response_id` would carry the first response
+# over, but needs `store=True`, which this pipeline deliberately sends as False.
+# The usual chat workaround — append the partial assistant message and say
+# "continue" — is reported on community.openai.com to break JSON mode, and a
+# strict schema cannot describe "the rest of an object already half written".
+# So the follow-up is a fresh, complete request for a smaller object: the
+# buckets that never arrived, under a schema holding only those.
+
+
+def _delivered_counts(data):
+    """``{bucket: entries}`` for what a response delivered, in written order.
+
+    None for a bucket that is not a list (red_team's three findings are
+    objects), which the continuation block words as "delivered".
+    """
+    if not isinstance(data, dict):
+        return {}
+    return {k: (len(v) if isinstance(v, list) else None) for k, v in data.items()}
+
+
+def _continuation_block(continuation):
+    """The text appended to a domain prompt for its continuation call."""
+
+    def _phrase(count):
+        if count is None:
+            return "delivered"
+        return f"{count} entr{'y' if count == 1 else 'ies'}"
+
+    delivered = continuation.get("delivered") or {}
+    lines = [f"- {name}: {_phrase(count)}" for name, count in delivered.items()]
+    return _render_prompt(
+        _load_prompt(_CONTINUATION_PROMPT),
+        delivered_buckets="\n".join(lines) or "- nothing complete",
+        missing_buckets=", ".join(continuation["missing"]),
+    )
+
+
+def _continuation_record(fresh, asked):
+    """What one continuation call cost and returned, for ``continuations``.
+
+    Everything ``cost.calculate`` needs to bill it as a call of its own: its
+    tokens, its searches, the model that answered and the attempts its own
+    retry threw away. Kept beside the pass it continued rather than as a second
+    result, because the report has one entry per (model, domain) and the
+    follow-up is not a second opinion.
+    """
+    record = {
+        "buckets_requested": list(asked),
+        "model": fresh.get("model"),
+        "tokens": fresh.get("tokens") or {},
+        "elapsed_seconds": fresh.get("elapsed_seconds"),
+        "max_tokens": fresh.get("max_tokens"),
+        "truncated": bool(fresh.get("truncated")),
+        "failed": bool(fresh.get("failed")),
+        "error": fresh.get("error") if fresh.get("failed") else None,
+    }
+    if "searches" in fresh:
+        record["searches"] = fresh["searches"]
+    if fresh.get("provider_cost_usd") is not None:
+        record["provider_cost_usd"] = fresh["provider_cost_usd"]
+    if fresh.get("discarded_attempts"):
+        record["discarded_attempts"] = fresh["discarded_attempts"]
+    # A request refused before generating (a 429) billed nothing, and is not
+    # spend the summary should call missing. Absent unless it was.
+    if fresh.get("unbilled") is True:
+        record["unbilled"] = True
+    return record
+
+
+def _accepted_buckets(domain, fresh, asked):
+    """The buckets of a continuation's answer that can be merged, in order.
+
+    Only those that were asked for: a schema-free provider (grounded gemini)
+    can re-send a delivered bucket, and the original's copy is the one kept.
+    A follow-up that was cut off too keeps only the buckets it finished — the
+    one it was inside when it stopped may be short, and a short bucket with
+    nothing saying so is what this pass exists to prevent.
+    """
+    if fresh.get("failed") or not isinstance(fresh.get("data"), dict):
+        return []
+    written = [k for k in fresh["data"] if k in asked]
+    if not fresh.get("truncated") or not written:
+        return written
+    extent = consolidation._truncation_extent(domain, fresh["data"], fresh.get("raw"))
+    # The raw text shows whether the cut came inside the last bucket written
+    # or inside one after it that salvage dropped; without raw, assume the worst.
+    if extent["cut_in"] in (None, written[-1]):
+        return written[:-1]
+    return written
+
+
+def _continue_truncated_passes(
+    raw_results, make_runner, pipeline_cfg, model_configs, task_timeout
+):
+    """Ask a pass cut off at its output ceiling for the buckets it never sent.
+
+    Measured 2026-10-23, a ``maximum`` run on a 169,940-character draft:
+    mistral:fact_check spent its 50,000-token ceiling on 154 confirmations and
+    never wrote a single other bucket. The run said so and did nothing about it;
+    recovery retries failed calls only, and a truncated pass succeeded.
+
+    For each truncated result whose domain has a schema and whose cut lost
+    whole buckets, one follow-up call to the same model: the same prompt and
+    ceiling (``_run_domain``'s ``continuation``), told which buckets already
+    arrived and asked only for the rest. The answer's buckets are merged under
+    the original's, which wins on any key both have. ``truncated`` is cleared
+    only when every missing bucket arrived; the bucket the first call was cut
+    inside is not asked for again and may still be short, which ``continued``
+    records for the report. Never recursive: a follow-up that is cut off or
+    fails is recorded and left there.
+
+    Also repairs a ``--retry-failed`` capture's truncated passes, and one a
+    previous continuation left incomplete (it asks for ``still_missing``).
+
+    Returns ``(raw_results, continued_from)``: the second maps each pass
+    continued here to the result it replaced, so the call log can tell the
+    original's spend (a capture's, under ``--retry-failed``) from the
+    follow-up's (this run's). Off with ``continue_truncated_passes: false``.
+    """
+    if not pipeline_cfg.get("continue_truncated_passes", True):
+        return raw_results, {}
+
+    plans = {}
+    for name, result in raw_results.items():
+        if not isinstance(result, dict) or result.get("failed"):
+            continue
+        model_name = result.get("_model") or name.partition(":")[0]
+        domain = result.get("_domain") or name.partition(":")[2]
+        if domain not in schemas.BY_DOMAIN:
+            continue
+        earlier = result.get("continued")
+        if isinstance(earlier, dict):
+            asked = list(earlier.get("still_missing") or [])
+            extent = earlier
+        elif result.get("truncated"):
+            extent = consolidation._truncation_extent(
+                domain, result.get("data"), result.get("raw")
+            )
+            asked = list(extent["missing_buckets"])
+        else:
+            continue
+        if not asked:
+            continue
+        plans[name] = (model_name, domain, asked, extent)
+    if not plans:
+        return raw_results, {}
+
+    log.info(
+        "Continuation: %d pass(es) cut off at the output-token ceiling, asking "
+        "each for the buckets it never delivered: %s",
+        len(plans),
+        ", ".join(sorted(plans)),
+    )
+    runners = [
+        make_runner(
+            model_name,
+            domain,
+            continuation={
+                "delivered": _delivered_counts(raw_results[name].get("data")),
+                "missing": asked,
+            },
+        )
+        for name, (model_name, domain, asked, _extent) in plans.items()
+    ]
+    answers = _run_reviews_in_parallel(
+        runners, pipeline_cfg, model_configs, task_timeout
+    )
+
+    continued_from = {}
+    for name, (model_name, domain, asked, extent) in plans.items():
+        original = raw_results[name]
+        fresh = answers.get(name) or {
+            "failed": True,
+            "error": "no result",
+            "tokens": {},
+        }
+        accepted = _accepted_buckets(domain, fresh, asked)
+        data = dict(original.get("data") or {})
+        for bucket in accepted:
+            data.setdefault(bucket, fresh["data"][bucket])
+        still_missing = [b for b in asked if b not in accepted]
+
+        earlier = (
+            original.get("continued")
+            if isinstance(original.get("continued"), dict)
+            else None
+        )
+        merged = dict(original)
+        merged["data"] = data
+        merged["truncated"] = bool(still_missing)
+        merged["continued"] = {
+            # What the first call never delivered, where it was cut, and how
+            # much of each bucket it had written: the report's account of the
+            # cut, which the merged data no longer shows.
+            "asked_for": list(earlier["asked_for"]) if earlier else asked,
+            "last_bucket": extent.get("last_bucket"),
+            "cut_in": extent.get("cut_in"),
+            "delivered": (
+                dict(earlier.get("delivered") or {})
+                if earlier
+                else _delivered_counts(original.get("data"))
+            ),
+            "recovered_buckets": list((earlier or {}).get("recovered_buckets") or [])
+            + accepted,
+            "still_missing": still_missing,
+        }
+        merged["continuations"] = list(original.get("continuations") or []) + [
+            _continuation_record(fresh, asked)
+        ]
+        raw_results[name] = merged
+        continued_from[name] = original
+
+        tokens = fresh.get("tokens") or {}
+        log.info(
+            "Continuation: %s asked for %d missing bucket(s) (%s), got %d, "
+            "%s+%s tokens",
+            name,
+            len(asked),
+            ", ".join(asked),
+            len(accepted),
+            tokens.get("prompt", 0) or 0,
+            tokens.get("completion", 0) or 0,
+        )
+        if still_missing:
+            why = (
+                f"the follow-up failed ({fresh.get('error') or 'no error recorded'})"
+                if fresh.get("failed")
+                else "the follow-up was cut off at its ceiling too"
+                if fresh.get("truncated")
+                else "the follow-up did not return them"
+            )
+            log.warning(
+                "Continuation: %s still missing %s — %s; kept everything that "
+                "arrived complete.",
+                name,
+                ", ".join(still_missing),
+                why,
+            )
+    return raw_results, continued_from
+
+
 #: Models that consult live sources without being asked to. gemini is sent
 #: `tools: [googleSearch]` on every call and perplexity is a search product, so
 #: neither can be un-grounded from config. openai, grok and claude ground only
@@ -3457,21 +3726,24 @@ def run_draft_pipeline(
     # Factored into a maker so a substitute call (below) is built exactly the
     # same way as the calls the preset asked for, rather than by a second
     # construction that could drift from this one.
-    def _make_runner(model_name, domain):
+    def _make_runner(model_name, domain, continuation=None):
         return (
             f"{model_name}:{domain}",
-            lambda m=model_name, d=domain, ps=custom_prompts.get(domain): _run_domain(
-                m,
-                d,
-                corrected_draft,
-                handoff,
-                pub_config,
-                api_keys,
-                pipeline_cfg,
-                model_configs,
-                prompt_str=ps,
-                scope=scope,
-                review_context=review_context,
+            lambda m=model_name, d=domain, ps=custom_prompts.get(domain), c=continuation: (
+                _run_domain(
+                    m,
+                    d,
+                    corrected_draft,
+                    handoff,
+                    pub_config,
+                    api_keys,
+                    pipeline_cfg,
+                    model_configs,
+                    prompt_str=ps,
+                    scope=scope,
+                    review_context=review_context,
+                    **({"continuation": c} if c else {}),
+                )
             ),
         )
 
@@ -3522,6 +3794,22 @@ def run_draft_pipeline(
             len(still_failed),
             len(raw_results),
         )
+        # Not re-run: a truncated pass's complete buckets are good, and a full
+        # call would pay for them again. The continuation pass below asks it
+        # for only what it never delivered.
+        truncated_in_capture = sorted(
+            name
+            for name, r in prior_results.items()
+            if not r.get("failed")
+            and (r.get("truncated") or (r.get("continued") or {}).get("still_missing"))
+        )
+        if truncated_in_capture and pipeline_cfg.get("continue_truncated_passes", True):
+            log.info(
+                "%d pass(es) in the capture were cut off at their output-token "
+                "ceiling and get a continuation call, not a re-run: %s",
+                len(truncated_in_capture),
+                ", ".join(truncated_in_capture),
+            )
     elif pipeline_cfg.get("parallel_review_calls", True):
         raw_results = _run_reviews_in_parallel(
             runners, pipeline_cfg, model_configs, task_timeout
@@ -3565,6 +3853,17 @@ def run_draft_pipeline(
             # What the preset asked for, so a domain whose only model was never
             # assigned is repairable too, not just one whose model failed.
             expected_domains=expected_domains,
+        )
+
+    # A pass cut off at its output ceiling gets one follow-up call for the
+    # buckets it never delivered. After recovery and substitution, so a
+    # recovered or substitute call that was cut off is covered too, and on
+    # --retry-failed for the capture's truncated passes as well. Skipped on
+    # replay: a replayed result is history, and a replay makes no calls.
+    continued_from: dict[str, dict] = {}
+    if not replay_results:
+        raw_results, continued_from = _continue_truncated_passes(
+            raw_results, _make_runner, pipeline_cfg, model_configs, task_timeout
         )
 
     # Hold the raw ensemble output for capture. Written next to the report once
@@ -3630,7 +3929,15 @@ def run_draft_pipeline(
         elapsed = result.get("elapsed_seconds")
         out_tokens = (result.get("tokens") or {}).get("completion")
         timed_out = "timed out" in str(result.get("error", "")).lower()
-        truncated = bool(result.get("truncated"))
+        # The entry's tokens and ceiling are the first call's, so its status is
+        # too: a pass a continuation call repaired was still cut off, and the
+        # calibration record must say so. The follow-up is in `continuations`.
+        continued = (
+            result.get("continued")
+            if isinstance(result.get("continued"), dict)
+            else None
+        )
+        truncated = bool(result.get("truncated")) or continued is not None
         # A call that succeeded and returned a schema-valid payload with nothing
         # in it is a third outcome, and the status line is where a reader looks
         # to see whether a pass ran. Same predicate consolidation uses to build
@@ -3692,7 +3999,18 @@ def run_draft_pipeline(
         # numbers the socket budgets bound. See ci_core.llm.client._StreamTiming.
         if result.get("stream_timing"):
             log_entry["stream_timing"] = result["stream_timing"]
-        if replay_results or prior_results.get(f"{model_name}:{domain}") is result:
+        # The follow-up calls a truncated pass got, each billed on its own by
+        # cost.calculate. Copied, because the replayed marking below is this
+        # run's bookkeeping and must not leak into the capture.
+        pass_name = f"{model_name}:{domain}"
+        if result.get("continuations"):
+            log_entry["continuations"] = [
+                dict(c) for c in result["continuations"] if isinstance(c, dict)
+            ]
+        # A pass this run continued is a new object; whether its first call is
+        # history depends on the one it replaced.
+        before_continuing = continued_from.get(pass_name, result)
+        if replay_results or prior_results.get(pass_name) is before_continuing:
             # These token counts came out of a capture file — they are the
             # captured run's spend, not this one's. A replay re-reports its
             # whole capture; --retry-failed re-reports each result it passed
@@ -3712,6 +4030,13 @@ def run_draft_pipeline(
                 # may have searched, and nothing says how often, so the replay
                 # calls its total "at least" rather than "exact".
                 log_entry["searches"] = None
+            if pass_name in continued_from:
+                # --retry-failed continued a pass it loaded: the first call is
+                # the capture's spend, the follow-up this run's. A continuation
+                # that arrived in the capture stays history with its entry.
+                already = len(continued_from[pass_name].get("continuations") or [])
+                for record in log_entry.get("continuations", [])[already:]:
+                    record["replayed"] = False
         if (not status_ok or truncated) and result.get("raw"):
             log_entry["raw_excerpt"] = _raw_excerpt(result["raw"])
         if not status_ok and result.get("error_body"):
@@ -3762,10 +4087,21 @@ def run_draft_pipeline(
             )
         elif status_ok and truncated:
             against = f" against a {ceiling}-token ceiling" if ceiling else ""
+            if continued is None:
+                outcome = "complete findings kept, the rest lost"
+            else:
+                recovered = continued.get("recovered_buckets") or []
+                missing = continued.get("still_missing") or []
+                outcome = "complete findings kept; a follow-up call " + (
+                    f"delivered {', '.join(recovered)}"
+                    if recovered
+                    else "delivered nothing"
+                )
+                if missing:
+                    outcome += f"; still missing {', '.join(missing)}"
             log.warning(
                 f"  {model_name}:{domain}: PARTIAL — cut off at the output-token "
-                f"ceiling after {out_tokens} output tokens{against}; complete "
-                f"findings kept, the rest lost"
+                f"ceiling after {out_tokens} output tokens{against}; {outcome}"
             )
             if "raw_excerpt" in log_entry:
                 log.debug(
@@ -4127,12 +4463,19 @@ def run_draft_pipeline(
     # Spend the provider billed that this run has no number for. Each makes
     # the total a floor.
     unpriced = []
-    if cost_summary.get("uncosted_calls"):
+    uncosted_continuations = cost_summary.get("uncosted_continuation_calls", 0)
+    uncosted_retries = cost_summary.get("uncosted_calls", 0) - uncosted_continuations
+    if uncosted_retries:
         # Retried attempts the provider billed for and this run cannot price,
         # because a stalled stream reports no usage.
         unpriced.append(
-            f"{cost_summary['uncosted_calls']} retried attempt(s) "
+            f"{uncosted_retries} retried attempt(s) "
             f"were billed by the provider with no usage reported"
+        )
+    if uncosted_continuations:
+        unpriced.append(
+            f"{uncosted_continuations} continuation call(s) may have been billed "
+            f"with no usage reported"
         )
     if cost_summary.get("unmeasured_search_calls"):
         unpriced.append(
@@ -4164,12 +4507,17 @@ def run_draft_pipeline(
             "Retries: %d attempt(s) discarded and re-run; %d of them had usage "
             "the cost above includes%s.",
             cost_summary["discarded_calls"],
-            cost_summary["discarded_calls"]
-            - cost_summary.get("uncosted_calls", 0)
-            - refused,
+            cost_summary["discarded_calls"] - uncosted_retries - refused,
             f", and {refused} refused before generating, so cost nothing"
             if refused
             else "",
+        )
+    if cost_summary.get("continuation_calls"):
+        log.info(
+            "Continuations: %d follow-up call(s) for passes cut off at their "
+            "output ceiling, $%.4f of the cost above.",
+            cost_summary["continuation_calls"],
+            cost_summary.get("continuation_usd", 0.0),
         )
 
     # Attach pre-analysis
@@ -4605,9 +4953,26 @@ def _print_draft_summary(
                 spent = f" after {used} output tokens{at}" if used else at
                 print(f"  - {detail['pass']} truncated{spent}.")
                 missing = detail.get("missing_buckets") or []
+                continued = bool(detail.get("continued"))
+                if continued:
+                    recovered = detail.get("recovered_buckets") or []
+                    print(
+                        "    Recovered by a follow-up call: "
+                        + (", ".join(recovered) if recovered else "nothing")
+                        + "."
+                    )
                 if missing:
                     print(f"    Never arrived: {', '.join(missing)}.")
-                if detail.get("section"):
+                cut_in = detail.get("cut_in")
+                partway = cut_in and cut_in == detail.get("last_bucket")
+                if continued and partway:
+                    entries = detail.get("cut_in_entries")
+                    after = f" after {entries} entries" if entries is not None else ""
+                    print(
+                        f"    {cut_in} was cut off partway{after} and may be "
+                        "incomplete; it is not asked for again."
+                    )
+                if detail.get("section") and (missing or partway or not continued):
                     print(f"    {detail['section']} is incomplete for this model.")
         else:
             print(f"  {', '.join(report['truncated_results'])}")

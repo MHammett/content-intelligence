@@ -897,6 +897,15 @@ def _truncation_caveat(truncated):
         dict.fromkeys(b for d in truncated for b in d.get("missing_buckets") or [])
     )
     lost = f" — {', '.join(never)} never arrived" if never else ""
+    # A continuation call's buckets are in this list; `missing_buckets` is
+    # already what neither call delivered.
+    recovered = list(
+        dict.fromkeys(b for d in truncated for b in d.get("recovered_buckets") or [])
+    )
+    if recovered:
+        lost += (
+            f"{';' if lost else ' —'} a follow-up call recovered {', '.join(recovered)}"
+        )
     return [
         f"_Built from an incomplete fact-check: {models} hit the output-token "
         f"ceiling before finishing{lost}. A claim only a truncated pass would "

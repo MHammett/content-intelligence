@@ -1793,12 +1793,15 @@ def _truncation_extent(domain, data, raw=None):
     model rather than cut off, and is not reported. A custom domain declares no
     schema, so there is nothing to compare against and the fields come back
     empty.
+
+    "Schema order" is the order the response was asked for in, which is not
+    always today's: see ``_written_order``.
     """
     schema = schemas.BY_DOMAIN.get(domain)
     if not schema:
         return {"missing_buckets": [], "last_bucket": None, "cut_in": None}
-    order = list(schema["properties"])
     present = data if isinstance(data, dict) else {}
+    order = _written_order(domain, present)
     arrived = [k for k in order if k in present]
     last = arrived[-1] if arrived else None
     missing = order[order.index(last) + 1 :] if last else order
@@ -1814,6 +1817,92 @@ def _truncation_extent(domain, data, raw=None):
         max(opened, key=opened.get) if any(v >= 0 for v in opened.values()) else None
     )
     return {"missing_buckets": missing, "last_bucket": last, "cut_in": cut_in}
+
+
+def _written_order(domain, present):
+    """The bucket order a response for ``domain`` was written in.
+
+    Today's schema order, unless the response is plainly following an older
+    one (``schemas.LEGACY_ORDER``): a capture saved before fact_check moved
+    ``confirmed`` from first to second-last holds ``{"confirmed": [...]}`` when
+    it was cut off early, which in today's order would read as five buckets
+    skipped and one lost, where the truth is six lost.
+
+    The buckets that arrived, in the order the response wrote them (a parsed
+    dict keeps it), are matched against each candidate order: the first one
+    they are a prefix of wins, since a response that skips nothing writes a
+    prefix of what it was asked for, and strict schemas require every key.
+    Failing that, the first one they are an in-order subsequence of; failing
+    that, today's.
+    """
+    current = list(schemas.BY_DOMAIN[domain]["properties"])
+    candidates = [current] + [list(o) for o in schemas.LEGACY_ORDER.get(domain, ())]
+    observed = [k for k in present if k in current]
+
+    def _subsequence(seq, order):
+        it = iter(order)
+        return all(k in it for k in seq)
+
+    for order in candidates:
+        if order[: len(observed)] == observed:
+            return order
+    for order in candidates:
+        if _subsequence(observed, order):
+            return order
+    return current
+
+
+def _truncation_detail(model, domain, r):
+    """One ``truncated_result_details`` entry for a pass that was cut off.
+
+    A pass a continuation call followed up (``pipeline._continue_truncated_passes``)
+    no longer shows the cut in its data, which now holds the follow-up's buckets
+    too, so its extent is the one recorded when the cut was found, in
+    ``r["continued"]``. ``missing_buckets`` then means what never arrived from
+    either call, which is what every reader of it wants to know; the buckets
+    the first call missed are kept as ``originally_missing``.
+    """
+    detail = {
+        "pass": f"{model}:{domain}",
+        "model": r.get("model") or model,
+        "domain": domain,
+        "section": _DOMAIN_SECTIONS.get(domain),
+        "completion_tokens": (r.get("tokens") or {}).get("completion"),
+        "max_tokens": r.get("max_tokens"),
+    }
+    continued = r.get("continued")
+    if not isinstance(continued, dict):
+        detail.update(_truncation_extent(domain, r.get("data"), r.get("raw")))
+        return detail
+    still_missing = list(continued.get("still_missing") or [])
+    detail.update(
+        {
+            "missing_buckets": still_missing,
+            "last_bucket": continued.get("last_bucket"),
+            "cut_in": continued.get("cut_in"),
+            "continued": True,
+            "originally_missing": list(continued.get("asked_for") or []),
+            "recovered_buckets": list(continued.get("recovered_buckets") or []),
+            "still_missing": still_missing,
+        }
+    )
+    delivered = continued.get("delivered") or {}
+    cut_in = continued.get("cut_in")
+    if cut_in and cut_in == continued.get("last_bucket") and cut_in in delivered:
+        # How far into the bucket it was cut: the one figure that says how
+        # much of it may be missing.
+        detail["cut_in_entries"] = delivered[cut_in]
+    attempts = [c for c in r.get("continuations") or () if isinstance(c, dict)]
+    if attempts:
+        last = attempts[-1]
+        detail["continuation_outcome"] = (
+            "failed"
+            if last.get("failed")
+            else "truncated"
+            if last.get("truncated")
+            else "complete"
+        )
+    return detail
 
 
 def _collect_low_confidence(results):
@@ -2169,10 +2258,14 @@ def build_report(
     # some findings were recovered, but some were genuinely lost. Not a failure
     # (its findings are already merged into the sections above), but distinct
     # enough from a clean call that it needs to stay visible in the report.
+    #
+    # A pass a continuation call repaired is still listed: its first call was
+    # cut off, and the bucket it was cut inside may be short however much the
+    # follow-up recovered.
     truncated_results = [
         f"{model}:{domain}"
         for (model, domain), r in results.items()
-        if r.get("truncated")
+        if r.get("truncated") or r.get("continued")
     ]
     # …and what each one lost. The bare pass name was the whole record, and a
     # truncated fact-check reads exactly like a finished one: it has findings,
@@ -2181,17 +2274,9 @@ def build_report(
     # mistral:fact_check never delivered contradicted, unverifiable,
     # primary_source_needed, out_of_scope or additional_observations.
     truncated_result_details = [
-        {
-            "pass": f"{model}:{domain}",
-            "model": r.get("model") or model,
-            "domain": domain,
-            "section": _DOMAIN_SECTIONS.get(domain),
-            "completion_tokens": (r.get("tokens") or {}).get("completion"),
-            "max_tokens": r.get("max_tokens"),
-            **_truncation_extent(domain, r.get("data"), r.get("raw")),
-        }
+        _truncation_detail(model, domain, r)
         for (model, domain), r in received.items()
-        if r.get("truncated")
+        if r.get("truncated") or r.get("continued")
     ]
 
     # Calls that returned a well-formed response containing nothing at all.
