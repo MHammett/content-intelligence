@@ -67,8 +67,12 @@ the same API would be a second thing to keep true). `socket.connect` and
 rather than a courtesy — a new code path that reaches the network fails loudly
 instead of quietly publishing. `--wp-user`/`--wp-password` are forced to dummy
 values, which beat the config file in this project's credential precedence, so the
-real ones are never read. Flags after a bare `--` are forwarded, which is how to
-rehearse `--publish-live` or `--keep-image-metadata`.
+real ones are never read. Config loading stops at the first `${VAR}` with no value
+even though `--publish` calls no model, so every placeholder found under
+`--config-dir` that has no value gets a dummy first (the run prints which), and a
+stub `.env` no longer turns a rehearsal into one missing key per run. Flags after a
+bare `--` are forwarded, which is how to rehearse `--publish-live` or
+`--keep-image-metadata`.
 
 ```bash
 uv run python tools/publish_rehearsal.py handoff.md --publication mikehammett \
