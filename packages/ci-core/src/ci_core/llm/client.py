@@ -1240,6 +1240,10 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
             # 8000 matches the default mistral's no-effort path already uses,
             # and claude-haiku-4-5's real max_output_tokens is 64000, so this
             # is still 8x below the provider's ceiling rather than near it.
+            # A fallback for callers that pass no ceiling: the review pipeline
+            # sizes no-effort passes too since 2026-10-24, because this 8000
+            # cut claude-haiku-4-5:argument_integrity off twice at `wide`
+            # (ci_core/llm/output_tokens.py).
             default_max_tokens = 8000
         if budget is None and _thinks_adaptively(effort, target):
             # Ask for that thinking back as a summary, so it is audible on the
@@ -1299,12 +1303,13 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
             # max_output_tokens is 262144 per litellm's model map) — 8000 was
             # a self-imposed cap, not a provider limit.
             #
-            # 16000 is now only the fallback for a caller that passes no
-            # ceiling. The review pipeline sizes each reasoning pass from the
-            # draft and the domain (ci_core/llm/output_tokens.py), because
-            # 16000 still truncated 4 of the last 7 mistral fact_checks —
-            # on drafts as small as 2,182 chars, the reasoning alone ran past
-            # it. A cfg["max_tokens"] set explicitly wins over both.
+            # 16000 and 8000 are now only the fallbacks for a caller that
+            # passes no ceiling. The review pipeline sizes every pass from the
+            # draft, the domain and the effort (ci_core/llm/output_tokens.py),
+            # because 16000 still truncated 4 of the last 7 mistral
+            # fact_checks — on drafts as small as 2,182 chars, the reasoning
+            # alone ran past it. A cfg["max_tokens"] set explicitly wins over
+            # both.
             default_max_tokens = 16000 if effort == "high" else 8000
             params["max_tokens"] = int(cfg.get("max_tokens", default_max_tokens))
 
@@ -2911,6 +2916,7 @@ def _attempt(
             "raw": content,
             "model": model,
             "tokens": tokens,
+            "finish_reason": assembled["finish_reason"],
             **_searches_field(assembled),
             "elapsed_seconds": elapsed,
             **_extras_from(assembled),
@@ -2981,6 +2987,11 @@ def _attempt(
         "data": parsed,
         "model": model,
         "tokens": tokens,
+        # Why the provider stopped, in litellm's OpenAI spelling ("stop",
+        # "length", ...; the Responses and Agent APIs' statuses are mapped to
+        # it where the stream is read). Kept beside `truncated`, which is
+        # inferred from it and from the salvage, so a capture says which.
+        "finish_reason": assembled["finish_reason"],
         **_searches_field(assembled),
         "elapsed_seconds": elapsed,
         **extras,
