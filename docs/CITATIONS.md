@@ -222,8 +222,8 @@ Three mechanisms now sit in front of it, because no one of them is sufficient:
 | Mechanism | Value | Why |
 |---|---|---|
 | Minimum interval between calls | `3.0s`, serialised on a process-wide lock | Resolution runs in a thread pool, so without this the *pool's width* sets the request rate, not any deliberate choice. |
-| Retry with backoff | up to `3` attempts, `5s × 2^attempt`, capped at the server's `Retry-After` (max 60s) | Prefers archive.org's own answer about when to come back over a number we invented. |
-| Circuit breaker | trips after `5` consecutive 429s | Once archive.org is refusing consistently, further calls only spend the run's time collecting more 429s. |
+| Retry with backoff | up to `3` attempts per lookup; after a 429 every thread waits the server's `Retry-After` (capped at 60s) if it sent one, else `5s × 2^attempt` | Prefers archive.org's own answer about when to come back over a number we invented. The wait moves the shared clock rather than sleeping in the failing thread, so the whole process slows down. |
+| Circuit breaker | trips after `5` refused lookups in a run: a lookup that used every attempt and met a 429, counted once however many attempts it took, and never reset by a success | With threads interleaved, "consecutive" is not a quantity they can agree on, and a counter that reset on success never tripped on a run throttled four in five. Once archive.org is refusing this often, further calls only spend the run's time collecting more 429s. |
 
 **What a tripped breaker means for the report.** Every lookup after the trip is skipped, so those citations carry `archived: null` — *the lookup did not complete*, which is not the same as *no snapshot exists*, and nothing is submitted for archiving on the strength of a null. Because the breaker makes this the common case rather than a rare one, Section 9 states it once at the top rather than leaving the reader to infer it from a page of per-entry notices:
 
