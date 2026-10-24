@@ -51,6 +51,13 @@ that carried a real URL. A call two models agree on stands, and an author
 marking is never outvoted. ``fact_check_scope.min_sources_to_overrule`` sets
 the number.
 
+**Overlapping spans: a verdict joins the closest entry.** Models quote a
+sentence or the paragraph around it, so one verdict can fall inside several
+out-of-scope entries. It is withdrawn into, and counted for the outvote of, the
+single closest one: the same text, else the narrowest entry that holds it, else
+the widest entry it holds. The first entry in list order never decides it, and
+neither does the order models answered in.
+
 **Nothing is ever dropped.** Exclusion is a move into an ``out_of_scope`` bucket
 the report renders in full, carrying the reason, who decided it, and — when a
 model had already reached a verdict the exclusion overrides — that verdict too.
@@ -451,15 +458,12 @@ class ScopeRules:
         )
 
     def author_exclusion_for(self, claim):
-        """The author marking covering ``claim``, or None."""
-        normalised = _normalise(claim)
-        if not normalised:
-            return None
-        words = _content_words(normalised)
-        for exclusion in self.exclusions:
-            if _matches(normalised, words, exclusion):
-                return exclusion
-        return None
+        """The author marking covering ``claim``, or None.
+
+        When several markings cover it (a sentence marked inside a marked
+        paragraph) the closest wins, by the rule in :func:`_closest_match`.
+        """
+        return _closest_match(claim, [(e, e) for e in self.exclusions])
 
     def honours(self, claim_type):
         """Whether a model classification of ``claim_type`` is acted on."""
@@ -512,6 +516,12 @@ class ScopeRules:
         claim stays in verification and those verdicts stay where they are. A
         call two models agree on stands, and author markings are never
         outvoted.
+
+        **A verdict goes to one entry: the closest.** Models classify
+        overlapping spans (one quotes a sentence, two others the paragraph
+        around it), so a verdict can match several entries. It is withdrawn
+        into, and counted towards the outvote of, the entry :func:`_closest_match`
+        picks, not whichever happens to come first (#360).
         """
         if not fact_check:
             return fact_check
@@ -633,10 +643,16 @@ class ScopeRules:
         # `trust_model_classification: false` or a narrower `exclude_types`
         # turns the whole path off.
         result = dict(fact_check)
+        #
+        # An outvoted entry is in the pool too, and a verdict whose closest
+        # entry is one stays where it is. Left out, its verdicts would fall
+        # through to a broader excluded entry around them and be withdrawn
+        # there, while the outvoted entry's own note said the claim stayed in
+        # verification (#360).
         honoured = [
             (_exclusion(entry["claim"], entry["reason"], entry["excluded_by"]), entry)
             for entry in entries
-            if entry["excluded"] and entry["claim"]
+            if (entry["excluded"] or id(entry) in outvoted) and entry["claim"]
         ]
         for bucket in SWEPT_BUCKETS:
             kept = []
@@ -657,8 +673,8 @@ class ScopeRules:
                         True,
                     )
                 else:
-                    entry = _first_match(claim, honoured)
-                if entry is None:
+                    entry = _closest_match(claim, honoured)
+                if entry is None or not entry["excluded"]:
                     kept.append(item)
                     continue
                 entry["withdrawn_verdicts"].append(
@@ -756,9 +772,9 @@ class ScopeRules:
         if not candidates:
             return []
 
-        # Matched against every exclusion, in the order the sweep will use, so
-        # that an item counted here for one entry is the item the sweep would
-        # have withdrawn into that same entry.
+        # Matched against every exclusion by the rule the sweep uses
+        # (`_closest_match`), so that an item counted here for one entry is the
+        # item the sweep would have withdrawn into that same entry.
         pool = [
             (_exclusion(e["claim"], "", e["excluded_by"]), e)
             for e in entries
@@ -771,7 +787,7 @@ class ScopeRules:
                 url = _real_url(item.get("source_url"))
                 if not claim or not url or self.author_exclusion_for(claim):
                     continue
-                entry = _first_match(claim, pool)
+                entry = _closest_match(claim, pool)
                 if entry is None or id(entry) not in candidates:
                     continue
                 by_model = found.setdefault(id(entry), {})
@@ -828,8 +844,35 @@ def _outvote_note(entry, sources):
     )
 
 
-def _first_match(claim, candidates):
-    """The entry whose claim ``claim`` restates, or None.
+def _match_rank(claim_norm, claim_words, exclusion):
+    """How closely ``exclusion`` covers a claim: a sort key, or None for no match.
+
+    Lower is closer. In order: the same text; a passage that holds the claim,
+    the narrowest first (a sentence's verdict belongs to the smallest span it
+    sits in); a passage the claim holds, the widest first (a verdict quoting a
+    paragraph and a bit more belongs to the paragraph, not to a sentence inside
+    it); then a token-overlap paraphrase. Plain narrowest-first would get the
+    third case wrong.
+    """
+    if not _matches(claim_norm, claim_words, exclusion):
+        return None
+    passage_norm = exclusion["_normalised"]
+    if claim_norm == passage_norm:
+        return (0, 0)
+    if claim_norm in passage_norm:
+        return (1, len(passage_norm))
+    if passage_norm in claim_norm:
+        return (2, -len(passage_norm))
+    return (3, 0)
+
+
+def _closest_match(claim, candidates):
+    """The entry that covers ``claim`` most closely, or None.
+
+    Several entries can cover one claim when models classify overlapping spans,
+    or when the author marks a sentence inside a marked paragraph. The first one
+    in list order is an accident of which model answered first, so rank them
+    (:func:`_match_rank`); a tie goes to the earlier entry.
 
     ``candidates`` are ``(exclusion, entry)`` pairs so the matcher's precomputed
     normalisation is reused rather than recomputed per bucket item.
@@ -838,10 +881,12 @@ def _first_match(claim, candidates):
     if not normalised:
         return None
     words = _content_words(normalised)
+    best, best_rank = None, None
     for exclusion, entry in candidates:
-        if _matches(normalised, words, exclusion):
-            return entry
-    return None
+        rank = _match_rank(normalised, words, exclusion)
+        if rank is not None and (best_rank is None or rank < best_rank):
+            best, best_rank = entry, rank
+    return best
 
 
 def _min_sources_to_overrule(cfg):
