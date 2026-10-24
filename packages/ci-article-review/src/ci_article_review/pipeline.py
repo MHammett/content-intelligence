@@ -68,6 +68,7 @@ from .handoff_parser import (
 from . import history as hist
 from .history_analytics import resolve_history_root
 from . import consolidation
+from . import claim_status
 from . import handoff_gaps
 from . import reproducibility
 from ci_core import redact
@@ -4200,12 +4201,21 @@ def run_draft_pipeline(
     # answer changes nothing downstream. Best-effort for the same reason as the
     # reproducibility pass below: it must never take down a run that has
     # already paid for its findings.
+    #
+    # One page cache per run, shared with Section 9 below so a cited page is
+    # fetched once (issue #356). A local, never stored: a replay or a second run
+    # starts from an empty one.
+    from .adapters.citation.page_cache import PageCache
+
+    page_cache = PageCache()
     quote_checks, quote_summary = {}, None
     if not offline and pipeline_cfg.get("quote_check", True):
         from .adapters.citation import quote_check
 
         try:
-            quote_checks, quote_summary = quote_check.check_quotes(results)
+            quote_checks, quote_summary = quote_check.check_quotes(
+                results, cache=page_cache
+            )
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("Quote check unavailable: %s", exc)
             quote_checks = {}
@@ -4330,6 +4340,7 @@ def run_draft_pipeline(
             # which carries no metadata at all.
             author=citation_author,
             capture_settings=pipeline_cfg.get("wayback_capture"),
+            page_cache=page_cache,
         )
         verified_count = sum(
             1 for r in citation_results if r.get("verification") == "checksum"
@@ -4403,6 +4414,7 @@ def run_draft_pipeline(
                         history_root=_history_root(),
                         author=citation_author,
                         capture_settings=pipeline_cfg.get("wayback_capture"),
+                        page_cache=page_cache,
                     )
                     citation_reask.attach_source_checks(pending, checked)
                 log.info(
@@ -4414,7 +4426,28 @@ def run_draft_pipeline(
     else:
         citation_results = []
         log.info("Citations: no actionable claims to resolve")
+    cache_stats = page_cache.stats()
+    if cache_stats["fetched"] or cache_stats["reused"]:
+        log.info(
+            "Page cache: %d page fetch(es) made, %d more request(s) served from "
+            "the quote check's and earlier claims' reads",
+            cache_stats["fetched"],
+            cache_stats["reused"],
+        )
     report["section_9_citations"] = citation_results
+
+    # One net status per claim, built here and only here: after consolidation
+    # (Section 2 is final) and after citation resolution and re-ask (Section 9
+    # is final). Every reader — the Section 2 entries, the console line below,
+    # and later the worklist — takes it from the report rather than deriving its
+    # own, which is how four places came to disagree about one claim (#338).
+    report["claim_ledger"] = claim_status.build_claim_ledger(
+        report, author_hosts=claim_status.author_hosts(pub_config)
+    )
+    claim_status.annotate_fact_check(
+        report.get("section_2_fact_check"), report["claim_ledger"]
+    )
+    log.info(claim_status.summary_line(report["claim_ledger"]))
 
     # Every URL the expansion pass proposed, checked. Cheap (HEAD requests, no
     # model calls) and it runs whenever the pass ran.
@@ -5085,6 +5118,10 @@ def _print_draft_summary(
             f"({_held} also held out of Section 9) — see 'Out of scope for "
             f"verification' in the review"
         )
+    # The per-claim rollup. A report saved before the ledger existed has none,
+    # and this summary also prints saved reports, so the line is conditional.
+    if report.get("claim_ledger") is not None:
+        print(f"  {claim_status.summary_line(report['claim_ledger'])}")
     print(f"Section 3 — Voice flags: {len(report['section_3_voice'])}")
     print(f"Section 4 — Argument flags: {len(report['section_4_argument'])}")
     print(f"Section 5 — Completeness flags: {len(report['section_5_completeness'])}")
@@ -5859,7 +5896,7 @@ def run_publish_pipeline(
         _suggest_seo_for_publish(pub_handoff, pub_config, config["api_keys"])
 
     wp.print_image_plan(image_plan)
-    confirmed = wp.print_checklist_and_confirm()
+    confirmed = wp.print_checklist_and_confirm(wp_config)
     if not confirmed:
         sys.exit(0)
 
@@ -5957,6 +5994,7 @@ def run_publish_pipeline(
                 print(f"  - {term}")
             print("Create them in WP admin, then set them on the post.")
             print("!" * 60)
+        wp.print_author_result(result)
         print(
             f"Status:   {'PUBLISHED' if publish_live else 'DRAFT (pass --publish-live to publish)'}"
         )

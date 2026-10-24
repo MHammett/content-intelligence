@@ -39,8 +39,8 @@ The fetch reuses the resolver's: SSRF-guarded ``safe_get``, the same text
 extraction, and the same TLS-fingerprint retry on a 403. It does not use the
 archive.org fallback (a quote found in a year-old snapshot is not a quote on the
 page the draft cites, and the lookups would multiply with the number of URLs).
-Section 9 fetches the same pages again for its own purposes; sharing one fetch
-between them is possible and not done here.
+Section 9 reads the same pages for its own purposes. The pipeline hands both one
+``page_cache.PageCache`` so each page is fetched once per run (#356).
 """
 
 import html
@@ -121,6 +121,10 @@ class PageRead:
     texts: list = field(default_factory=list)
     partial: bool = False
     detail: str = ""
+    #: Where the fetch ended up after following redirects, when it got that far
+    #: ("" otherwise). A grounded model cites through a forwarder, so this is the
+    #: only place the page a verdict names is learned (#359).
+    final_url: str = ""
 
 
 def _compact(text):
@@ -235,26 +239,70 @@ def _classify(texts, partial):
     return PageRead(status="read", texts=texts, partial=partial)
 
 
-def fetch_page(url, timeout=_FETCH_TIMEOUT):
-    """Fetch ``url`` and return what a quote can be looked for in. Never raises."""
+def _get_checked(url, timeout):
+    resp = safe_get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+
+def fetch_page(url, timeout=_FETCH_TIMEOUT, cache=None):
+    """Fetch ``url`` and return what a quote can be looked for in. Never raises.
+
+    ``cache`` is the run's ``page_cache.PageCache``: the response is kept in it
+    for Section 9, and a page another caller already fetched is not fetched again.
+    """
+    landed = ""
     try:
-        resp = safe_get(url, timeout=timeout)
-        resp.raise_for_status()
-        return _read_response(resp, url)
+        if cache is None:
+            resp = _get_checked(url, timeout)
+        else:
+            resp = cache.get_page(url, lambda: _get_checked(url, timeout), timeout)
+        landed = getattr(resp, "url", "") or ""
+        page = _read_response(resp, url)
+        page.final_url = landed
+        return page
     except UnsafeURLError:
         return PageRead(status="unsafe", detail="a non-public address")
     except Exception as exc:  # noqa: BLE001 - any failure is "could not read"
+        # A refusal still carries the response, and with it the page a
+        # forwarder pointed at: that is all the scope vote needs.
+        landed = landed or getattr(getattr(exc, "response", None), "url", "") or ""
         if wayback.fallback_reason_for_exception(exc) == "blocked":
-            escalated = resolver._impersonation_fallback_content(url, timeout)
+            escalated = resolver._escalate(url, timeout, cache)
             if escalated is not None:
-                _final, content, _kind = escalated
-                return _classify([content], False)
-        return PageRead(status="failed", detail=_describe(exc))
+                final, content, _kind = escalated
+                page = _classify([content], False)
+                page.final_url = final or landed
+                return page
+        return PageRead(status="failed", detail=_describe(exc), final_url=landed)
 
 
 def _describe(exc):
     cert = wayback.certificate_failure_summary(exc)
     return cert or f"{type(exc).__name__}: {exc}"[:160]
+
+
+#: Search-provider forwarders that name no page. Gemini's grounding metadata
+#: returns every citation as one, and the token differs per citation whatever
+#: the page behind it (the documented behaviour of Grounding with Google Search;
+#: see the note above ``pipeline._URL_REDIRECTOR_MARKERS``). A fetch that ended
+#: on another forwarder named nothing.
+_FORWARDER_MARKER = "grounding-api-redirect"
+
+
+def _landing_page(url, page):
+    """Where ``url`` led, when that is a different page than the one cited.
+
+    Empty when the fetch recorded nothing, landed where it started (a
+    trailing slash or a scheme does not make a new page) or ended on another
+    forwarder, which an expired wrapper does.
+    """
+    landed = getattr(page, "final_url", "") or ""
+    if not landed or _FORWARDER_MARKER in landed.lower():
+        return ""
+    if consolidation.url_key(landed) == consolidation.url_key(url):
+        return ""
+    return landed
 
 
 def _targets(results):
@@ -286,18 +334,21 @@ def _targets(results):
     return list(targets)
 
 
-def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL):
+def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL, cache=None):
     """Look for each fact-check verdict's quote on the page it cites.
 
     ``results`` is the ensemble's ``{(model, domain): result}`` dict, untouched.
-    ``fetch`` is for tests: ``fetch(url, timeout) -> PageRead``.
+    ``fetch`` is for tests: ``fetch(url, timeout) -> PageRead``. ``cache`` is the
+    run's ``page_cache.PageCache``, handed on to ``fetch_page`` so Section 9 can
+    reuse these fetches; it is not used when ``fetch`` is given.
 
     Returns ``(checks, summary)``. ``checks`` maps ``(url, quote)`` to
     ``{"found": True | False | None, "reason": str, "chars": int}``; ``found`` is
     ``None`` whenever nothing was established. ``summary`` counts the outcomes
     for the report.
     """
-    fetch = fetch or fetch_page
+    if fetch is None:
+        fetch = lambda url, timeout: fetch_page(url, timeout, cache=cache)  # noqa: E731
     pairs = _targets(results)
     urls = list(dict.fromkeys(url for url, _quote in pairs))
     fetched_urls, over_limit = urls[:_MAX_URLS], set(urls[_MAX_URLS:])
@@ -336,19 +387,22 @@ def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL):
                 "found": None,
                 "reason": f"page not read ({page.status}: {page.detail})",
             }
-            continue
-        found = quote_found(quote, page.texts)
-        if found is False and page.partial:
-            checks[(url, quote)] = {
-                "found": None,
-                "reason": "document longer than the pages read",
-            }
-            continue
-        checks[(url, quote)] = {
-            "found": found,
-            "reason": "" if found is not None else "nothing to compare",
-            "chars": max((len(t) for t in page.texts), default=0),
-        }
+        else:
+            found = quote_found(quote, page.texts)
+            if found is False and page.partial:
+                checks[(url, quote)] = {
+                    "found": None,
+                    "reason": "document longer than the pages read",
+                }
+            else:
+                checks[(url, quote)] = {
+                    "found": found,
+                    "reason": "" if found is not None else "nothing to compare",
+                    "chars": max((len(t) for t in page.texts), default=0),
+                }
+        landed = _landing_page(url, page)
+        if landed:
+            checks[(url, quote)]["final_url"] = landed
 
     outcome_counts = Counter(
         {True: "found", False: "not_found", None: "unchecked"}[c["found"]]

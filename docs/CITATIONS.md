@@ -140,9 +140,41 @@ A claim that is true but sits on page 2 of an archive, a listing or a multi-page
 
 At most five pages are read for one citation (the first included). A link to another site or scheme, or to a page already read, is not followed, and a page that fails to fetch or yields no text stops the walk and keeps what was read. A bot-check interstitial is never walked.
 
-The entry records `pages_read` and a `pagination` block (the URLs followed, the WordPress totals if any, and `stopped`: `page cap`, `fetch failed (...)` or `unreadable page`). The checksum, the content summary and the drift comparison still describe **page one only**: hashing the extra pages would report every paginated source as changed against every earlier run. When the walk stopped at the cap and the source still did not support the claim, the note says only the first five pages were read, so the claim may sit further on.
+**Size budget for pages that are not HTML (`pagination.MAX_FOLLOWED_CHARS`, 60,000 characters).** A WordPress REST collection is JSON carrying every post's full body, and JSON reaches the verifier unstripped, so four pages of `.../wp-json/wp/v2/posts?per_page=3` came to about 238,000 bytes fetched and 238,800 characters in the verifier's candidate text, against a verifier that windows the lot to 20,000 (issue #357). The followed pages of a non-HTML source now share a budget of three of those windows. The page that crosses it is cut at the budget and ends with a line saying so, and the walk stops there, so what is held is bounded by the budget and what is fetched by the budget plus one page (a response arrives whole before its size is known). On the same URL, 2026-10-24: two fetches and 153,018 bytes instead of four and 238,386, and 131,325 candidate characters instead of 238,808. **HTML is not charged**: it is reduced to its article text before it is held, so a long paginated article reads exactly as it did. The totals line is not charged either.
+
+Why not skip following pages when `X-WP-Total` already settles a count claim: the pagination code never sees the claim, and deciding that a claim is a count of the collection (not, say, "11 posts about substations", which has the same number) is a judgement that can only err toward a false *supports*. A budget costs bytes and, at worst, a claim that sits beyond it, which the note below says. The totals line is still stated to the verifier whenever the headers are present.
+
+The entry records `pages_read` and a `pagination` block (the URLs followed, the WordPress totals if any, and `stopped`: `page cap`, `byte budget`, `fetch failed (...)` or `unreadable page`). The checksum, the content summary and the drift comparison still describe **page one only**: hashing the extra pages would report every paginated source as changed against every earlier run. When the walk stopped at the page cap or the size budget and the source still did not support the claim, the note says so (only the first five pages were read, or reading stopped at a size limit), so the claim may sit further on.
 
 Checked on `mikehammett.net`, 2026-10-06: the homepage listing now reaches `/page/2/` (a post title the first page does not carry becomes visible to the check), a REST collection `?per_page=3` reports 11 posts in 4 pages and walks all four, and a single article still costs one fetch.
+
+---
+
+## One status per claim
+
+The tiers above describe one citation. A claim can have several models' verdicts in Section 2, an out-of-scope classification, a Section 9 entry and a Section 1 flag, and before the claim ledger those four could disagree with nothing saying which to believe: in a saved run a count of the author's published posts was `confirmed` by one model, `primary_source_needed` for another, classified out of scope by a third, and `content_mismatch` in Section 9, and the worklist labelled it "contradicted or outdated" although neither bucket held it (issue #338).
+
+`claim_status.build_claim_ledger` settles that once, after consolidation and after citation resolution and re-ask, and the result is saved as `claim_ledger` in `report.json`. Each entry has the claim, one `status`, a one-line `why`, and the evidence behind it (which models put it in which bucket, the exclusion if any, the deciding citation, the Section 1 passages that contain it). The same status is stamped on every Section 2 entry as `net_status` and rendered as its first line, "Net status: ...", and the console summary prints the counts under the Section 2 line.
+
+The statuses, strongest first; the first whose condition holds is the claim's:
+
+| status | holds when |
+|---|---|
+| Excluded by the author | an inline marker, the handoff's OUT OF SCOPE section or the publication config excluded it |
+| Excluded by a fact-check model | a model classed it out of scope and the scope rules honoured that (`excluded: true`); a classification that was outvoted or not acted on is not an exclusion |
+| Contradicted | any one `contradicted` or `outdated` verdict; or the source read `contradicts` it; or the asserting model conceded at re-ask (`correct_claim` or `withdraw`, in which case the corrected wording is on the entry) |
+| Source read, does not support the claim | Section 9 `content_mismatch`, including `not_addressed` |
+| Confirmed, source read | Section 9 `checksum` |
+| Confirmed by a model, source not read | in the `confirmed` bucket, and no citation reached a read tier |
+| Unverified | everything else |
+
+Three rules fall out of that order. An exclusion beats everything, because the scope rules have already withdrawn the verdicts behind it; they survive in `withdrawn_verdicts` and the `why` names them. A page that was read outranks a model's assertion, in either direction. `unverifiable` is not a contradiction: one model confirming and another unable to verify is a disagreement about evidence, which `contradictions` in the report already lists.
+
+Two things the ledger records without changing the status. `source_is_authors: true` means the supporting page is on the publication's own site (`wordpress.site_url`): the author confirming the author, rendered as "the author's own page supports it". Section 1 passages are references only: its items are paragraph-sized, and `passage_match` never merges a sentence into the paragraph that contains it, so a Section 1 flag links to the entry and cannot move it.
+
+Claims are joined the way `find_contradictions` joins them, with `passage_match.group_passages`, not by exact text, since the same claim comes back with different quote marks and clause boundaries. That grouping is conservative: short claims never merge, so "I have a day job." and "I have a day job. I have a side job." stay two entries with their own statuses.
+
+An `--offline` replay has no Section 9, so its ledger says `citations_resolved: false` and nothing in it can rank above "Confirmed by a model, source not read"; the console line says so. A report saved before the ledger existed has no `claim_ledger` and renders as it always did.
 
 ---
 
@@ -190,8 +222,8 @@ Three mechanisms now sit in front of it, because no one of them is sufficient:
 | Mechanism | Value | Why |
 |---|---|---|
 | Minimum interval between calls | `3.0s`, serialised on a process-wide lock | Resolution runs in a thread pool, so without this the *pool's width* sets the request rate, not any deliberate choice. |
-| Retry with backoff | up to `3` attempts, `5s × 2^attempt`, capped at the server's `Retry-After` (max 60s) | Prefers archive.org's own answer about when to come back over a number we invented. |
-| Circuit breaker | trips after `5` consecutive 429s | Once archive.org is refusing consistently, further calls only spend the run's time collecting more 429s. |
+| Retry with backoff | up to `3` attempts per lookup; after a 429 every thread waits the server's `Retry-After` (capped at 60s) if it sent one, else `5s × 2^attempt` | Prefers archive.org's own answer about when to come back over a number we invented. The wait moves the shared clock rather than sleeping in the failing thread, so the whole process slows down. |
+| Circuit breaker | trips after `5` refused lookups in a run: a lookup that used every attempt and met a 429, counted once however many attempts it took, and never reset by a success | With threads interleaved, "consecutive" is not a quantity they can agree on, and a counter that reset on success never tripped on a run throttled four in five. Once archive.org is refusing this often, further calls only spend the run's time collecting more 429s. |
 
 **What a tripped breaker means for the report.** Every lookup after the trip is skipped, so those citations carry `archived: null` — *the lookup did not complete*, which is not the same as *no snapshot exists*, and nothing is submitted for archiving on the strength of a null. Because the breaker makes this the common case rather than a rare one, Section 9 states it once at the top rather than leaving the reader to infer it from a page of per-entry notices:
 
