@@ -416,7 +416,7 @@ def _stubbed_run(tmp_path, extra_patches=(), sleeps=None, **run_kwargs):
         stack.enter_context(
             patch(
                 "ci_article_review.adapters.citation.quote_check.fetch_page",
-                side_effect=lambda url, timeout=15: quote_check.PageRead(
+                side_effect=lambda url, timeout=15, **_kw: quote_check.PageRead(
                     status="failed", detail="stubbed: no network in tests"
                 ),
             )
@@ -500,7 +500,7 @@ class TestQuoteCheckIsWired:
     def _serve(self, text):
         return patch(
             "ci_article_review.adapters.citation.quote_check.fetch_page",
-            side_effect=lambda url, timeout=15: quote_check.PageRead(
+            side_effect=lambda url, timeout=15, **_kw: quote_check.PageRead(
                 status="read", texts=[text]
             ),
         )
@@ -567,6 +567,62 @@ class TestQuoteCheckIsWired:
         )
         with _stubbed_run(tmp_path, extra_patches=[boom]) as report:
             assert len(report["section_2_fact_check"]["confirmed"]) == 1
+
+
+class TestPageCacheIsWired:
+    """Issue #356: the quote check and Section 9 share one page cache per run.
+
+    The cache is what saves the second fetch of every cited page. It only does
+    so if the pipeline hands the *same* object to both, and a new one to each
+    run, so nothing a run fetched is served to the next.
+    """
+
+    @staticmethod
+    def _spies(seen):
+        real_check = quote_check.check_quotes
+
+        def check(results, *a, **kw):
+            seen.append(("quote_check", kw.get("cache")))
+            return real_check(results, *a, **kw)
+
+        def resolve(claims, *a, **kw):
+            seen.append(("section_9", kw.get("page_cache")))
+            return _fake_resolve_citations(claims, *a, **kw)
+
+        return [
+            patch(
+                "ci_article_review.adapters.citation.quote_check.check_quotes",
+                side_effect=check,
+            ),
+            patch(
+                "ci_article_review.adapters.citation.resolver.resolve_citations",
+                side_effect=resolve,
+            ),
+        ]
+
+    def test_both_get_the_same_cache(self, tmp_path):
+        from ci_article_review.adapters.citation.page_cache import PageCache
+
+        seen = []
+        with _stubbed_run(tmp_path, extra_patches=self._spies(seen)):
+            pass
+        assert [name for name, _cache in seen] == ["quote_check", "section_9"]
+        caches = [cache for _name, cache in seen]
+        assert isinstance(caches[0], PageCache)
+        assert caches[0] is caches[1]
+
+    def test_a_second_run_gets_a_new_cache(self, tmp_path):
+        seen = []
+        for run in ("one", "two"):
+            with _stubbed_run(tmp_path / run, extra_patches=self._spies(seen)):
+                pass
+        first, second = ({id(c) for _n, c in seen[i : i + 2]} for i in (0, 2))
+        assert len(first) == len(second) == 1
+        assert first != second
+
+    def test_the_cache_is_not_written_into_the_report(self, tmp_path):
+        with _stubbed_run(tmp_path) as report:
+            assert "PageCache" not in json.dumps(report, default=repr)
 
 
 class TestLiveModelCheckIsAdvisoryOnly:

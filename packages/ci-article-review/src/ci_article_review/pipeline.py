@@ -4200,12 +4200,21 @@ def run_draft_pipeline(
     # answer changes nothing downstream. Best-effort for the same reason as the
     # reproducibility pass below: it must never take down a run that has
     # already paid for its findings.
+    #
+    # One page cache per run, shared with Section 9 below so a cited page is
+    # fetched once (issue #356). A local, never stored: a replay or a second run
+    # starts from an empty one.
+    from .adapters.citation.page_cache import PageCache
+
+    page_cache = PageCache()
     quote_checks, quote_summary = {}, None
     if not offline and pipeline_cfg.get("quote_check", True):
         from .adapters.citation import quote_check
 
         try:
-            quote_checks, quote_summary = quote_check.check_quotes(results)
+            quote_checks, quote_summary = quote_check.check_quotes(
+                results, cache=page_cache
+            )
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("Quote check unavailable: %s", exc)
             quote_checks = {}
@@ -4330,6 +4339,7 @@ def run_draft_pipeline(
             # which carries no metadata at all.
             author=citation_author,
             capture_settings=pipeline_cfg.get("wayback_capture"),
+            page_cache=page_cache,
         )
         verified_count = sum(
             1 for r in citation_results if r.get("verification") == "checksum"
@@ -4403,6 +4413,7 @@ def run_draft_pipeline(
                         history_root=_history_root(),
                         author=citation_author,
                         capture_settings=pipeline_cfg.get("wayback_capture"),
+                        page_cache=page_cache,
                     )
                     citation_reask.attach_source_checks(pending, checked)
                 log.info(
@@ -4414,6 +4425,14 @@ def run_draft_pipeline(
     else:
         citation_results = []
         log.info("Citations: no actionable claims to resolve")
+    cache_stats = page_cache.stats()
+    if cache_stats["fetched"] or cache_stats["reused"]:
+        log.info(
+            "Page cache: %d page fetch(es) made, %d more request(s) served from "
+            "the quote check's and earlier claims' reads",
+            cache_stats["fetched"],
+            cache_stats["reused"],
+        )
     report["section_9_citations"] = citation_results
 
     # One net status per claim, built here and only here: after consolidation

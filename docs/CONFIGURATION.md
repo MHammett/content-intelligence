@@ -913,9 +913,15 @@ A wrapper that was not followed (`--offline`, a fetch that failed before
 redirecting, an expired wrapper) still counts as a page of its own, which can
 only keep a claim in verification.
 
-**Cost.** Fetches, no model calls. Section 9 reads the same pages again for its
-own purposes. Not run with `--offline`, so a replay with `--offline` keeps every
-verdict where the capture had it.
+**Cost.** Fetches, no model calls. Section 9 reads the same pages for its own
+purposes, and the two share one per-run page cache (issue #356): a page that was
+fetched successfully is fetched once, however many claims cite it, and the log
+ends the citation pass with `Page cache: N page fetch(es) made, M more
+request(s) served`. Only successes are kept, so a refused or rate-limited page is
+asked for again and Section 9's 403 retry and archive.org fallback still decide
+`verified_via`. The cache lives for one run: nothing is saved with a capture or a
+report, and a replay starts empty. Not run with `--offline`, so a replay with
+`--offline` keeps every verdict where the capture had it.
 
 ---
 
