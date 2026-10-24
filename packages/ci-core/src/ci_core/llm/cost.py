@@ -156,6 +156,10 @@ def call_log_entry(pass_name, result, default_model=""):
     # the overwhelming majority of calls, so only present when it happened.
     if result.get("discarded_attempts"):
         entry["discarded_attempts"] = result["discarded_attempts"]
+    # Follow-up calls made for a response cut off at its output ceiling, each
+    # billed on its own (see calculate()). Only present when one ran.
+    if result.get("continuations"):
+        entry["continuations"] = result["continuations"]
     # One record per stream the call opened: how long it went silent before
     # and after real output. See ci_core.llm.client._StreamTiming.
     if result.get("stream_timing"):
@@ -300,9 +304,25 @@ def calculate(api_call_log):
       replayed_usd      float  — of total_usd, what ``replayed`` entries cost:
                                  a capture's spend, re-reported, not re-spent
       incurred_usd      float  — the rest: what this run actually bought
+      continuation_calls int   — follow-up calls made for passes cut off at
+                                 their output ceiling (an entry's
+                                 ``continuations``)
+      continuation_usd  float  — of total_usd, what those cost
+      uncosted_continuation_calls int — of uncosted_calls, the continuation
+                                 calls that carried no usage
 
     The attempt and search counts describe total_usd, so a replayed entry's are
     counted too — they are what makes that history a floor.
+
+    A continuation is a call of its own, beside the entry it continued: its
+    tokens are priced at the model that answered it (the entry's, unless a
+    fallback did), its searches billed per call, and the attempts its own retry
+    discarded counted with everyone else's. One that carried no usage is in
+    ``uncosted_calls``, as a discarded attempt would be, unless the provider
+    refused it before generating. It is history when its entry is ``replayed``,
+    unless it says ``replayed: False`` itself: ``--retry-failed`` continues a
+    pass from its capture, so the first call is the capture's spend and the
+    follow-up this run's.
 
     Search fees follow the same rule as discarded attempts: price what the
     response reported, and count what it did not. A call carries ``searches``
@@ -334,14 +354,15 @@ def calculate(api_call_log):
     unpriced_searches = 0
     replayed_usd = 0.0
     incurred_usd = 0.0
+    continuation_calls = 0
+    continuation_usd = 0.0
+    uncosted_continuation_calls = 0
 
     for entry in api_call_log or []:
         in_usd, out_usd = _entry_cost(entry)
         model_id = (entry.get("model") or "").split(" ")[0]
-        if model_id and model_id not in _PRICING:
-            # Check prefix match
-            if not any(model_id.startswith(k) for k in _PRICING):
-                pricing_known = False
+        if not _is_priced(model_id):
+            pricing_known = False
 
         # One count per attempt that reached the provider and could search:
         # the call's own, then any its retries threw away. Priced one by one,
@@ -349,33 +370,68 @@ def calculate(api_call_log):
         counts = [entry["searches"]] if "searches" in entry else []
         discarded = entry.get("discarded_attempts") or {}
         if discarded:
-            discarded_calls += discarded.get("count", 0)
-            refused = _unbilled_attempts(discarded, entry.get("stream_timing"))
-            refused_calls += refused
-            uncosted_calls += (
-                discarded.get("count", 0) - discarded.get("costed", 0) - refused
+            d = _discarded_cost(
+                entry.get("model", ""), discarded, entry.get("stream_timing")
             )
-            d_in, d_out = _entry_cost(
-                {
-                    "model": entry.get("model", ""),
-                    "tokens": discarded.get("tokens", {}),
-                }
-            )
-            in_usd += d_in
-            out_usd += d_out
-            counts += discarded.get("searches") or []
+            discarded_calls += d["count"]
+            refused_calls += d["refused"]
+            uncosted_calls += d["uncosted"]
+            in_usd += d["input_usd"]
+            out_usd += d["output_usd"]
+            counts += d["searches"]
 
-        search_usd = 0.0
-        units = 0
-        unmeasured = 0
-        for count in counts:
-            if count is None:
-                unmeasured += 1
-                continue
-            s_usd, s_units, unpriced = _search_cost(model_id, count)
-            search_usd += s_usd
-            units += s_units
-            unpriced_searches += unpriced
+        search_usd, units, unmeasured, unpriced = _searches_cost(model_id, counts)
+        unpriced_searches += unpriced
+        own_usd = in_usd + out_usd + search_usd
+
+        # Follow-up calls for a response cut off at its ceiling: each a call of
+        # its own, priced at the model that answered it.
+        cont_spent = 0.0
+        cont_history = 0.0
+        cont_searched = False
+        records = [c for c in entry.get("continuations") or () if isinstance(c, dict)]
+        for record in records:
+            continuation_calls += 1
+            c_model = record.get("model") or entry.get("model", "")
+            c_model_id = c_model.split(" ")[0]
+            if not _is_priced(c_model_id):
+                pricing_known = False
+            tokens = record.get("tokens") or {}
+            c_in, c_out = _entry_cost({"model": c_model, "tokens": tokens})
+            if (
+                not (tokens.get("prompt") or tokens.get("completion"))
+                and record.get("unbilled") is not True
+            ):
+                # Nothing to price, and nothing says it was not billed: the
+                # same floor a stalled, discarded attempt marks.
+                uncosted_calls += 1
+                uncosted_continuation_calls += 1
+            c_counts = [record["searches"]] if "searches" in record else []
+            c_discarded = record.get("discarded_attempts") or {}
+            if c_discarded:
+                d = _discarded_cost(c_model, c_discarded)
+                discarded_calls += d["count"]
+                refused_calls += d["refused"]
+                uncosted_calls += d["uncosted"]
+                c_in += d["input_usd"]
+                c_out += d["output_usd"]
+                c_counts += d["searches"]
+            c_search, c_units, c_unmeasured, c_unpriced = _searches_cost(
+                c_model_id, c_counts
+            )
+            cont_searched = cont_searched or bool(c_counts)
+            units += c_units
+            unmeasured += c_unmeasured
+            unpriced_searches += c_unpriced
+            in_usd += c_in
+            out_usd += c_out
+            search_usd += c_search
+            c_total = c_in + c_out + c_search
+            continuation_usd += c_total
+            if record.get("replayed", entry.get("replayed")):
+                cont_history += c_total
+            else:
+                cont_spent += c_total
         unmeasured_search_calls += unmeasured
 
         row = {
@@ -385,7 +441,7 @@ def calculate(api_call_log):
             "output_usd": round(out_usd, 6),
             "total_usd": round(in_usd + out_usd + search_usd, 6),
         }
-        if counts:
+        if counts or cont_searched:
             # Only on a call that could search, so a zero here means it could
             # and did not, not that nobody looked.
             row["search_usd"] = round(search_usd, 6)
@@ -394,18 +450,27 @@ def calculate(api_call_log):
             # Without this, a pass whose count never came back reads the same
             # as one that searched nothing: search_usd 0.0 either way.
             row["unmeasured_search_calls"] = unmeasured
+        if records:
+            row["continuation_usd"] = round(cont_spent + cont_history, 6)
         by_pass.append(row)
         total_in += in_usd
         total_out += out_usd
         total_search += search_usd
         search_units += units
         if entry.get("replayed"):
-            replayed_usd += in_usd + out_usd + search_usd
-            # So a reader of by_pass can tell history from spend pass by pass,
-            # not only in total. Present only when true, like the entry's own.
-            by_pass[-1]["replayed"] = True
+            replayed_usd += own_usd
+            if cont_spent:
+                # History with this run's follow-up on top (--retry-failed).
+                row["incurred_usd"] = round(cont_spent, 6)
+            else:
+                # So a reader of by_pass can tell history from spend pass by
+                # pass, not only in total. Present only when true, like the
+                # entry's own.
+                row["replayed"] = True
         else:
-            incurred_usd += in_usd + out_usd + search_usd
+            incurred_usd += own_usd
+        replayed_usd += cont_history
+        incurred_usd += cont_spent
 
     return {
         "total_usd": round(total_in + total_out + total_search, 4),
@@ -425,4 +490,54 @@ def calculate(api_call_log):
         # "$0.0000" only when that is true.
         "replayed_usd": round(replayed_usd, 4),
         "incurred_usd": round(incurred_usd, 4),
+        "continuation_calls": continuation_calls,
+        "continuation_usd": round(continuation_usd, 4),
+        "uncosted_continuation_calls": uncosted_continuation_calls,
     }
+
+
+def _is_priced(model_id):
+    """False for a model id the token table has no row for, exact or prefix."""
+    if not model_id or model_id in _PRICING:
+        return True
+    return any(model_id.startswith(k) for k in _PRICING)
+
+
+def _discarded_cost(model, discarded, stream_timing=None):
+    """What one ``discarded_attempts`` summary cost, priced at ``model``.
+
+    ``count`` attempts, of which ``refused`` the provider turned away before
+    generating and ``uncosted`` may have been billed with no usage to price.
+    ``searches`` is one count per attempt that reported one.
+    """
+    refused = _unbilled_attempts(discarded, stream_timing)
+    d_in, d_out = _entry_cost({"model": model, "tokens": discarded.get("tokens", {})})
+    return {
+        "count": discarded.get("count", 0),
+        "refused": refused,
+        "uncosted": discarded.get("count", 0) - discarded.get("costed", 0) - refused,
+        "input_usd": d_in,
+        "output_usd": d_out,
+        "searches": list(discarded.get("searches") or []),
+    }
+
+
+def _searches_cost(model_id, counts):
+    """``(usd, billed_units, unmeasured, unpriced)`` for per-attempt counts.
+
+    A None count is an attempt that could search and did not say how often:
+    counted as ``unmeasured``, never priced.
+    """
+    usd = 0.0
+    units = 0
+    unmeasured = 0
+    unpriced = 0
+    for count in counts:
+        if count is None:
+            unmeasured += 1
+            continue
+        s_usd, s_units, s_unpriced = _search_cost(model_id, count)
+        usd += s_usd
+        units += s_units
+        unpriced += s_unpriced
+    return usd, units, unmeasured, unpriced
