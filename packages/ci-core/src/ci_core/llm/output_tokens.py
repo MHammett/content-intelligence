@@ -1,17 +1,25 @@
-"""Output-token ceiling for reasoning passes — the ``max_tokens`` they are sent.
+"""Output-token ceiling for capped passes — the ``max_tokens`` they are sent.
 
-    max_tokens = reasoning_tokens[effort] + answer_tokens[domain] × size_mult(chars)
+    max_tokens = reasoning_tokens[effort]
+               + max(answer_tokens[domain] × size_mult(chars),
+                     answer_tokens_per_char[domain] × chars,
+                     answer_floor_tokens)
 
-clamped to the model's own output limit. ``size_mult`` is the timeout model's
-size table (configs/timeouts.yaml), used as-is, so the ceiling and the wall-clock
-budget scale with the draft together. The numbers and the evidence behind them
-are in configs/output_tokens.yaml.
+clamped to the model's own output limit and to the room its context window
+leaves after the prompt. ``size_mult`` is the timeout model's size table
+(configs/timeouts.yaml), used as-is, so the ceiling and the wall-clock budget
+scale with the draft together. The numbers and the evidence behind them are in
+configs/output_tokens.yaml.
 
 Only two providers send a ceiling at all: claude (Anthropic requires one) and
 mistral. The other four run to the model's own limit and are left alone here.
-Of those two, only reasoning passes get a computed ceiling; the no-effort paths
-keep ``client._provider_params``'s defaults. A claude model that thinks with no
-effort set is a reasoning pass, not a no-effort one — see ``_EFFORT_WHEN_UNSET``.
+Of those two, every pass gets a computed ceiling: a reasoning pass gets the
+reasoning term and the answer term, a no-effort pass the answer term alone
+(until 2026-10-24 it kept ``client._provider_params``'s flat 8000, which cut
+claude-haiku-4-5:argument_integrity off twice at ``wide``). A claude model that
+thinks with no effort set is a reasoning pass, not a no-effort one — see
+``_EFFORT_WHEN_UNSET`` — and one with a ``thinking_budget`` gets the budget
+in place of the reasoning term, as the client's own default did.
 
 The ceiling counts thinking. On Anthropic, "thinking tokens count toward the
 max_tokens limit for the turn" (platform.claude.com, extended thinking), and a
@@ -113,6 +121,22 @@ def _load():
                 raise PackagedConfigError(
                     f"{path}: {key}.{name} must be a positive number, got {value!r}"
                 )
+    # The per-character line is optional per domain and needs no default: a
+    # domain without one keeps the size table alone.
+    per_char = data.get("answer_tokens_per_char", {})
+    if not isinstance(per_char, dict):
+        raise PackagedConfigError(f"{path}: 'answer_tokens_per_char' must be a mapping")
+    for name, value in per_char.items():
+        if not isinstance(value, (int, float)) or value < 0:
+            raise PackagedConfigError(
+                f"{path}: answer_tokens_per_char.{name} must be a non-negative "
+                f"number, got {value!r}"
+            )
+    floor = data.get("answer_floor_tokens", 0)
+    if not isinstance(floor, (int, float)) or floor < 0:
+        raise PackagedConfigError(
+            f"{path}: 'answer_floor_tokens' must be a non-negative number, got {floor!r}"
+        )
     return data
 
 
@@ -427,14 +451,11 @@ def effort_warnings(model_configs):
     )
 
 
-@functools.lru_cache(maxsize=None)
-def model_output_limit(provider, model):
-    """The model's own maximum output, from litellm's model map, or None.
+def _model_info_field(provider, model, *names):
+    """A positive integer field of litellm's model map for ``model``, or None.
 
     None when the map does not know the model — a pinned route or a model newer
-    than the installed litellm. The ceiling is then left unclamped rather than
-    guessed: every value this module computes sits far below any current
-    model's limit, so the clamp only ever matters for the calibration lift.
+    than the installed litellm — or carries no such field.
     """
     if not model:
         return None
@@ -444,34 +465,121 @@ def model_output_limit(provider, model):
         info = client._litellm().get_model_info(client._qualified(provider, model))
     except Exception:
         return None
-    limit = info.get("max_output_tokens") or info.get("max_tokens")
-    return int(limit) if isinstance(limit, (int, float)) and limit > 0 else None
+    for name in names:
+        value = info.get(name)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+    return None
 
 
-def compute_max_tokens(provider, cfg, domain, char_count, config=None):
-    """The output ceiling for one reasoning pass, or None when none applies.
+@functools.lru_cache(maxsize=None)
+def model_output_limit(provider, model):
+    """The model's own maximum output, from litellm's model map, or None.
 
-    None means "leave the request alone": a provider that sends no ceiling, or a
-    pass that does not reason, where the client's own default already fits.
+    The ceiling is left unclamped when this is None rather than guessed: every
+    value this module computes sits far below any current model's limit, so the
+    clamp only ever matters for the calibration lift. Checked against the
+    vendors' pages 2026-10-24 for every preset model: Anthropic publishes 64,000
+    (haiku-4-5) and 128,000 (opus-5, sonnet-5) and the map agrees; Google
+    65,536 for gemini-3.5-flash, agreed. The map's 262,144 for Mistral is the
+    context window, which is why ``model_context_limit`` exists; its 500,000
+    and 1,000,000 for grok are context windows too (xAI: "No text output
+    limit"), and OpenAI's 128,000 for gpt-6.x could only be confirmed through
+    third parties. None of those four is capped here, so none of that reaches a
+    request.
     """
-    if provider not in CAPPED_PROVIDERS:
-        return None
-    effort = effort_of(provider, cfg)
-    if effort is None:
-        return None
-    table = config or _CONFIG
-    reasoning = table["reasoning_tokens"]
+    return _model_info_field(provider, model, "max_output_tokens", "max_tokens")
+
+
+@functools.lru_cache(maxsize=None)
+def model_context_limit(provider, model):
+    """The model's input/context limit from litellm's model map, or None.
+
+    Mistral rejects a request whose prompt plus ``max_tokens`` exceeds the
+    context window, and its map entry reports that window (262,144) as the
+    output limit too, so clamping to ``max_output_tokens`` alone would let a
+    long draft ask for more than the window has left.
+    """
+    return _model_info_field(provider, model, "max_input_tokens")
+
+
+#: The prompt's size in tokens, estimated from the draft's characters alone.
+#: The DENSEST ratio on record is used (mistral's prompts ran 2.9-3.7 chars per
+#: token on the saved runs; this errs towards a larger prompt) plus a round
+#: allowance for everything in the prompt that is not the draft — system
+#: prompt, handoff, review context — which ran 1,400-10,000 tokens. Only the
+#: context clamp reads it, and only a draft within an order of magnitude of
+#: the window makes it bind.
+_CHARS_PER_PROMPT_TOKEN = 2.5
+_PROMPT_OVERHEAD_TOKENS = 10_000
+
+
+def _prompt_estimate(char_count):
+    return math.ceil(char_count / _CHARS_PER_PROMPT_TOKEN) + _PROMPT_OVERHEAD_TOKENS
+
+
+def _answer_term(domain, char_count, table):
+    """Tokens of visible answer the ceiling leaves room for.
+
+    The larger of the size-table term and the per-character line, and never
+    below ``answer_floor_tokens``. The table shapes small and medium drafts;
+    the line takes over where the table's top bucket stops growing and the
+    output does not (configs/output_tokens.yaml, "answer_tokens_per_char").
+    """
     answer = table["answer_tokens"]
     size = timeout_model._size_mult(
         char_count, timeout_model._CONFIG["size_multipliers"]
     )
-    raw = (
-        float(reasoning.get(effort, reasoning["default"]))
-        + float(answer.get(domain, answer["default"])) * size
+    scaled = float(answer.get(domain, answer["default"])) * size
+    per_char = table.get("answer_tokens_per_char") or {}
+    rate = float(per_char.get(domain, per_char.get("default", 0)))
+    return max(scaled, rate * char_count, float(table.get("answer_floor_tokens", 0)))
+
+
+def _reasoning_term(provider, cfg, table):
+    """Tokens of thinking the ceiling leaves room for: 0 for a no-effort pass.
+
+    A claude ``thinking_budget`` is the thinking's own size and is sent in
+    place of any effort (``client._provider_params``), so it stands in for the
+    table here too.
+    """
+    budget = cfg.get("thinking_budget") if provider == "claude" else None
+    if budget is not None:
+        return float(budget)
+    effort = effort_of(provider, cfg)
+    if effort is None:
+        return 0.0
+    reasoning = table["reasoning_tokens"]
+    return float(reasoning.get(effort, reasoning["default"]))
+
+
+def compute_max_tokens(provider, cfg, domain, char_count, config=None):
+    """The output ceiling for one pass, or None for a provider that sends none.
+
+    None means "leave the request alone": only openai, grok, gemini and
+    perplexity get it, since their requests carry no ceiling. Every claude and
+    mistral pass gets a number, sized from the pass's effort, its domain and the
+    draft, then clamped to the model's output limit and to the room its context
+    window leaves after the prompt.
+    """
+    if provider not in CAPPED_PROVIDERS:
+        return None
+    cfg = cfg or {}
+    table = config or _CONFIG
+    ceiling = math.ceil(
+        _reasoning_term(provider, cfg, table) + _answer_term(domain, char_count, table)
     )
-    ceiling = math.ceil(raw)
-    limit = model_output_limit(provider, (cfg or {}).get("model"))
-    return min(ceiling, limit) if limit else ceiling
+    model = cfg.get("model")
+    bounds = [ceiling]
+    limit = model_output_limit(provider, model)
+    if limit:
+        bounds.append(limit)
+    context = model_context_limit(provider, model)
+    if context:
+        room = context - _prompt_estimate(char_count)
+        if room > 0:
+            bounds.append(room)
+    return min(bounds)
 
 
 def largest_ceiling(provider, cfg, char_count, config=None):

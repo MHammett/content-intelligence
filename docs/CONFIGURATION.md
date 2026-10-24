@@ -293,13 +293,16 @@ Under streaming the adapter passes `timeout=(connect, read_gap)` to the HTTP req
 
 #### Output-token ceiling is automatic too
 
-Claude and Mistral are the two providers whose requests carry an output-token ceiling (`max_tokens`); the other four run to the model's own limit. On a reasoning pass (`effort` / `reasoning_effort` set, or a Claude model that thinks with none set — see [below](#claude--adaptive-vs-extended-thinking)) the pipeline sizes that ceiling per call, from [`ci-core`'s `output_tokens.yaml`](../packages/ci-core/src/ci_core/configs/output_tokens.yaml):
+Claude and Mistral are the two providers whose requests carry an output-token ceiling (`max_tokens`); the other four run to the model's own limit (checked 2026-10-24: gpt-6.x 128,000, gemini-3.5-flash 65,536, grok-4.x "no text output limit", sonar undocumented). The pipeline sizes that ceiling per call for every Claude and Mistral pass, from [`ci-core`'s `output_tokens.yaml`](../packages/ci-core/src/ci_core/configs/output_tokens.yaml):
 
 ```
-max_tokens = reasoning_tokens[effort] + answer_tokens[domain] × size_mult
+max_tokens = reasoning_tokens[effort]
+           + max(answer_tokens[domain] × size_mult, answer_tokens_per_char[domain] × chars, answer_floor_tokens)
 ```
 
-`size_mult` is the wall-clock formula's own size table, so the two scale together. The ceiling counts **thinking**: every truncated pass on record ran out while reasoning, including on drafts under 5,000 characters, which is why reasoning is a flat term and only the answer scales with the draft. A capped model's wall-clock backstop is raised, if it has to be, to the time a healthy call needs to reach its ceiling — otherwise a longer ceiling just turns truncations into timeouts.
+clamped to the model's output limit and to what its context window leaves after the prompt. `size_mult` is the wall-clock formula's own size table, so the two scale together. The ceiling counts **thinking**: every truncated pass on record up to 2026-09 ran out while reasoning, including on drafts under 5,000 characters, which is why reasoning is a flat term (0 on a pass that does not reason — `effort` / `reasoning_effort` unset or `none`, on a model that does not think by default; see [below](#claude--adaptive-vs-extended-thinking)). The answer term scales with the draft two ways, and the larger wins: the size table, which shapes small and medium drafts, and for `fact_check` a straight line of 0.25 tokens per character, which takes over from about 90,000 characters — on a 190,170-character draft at `maximum`, `mistral:fact_check` wrote 154 `confirmed` entries and hit the table's 50,000 before any other bucket (2026-10-23); the line gives that pass 79,543. A capped model's wall-clock backstop is raised, if it has to be, to the time a healthy call needs to reach its ceiling — otherwise a longer ceiling just turns truncations into timeouts. Past roughly 120,000 characters at `maximum` that time exceeds `task_timeout_seconds` (1100) at the slowest healthy rate on record, and the task ceiling, not the token ceiling, is what bounds the pass; raise `task_timeout_seconds` for drafts that size if a `fact_check` keeps timing out.
+
+The call log records `finish_reason` beside `max_tokens` and `truncated`, so a capture says whether the provider stopped on its own (`stop`), at the ceiling (`length`), or otherwise.
 
 A truncated pass is reported as **PARTIAL**: the complete findings it wrote are kept, and the report names which of its output buckets never arrived — in the header, and above the section it feeds.
 

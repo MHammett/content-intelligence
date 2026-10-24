@@ -3978,6 +3978,10 @@ def run_draft_pipeline(
             "timeout_budget_seconds": budget,
             "headroom_seconds": headroom,
             "max_tokens": ceiling,
+            # Why the provider stopped, as the client read it ("stop",
+            # "length", ...). None on a capture from before it was recorded,
+            # and on a failure that never reached a stop.
+            "finish_reason": result.get("finish_reason"),
             "char_count": char_count,
             "status": status,
         }

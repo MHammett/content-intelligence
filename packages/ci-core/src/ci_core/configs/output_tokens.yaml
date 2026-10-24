@@ -1,20 +1,31 @@
-# Output-token ceiling model — the `max_tokens` a reasoning review pass is sent.
+# Output-token ceiling model — the `max_tokens` a capped review pass is sent.
 #
-#   max_tokens = reasoning_tokens[effort] + answer_tokens[domain] × size_mult(draft chars)
+#   max_tokens = reasoning_tokens[effort]
+#              + max(answer_tokens[domain] × size_mult(draft chars),
+#                    answer_tokens_per_char[domain] × draft chars)
 #
-# clamped to the model's own output limit. `size_mult` is NOT defined here: it is
-# timeouts.yaml's size_multipliers table, read from there, so the ceiling and the
-# wall-clock budget scale with the draft in lockstep and cannot drift apart.
+# with the answer term never below `answer_floor_tokens`, the whole clamped to
+# the model's own output limit AND to what its context window leaves after the
+# prompt. `size_mult` is NOT defined here: it is timeouts.yaml's size_multipliers
+# table, read from there, so the ceiling and the wall-clock budget scale with
+# the draft in lockstep and cannot drift apart.
 #
 # WHO THIS APPLIES TO. Only claude and mistral send a ceiling at all — openai
 # (Responses API), grok, gemini and perplexity send none and run to the model's
-# own limit. And only their REASONING passes (an `effort` / `reasoning_effort`
-# other than "none"); the no-effort paths keep client.py's 8000 default, which
-# nothing has truncated since it was set. A claude model that thinks with no
-# effort set (claude-opus-5, claude-sonnet-5) is a reasoning pass at `high`, the
-# API default, not a no-effort one — see _EFFORT_WHEN_UNSET in
-# ci_core/llm/output_tokens.py. An explicit `max_tokens` in a model config
-# always wins over this.
+# own limit (audited 2026-10-24 against litellm's map and the vendors' pages:
+# gpt-6.x 128,000; gemini-3.5-flash 65,536; grok-4.x "no text output limit";
+# sonar undocumented). Both capped providers get a ceiling on EVERY pass:
+#   * a reasoning pass (an `effort` / `reasoning_effort` other than "none", or a
+#     claude model that thinks with none set — claude-opus-5, claude-sonnet-5
+#     run at `high`, the API default; see _EFFORT_WHEN_UNSET in
+#     ci_core/llm/output_tokens.py) gets reasoning_tokens plus the answer term;
+#   * a no-effort pass gets the answer term alone. Until 2026-10-24 these kept
+#     client.py's flat 8000, and that cut claude-haiku-4-5:argument_integrity
+#     at exactly 8000 tokens twice at `wide` (2026-09-28 and 2026-10-04, a
+#     9,456-char draft, 38,021 chars of flags written and the rest lost). On a
+#     claude model with a `thinking_budget`, the budget stands in for the
+#     reasoning term, as the client's own default did.
+# An explicit `max_tokens` in a model config always wins over this.
 #
 # WHY THE FORMULA HAS TWO TERMS. Measured 2026-09-18 across every captured run on
 # this machine (1,144 ensemble calls). Before this file existed the ceiling was a
@@ -61,16 +72,61 @@ reasoning_tokens:
 
 # The visible JSON the domain returns, in tokens, at timeouts.yaml's 1.0 size
 # bucket (50-80k chars). Scaled by that same table, so 0.7x under 5k chars and
-# 1.4x at 80-150k.
+# 1.4x at 80-150k — up to the point where the per-character term below is
+# larger, which it is from about 90,000 chars on for fact_check.
 answer_tokens:
-  # MEASURED: largest visible fact_check answer on record was 8,061 tokens
-  # (mistral, 18,167 chars — the 0.8 bucket), so 10,000 at the anchor puts
-  # the 0.8 bucket right on it. The reasoning term is the real headroom.
-  fact_check: 10000
-  # Every other domain returns a handful of flags. Largest visible answers on
-  # record: ~4,300 tokens (claude-opus-5 argument_integrity, haiku-4-5 with no
-  # reasoning at all).
-  default: 5000
+  # MEASURED: largest visible fact_check answer on record at or under the
+  # anchor is ~9,200 tokens (gpt-5.6-sol, 33,026 chars of JSON on the
+  # 18,167-char draft — the 0.8 bucket; mistral's 29,021 chars on the same
+  # draft is the one 2026-09-18 sized from, as 8,061). 16,000 at the anchor is
+  # 12,800 at that bucket, 1.4x the measurement, and keeps fact_check above
+  # the flag domains' 15,000 at every size: it is the domain that writes one
+  # entry per claim, and the budgets size off the largest ceiling.
+  fact_check: 16000
+  # Every other domain returns a handful of flags, but a flag carries prose.
+  # Largest visible answers on record, re-measured 2026-10-24 over every saved
+  # capture (JSON chars / 4): ~10,000 tokens (gpt-5.6-sol voice_style, 40,285
+  # chars, 18,167-char draft), ~9,500 CENSORED (claude-haiku-4-5
+  # argument_integrity, cut at the 8000 ceiling with 38,021 chars written,
+  # 9,456-char draft), ~8,500 (claude-opus-5 argument_integrity, 34,111 chars,
+  # 169,940-char draft). Was 5000, from a ~4,300-token high-water mark that the
+  # haiku pass passed twice. 15,000 at the anchor is 12,000 at haiku's 0.8
+  # bucket, 1.26x the censored figure.
+  default: 15000
+
+# The answer term's other shape, for the domain whose output is one entry per
+# claim: tokens per character of draft, as a straight line through the origin.
+# The size table above tops out at 1.8x while the output keeps growing —
+# MEASURED 2026-10-23, `maximum`, a 169,940-char draft (190,170 chars as sent):
+#
+#   pass                 entries   visible JSON    tokens (chars/4)
+#   mistral:fact_check   154 (confirmed only; CUT OFF at 50,000 total)
+#                                  109,656 chars   ~27,400 and counting
+#   openai:fact_check    147       74,076 chars    ~18,500 (finished)
+#   mistral:fact_check    75       47,681 chars    ~11,900 (run 23, same
+#                                                   article, finished)
+#
+# The same model on the same article wrote 2x the entries one run apart, so
+# the ceiling has to cover the heavy tail, not the median. Per entry the size
+# is steady, 240-720 chars (~70-200 tokens) across every model and draft;
+# what grows is the count. 0.25 tokens per character is the run-24 pass
+# extrapolated to finishing its remaining six buckets at its own per-entry
+# size (~250 entries x 712 chars / 4 ≈ 44,500 tokens on 190,170 chars), and
+# gives that pass 79,543 instead of 50,000. Below the crossover the table
+# still decides, so nothing under 56,000 chars changes. A ceiling, not a
+# target: it bills only what is generated. With the anchor above, the line
+# decides from about 90,000 chars (where 16,000 x 1.4 = 22,400 meets 0.25 x
+# 89,600) and the table below it, so nothing under that size changes.
+#
+# Only fact_check has a line; the flag domains do not grow with the claim
+# count and keep the table alone.
+answer_tokens_per_char:
+  fact_check: 0.25
+
+# The answer term never goes below this, so a no-effort pass is never sent
+# less than the flat 8000 client.py sent before 2026-10-24 — a 2,000-char
+# fact_check would otherwise get 7,000 — and nothing shrinks.
+answer_floor_tokens: 8000
 
 # Throughput used to turn a ceiling back into seconds: output tokens per second
 # over the WHOLE call (first byte and any search included), a little under the
