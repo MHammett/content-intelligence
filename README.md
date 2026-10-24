@@ -947,6 +947,8 @@ content-intelligence/
 │   │   │   │   ├── output_tokens.py   output-token ceiling for claude/mistral reasoning
 │   │   │   │   │                      passes: reasoning + answer × the same size table
 │   │   │   │   ├── model_registry.py  current/superseded model detection
+│   │   │   │   ├── ratelimit.py       per-provider tokens-per-minute meter: a call waits for room
+│   │   │   │   │                      instead of drawing a 429 (rate_limits: in user.yaml)
 │   │   │   │   └── watermarking.py    which providers mark generated text;
 │   │   │   │                          provenance bookkeeping, not detection
 │   │   │   ├── extract.py        HTML/PDF -> readable text, claim-centred excerpts
