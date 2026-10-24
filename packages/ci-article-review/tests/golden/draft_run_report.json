@@ -135,6 +135,116 @@
     }
   ],
   "article_title": "A Grid Piece With A Sufficiently Long Title",
+  "claim_ledger": {
+    "citations_resolved": true,
+    "claims": [
+      {
+        "claim": "Cooling draws 3 million gallons annually.",
+        "evidence": {
+          "buckets": {
+            "primary_source_needed": [
+              "gemini"
+            ]
+          },
+          "citation": {
+            "disposition": "checksum",
+            "reask": null,
+            "relevance_verdict": null,
+            "url": "https://example.org/resolved"
+          },
+          "citations_total": 1,
+          "exclusion": null,
+          "section_1_passages": [],
+          "variants": []
+        },
+        "source_is_authors": false,
+        "status": "confirmed_source_read",
+        "why": "the source was read and supports it (example.org)"
+      },
+      {
+        "claim": "Local officials were not consulted.",
+        "evidence": {
+          "buckets": {
+            "unverifiable": [
+              "gemini"
+            ]
+          },
+          "citation": {
+            "disposition": "checksum",
+            "reask": null,
+            "relevance_verdict": null,
+            "url": "https://example.org/resolved"
+          },
+          "citations_total": 1,
+          "exclusion": null,
+          "section_1_passages": [
+            "Local officials were not consulted."
+          ],
+          "variants": []
+        },
+        "source_is_authors": false,
+        "status": "confirmed_source_read",
+        "why": "the source was read and supports it (example.org)"
+      },
+      {
+        "claim": "The 2019 figure was 33 percent.",
+        "evidence": {
+          "buckets": {
+            "unverifiable": [
+              "gemini"
+            ]
+          },
+          "citation": {
+            "disposition": "checksum",
+            "reask": null,
+            "relevance_verdict": null,
+            "url": "https://example.org/resolved"
+          },
+          "citations_total": 1,
+          "exclusion": null,
+          "section_1_passages": [
+            "The 2019 figure was 33 percent."
+          ],
+          "variants": []
+        },
+        "source_is_authors": false,
+        "status": "confirmed_source_read",
+        "why": "the source was read and supports it (example.org)"
+      },
+      {
+        "claim": "The grid served 41 percent of load from nuclear.",
+        "evidence": {
+          "buckets": {
+            "confirmed": [
+              "gemini"
+            ]
+          },
+          "citation": {
+            "disposition": "checksum",
+            "reask": null,
+            "relevance_verdict": null,
+            "url": "https://example.org/resolved"
+          },
+          "citations_total": 1,
+          "exclusion": null,
+          "section_1_passages": [],
+          "variants": []
+        },
+        "source_is_authors": false,
+        "status": "confirmed_source_read",
+        "why": "the source was read and supports it (example.org)"
+      }
+    ],
+    "counts": {
+      "confirmed_source_not_read": 0,
+      "confirmed_source_read": 4,
+      "contradicted": 0,
+      "excluded_by_author": 0,
+      "excluded_by_model": 0,
+      "source_does_not_support": 0,
+      "unverified": 0
+    }
+  },
   "contradictions": [],
   "corrected_draft": "# A Grid Piece With A Sufficiently Long Title\n\nIt is important to note that the grid is complex. The 2019 figure was 33 percent. The grid served 41 percent of load from nuclear.\n\n## Cooling\n\nCooling draws 3 million gallons annually. Local officials were not consulted. See https://example.org/source-one for the underlying data.\n",
   "cost_summary": {
@@ -714,6 +824,7 @@
         "claim": "The grid served 41 percent of load from nuclear.",
         "confidence": "high",
         "grounding": true,
+        "net_status": "confirmed_source_read",
         "source": "EIA State Profile, https://example.org/eia-profile",
         "source_model": "gemini",
         "source_url": "https://example.org/eia-profile",
@@ -729,6 +840,7 @@
         "best_candidate_source": "https://example.org/water-report",
         "claim": "Cooling draws 3 million gallons annually.",
         "grounding": true,
+        "net_status": "confirmed_source_read",
         "source_model": "gemini",
         "source_weight": 1.5
       }
@@ -738,6 +850,7 @@
         "checked": "county board minutes",
         "claim": "Local officials were not consulted.",
         "grounding": true,
+        "net_status": "confirmed_source_read",
         "reason": "no public record found",
         "source_model": "gemini",
         "source_weight": 1.5
@@ -747,6 +860,7 @@
         "claim": "The 2019 figure was 33 percent.",
         "demoted_from": "outdated",
         "grounding": true,
+        "net_status": "confirmed_source_read",
         "reason": "Reported as outdated (as a verdict) without a verbatim quote from https://example.org/updated-table. A verdict nothing was quoted for has not been shown against the page. It reported the current value as: 38 percent as of 2025.",
         "source_model": "gemini",
         "source_weight": 1.5,

@@ -24,6 +24,10 @@ from .adapters.citation.wayback import lookup_was_rate_limited
 # pulls nothing in behind it.
 from .worklist import build_worklist, render_worklist
 
+# ``claim_status`` is a third, on the same grounds: it reads the report dict
+# and imports only ``passage_match``, ``fact_check_scope`` and the leaf above.
+from . import claim_status
+
 #: Order the suggested SEO fields render in: publication.md's SEO METADATA
 #: order, then schema type, which that block no longer carries. Duplicated
 #: from ``analysis.seo_suggest.FIELD_ORDER`` rather than imported so
@@ -1098,6 +1102,19 @@ _CLAIM_TYPE_PHRASES = {
 }
 
 
+def _net_status_line(item):
+    """The claim's one net status, first under the claim, where a reader looks.
+
+    Stamped on each Section 2 entry by ``claim_status.annotate_fact_check`` once
+    the ledger is built (issue #338). A report saved before the ledger existed
+    has no ``net_status`` and renders as it always did.
+    """
+    status = item.get("net_status")
+    if not status:
+        return []
+    return [f"  - Net status: {claim_status.label_for(status)}"]
+
+
 def _render_out_of_scope(items):
     """The claims that were never candidates for external verification.
 
@@ -1136,6 +1153,7 @@ def _render_out_of_scope(items):
 
     for item in items:
         lines.append(f'- "{item.get("claim", "")}"')
+        lines.extend(_net_status_line(item))
         state = "excluded" if item.get("excluded") else "reported only, still checked"
         lines.append(f"  - Status: {state}")
         lines.append(f"  - Decided by: {item.get('excluded_by', 'unknown')}")
@@ -1216,7 +1234,8 @@ def _render_section_2(fact_check, report=None):
         for item in items:
             claim = item.get("claim", "")
             lines.append(f'- "{claim}"{_reproduction_note(item)}')
-            for kv in _kv_lines(item, exclude=("claim",)):
+            lines.extend(_net_status_line(item))
+            for kv in _kv_lines(item, exclude=("claim", "net_status")):
                 lines.append(kv)
         lines.append("")
 

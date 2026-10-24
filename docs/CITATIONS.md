@@ -150,6 +150,34 @@ Checked on `mikehammett.net`, 2026-10-06: the homepage listing now reaches `/pag
 
 ---
 
+## One status per claim
+
+The tiers above describe one citation. A claim can have several models' verdicts in Section 2, an out-of-scope classification, a Section 9 entry and a Section 1 flag, and before the claim ledger those four could disagree with nothing saying which to believe: in a saved run a count of the author's published posts was `confirmed` by one model, `primary_source_needed` for another, classified out of scope by a third, and `content_mismatch` in Section 9, and the worklist labelled it "contradicted or outdated" although neither bucket held it (issue #338).
+
+`claim_status.build_claim_ledger` settles that once, after consolidation and after citation resolution and re-ask, and the result is saved as `claim_ledger` in `report.json`. Each entry has the claim, one `status`, a one-line `why`, and the evidence behind it (which models put it in which bucket, the exclusion if any, the deciding citation, the Section 1 passages that contain it). The same status is stamped on every Section 2 entry as `net_status` and rendered as its first line, "Net status: ...", and the console summary prints the counts under the Section 2 line.
+
+The statuses, strongest first; the first whose condition holds is the claim's:
+
+| status | holds when |
+|---|---|
+| Excluded by the author | an inline marker, the handoff's OUT OF SCOPE section or the publication config excluded it |
+| Excluded by a fact-check model | a model classed it out of scope and the scope rules honoured that (`excluded: true`); a classification that was outvoted or not acted on is not an exclusion |
+| Contradicted | any one `contradicted` or `outdated` verdict; or the source read `contradicts` it; or the asserting model conceded at re-ask (`correct_claim` or `withdraw`, in which case the corrected wording is on the entry) |
+| Source read, does not support the claim | Section 9 `content_mismatch`, including `not_addressed` |
+| Confirmed, source read | Section 9 `checksum` |
+| Confirmed by a model, source not read | in the `confirmed` bucket, and no citation reached a read tier |
+| Unverified | everything else |
+
+Three rules fall out of that order. An exclusion beats everything, because the scope rules have already withdrawn the verdicts behind it; they survive in `withdrawn_verdicts` and the `why` names them. A page that was read outranks a model's assertion, in either direction. `unverifiable` is not a contradiction: one model confirming and another unable to verify is a disagreement about evidence, which `contradictions` in the report already lists.
+
+Two things the ledger records without changing the status. `source_is_authors: true` means the supporting page is on the publication's own site (`wordpress.site_url`): the author confirming the author, rendered as "the author's own page supports it". Section 1 passages are references only: its items are paragraph-sized, and `passage_match` never merges a sentence into the paragraph that contains it, so a Section 1 flag links to the entry and cannot move it.
+
+Claims are joined the way `find_contradictions` joins them, with `passage_match.group_passages`, not by exact text, since the same claim comes back with different quote marks and clause boundaries. That grouping is conservative: short claims never merge, so "I have a day job." and "I have a day job. I have a side job." stay two entries with their own statuses.
+
+An `--offline` replay has no Section 9, so its ledger says `citations_resolved: false` and nothing in it can rank above "Confirmed by a model, source not read"; the console line says so. A report saved before the ledger existed has no `claim_ledger` and renders as it always did.
+
+---
+
 ## Content drift
 
 The checksum recorded on a verified citation isn't only a fingerprint of what was fetched — it's comparable across runs. Before resolution starts, the pipeline builds a URL → prior-checksum index from every report under `pipeline_history/`: every run, every article, since the same primary sources (EPA eGRID, EIA state profiles) get cited across many articles for one publication. When a citation resolves and its URL is already in that index with a different checksum, the entry gains a `content_changed_since` field recording the prior checksum, and which run of which article last saw it.
