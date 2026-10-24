@@ -74,6 +74,17 @@ _UNVERIFIABLE_NOTES = {
 #: citation, so it deliberately avoids a heavyweight reasoning model.
 _VERIFICATION_MODEL = "mistral-small-latest"
 
+#: Retries for that call, where every other model call gets one. Mistral
+#: limits mistral-small to 100 requests a minute on this account (the console,
+#: 2026-10-24; the docs publish no figure), and three of these calls at once at
+#: ~1.1s each run at ~160 a minute, so a 429 is a burst, not a fault. Measured
+#: 2026-10-24: four back-to-back calls went ok, ok, 429, 429, and with one retry
+#: each refused call cost its claim the verdict (#389). The call is well under a
+#: cent and ``_with_retry`` honours ``Retry-After``, so a few more attempts are
+#: cheaper than a lost claim; the limiter in ``ci_core.llm.ratelimit`` is what
+#: keeps a run from needing them.
+_VERIFICATION_RETRIES = 3
+
 _VERIFICATION_SYSTEM_PROMPT = (
     "You verify whether a web page's content supports a specific factual claim. "
     "Respond with ONLY a JSON object of the form "
@@ -657,6 +668,7 @@ def _verify_relevance(claim, content, api_keys, author=None):
                 _VERIFICATION_SYSTEM_PROMPT,
                 user_prompt,
                 api_key,
+                retry=_VERIFICATION_RETRIES,
                 model=_VERIFICATION_MODEL,
             )
     except Exception as e:
