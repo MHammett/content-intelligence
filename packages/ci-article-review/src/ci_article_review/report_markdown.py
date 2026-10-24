@@ -1102,6 +1102,44 @@ _CLAIM_TYPE_PHRASES = {
 }
 
 
+def _net_status_counts(statuses):
+    """``"3 confirmed, source read, 1 unverified"`` for the non-zero statuses, in
+    precedence order; empty string when there are none."""
+    counts = {}
+    for status in statuses:
+        counts[status] = counts.get(status, 0) + 1
+    return ", ".join(
+        f"{counts[key]} {claim_status.label_for(key).lower()}"
+        for key, _ in claim_status.STATUSES
+        if counts.get(key)
+    )
+
+
+def _render_net_status_counts(ledger):
+    """The Section 2 header's one line of net-status counts, from the ledger.
+
+    Placed above the buckets so a reader meets the run's answer before the
+    per-model verdicts, which can disagree with each other and with Section 9.
+    """
+    if not isinstance(ledger, dict) or not ledger.get("claims"):
+        return []
+    claims = [c for c in ledger["claims"] if isinstance(c, dict)]
+    counts = _net_status_counts(c.get("status") for c in claims)
+    line = (
+        f"**Net status across {len(claims)} claim(s):** {counts}. Each entry "
+        "below carries its own Net status line. Where that line disagrees with "
+        "the bucket the entry sits under, the net status is the one to act on: "
+        "the bucket is one model's verdict, and the net status also reads "
+        "Section 9."
+    )
+    if not ledger.get("citations_resolved"):
+        line += (
+            " Section 9 did not run this time, so nothing here can rank above "
+            "a model's confirmation."
+        )
+    return [line, ""]
+
+
 def _net_status_line(item):
     """The claim's one net status, first under the claim, where a reader looks.
 
@@ -1226,6 +1264,7 @@ def _render_section_2(fact_check, report=None):
     lines.extend(
         _render_evidence_coverage(fact_check, (report or {}).get("quote_check"))
     )
+    lines.extend(_render_net_status_counts((report or {}).get("claim_ledger")))
     for key, label in labels.items():
         items = fact_check.get(key, [])
         if not items:
@@ -2422,7 +2461,34 @@ def _render_reference_list(citations):
     return lines
 
 
-def _render_section_9(citations, out_of_scope=()):
+def _render_section_9_net_status(ledger):
+    """What the ledger says about the claims that have a citation here.
+
+    The tiers in this section are what retrieval established; the ``Bucket``
+    on each entry is what a model asserted. Neither is the claim's status. The
+    ledger's is, and this line gives it for exactly the claims in this section,
+    so the arithmetic matches the table that follows.
+    """
+    if not isinstance(ledger, dict):
+        return []
+    here = [
+        c
+        for c in ledger.get("claims") or []
+        if isinstance(c, dict) and (c.get("evidence") or {}).get("citation")
+    ]
+    if not here:
+        return []
+    counts = _net_status_counts(c.get("status") for c in here)
+    return [
+        f"**Net status of the {len(here)} claim(s) in this section:** {counts}. "
+        "The `Bucket` on an entry is one model's verdict and the tier is what "
+        "retrieval found; the net status weighs both, and it is the one on the "
+        "claim's Section 2 entry.",
+        "",
+    ]
+
+
+def _render_section_9(citations, out_of_scope=(), ledger=None):
     # The heading carries the framing deliberately. "Citations" alone reads as a
     # list of sources backing the article, which invites more confidence than
     # the tiers below have earned — in a real run 18 of 144 claims had a document
@@ -2503,6 +2569,7 @@ def _render_section_9(citations, out_of_scope=()):
         "which; every claim is in exactly one row."
     )
     lines.append("")
+    lines.extend(_render_section_9_net_status(ledger))
     lines.append("| What happened | Claims |")
     lines.append("| --- | ---: |")
     for key, label in _DISPOSITIONS:
@@ -3493,6 +3560,7 @@ def render_report_markdown(report):
         _render_section_9(
             report.get("section_9_citations", []),
             _mapping(report.get("section_2_fact_check")).get("out_of_scope") or [],
+            ledger=report.get("claim_ledger"),
         )
     )
     lines.extend(_render_section_10(report.get("section_10_expansion", {})))
