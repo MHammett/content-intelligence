@@ -125,6 +125,20 @@ class TestEveryResultCarriesItsTiming:
         assert report["fetch"] >= 0.0
         assert set(report) == {"fetch", "relevance", "total"}
 
+    def test_total_counts_from_the_first_step_not_from_creation(self):
+        """The batch makes every clock up front; a claim in wave 30 queues for
+        half an hour first. Measured on the first live replay: "total" read
+        1,048s at the median while the steps summed to 24s."""
+        clock = resolver._StepClock()
+        time.sleep(0.05)
+        assert clock.report()["total"] == 0.0, "nothing has started"
+        clock.enter("fetch")
+        time.sleep(0.02)
+        clock.done()
+        report = clock.report()
+        assert report["total"] < 0.05, f"queue time was charged: {report}"
+        assert report["total"] >= report["fetch"]
+
     def test_the_formatter_reads_like_a_sentence(self):
         line = resolver._format_timing(
             {"fetch": 1.0, "extract": 1.9, "relevance": 39.0, "total": 44.2}

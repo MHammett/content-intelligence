@@ -177,8 +177,10 @@ _FETCH_TIMEOUT_SECONDS = 15
 #:   fallback path, the snapshot fetch. archive.org pacing (a 3s shared clock,
 #:   5s backoff base, shared by every worker) sits on top and is not budgeted.
 #: * Pagination: up to ``MAX_PAGES - 1`` further fetches.
-#: * The relevance call: mistral-small answers in ~1-2s, but a 429 puts a
-#:   10s wait before the retry, and the retry can be refused too.
+#: * The relevance call: mistral-small answers in ~1-2s, but the call queues
+#:   behind ``_MAX_VERIFY_PARALLEL`` others and the token meter, and a 429
+#:   puts up to three waits of up to 30s before it. Measured on the first
+#:   live replay of a 267-claim draft: median 18.7s, p90 81s, max 166s.
 #:
 #: Not every claim walks the whole chain, and a claim citing several URLs
 #: walks it once per URL (``_resolve_candidates``), so this is neither a
@@ -192,9 +194,9 @@ _ESCALATION_SECONDS = _FETCH_TIMEOUT_SECONDS
 _ARCHIVE_CHECK_SECONDS = 10
 _ARCHIVE_SECONDS = _ARCHIVE_CHECK_SECONDS + _FETCH_TIMEOUT_SECONDS
 _PAGINATION_SECONDS = _FETCH_TIMEOUT_SECONDS * (pagination.MAX_PAGES - 1)
-_RELEVANCE_SECONDS = 60
+_RELEVANCE_SECONDS = 120
 
-#: Per-claim budget for one resolution job: the chain above, summed (250s at
+#: Per-claim budget for one resolution job: the chain above, summed (310s at
 #: the values this was written with). ``batch_ceiling`` sizes the whole batch
 #: from it, so raising a step's timeout raises both.
 _RESOLVE_TIMEOUT_SECONDS = (
@@ -253,7 +255,11 @@ class _StepClock:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.started = time.monotonic()
+        # Set on the first step, not here: the batch makes every clock up
+        # front and a claim in wave 30 waits half an hour for a slot. Measured
+        # on the first live run of this: "total" read 1,048s at the median
+        # while the steps summed to 24s. Queue time is not the claim's.
+        self.started = None
         self._steps = {}
         self._current = None
         self._since = None
@@ -261,6 +267,8 @@ class _StepClock:
     def enter(self, step):
         with self._lock:
             now = time.monotonic()
+            if self.started is None:
+                self.started = now
             self._close(now)
             self._current = step
             self._since = now
@@ -286,7 +294,7 @@ class _StepClock:
                 )
             current = self._current
         out = {step: round(seconds, 1) for step, seconds in steps.items()}
-        out["total"] = round(now - self.started, 1)
+        out["total"] = round(now - self.started, 1) if self.started is not None else 0.0
         if current is not None:
             out["in_progress"] = current
         return out
