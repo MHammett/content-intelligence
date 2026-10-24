@@ -25,20 +25,49 @@ values, which beat the config file in this project's credential precedence. Any
 flag after a bare ``--`` is forwarded to the CLI, so this is also how to rehearse
 ``--keep-image-metadata`` or ``--publish-live``.
 
+Two more things it does so that a rehearsal stays a rehearsal. The run's log goes
+to a temporary directory (``CI_HISTORY_ROOT`` is pointed there for the run), not
+to ``pipeline_history/`` or whatever ``CI_HISTORY_ROOT`` named, so a rehearsal
+adds nothing to the real daily log. And no ``.env`` is loaded: ``find_dotenv`` and
+``load_dotenv`` are replaced before the project is imported, because a worktree
+inside the main checkout otherwise finds the real ``.env`` and puts every provider
+key in the process's environment. Nothing would use one, but "never read" should
+be true of all the credentials and not only the WordPress ones.
+
 Uploaded file bytes are written to ``--out-dir`` so they can be inspected --
-``tools/image_metadata.py report`` is the companion for that. Headers are never
-printed; the body of each POST is.
+``tools/image_metadata.py report`` is the companion for that, and so is the body of
+each post: the markup WordPress would have been sent goes to
+``rehearsal-post-N.html`` in the same place, whole, because the terminal copy of a
+long article was cut mid-paragraph. Headers are never printed; the other fields of
+each POST are.
 """
 
 import argparse
 import json
+import logging
+import os
 import pathlib
 import socket
 import sys
+import tempfile
 from unittest.mock import patch
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 TESTS = REPO / "packages" / "ci-article-review" / "tests"
+
+
+def disable_dotenv():
+    """Stop the project loading a ``.env``. Call before importing ``ci_article_review``.
+
+    ``config_loader`` runs ``load_dotenv(find_dotenv())`` when it is imported, and
+    ``find_dotenv`` walks up from the package file, so a worktree inside the main
+    checkout reaches the real one. With both replaced it finds no file and loads
+    nothing, which is what a checkout without a ``.env`` already does.
+    """
+    import dotenv
+
+    dotenv.find_dotenv = lambda *_a, **_k: ""
+    dotenv.load_dotenv = lambda *_a, **_k: False
 
 
 def _block_sockets():
@@ -81,6 +110,7 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _block_sockets()
+    disable_dotenv()
     sys.path.insert(0, str(TESTS))
     from test_wordpress_images import FakeWordPress  # noqa: E402
 
@@ -105,7 +135,11 @@ def main(argv=None):
     wp = "ci_article_review.adapters.cms.wordpress"
     code = None
     print(f"$ {' '.join(argv_cli)}\n")
+    # The daily log is written under the history root, which is the real shared
+    # one unless this says otherwise; a rehearsal's lines do not belong in it.
     with (
+        tempfile.TemporaryDirectory(prefix="rehearsal-history-") as history,
+        patch.dict(os.environ, {"CI_HISTORY_ROOT": history}),
         patch.object(sys, "argv", argv_cli),
         patch(f"{wp}.requests.post", fake.post),
         patch(f"{wp}.requests.get", fake.get),
@@ -116,6 +150,13 @@ def main(argv=None):
             pipeline.main()
         except SystemExit as e:
             code = e.code
+        finally:
+            # The file handler holds the log open, and Windows will not delete
+            # a directory that has an open file in it.
+            for handler in list(logging.getLogger().handlers):
+                if isinstance(handler, logging.FileHandler):
+                    handler.close()
+                    logging.getLogger().removeHandler(handler)
 
     print(f"\n{'=' * 70}\nWHAT LEFT THE PROCESS (nothing did; this is what would have)")
     print("=" * 70)
@@ -129,9 +170,15 @@ def main(argv=None):
         print(f"\nupload {up['name']} ({up['mime']}, {len(up['bytes']):,} bytes)")
         print(f"  alt_text: {up['data'].get('alt_text')!r}")
         print(f"  bytes written to {target}")
-    for created in fake.created:
-        print("\npost body:")
-        print(json.dumps(created, indent=2)[:2000])
+    for n, created in enumerate(fake.created, 1):
+        target = out_dir / f"rehearsal-post-{n}.html"
+        body = created.get("content", "")
+        target.write_text(body, encoding="utf-8")
+        print(f"\npost {n}:")
+        print(
+            json.dumps({**created, "content": f"<{len(body):,} characters>"}, indent=2)
+        )
+        print(f"  content written to {target}")
     return 0 if code in (None, 0) else code
 
 

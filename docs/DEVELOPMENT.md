@@ -80,6 +80,16 @@ Use it before committing any change to handoff parsing, `run_publish_pipeline` o
 Math as the Facebook and Twitter descriptions (PR #194); unit tests pinned that
 afterwards, but this is what found it.
 
+**A rehearsal touches nothing shared.** Its log goes to a temporary directory
+(`CI_HISTORY_ROOT` is pointed there for the run), so it adds no lines to the real
+`pipeline_<date>.log`. No `.env` is loaded, so "credentials are never read" is
+true of the provider keys as well as the WordPress ones, even from a worktree that
+sits inside the main checkout and would otherwise find the real file. Each post's
+markup is written whole to `rehearsal-post-N.html` in `--out-dir`, next to the
+uploads, and the terminal shows the post's other fields and that path. The old
+terminal copy was cut at 2,000 characters of its JSON-escaped form, mid-paragraph
+on a long article.
+
 **`tools/image_metadata.py` reads an image with exifread, not Pillow.** The
 uploader's strip is built on Pillow, so checking it with Pillow would be Pillow
 agreeing with itself. `make` writes a photo carrying an 11-tag GPS block, make,
@@ -211,7 +221,8 @@ separator blocks is `true` for both.
 
 A rehearsal and this are two halves. `tools/publish_rehearsal.py` shows what leaves
 the process, and the editor says whether it is accepted. The body a rehearsal
-prints is the publish path's own output, so it can be run through `check` too.
+writes to `rehearsal-post-N.html` is the publish path's own output, so it can be
+run through `check` too.
 
 ## Dependencies and packaging
 
