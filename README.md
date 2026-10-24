@@ -1021,6 +1021,10 @@ content-intelligence/
 
 Released under the [MIT License](LICENSE). Copyright (c) 2026 Mike Hammett.
 
+Much of this code was written with AI assistance (Claude Code). The commits
+that were carry a `Co-Authored-By` trailer. Mike Hammett directs, reviews and
+takes responsibility for it, and licenses it under the MIT License above.
+
 Dependencies keep their own licenses. Data copied from litellm carries its
 notice in
 `packages/ci-core/src/ci_core/configs/litellm_pending_models.NOTICE.md`.
