@@ -925,21 +925,28 @@ report, and a replay starts empty. Not run with `--offline`, so a replay with
 
 ---
 
-### Provider token limits (rate_limits)
+### Provider rate limits (rate_limits)
 
-A provider limits the tokens one key may use in a minute, across every model on it. Mistral's is 100,000 a minute on the key measured on 2026-10-24, and a review of a 135,514-character draft spent an estimated 140,000 of them in the ensemble (42,000 output tokens logged, the rest an estimate of the prompts) before its citation relevance checks began, so five of those checks were refused with HTTP 429 and lost (issue #361). A cap on how many calls run at once does not help; the budget is tokens, and whatever ran in the last minute has spent it.
+A provider limits what one key may do in a minute: tokens, and requests. Both have cost a review findings. On 2026-10-05 a review of a 135,514-character draft spent an estimated 140,000 Mistral tokens in the ensemble before its citation relevance checks began, so five of those checks were refused with HTTP 429 and lost (issue #361). On 2026-10-24 the same checks, three at a time at about 1.1 s each, ran at about 160 requests a minute against `mistral-small`'s 100 and were refused with the token window nearly empty (issue #389). A cap on how many calls run at once fixes neither: the budgets are per minute, and whatever ran in the last minute has spent them.
 
 ```yaml
 rate_limits:
-  mistral:
+  mistral/mistral-small-latest:   # one model: wins over the provider's entry
     tokens_per_minute: 100000
+    requests_per_minute: 100
+  mistral:                        # every other Mistral model
+    tokens_per_minute: 400000
 ```
 
-With a limit set, each call to that provider reserves an estimate of its prompt (characters divided by three, so a little high) before it is sent and waits until the last minute's usage leaves room under 90% of the limit. When the call ends, the reservation is replaced with the real prompt and completion counts. A call refused with a 429 gives its reservation back and also marks the window as full, so the calls behind it wait out a minute instead of walking into the same refusal; that is how it copes with an estimate that is off, or with another review using the same key. One that failed some other way keeps its reservation, because the provider may have counted it. No call waits more than 70 seconds, and a call larger than the whole budget goes once the window is empty. A provider you leave out is not metered, and with no `rate_limits` block nothing changes.
+A key names a provider or one model as `provider/model`; the model's entry wins over the provider's. Mistral and OpenAI enforce their limits per model, so a single provider-wide figure either holds the large model to the small one's budget or lets the small one through; name the model that is actually tight.
 
-The figure is your account's, which this code cannot see: read it from the provider's console (Mistral: Admin > Limits). It is shared with anything else using the same key at the same time, such as another review running in another window, so set it a little under what the console says if you run several at once.
+With a limit set, each call it governs reserves an estimate of its prompt (characters divided by three, so a little high) and counts one request before it is sent, and waits until the last minute's usage leaves room under 90% of each limit. When the call ends, the token reservation is replaced with the real prompt and completion counts. A call refused with a 429 gives its token reservation back (the request stays counted, since the provider saw it) and marks the window as full, so the calls behind it wait out a minute instead of walking into the same refusal; that is how it copes with an estimate that is off, or with another review using the same key. One that failed some other way keeps its reservation, because the provider may have counted it. No call waits more than 70 seconds, and a call larger than the whole token budget goes once the window is empty. A provider you leave out is not metered.
 
-Mistral does send `x-ratelimit-remaining-tokens-minute`, but litellm drops the response headers of a streamed Mistral call, so the meter counts from the usage each call reports instead. Whether Mistral counts a streamed call's tokens when it starts or when it ends is not documented; the 90% headroom is there to absorb the difference.
+**What happens with nothing configured.** The meter waits for nothing, but every 429 is still counted. At the end of the run, a provider that refused calls with no `rate_limits` entry is named in a warning, with the key to set and where the figure comes from, and `rate_limit_refusals` on the report records the count per provider. A run that shows that warning is a run that lost retries, and possibly findings, to a limit a config line would have respected.
+
+The figures are your account's, which this code cannot see, and they move with cumulative spend. Read them from the console: Mistral at admin.mistral.ai › API › Limits (per model; the docs publish no numbers), OpenAI at Settings › Organization › Limits, Anthropic at Usage › Rate limits, Perplexity at Pricing › Usage tiers, xAI at the team's Models page. On the account measured 2026-10-24, `mistral-small-latest` allowed 100,000 tokens and 100 requests a minute, `mistral-medium-latest` 500,000 and 1,000, and `mistral-large-2512` 400,000 tokens but only 15 requests a minute. A limit is shared with anything else using the same key at the same time, such as another review running in another window, so set it a little under what the console says if you run several at once.
+
+Mistral does send `x-ratelimit-remaining-tokens-minute` and `x-ratelimit-remaining-req-minute`, but only on a non-streamed call; litellm drops the response headers of a streamed Mistral call, which is how every call here is made, so the meter counts from the usage each call reports instead. Whether Mistral counts a streamed call's tokens when it starts or when it ends is not documented; the 90% headroom is there to absorb the difference.
 
 ### Reproducibility context
 

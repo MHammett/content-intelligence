@@ -536,14 +536,25 @@ pipeline:
 #       voice_style: 1.1
 
 
-# Account limits that a provider enforces across everything on one key. Optional.
-# With a limit set, a call whose tokens would not fit under it waits for the last
-# minute's usage to age out, instead of being refused with a 429. Leave a
-# provider out and nothing is metered for it. Find the figure in the provider's
-# console (Mistral: Admin > Limits); a paid key's differs from the free tier's.
+# Account limits that a provider enforces on one key. Optional. With a limit
+# set, a call that would not fit under it waits for the last minute's usage to
+# age out, instead of being refused with a 429. Leave a provider out and nothing
+# is metered for it, but a run that drew 429s from an unmetered provider says so
+# at the end and names the key to set. The figures are your account's: read
+# them from the provider's console (Mistral: admin.mistral.ai > API > Limits;
+# OpenAI: Settings > Organization > Limits; Anthropic: Usage > Rate limits).
+# Tiers rise with cumulative spend, so re-read them now and then.
+#
+# A key names a provider (every model on it) or one model, provider/model, which
+# wins over the provider's entry. Mistral and OpenAI limit per model: on the
+# account measured 2026-10-24, mistral-small-latest allowed 100,000 tokens and
+# 100 requests a minute where mistral-medium allowed 500,000 and 1,000.
 # rate_limits:
-#   mistral:
+#   mistral/mistral-small-latest:
 #     tokens_per_minute: 100000
+#     requests_per_minute: 100
+#   mistral:                       # every other Mistral model
+#     tokens_per_minute: 400000
 
 # Delta assessment thresholds for re-run recommendation
 delta:

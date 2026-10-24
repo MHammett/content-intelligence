@@ -207,6 +207,135 @@ class TestMeter:
         assert "tokens_per_minute" in caplog.text
 
 
+class TestRequestsPerMinute:
+    """Mistral holds mistral-small to 100 requests a minute on the account measured
+    2026-10-24, and three relevance checks at once at ~1.1s each ran at ~160, so
+    the 429s of #389 came with the token window nearly empty. A meter of starts,
+    beside the meter of tokens."""
+
+    def _requests(self, per_minute, key="mistral"):
+        ratelimit.configure({key: {"requests_per_minute": per_minute}})
+
+    def test_starts_under_the_limit_do_not_wait(self, clock):
+        self._requests(10)
+        for _ in range(9):
+            ratelimit.reserve("mistral", 1)
+        assert clock.slept == []
+
+    def test_the_tenth_start_waits_for_the_first_to_age_out(self, clock):
+        self._requests(10)
+        ratelimit.reserve("mistral", 1)
+        clock.now += 20
+        for _ in range(8):
+            ratelimit.reserve("mistral", 1)
+        ratelimit.reserve("mistral", 1)
+        # 9 starts fill 90% of 10; the first is 20s old, so 40s of its minute remain.
+        assert clock.slept == [pytest.approx(40.0)]
+
+    def test_a_refused_request_stays_counted(self, clock):
+        """The provider saw the attempt; only the token reservation comes back."""
+        self._requests(10)
+        tickets = [ratelimit.reserve("mistral", 1) for _ in range(9)]
+        ratelimit.release(tickets[0])
+        ratelimit.configure({"mistral": {"requests_per_minute": 10}})  # fresh window
+        for _ in range(9):
+            ratelimit.reserve("mistral", 1)
+        assert clock.slept == []
+
+    def test_a_token_only_limit_counts_no_requests(self, clock):
+        _limit(10**6)
+        for _ in range(50):
+            ratelimit.reserve("mistral", 1)
+        assert clock.slept == []
+
+    def test_the_wait_is_the_longer_of_the_two_meters(self, clock):
+        ratelimit.configure(
+            {"mistral": {"tokens_per_minute": 1000, "requests_per_minute": 100}}
+        )
+        first = ratelimit.reserve("mistral", 600)
+        ratelimit.settle(first, 600, 0)
+        clock.now += 10
+        ratelimit.reserve("mistral", 600)
+        assert clock.slept == [pytest.approx(50.0)]
+
+
+class TestPerModelLimits:
+    """Mistral and OpenAI limit per model, so a provider-wide figure is wrong for
+    one of them. A ``provider/model`` key governs that model and wins over the
+    provider's entry; the provider's entry still covers the rest."""
+
+    def test_the_models_own_entry_wins(self, clock):
+        ratelimit.configure(
+            {
+                "mistral": {"tokens_per_minute": 10**6},
+                "mistral/mistral-small-latest": {"tokens_per_minute": 1000},
+            }
+        )
+        first = ratelimit.reserve("mistral", 600, model="mistral-small-latest")
+        ratelimit.settle(first, 600, 0)
+        clock.now += 10
+        ratelimit.reserve("mistral", 600, model="mistral-small-latest")
+        assert clock.slept == [pytest.approx(50.0)]
+
+    def test_another_model_falls_back_to_the_providers_entry(self, clock):
+        ratelimit.configure(
+            {
+                "mistral": {"tokens_per_minute": 10**6},
+                "mistral/mistral-small-latest": {"tokens_per_minute": 1000},
+            }
+        )
+        ratelimit.reserve("mistral", 600, model="mistral-small-latest")
+        ratelimit.reserve("mistral", 600, model="mistral-medium-latest")
+        assert clock.slept == [], "the medium call is not held to small's budget"
+
+    def test_a_model_with_no_entry_and_no_provider_entry_is_not_metered(self, clock):
+        ratelimit.configure({"mistral/mistral-small-latest": {"tokens_per_minute": 1}})
+        assert ratelimit.reserve("mistral", 10**6, model="mistral-large-latest") is None
+        assert ratelimit.has_limit("mistral", "mistral-small-latest")
+        assert not ratelimit.has_limit("mistral", "mistral-large-latest")
+        assert not ratelimit.has_limit("mistral")
+
+    def test_an_entry_with_neither_figure_is_ignored_with_a_warning(
+        self, caplog, clock
+    ):
+        with caplog.at_level(logging.WARNING):
+            ratelimit.configure({"mistral": {"other": 5}})
+        assert not ratelimit.has_limit("mistral")
+        assert "neither tokens_per_minute nor requests_per_minute" in caplog.text
+
+
+class TestRefusalsAreCountedWithoutALimit:
+    """With nothing configured the meter was a no-op and a run found out about
+    its limit only from the 429s in its log. Now every refusal is counted, so the
+    end of the run can name the provider and the key to set."""
+
+    def test_a_refusal_is_counted_whether_or_not_a_limit_is_set(self, clock):
+        ratelimit.note_refused("mistral")
+        ratelimit.note_refused("mistral", model="mistral-small-latest")
+        ratelimit.note_refused("grok")
+        assert ratelimit.refusals() == {"mistral": 2, "grok": 1}
+        assert ratelimit.unmetered_refusals() == {"mistral": 2, "grok": 1}
+
+    def test_a_metered_provider_is_not_reported_as_unmetered(self, clock):
+        ratelimit.configure(
+            {"mistral/mistral-small-latest": {"requests_per_minute": 5}}
+        )
+        ratelimit.note_refused("mistral", model="mistral-large-latest")
+        ratelimit.note_refused("grok")
+        assert ratelimit.unmetered_refusals() == {"grok": 1}
+
+    def test_configure_starts_the_count_over(self, clock):
+        ratelimit.note_refused("mistral")
+        ratelimit.configure(None)
+        assert ratelimit.refusals() == {}
+
+    def test_the_client_reports_a_429_with_no_limit_set(self, clock):
+        with patch.object(client.litellm, "completion", side_effect=_http_error(429)):
+            _call("mistral", user_prompt="x" * 30)
+        assert ratelimit.refusals() == {"mistral": 1}
+        assert clock.slept == []
+
+
 class TestClientWaitsForRoom:
     """The meter is wired into the one place every model call passes through."""
 

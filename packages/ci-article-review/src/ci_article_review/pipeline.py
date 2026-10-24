@@ -2094,6 +2094,33 @@ def _delay_start(fn, delay):
     return _delayed
 
 
+def _warn_about_unmetered_refusals(report):
+    """Say, once per provider, that it refused calls this run with no limit set.
+
+    The meter in ``ci_core.llm.ratelimit`` waits for room only where
+    ``rate_limits:`` names the provider; with nothing configured it is a no-op
+    and a run finds out about the account's limit from 429s, each of which
+    costs a retry wait and can cost a finding (#361, #389). The client counts
+    every 429 whether or not a limit is set, so the run can point at the key to
+    set and where the figure comes from. Recorded on the report too, so a saved
+    run says how often it was refused.
+    """
+    refused = llm.ratelimit.refusals()
+    if refused:
+        report["rate_limit_refusals"] = refused
+    for provider, count in sorted(llm.ratelimit.unmetered_refusals().items()):
+        log.warning(
+            "%s refused %d request(s) with HTTP 429 this run and no rate_limits.%s "
+            "is configured, so nothing waited for room. Set tokens_per_minute "
+            "and requests_per_minute from the account's console (Mistral: "
+            "admin.mistral.ai > API > Limits, per model) under rate_limits: in "
+            "user.yaml; see docs/CONFIGURATION.md.",
+            provider,
+            count,
+            provider,
+        )
+
+
 def _global_ceiling(per_task_timeouts, retry_delay):
     """Outer wall-clock bound for the whole parallel batch.
 
@@ -4553,6 +4580,7 @@ def run_draft_pipeline(
             cost_summary["continuation_calls"],
             cost_summary.get("continuation_usd", 0.0),
         )
+    _warn_about_unmetered_refusals(report)
 
     # Attach pre-analysis
     report["pre_analysis"] = pre_analysis
