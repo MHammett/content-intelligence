@@ -43,10 +43,13 @@ dependency-free renderer over a plain dict.
 
 import re
 
-# The one package import, and it costs this module nothing: ``disposition``
-# is a leaf — a tuple, a lookup and a pure function, importing nothing
-# itself. It exists precisely because two callers classifying citations
-# independently drifted apart; a third doing so would be the same bug.
+# Two package imports, and they cost this module little: ``disposition`` is a
+# leaf — a tuple, a lookup and a pure function, importing nothing itself. It
+# exists precisely because two callers classifying citations independently
+# drifted apart; a third doing so would be the same bug. ``claim_status`` is
+# the same idea one level up — one status per claim — and imports only that
+# leaf, ``passage_match`` and ``fact_check_scope``.
+from . import claim_status
 from .adapters.citation.disposition import disposition as _disposition
 
 #: Ranked items rendered before the list is cut off. A list nobody finishes is
@@ -301,6 +304,8 @@ def _item(
         "claims": list(claims),
         "gap": gap,
         "possibly_wrong": False,
+        # The ledger status that made it suspect, so the banner can say which.
+        "possibly_wrong_status": None,
     }
 
 
@@ -668,25 +673,37 @@ def _dedupe_across_items(items):
     return [i for i in items if i["claims"]]
 
 
+#: Ledger statuses that make an item a possible error rather than a gap, in
+#: the order the banner prefers when one action carries both.
+_SUSPECT_STATUSES = ("contradicted", "source_does_not_support")
+
+
 def _flag_possibly_wrong(items, report):
     """Mark items whose claims the run itself suspected, so they sort first.
 
     An unread source behind a claim nothing disputes is a coverage gap. The same
-    unread source behind a claim another model contradicted is a possible error
-    in the published article, and it should not rank below a page that happens
-    to cover more claims.
+    unread source behind a claim the run found wrong is a possible error in the
+    published article, and it should not rank below a page that happens to
+    cover more claims.
+
+    "Found wrong" is read off the claim ledger (``claim_status``), not derived
+    here. This used to keep its own rule: the two Section 2 buckets plus any
+    Section 9 ``content_mismatch``, under one banner that named only the
+    buckets. On a real run that banner called a claim "contradicted or
+    outdated" when Section 2 held neither; the mismatch had come from a page
+    that simply did not mention it (#338). The ledger's status says which it
+    was, and the banner repeats that. A report saved before the ledger existed
+    gets one built from it, so the rule is the same rule in both cases.
     """
-    suspect = set()
-    fact_check = _mapping(report.get("section_2_fact_check"))
-    for bucket in ("contradicted", "outdated"):
-        for entry in _dicts(fact_check.get(bucket)):
-            if entry.get("claim"):
-                suspect.add(entry["claim"])
-    for c in _dicts(report.get("section_9_citations")):
-        if c.get("verification") == "content_mismatch" and c.get("claim"):
-            suspect.add(c["claim"])
+    ledger = report.get("claim_ledger")
+    if not isinstance(ledger, dict):
+        ledger = claim_status.build_claim_ledger(report)
+    status_of = claim_status.status_by_claim(ledger)
     for item in items:
-        item["possibly_wrong"] = any(claim in suspect for claim in item["claims"])
+        found = {status_of.get(claim) for claim in item["claims"]}
+        worst = next((s for s in _SUSPECT_STATUSES if s in found), None)
+        item["possibly_wrong"] = worst is not None
+        item["possibly_wrong_status"] = worst
     return items
 
 
@@ -869,10 +886,18 @@ def _render_item(number, item):
         f"clears {len(item['claims'])} claim(s)"
     ]
     if item["possibly_wrong"]:
+        # Worded from the ledger status, so the banner cannot name a bucket the
+        # run never filled.
+        if item.get("possibly_wrong_status") == "contradicted":
+            what = (
+                "is contradicted: by a model's verdict, by the source that was "
+                "read, or by its own model at re-ask"
+            )
+        else:
+            what = "has a source that was read and does not support it"
         lines.append(
-            f"{indent}⚠ At least one claim here was contradicted or came back "
-            "outdated. Treat this as a possible error in the article, not a "
-            "gap in its sourcing."
+            f"{indent}⚠ At least one claim here {what}. Treat this as a "
+            "possible error in the article, not a gap in its sourcing."
         )
     if item["target"]:
         lines.append(f"{indent}{item['target_label']}: {item['target']}")
