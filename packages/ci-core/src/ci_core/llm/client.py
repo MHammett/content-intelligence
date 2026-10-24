@@ -2758,7 +2758,9 @@ def _attempt(
         # wait is ours, not the provider's, and must not count as a first-byte
         # silence. A no-op, returning None, where no limit is set.
         ticket = ratelimit.reserve(
-            provider, ratelimit.estimate_tokens(system_prompt, user_prompt)
+            provider,
+            ratelimit.estimate_tokens(system_prompt, user_prompt),
+            model=model,
         )
         # Started before litellm is called, so no wait for the provider goes
         # unmeasured — including the one inside completion() itself, which is
@@ -2779,7 +2781,9 @@ def _attempt(
             if _status_of(exc) == 429:
                 ratelimit.release(ticket)
                 # And take it as the provider's word that the window is full.
-                ratelimit.note_refused(provider)
+                # Counted whether or not a limit is set: the end of the run
+                # warns about a provider that refused calls with none.
+                ratelimit.note_refused(provider, model=model)
             raise
         used = _read_tokens(assembled.get("usage"))
         ratelimit.settle(ticket, used["prompt"], used["completion"])
