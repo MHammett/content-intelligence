@@ -98,9 +98,9 @@ def _prune(entries, now):
 
 def _seconds_until_room(entries, need, budget, now):
     """Seconds until enough of the window has expired to fit ``need`` more tokens."""
-    used = sum(tokens for _, tokens in entries)
+    used = sum(e[1] for e in entries)
     stamp = now
-    for stamp, tokens in sorted(entries):
+    for stamp, tokens, *_ in sorted(entries):
         used -= tokens
         if used + need <= budget:
             break
@@ -127,7 +127,7 @@ def reserve(provider, estimate):
             entries = _entries.setdefault(provider, [])
             now = time.monotonic()
             _prune(entries, now)
-            used = sum(tokens for _, tokens in entries)
+            used = sum(e[1] for e in entries)
             waited = now - started
             if used == 0 or used + estimate <= budget or waited >= _MAX_WAIT_SECONDS:
                 ticket = [now, estimate]
@@ -166,3 +166,22 @@ def release(ticket):
     with _lock:
         for entries in _entries.values():
             entries[:] = [e for e in entries if e is not ticket]
+
+
+def note_refused(provider):
+    """Record that ``provider`` refused a call as over its limit (a 429).
+
+    The meter's own count can be wrong: the prompt estimate is a guess, and the
+    key may be shared with another review running elsewhere, which this process
+    cannot see. A refusal is the provider's own reading of the window, so it
+    stands in for a full one: the next call waits a window instead of walking
+    into the same refusal. A burst of refusals leaves one such marker, stamped at
+    the latest, not one per refusal.
+    """
+    with _lock:
+        limit = _limits.get(provider)
+        if not limit:
+            return
+        entries = _entries.setdefault(provider, [])
+        entries[:] = [e for e in entries if len(e) < 3]
+        entries.append([time.monotonic(), limit, True])

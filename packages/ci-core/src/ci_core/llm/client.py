@@ -2746,6 +2746,8 @@ def _attempt(
             # been, and keeps its reservation.
             if _status_of(exc) == 429:
                 ratelimit.release(ticket)
+                # And take it as the provider's word that the window is full.
+                ratelimit.note_refused(provider)
             raise
         used = _read_tokens(assembled.get("usage"))
         ratelimit.settle(ticket, used["prompt"], used["completion"])

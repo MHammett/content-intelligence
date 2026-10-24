@@ -170,6 +170,24 @@ class TestMeter:
             ratelimit.reserve("mistral", 800)
         assert sum(clock.slept) == pytest.approx(5.0)
 
+    def test_a_refusal_fills_the_window_for_the_next_caller(self, clock):
+        _limit(1000)
+        ratelimit.note_refused("mistral")
+        ratelimit.reserve("mistral", 1)
+        assert clock.slept == [pytest.approx(60.0)]
+
+    def test_a_burst_of_refusals_costs_one_window_not_one_each(self, clock):
+        _limit(1000)
+        for _ in range(5):
+            ratelimit.note_refused("mistral")
+        ratelimit.reserve("mistral", 1)
+        assert sum(clock.slept) == pytest.approx(60.0)
+
+    def test_a_refusal_is_ignored_where_no_limit_is_set(self, clock):
+        ratelimit.note_refused("mistral")
+        assert ratelimit.reserve("mistral", 1) is None
+        assert clock.slept == []
+
     def test_other_providers_are_not_metered(self, clock):
         _limit(1000)
         ratelimit.reserve("mistral", 800)
@@ -222,18 +240,24 @@ class TestClientWaitsForRoom:
             _call("mistral", user_prompt="x" * 600)
         assert clock.slept == []
 
-    def test_a_refused_call_does_not_count_against_the_limit(self, clock):
+    def test_a_refused_call_sends_the_next_one_to_wait_out_the_window(self, clock):
+        """A 429 is the provider saying the window is full, whatever the meter thought.
+
+        The estimate can be wrong and the key can be shared with another process,
+        neither of which the meter sees. A refusal is the one measurement of the
+        provider's own count, so the next call waits a window.
+        """
         _limit(1000)
         with patch.object(client.litellm, "completion", side_effect=_http_error(429)):
-            result = _call("mistral", user_prompt="x" * 2000)
+            result = _call("mistral", user_prompt="x" * 30)
         assert result["failed"] is True
 
         with patch.object(
             client.litellm, "completion", return_value=_completion_stream()
         ):
-            _call("mistral", user_prompt="x" * 2000)
+            _call("mistral", user_prompt="x" * 30)
 
-        assert clock.slept == []
+        assert sum(clock.slept) == pytest.approx(60.0, abs=1.0)
 
     def test_a_call_that_fails_some_other_way_still_counts(self, clock):
         """A stream that died part-way may have been billed; keep its reservation."""
