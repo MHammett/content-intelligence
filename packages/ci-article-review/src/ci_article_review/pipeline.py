@@ -5973,6 +5973,7 @@ def run_publish_pipeline(
                 print(f"  - {term}")
             print("Create them in WP admin, then set them on the post.")
             print("!" * 60)
+        wp.print_author_result(result)
         print(
             f"Status:   {'PUBLISHED' if publish_live else 'DRAFT (pass --publish-live to publish)'}"
         )

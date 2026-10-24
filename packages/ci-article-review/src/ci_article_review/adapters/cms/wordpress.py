@@ -148,6 +148,60 @@ def _lookup_term_ids(api_base, headers, taxonomy, items):
     return resolved, unresolved
 
 
+def _lookup_author_id(api_base, headers, author):
+    """Convert a handoff's ``WordPress author:`` to a WP user id: ``(id, unresolved)``.
+
+    The template tells the author to write a login name, and the REST API takes
+    only an integer user id in ``author``: a login sent as it stands is a 400
+    ("author is not of type integer") and no post. An integer, or a string of
+    digits, is an id already and passes through. Anything else is looked up with
+    ``GET /users?slug=<login>``, which WordPress matches against the account's
+    nicename after running ``sanitize_title`` over what it was given. That is the
+    login for any login made of lowercase letters, digits and hyphens, which is
+    nearly every one; an account whose nicename was edited to differ from its
+    login will not be found by it, and is reported as unresolved like any other
+    miss.
+
+    The users endpoint is not readable without credentials, so ``headers`` has to
+    carry them, and an account without the ``list_users`` capability is refused
+    with a 403. Either is reported as unresolved and not raised: the answer is
+    the same, that the post cannot be filed under that author, and the caller
+    decides what that costs. Returns ``(None, None)`` when no author was asked
+    for, so a handoff without one sends the post under the authenticated user as
+    it always has.
+    """
+    if isinstance(author, bool) or not author:
+        return None, None
+    if isinstance(author, int):
+        return author, None
+    if not isinstance(author, str):
+        return None, str(author)
+    login = author.strip()
+    if not login:
+        return None, None
+    if login.isdigit():
+        return int(login), None
+    try:
+        resp = requests.get(
+            f"{api_base}/users",
+            params={"slug": login},
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        users = resp.json()
+        if users:
+            log.debug(f"Resolved WordPress author '{login}' → ID {users[0]['id']}")
+            return users[0]["id"], None
+        log.warning(
+            f"WordPress author '{login}' not found: write the login of an "
+            f"existing account, or its integer ID."
+        )
+    except Exception as e:
+        log.warning(f"WordPress author lookup failed for '{login}': {e}")
+    return None, login
+
+
 #: WordPress core content types this adapter can create, mapped to their REST
 #: route. Both are "posts" in WordPress's internal vocabulary, but they are
 #: different endpoints with different fields: only ``post`` carries categories
@@ -188,6 +242,7 @@ def _build_post_payload(
     tag_ids,
     post_type="post",
     featured_media=None,
+    author_id=None,
 ):
     payload = {
         "title": pub_params.get("title", ""),
@@ -204,9 +259,10 @@ def _build_post_payload(
         for field in _TAXONOMY_FIELDS:
             payload.pop(field, None)
 
-    author = pub_params.get("author")
-    if author:
-        payload["author"] = author
+    # The REST API takes a user id here and nothing else; push resolves the
+    # handoff's login to one (_lookup_author_id) and passes it in.
+    if author_id:
+        payload["author"] = author_id
 
     # Slug, excerpt and featured image are optional and are left out of the
     # payload, not sent empty, when the handoff did not set them: an absent key
@@ -1083,6 +1139,26 @@ def print_post_fields_result(result):
         print(f"WARNING: {warning}")
 
 
+def print_author_result(result):
+    """Say plainly when the handoff's author was not applied, next to the post URL.
+
+    Printed beside the success line, as an unresolved category is, because the post
+    exists and is filed under the account that pushed it, not the one the handoff
+    named.
+    """
+    author = result.get("unresolved_author")
+    if not author:
+        return
+    print(f"\n{'!' * 60}")
+    print(
+        f"WARNING: WordPress author '{author}' could not be matched to an "
+        "account and was NOT applied; the post is filed under the account "
+        "that pushed it."
+    )
+    print("Write the login of an existing account, then set the author on the post.")
+    print("!" * 60)
+
+
 def push(
     content,
     pub_params,
@@ -1184,6 +1260,16 @@ def push(
             pub_params.get("tags", []),
         )
 
+    # The author is a login in the handoff and an id on the wire. A login that
+    # does not resolve is not sent: the post would be filed under the account
+    # that is pushing it, which for a draft is a thing to fix in WP admin and for
+    # a live publish is a byline that is wrong in public.
+    author_id, unresolved_author = _lookup_author_id(
+        api_base,
+        auth_headers,
+        pub_params.get("author"),
+    )
+
     # Fail closed before an irreversible publish. Going live into no category,
     # with none of its tags, is a real editorial failure, and the checklist item
     # the user already ticked ("WordPress category correct") was confirmed before
@@ -1200,6 +1286,17 @@ def push(
                 "allow_missing_terms=True to publish without them."
             ),
             "unresolved_terms": sorted(unresolved),
+        }
+    if unresolved_author and publish_live and not allow_missing_terms:
+        return {
+            "success": False,
+            "error": (
+                "Refusing to publish live with an unresolved WordPress author: "
+                f"{unresolved_author}. Write the login of an existing account (or "
+                "its integer ID), or pass allow_missing_terms=True to publish "
+                "under the account that is pushing."
+            ),
+            "unresolved_author": unresolved_author,
         }
 
     # WordPress stores HTML; the pipeline carries Markdown. Converting here
@@ -1242,6 +1339,7 @@ def push(
         tag_ids=tag_ids,
         post_type=post_type,
         featured_media=featured_media,
+        author_id=author_id,
     )
 
     if publish_live:
@@ -1279,6 +1377,8 @@ def push(
             # Surfaced on the result, not just in a log line, so the caller can
             # print it next to the success message instead of it scrolling past.
             result["unresolved_terms"] = sorted(unresolved)
+        if unresolved_author:
+            result["unresolved_author"] = unresolved_author
         post_fields, field_warnings = _confirm_post_fields(
             payload,
             data,
