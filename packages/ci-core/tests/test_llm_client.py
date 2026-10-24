@@ -686,6 +686,31 @@ class TestTruncation:
         assert result["failed"] is False
         assert result["truncated"] is True
 
+    def test_the_finish_reason_itself_is_kept(self):
+        """`truncated` is inferred from it and from the salvage; the reason the
+        provider gave is recorded beside it so a capture says which. Nothing
+        recorded it until 2026-10-24, and the grok empty-answer investigation
+        (issue #363) had no way to tell a stop from a filter."""
+        for reason in ("length", "stop"):
+            with patch.object(
+                client.litellm,
+                "completion",
+                return_value=_completion_stream('{"flags": []}', finish_reason=reason),
+            ):
+                result = _call("mistral")
+            assert result["finish_reason"] == reason
+
+    def test_a_malformed_response_keeps_its_finish_reason_too(self):
+        with patch.object(
+            client.litellm,
+            "completion",
+            side_effect=lambda **kw: _completion_stream("prose", finish_reason="stop"),
+        ):
+            result = _call("mistral")
+        assert result["failed"] is True
+        assert result["error"] == "Malformed JSON response"
+        assert result["finish_reason"] == "stop"
+
     def test_salvage_is_reachable_through_the_shim(self):
         """json_utils' salvage recovers complete array elements from a response
         cut off at the output-token ceiling. litellm has no equivalent, so the

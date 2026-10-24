@@ -24,6 +24,9 @@ Some claims cannot be settled by any source, and checking them against one produ
 
 A passage the author has marked above goes in "out_of_scope" whether or not a source exists for it. Everything else in the draft is in scope as usual. Judging a claim out of scope removes it from verification and from citation resolution, so it is reported to the author with your reason attached — do not use it to set aside a claim a source could settle.
 
+IF YOU HAVE NO SEARCH TOOL:
+Some models run this review with live web search and some do not. If this request gave you no search tool, you cannot open any page, and the sentence above about searching does not apply to you. Do not say you will search, do not write a tool call, and do not end your turn before the JSON: nothing will answer a tool call, so a reply that only announces a search is an empty review. Answer in this one reply from what you already know. Put each claim you cannot support with a page you actually opened in "unverifiable" (say "no search available" in "checked") or in "primary_source_needed", and use the other buckets as the evidence requirements below allow.
+
 YOUR TASK:
 For each specific figure, statistic, date, regulatory reference, named attribution, and quantitative claim in the draft, verify it against current authoritative sources.
 
@@ -47,14 +50,11 @@ While performing your fact-check, you may notice issues outside your primary sco
 
 RETURN FORMAT (JSON only, no other text):
 {
-  "confirmed": [
-    {"claim": "exact quote from draft", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page establishing the claim", "confidence": "high|medium|low", "note": "optional"}
+  "contradicted": [
+    {"claim": "exact quote from draft", "contradiction": "what contradicts it", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page that conflicts with the claim", "confidence": "high|medium|low"}
   ],
   "outdated": [
     {"claim": "exact quote from draft", "current_value": "what it should be", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page giving the current value", "confidence": "high|medium|low"}
-  ],
-  "contradicted": [
-    {"claim": "exact quote from draft", "contradiction": "what contradicts it", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page that conflicts with the claim", "confidence": "high|medium|low"}
   ],
   "unverifiable": [
     {"claim": "exact quote from draft", "checked": "what sources were searched", "sources_checked": ["https://... every page you actually opened, [] if none"], "reason": "why it could not be verified"}
@@ -64,6 +64,9 @@ RETURN FORMAT (JSON only, no other text):
   ],
   "out_of_scope": [
     {"claim": "exact quote from draft", "claim_type": "first_person|author_hypothesis|internal_arithmetic|subjective_judgment|future_prediction|other", "reason": "why no source can settle this"}
+  ],
+  "confirmed": [
+    {"claim": "exact quote from draft", "source": "source name and URL", "source_url": "https://... the exact page carrying the evidence", "supporting_quote": "verbatim text from that page establishing the claim", "confidence": "high|medium|low", "note": "optional"}
   ],
   "additional_observations": [
     {

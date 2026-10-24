@@ -293,13 +293,16 @@ Under streaming the adapter passes `timeout=(connect, read_gap)` to the HTTP req
 
 #### Output-token ceiling is automatic too
 
-Claude and Mistral are the two providers whose requests carry an output-token ceiling (`max_tokens`); the other four run to the model's own limit. On a reasoning pass (`effort` / `reasoning_effort` set, or a Claude model that thinks with none set — see [below](#claude--adaptive-vs-extended-thinking)) the pipeline sizes that ceiling per call, from [`ci-core`'s `output_tokens.yaml`](../packages/ci-core/src/ci_core/configs/output_tokens.yaml):
+Claude and Mistral are the two providers whose requests carry an output-token ceiling (`max_tokens`); the other four run to the model's own limit (checked 2026-10-24: gpt-6.x 128,000, gemini-3.5-flash 65,536, grok-4.x "no text output limit", sonar undocumented). The pipeline sizes that ceiling per call for every Claude and Mistral pass, from [`ci-core`'s `output_tokens.yaml`](../packages/ci-core/src/ci_core/configs/output_tokens.yaml):
 
 ```
-max_tokens = reasoning_tokens[effort] + answer_tokens[domain] × size_mult
+max_tokens = reasoning_tokens[effort]
+           + max(answer_tokens[domain] × size_mult, answer_tokens_per_char[domain] × chars, answer_floor_tokens)
 ```
 
-`size_mult` is the wall-clock formula's own size table, so the two scale together. The ceiling counts **thinking**: every truncated pass on record ran out while reasoning, including on drafts under 5,000 characters, which is why reasoning is a flat term and only the answer scales with the draft. A capped model's wall-clock backstop is raised, if it has to be, to the time a healthy call needs to reach its ceiling — otherwise a longer ceiling just turns truncations into timeouts.
+clamped to the model's output limit and to what its context window leaves after the prompt. `size_mult` is the wall-clock formula's own size table, so the two scale together. The ceiling counts **thinking**: every truncated pass on record up to 2026-09 ran out while reasoning, including on drafts under 5,000 characters, which is why reasoning is a flat term (0 on a pass that does not reason — `effort` / `reasoning_effort` unset or `none`, on a model that does not think by default; see [below](#claude--adaptive-vs-extended-thinking)). The answer term scales with the draft two ways, and the larger wins: the size table, which shapes small and medium drafts, and for `fact_check` a straight line of 0.25 tokens per character, which takes over from about 90,000 characters — on a 190,170-character draft at `maximum`, `mistral:fact_check` wrote 154 `confirmed` entries and hit the table's 50,000 before any other bucket (2026-10-23); the line gives that pass 79,543. A capped model's wall-clock backstop is raised, if it has to be, to the time a healthy call needs to reach its ceiling — otherwise a longer ceiling just turns truncations into timeouts. Past roughly 120,000 characters at `maximum` that time exceeds `task_timeout_seconds` (1100) at the slowest healthy rate on record, and the task ceiling, not the token ceiling, is what bounds the pass; raise `task_timeout_seconds` for drafts that size if a `fact_check` keeps timing out.
+
+The call log records `finish_reason` beside `max_tokens` and `truncated`, so a capture says whether the provider stopped on its own (`stop`), at the ceiling (`length`), or otherwise.
 
 A truncated pass is reported as **PARTIAL**: the complete findings it wrote are kept, and the report names which of its output buckets never arrived — in the header, and above the section it feeds.
 
@@ -660,6 +663,52 @@ candidate was excluded — no credentials, `enabled: false`, a `prompts:` overri
 or drafting with the one model assigned to it — produces no result to be found
 empty, and used to be the one case this pass could not see. That is the total
 loss, not a partial one.
+
+---
+
+### Continuing a pass cut off at its output ceiling
+
+```yaml
+pipeline:
+  continue_truncated_passes: true   # default; false disables the pass
+```
+
+A pass that hits its output-token ceiling keeps the findings it finished and
+loses every bucket it had not reached. When that loses whole buckets, the
+pipeline makes **one** follow-up call to the same model: the same prompt, draft
+and ceiling, told which buckets the first call delivered and how many entries
+each held, and asked for only the missing ones under a schema that contains
+nothing else — so a provider that enforces the schema cannot spend the second
+ceiling re-writing `confirmed`. The answer's buckets are merged under the
+original's. It runs after recovery and substitution, so a recovered or substitute
+call that was cut off is covered too, and adds nothing to a run with no cut.
+
+**Why.** On 2026-10-23 a `maximum` run on a 169,940-character draft cut
+`mistral:fact_check` at its 50,000-token ceiling after 154 `confirmed` entries,
+and it never wrote `contradicted`, `outdated`, `unverifiable`,
+`primary_source_needed`, `out_of_scope` or `additional_observations`. The run
+reported the loss and did nothing about it: recovery retries failed calls, and a
+truncated pass succeeded. The same change moved `confirmed` to second-last in
+fact_check's bucket order, so a cut now costs confirmations rather than the
+verdicts that ask for a change.
+
+**What it cannot repair.** The bucket the first call was cut *inside* is not asked
+for again — asking would re-send every entry already delivered — so it may be
+short, and the report says so ("cut off partway through `confirmed` after 154
+entries; a follow-up call delivered …; `confirmed` may be incomplete"). A
+follow-up that is cut off too keeps only the buckets it finished, and one that
+fails keeps the original; either way the report names what never arrived. It is
+never recursive.
+
+**What it costs.** One more call per cut pass, reading the whole prompt again.
+Each follow-up is recorded under the pass in `continuations` and priced as a call
+of its own in `cost_summary` (`continuation_calls`, `continuation_usd`); one that
+reported no usage is counted in `uncosted_calls` and makes the total a floor, as a
+stalled retry does.
+
+**On a saved run.** `--retry-failed` gives each truncated pass in the capture a
+continuation instead of a re-run, billed as that run's spend while the first call
+stays the capture's. A replay never makes one: replayed results are history.
 
 ---
 

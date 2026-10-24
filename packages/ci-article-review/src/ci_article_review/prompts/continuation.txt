@@ -1,0 +1,9 @@
+
+
+CONTINUATION — THIS CALL FINISHES AN EARLIER ONE:
+An earlier response to the instructions above, on this same draft, ran out of output space before it finished. What it delivered is kept, and is not shown to you. It had written:
+{delivered_buckets}
+
+Return ONLY these keys, in this order, as one JSON object, and nothing else: {missing_buckets}
+
+Everything above still applies to them. Do not repeat the earlier response's keys and do not add keys for them: whatever belongs in one of those is already filed there, so leave it out rather than filing it somewhere else. An empty array is the right answer for a key with nothing in it.
