@@ -65,7 +65,7 @@ STATUSES = (
     # Above "source not read" because more is known — the document was opened
     # and part of it read — and below "source read" because that part did not
     # hold the claim. It is an open item, not a refutation: the pipeline's own
-    # page cap or excerpt window is what stopped the read.
+    # PDF time budget, pagination cap or excerpt window is what stopped the read.
     ("source_read_in_part", "Source read in part, claim not found in the part read"),
     ("confirmed_source_not_read", "Confirmed by a model, source not read"),
     ("unverified", "Unverified"),

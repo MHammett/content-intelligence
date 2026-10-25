@@ -21,6 +21,7 @@ would collapse that distinction into a generic failure.
 
 import logging
 import re
+import time
 from html.parser import HTMLParser
 
 log = logging.getLogger(__name__)
@@ -249,26 +250,41 @@ def looks_like_pdf(content_type=None, url=None, raw=None):
     return False
 
 
-#: PDF pages read before the extractor stops. One value for every reader in the
-#: pipeline, because two readers with different caps had already produced a
-#: false negative: the citation verifier stopped at 40 while the quote check
-#: read 400, so a claim cited to page 120 of a council packet was reported as
-#: "not supported" by a document the pipeline had not read past page 40.
+#: Wall-clock seconds one PDF may spend in text extraction before the reader
+#: stops and says so. One value for every reader in the pipeline, because two
+#: readers with different limits had already produced a false negative: the
+#: citation verifier stopped at 40 pages while the quote check read 400, so a
+#: claim cited to page 120 of a council packet was reported as "not supported"
+#: by a document the pipeline had not read past page 40.
 #:
-#: 400, not unlimited: pypdf's cost is real but small (a 10 MB, 156-page state
-#: report extracted in 5.5 s on 2026-10-24), and a cap keeps one pathological
-#: scan from holding a worker for minutes. What matters more than the number is
-#: that a read which stops here says so — see :func:`extract_pdf_text_with_coverage`.
-PDF_MAX_PAGES = 400
+#: A budget in seconds and not a page count, because pages are not the cost.
+#: Measured 2026-10-25 on a 981-page, 172 MB council packet (pypdf opens it in
+#: 0.3 s): 100 pages 2.0 s, 400 pages 14.8 s, 700 pages 73.5 s, all 981 pages
+#: 134.3 s. The cost is back-loaded, so a 400-page cap left the heaviest third of
+#: the document unread to save two minutes, and 156 light pages of a state
+#: report took 5.5 s. 180 s is that packet with margin; it is measured from the
+#: start of extraction (not the fetch) and checked between pages, so one
+#: pathological page can overrun it. At least one page is always read. A read
+#: that stops here says so: ``stopped_by`` in :func:`read_coverage`.
+PDF_MAX_SECONDS = 180
+
+#: A sanity ceiling on pages, far above any real document (the packet above has
+#: 981) and well short of the page count a malformed or hostile file can
+#: declare. The time budget is the working limit; this one only has to stop a
+#: file that is fast per page but endless.
+PDF_MAX_PAGES = 5000
 
 
-def read_coverage(kind, pages_total=None, pages_read=None):
+def read_coverage(kind, pages_total=None, pages_read=None, stopped_by=None):
     """What was read of a document, as the record every reader hands on.
 
     ``partial`` is True only when the pipeline's own limit left part of the
     document unread. It is the one field a verdict is allowed to consult before
     calling a negative answer evidence: a claim not found in a document read
     in part is a claim not found *yet*, and the report must say which.
+
+    ``stopped_by`` names the limit that ended a PDF read, ``"page_cap"`` or
+    ``"time_budget"``, and is None when nothing did.
     """
     partial = bool(
         pages_total is not None and pages_read is not None and pages_read < pages_total
@@ -278,15 +294,20 @@ def read_coverage(kind, pages_total=None, pages_read=None):
         "pages_total": pages_total,
         "pages_read": pages_read,
         "partial": partial,
+        "stopped_by": stopped_by if partial else None,
     }
 
 
-def extract_pdf_text_with_coverage(raw, max_pages=PDF_MAX_PAGES):
+def extract_pdf_text_with_coverage(
+    raw, max_pages=PDF_MAX_PAGES, max_seconds=PDF_MAX_SECONDS
+):
     """``(text, coverage)`` for PDF bytes. ``text`` is "" when unreadable.
 
     ``coverage`` is :func:`read_coverage` for kind ``"pdf"``: the page count the
-    document declares, how many were read, and whether ``max_pages`` cut the
-    read short. A document that could not be opened reports neither count.
+    document declares, how many were read, and which limit, ``max_pages`` or
+    the ``max_seconds`` wall-clock budget, cut the read short. ``max_seconds``
+    of None means no time limit. A document that could not be opened reports
+    neither count.
 
     Never raises — pypdf absent, bytes that are not a parseable PDF, a password
     the empty string does not open, or a pure scan with no text layer all come
@@ -315,13 +336,26 @@ def extract_pdf_text_with_coverage(raw, max_pages=PDF_MAX_PAGES):
                 log.warning("PDF is password-protected; cannot extract text.")
                 return "", read_coverage("pdf")
         total = len(reader.pages)
-        pages = reader.pages[:max_pages]
+        started = time.monotonic()
         chunks = []
-        for page in pages:
+        read = 0
+        stopped_by = None
+        for index in range(total):
+            if index >= max_pages:
+                stopped_by = "page_cap"
+                break
+            if (
+                index > 0
+                and max_seconds is not None
+                and time.monotonic() - started >= max_seconds
+            ):
+                stopped_by = "time_budget"
+                break
             try:
-                chunks.append(page.extract_text() or "")
+                chunks.append(reader.pages[index].extract_text() or "")
             except Exception:  # pragma: no cover - defensive, per-page corruption
-                continue
+                pass
+            read += 1
     except Exception as exc:
         log.warning(f"PDF text extraction failed: {exc}")
         return "", read_coverage("pdf")
@@ -329,18 +363,20 @@ def extract_pdf_text_with_coverage(raw, max_pages=PDF_MAX_PAGES):
     text = "\n\n".join(c.strip() for c in chunks if c.strip())
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text, read_coverage(
-        "pdf", pages_total=total, pages_read=min(total, len(pages))
+        "pdf", pages_total=total, pages_read=read, stopped_by=stopped_by
     )
 
 
-def extract_pdf_text(raw, max_pages=PDF_MAX_PAGES):
+def extract_pdf_text(raw, max_pages=PDF_MAX_PAGES, max_seconds=PDF_MAX_SECONDS):
     """Extract text from PDF bytes via pypdf. Returns "" when unreadable.
 
     The text half of :func:`extract_pdf_text_with_coverage`, for callers that
     do not report on what was read. Anything that turns the text into a verdict
     about the document should use the coverage-carrying form instead.
     """
-    return extract_pdf_text_with_coverage(raw, max_pages=max_pages)[0]
+    return extract_pdf_text_with_coverage(
+        raw, max_pages=max_pages, max_seconds=max_seconds
+    )[0]
 
 
 #: Phrases that identify an interstitial blocking us from the real document.
@@ -435,7 +471,8 @@ def extract_response_text_with_coverage(
 
     ``coverage`` is :func:`read_coverage`. For HTML and plain text the whole
     body is read, so it never reports ``partial``; for a PDF it carries the page
-    counts, and ``partial`` is True when :data:`PDF_MAX_PAGES` stopped the read.
+    counts, and ``partial`` is True when :data:`PDF_MAX_SECONDS` or :data:`PDF_MAX_PAGES`
+    stopped the read.
     """
     if isinstance(raw, str):
         decoded, raw = raw, raw.encode(encoding, errors="replace")

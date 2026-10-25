@@ -879,7 +879,7 @@ how many moved and, separately, the tally: quotes found, not found, unchecked.
 
 **What counts as a miss.** Only a page that was fetched, was readable text, and
 did not contain the quote. A 404, a refusal, a timeout, a bot wall, a near-empty
-page, a PDF over 400 pages, or a run over 200 distinct URLs is *unchecked*, and
+page, a PDF the extractor stopped short of (`PDF_MAX_SECONDS` in `ci_core/extract.py`), or a run over 200 distinct URLs is *unchecked*, and
 an unchecked quote leaves its verdict where it was.
 
 **How loosely it matches.** On letters and digits only, after Unicode NFKC and

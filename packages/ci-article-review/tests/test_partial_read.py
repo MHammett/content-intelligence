@@ -95,7 +95,12 @@ LONG = (
     + "More unrelated business about the fall festival. " * 400
 )
 WHOLE_PDF = extract.read_coverage("pdf", pages_total=12, pages_read=12)
-CAPPED_PDF = extract.read_coverage("pdf", pages_total=612, pages_read=400)
+CAPPED_PDF = extract.read_coverage(
+    "pdf", pages_total=612, pages_read=400, stopped_by="page_cap"
+)
+TIMED_PDF = extract.read_coverage(
+    "pdf", pages_total=612, pages_read=400, stopped_by="time_budget"
+)
 HTML = extract.read_coverage("html")
 
 
@@ -109,7 +114,28 @@ class TestResolverTellsNotFoundFromNotThere:
         assert result["read_coverage"]["partial"] is True
         assert "Read in part only" in result["note"]
         assert "400 of 612 PDF pages were read" in result["note"]
+        assert "the PDF page cap" in result["note"]
         assert "NOT evidence against the claim" in result["note"]
+
+    def test_pdf_cut_by_the_time_budget_names_the_budget(self):
+        result, _ = _resolve(SHORT, "pdf", TIMED_PDF, "not_addressed")
+
+        assert result["verification"] == "partial_read"
+        assert result["read_coverage"]["limits"] == ["pdf_time_budget"]
+        assert result["read_coverage"]["partial"] is True
+        assert (
+            "400 of 612 PDF pages were read before the PDF time budget stopped it"
+            in result["note"]
+        )
+        assert "page cap" not in result["note"]
+
+    def test_a_coverage_record_from_before_stopped_by_existed_reads_as_the_page_cap(
+        self,
+    ):
+        old = {"kind": "pdf", "pages_total": 612, "pages_read": 400, "partial": True}
+        result, _ = _resolve(SHORT, "pdf", old, "not_addressed")
+
+        assert result["read_coverage"]["limits"] == ["pdf_page_cap"]
         # The verdict is kept — it describes the part that was read.
         assert result["relevance_verdict"] == "not_addressed"
 
@@ -191,6 +217,9 @@ class TestOneCapForEveryReader:
     def test_the_quote_check_reads_to_the_same_page_as_the_verifier(self):
         assert quote_check._PDF_MAX_PAGES == extract.PDF_MAX_PAGES
 
+    def test_the_quote_check_job_outlasts_the_extraction_budget(self):
+        assert quote_check._JOB_TIMEOUT_SECONDS > extract.PDF_MAX_SECONDS
+
 
 class TestADocumentIsExtractedOncePerRun:
     """The page cache hands every claim on a URL the same response; the text
@@ -221,6 +250,36 @@ class TestADocumentIsExtractedOncePerRun:
             resolver._extract_fetched_with_coverage(resp, URL)
             resolver._extract_fetched_with_coverage(resp, URL + "/other")
         assert parse.call_count == 2
+
+    def test_claims_arriving_together_wait_for_one_parse(self):
+        """Eight workers on one packet: without a lock all eight parse it, and
+        each gets an eighth of the CPU, so each hits the time budget early."""
+        import threading
+        import time
+
+        resp = _response("application/pdf")
+        url = URL + "/concurrent"
+        started = threading.Barrier(8)
+
+        def slow_parse(*_a, **_k):
+            time.sleep(0.2)
+            return ("text", "pdf", WHOLE_PDF)
+
+        def claim():
+            started.wait()
+            resolver._extract_fetched_with_coverage(resp, url)
+
+        with patch(
+            "ci_article_review.adapters.citation.resolver.extract"
+            ".extract_response_text_with_coverage",
+            side_effect=slow_parse,
+        ) as parse:
+            threads = [threading.Thread(target=claim) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        assert parse.call_count == 1
 
 
 def _partial_citation(claim=CLAIM, url=URL, **extra):
@@ -298,6 +357,23 @@ class TestWorklistSendsTheAuthorToTheCitedPage:
         assert "400 of 612 PDF pages were read" in rendered
         assert "the PDF page cap" in rendered
         assert "Open at the cited page and look" in rendered
+
+    def test_the_worklist_names_the_time_budget_when_it_was_the_limit(self):
+        timed = _partial_citation()
+        timed["read_coverage"] = {
+            **timed["read_coverage"],
+            "limits": ["pdf_time_budget"],
+        }
+        rendered = "\n".join(
+            worklist.render_worklist(worklist.build_worklist(_report([timed])))
+        )
+
+        assert (
+            "400 of 612 PDF pages were read before the PDF time budget stopped it"
+            in rendered
+        )
+        assert "Left unread by the PDF time budget" in rendered
+        assert "page cap" not in rendered
         assert "[you]" in rendered
 
     def test_it_is_not_treated_as_settled(self):

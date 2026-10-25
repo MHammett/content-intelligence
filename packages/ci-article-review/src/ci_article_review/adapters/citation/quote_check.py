@@ -69,20 +69,22 @@ _FETCH_TIMEOUT = 15
 
 #: Safety net for one URL, above ``_FETCH_TIMEOUT`` for the same reason
 #: ``resolver._RESOLVE_TIMEOUT_SECONDS`` is: it exists for what the request
-#: timeout does not cover (a stalled DNS lookup, a slow PDF parse).
-_JOB_TIMEOUT_SECONDS = 60
+#: timeout does not cover (a stalled DNS lookup, a slow PDF parse). The parse
+#: has a budget of its own, ``extract.PDF_MAX_SECONDS``, which this sits above.
+_JOB_TIMEOUT_SECONDS = 60 + extract.PDF_MAX_SECONDS
 
 #: Most distinct URLs fetched in one run. A ``maximum`` run across six models
 #: cites a few dozen; the cap is a bound on a pathological response, and a URL
 #: past it is reported ``unchecked`` rather than skipped silently.
 _MAX_URLS = 200
 
-#: PDF pages read. The same cap as the citation verifier's — one number for the
-#: whole pipeline, kept in ``extract.PDF_MAX_PAGES``. The two used to differ (40
-#: there, 400 here), and the lower one produced a false negative: a claim cited
-#: to page 120 of a council packet was reported as unsupported by a document the
-#: verifier had not read past page 40. A miss past this cap is still reported as
-#: our limit and not the model's invention — see ``PageRead.partial``.
+#: PDF pages read. The same limits as the citation verifier's — one number for
+#: the whole pipeline, kept in ``extract.PDF_MAX_PAGES`` and
+#: ``extract.PDF_MAX_SECONDS``. The two used to differ (40 pages there, 400
+#: here), and the lower one produced a false negative: a claim cited to page 120
+#: of a council packet was reported as unsupported by a document the verifier
+#: had not read past page 40. A miss past either limit is still reported as our
+#: limit and not the model's invention — see ``PageRead.partial``.
 _PDF_MAX_PAGES = extract.PDF_MAX_PAGES
 
 #: A piece of a quote shorter than this (after ``_compact``) is not required to
@@ -199,7 +201,7 @@ def all_page_text(markup):
 
 
 def _pdf_text(raw):
-    """``(text, partial)`` for PDF bytes; ``partial`` when the page cap cut the read."""
+    """``(text, partial)`` for PDF bytes; ``partial`` when a read limit cut it short."""
     text, coverage = extract.extract_pdf_text_with_coverage(
         raw, max_pages=_PDF_MAX_PAGES
     )
