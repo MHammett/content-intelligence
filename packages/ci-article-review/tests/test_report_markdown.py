@@ -895,9 +895,9 @@ class TestSection9Citations:
 
         counts = [int(n) for n in re.findall(r"^\| .+ \| (\d+) \|$", md, re.M)]
         assert sum(counts) == len(citations)
-        # checksum, mismatch, unverifiable, fetch_failed, resolution_error,
-        # pointer, no_source
-        assert counts == [1, 1, 1, 0, 1, 1, 2]
+        # checksum, mismatch, partial_read, unverifiable, fetch_failed,
+        # resolution_error, pointer, no_source
+        assert counts == [1, 1, 0, 1, 0, 1, 1, 2]
 
     def test_content_mismatch_is_not_buried_with_never_looked_up_claims(self):
         """A source fetched, read, and found not to support the claim is the
@@ -1227,6 +1227,7 @@ class TestSection9Citations:
         citations = [
             {"claim": "a", "resolved": True, "verification": "checksum"},
             {"claim": "b", "resolved": False, "verification": "content_mismatch"},
+            {"claim": "h", "resolved": False, "verification": "partial_read"},
             {"claim": "c", "resolved": True, "verification": "unverifiable"},
             {"claim": "d", "resolved": False, "url": "https://example.gov/403"},
             {"claim": "e", "resolved": True, "verification": "pointer"},

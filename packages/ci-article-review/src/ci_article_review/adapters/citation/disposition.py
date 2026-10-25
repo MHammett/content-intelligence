@@ -19,6 +19,13 @@ __all__ = ["DISPOSITIONS", "disposition", "label_for"]
 DISPOSITIONS = (
     ("checksum", "Read, and supports the claim"),
     ("content_mismatch", "Read, and does NOT support the claim"),
+    # Between the two read outcomes and "could not be read", because that is
+    # what it is: the document was fetched and part of it read, and the claim
+    # was not in that part. It is NOT evidence against the claim. The verifier
+    # reads at most PDF_MAX_PAGES pages and shows the model a window of the
+    # text, so "not found" and "not there" are different findings, and this
+    # tier is what keeps a reader from mistaking the first for the second.
+    ("partial_read", "Read in part only — not found in the part read"),
     ("unverifiable", "Fetched, but could not be read"),
     ("fetch_failed", "Source URL identified, but the fetch was refused"),
     ("resolution_error", "Resolution did not complete (error or timeout)"),

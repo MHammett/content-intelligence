@@ -249,16 +249,49 @@ def looks_like_pdf(content_type=None, url=None, raw=None):
     return False
 
 
-def extract_pdf_text(raw, max_pages=40):
-    """Extract text from PDF bytes via pypdf. Returns "" when unreadable.
+#: PDF pages read before the extractor stops. One value for every reader in the
+#: pipeline, because two readers with different caps had already produced a
+#: false negative: the citation verifier stopped at 40 while the quote check
+#: read 400, so a claim cited to page 120 of a council packet was reported as
+#: "not supported" by a document the pipeline had not read past page 40.
+#:
+#: 400, not unlimited: pypdf's cost is real but small (a 10 MB, 156-page state
+#: report extracted in 5.5 s on 2026-10-24), and a cap keeps one pathological
+#: scan from holding a worker for minutes. What matters more than the number is
+#: that a read which stops here says so — see :func:`extract_pdf_text_with_coverage`.
+PDF_MAX_PAGES = 400
 
-    ``max_pages`` bounds the work on very long documents (some primary sources
-    here run to hundreds of pages); the leading pages are what a citation
-    excerpt search needs, and parsing all of them is pure latency.
 
-    Returns "" — never raises — when pypdf is absent, the bytes are not a
-    parseable PDF, or the PDF is a pure scan with no text layer. The caller
-    distinguishes that from a genuine content mismatch.
+def read_coverage(kind, pages_total=None, pages_read=None):
+    """What was read of a document, as the record every reader hands on.
+
+    ``partial`` is True only when the pipeline's own limit left part of the
+    document unread. It is the one field a verdict is allowed to consult before
+    calling a negative answer evidence: a claim not found in a document read
+    in part is a claim not found *yet*, and the report must say which.
+    """
+    partial = bool(
+        pages_total is not None and pages_read is not None and pages_read < pages_total
+    )
+    return {
+        "kind": kind,
+        "pages_total": pages_total,
+        "pages_read": pages_read,
+        "partial": partial,
+    }
+
+
+def extract_pdf_text_with_coverage(raw, max_pages=PDF_MAX_PAGES):
+    """``(text, coverage)`` for PDF bytes. ``text`` is "" when unreadable.
+
+    ``coverage`` is :func:`read_coverage` for kind ``"pdf"``: the page count the
+    document declares, how many were read, and whether ``max_pages`` cut the
+    read short. A document that could not be opened reports neither count.
+
+    Never raises — pypdf absent, bytes that are not a parseable PDF, a password
+    the empty string does not open, or a pure scan with no text layer all come
+    back as ``""``, which the caller reports as unreadable rather than as a
+    mismatch.
     """
     try:
         import pypdf
@@ -267,7 +300,7 @@ def extract_pdf_text(raw, max_pages=40):
             "pypdf is not installed — PDF citation sources cannot be verified. "
             "Install it to enable PDF content verification."
         )
-        return ""
+        return "", read_coverage("pdf")
 
     import io
 
@@ -280,7 +313,8 @@ def extract_pdf_text(raw, max_pages=40):
                 reader.decrypt("")
             except Exception:
                 log.warning("PDF is password-protected; cannot extract text.")
-                return ""
+                return "", read_coverage("pdf")
+        total = len(reader.pages)
         pages = reader.pages[:max_pages]
         chunks = []
         for page in pages:
@@ -290,10 +324,23 @@ def extract_pdf_text(raw, max_pages=40):
                 continue
     except Exception as exc:
         log.warning(f"PDF text extraction failed: {exc}")
-        return ""
+        return "", read_coverage("pdf")
 
     text = "\n\n".join(c.strip() for c in chunks if c.strip())
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text, read_coverage(
+        "pdf", pages_total=total, pages_read=min(total, len(pages))
+    )
+
+
+def extract_pdf_text(raw, max_pages=PDF_MAX_PAGES):
+    """Extract text from PDF bytes via pypdf. Returns "" when unreadable.
+
+    The text half of :func:`extract_pdf_text_with_coverage`, for callers that
+    do not report on what was read. Anything that turns the text into a verdict
+    about the document should use the coverage-carrying form instead.
+    """
+    return extract_pdf_text_with_coverage(raw, max_pages=max_pages)[0]
 
 
 #: Phrases that identify an interstitial blocking us from the real document.
@@ -369,6 +416,26 @@ def extract_response_text(raw, content_type=None, url=None, encoding="utf-8"):
 
     An empty ``text`` means "could not read this", which callers must report
     distinctly from "read it and it does not support the claim".
+
+    The two-value form, for callers that only need the text. A caller that will
+    judge a claim against the text wants
+    :func:`extract_response_text_with_coverage`, which also says how much of the
+    document the text covers.
+    """
+    text, kind, _coverage = extract_response_text_with_coverage(
+        raw, content_type=content_type, url=url, encoding=encoding
+    )
+    return text, kind
+
+
+def extract_response_text_with_coverage(
+    raw, content_type=None, url=None, encoding="utf-8"
+):
+    """``(text, kind, coverage)`` for a fetched response body.
+
+    ``coverage`` is :func:`read_coverage`. For HTML and plain text the whole
+    body is read, so it never reports ``partial``; for a PDF it carries the page
+    counts, and ``partial`` is True when :data:`PDF_MAX_PAGES` stopped the read.
     """
     if isinstance(raw, str):
         decoded, raw = raw, raw.encode(encoding, errors="replace")
@@ -376,8 +443,14 @@ def extract_response_text(raw, content_type=None, url=None, encoding="utf-8"):
         decoded = None
 
     if looks_like_pdf(content_type, url, raw):
-        return extract_pdf_text(raw), "pdf"
+        text, coverage = extract_pdf_text_with_coverage(raw)
+        return text, "pdf", coverage
 
+    text, kind = _extract_markup_or_text(raw, decoded, content_type, encoding)
+    return text, kind, read_coverage(kind)
+
+
+def _extract_markup_or_text(raw, decoded, content_type, encoding):
     if decoded is None:
         decoded = raw.decode(encoding or "utf-8", errors="replace")
 
@@ -495,21 +568,53 @@ def select_excerpt(text, claim, head=4000, tail=1000):
     matches several distinct terms; the score still rewards both breadth and
     density.
     """
+    return select_excerpt_with_window(text, claim, head=head, tail=tail)[0]
+
+
+def select_excerpt_with_window(text, claim, head=4000, tail=1000):
+    """:func:`select_excerpt`, plus a record of how much of ``text`` it kept.
+
+    Returns ``(excerpt, window)`` where ``window`` is::
+
+        {"chars_total": len(text), "chars_read": <characters handed on>,
+         "windowed": <True when part of the text was left out>,
+         "how": "whole" | "best_window" | "head_tail"}
+
+    ``windowed`` is the fact a verdict has to carry: a negative answer about a
+    windowed document is an answer about the window, not the document. The
+    window is chosen by the claim's own terms, which is a real search and not a
+    blind cut, but it is still a 20,000-character sample of what may be a
+    600,000-character council packet.
+    """
     from ci_core import redact
 
     text = text or ""
     budget = head + tail
-    if len(text) <= budget:
-        return text
+    total = len(text)
+    if total <= budget:
+        return text, {
+            "chars_total": total,
+            "chars_read": total,
+            "windowed": False,
+            "how": "whole",
+        }
+
+    def _head_tail():
+        return redact.truncate_excerpt(text, head=head, tail=tail), {
+            "chars_total": total,
+            "chars_read": min(total, budget),
+            "windowed": True,
+            "how": "head_tail",
+        }
 
     numbers, words = claim_terms(claim)
     if not numbers and not words:
-        return redact.truncate_excerpt(text, head=head, tail=tail)
+        return _head_tail()
 
     lowered = text.lower()
     step = max(budget // 8, 1)
     best_score, best_start = 0, None
-    for start in range(0, max(len(text) - budget, 0) + step, step):
+    for start in range(0, max(total - budget, 0) + step, step):
         end = start + budget
         if start >= len(lowered):
             break
@@ -524,12 +629,17 @@ def select_excerpt(text, claim, head=4000, tail=1000):
             best_score, best_start = score, start
 
     if best_start is None:
-        return redact.truncate_excerpt(text, head=head, tail=tail)
+        return _head_tail()
 
     excerpt = text[best_start : best_start + budget]
     if best_start > 0:
         excerpt = f"...[{best_start} chars omitted]...\n{excerpt}"
-    remaining = len(text) - (best_start + budget)
+    remaining = total - (best_start + budget)
     if remaining > 0:
         excerpt = f"{excerpt}\n...[{remaining} chars omitted]..."
-    return excerpt
+    return excerpt, {
+        "chars_total": total,
+        "chars_read": min(budget, total - best_start),
+        "windowed": True,
+        "how": "best_window",
+    }

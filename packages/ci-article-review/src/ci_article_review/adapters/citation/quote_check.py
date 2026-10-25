@@ -44,7 +44,6 @@ Section 9 reads the same pages for its own purposes. The pipeline hands both one
 """
 
 import html
-import io
 import logging
 import re
 import unicodedata
@@ -78,11 +77,13 @@ _JOB_TIMEOUT_SECONDS = 60
 #: past it is reported ``unchecked`` rather than skipped silently.
 _MAX_URLS = 200
 
-#: PDF pages read. ``extract.extract_pdf_text`` stops at 40 for the citation
-#: verifier, which wants the leading pages; a model's quote can come from
-#: anywhere in the document, and a miss in a PDF read only to page 40 would be
-#: our limit and not the model's invention.
-_PDF_MAX_PAGES = 400
+#: PDF pages read. The same cap as the citation verifier's — one number for the
+#: whole pipeline, kept in ``extract.PDF_MAX_PAGES``. The two used to differ (40
+#: there, 400 here), and the lower one produced a false negative: a claim cited
+#: to page 120 of a council packet was reported as unsupported by a document the
+#: verifier had not read past page 40. A miss past this cap is still reported as
+#: our limit and not the model's invention — see ``PageRead.partial``.
+_PDF_MAX_PAGES = extract.PDF_MAX_PAGES
 
 #: A piece of a quote shorter than this (after ``_compact``) is not required to
 #: match, provided a longer piece is. It is what is left around an ellipsis or an
@@ -198,16 +199,11 @@ def all_page_text(markup):
 
 
 def _pdf_text(raw):
-    """``(text, partial)`` for PDF bytes, reading past the verifier's page cap."""
-    pages = None
-    try:
-        import pypdf
-
-        pages = len(pypdf.PdfReader(io.BytesIO(raw)).pages)
-    except Exception:  # noqa: BLE001 - extract_pdf_text reports its own failure
-        pass
-    text = extract.extract_pdf_text(raw, max_pages=_PDF_MAX_PAGES)
-    return text, bool(pages and pages > _PDF_MAX_PAGES)
+    """``(text, partial)`` for PDF bytes; ``partial`` when the page cap cut the read."""
+    text, coverage = extract.extract_pdf_text_with_coverage(
+        raw, max_pages=_PDF_MAX_PAGES
+    )
+    return text, bool(coverage.get("partial"))
 
 
 def _read_response(resp, url):
@@ -270,7 +266,7 @@ def fetch_page(url, timeout=_FETCH_TIMEOUT, cache=None):
         if wayback.fallback_reason_for_exception(exc) == "blocked":
             escalated = resolver._escalate(url, timeout, cache)
             if escalated is not None:
-                final, content, _kind = escalated
+                final, content, _kind, _coverage = escalated
                 page = _classify([content], False)
                 page.final_url = final or landed
                 return page

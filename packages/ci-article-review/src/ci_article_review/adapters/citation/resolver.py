@@ -384,14 +384,49 @@ def _extract_fetched(resp, url):
 
     Returns ``(text, kind)``; an empty ``text`` means the body could not be
     read, which the caller must report as unverifiable rather than as a
-    content mismatch.
+    content mismatch. The paths that turn the text into a verdict about the
+    document use ``_extract_fetched_with_coverage`` instead, so the verdict can
+    say how much of the document it rests on.
     """
-    return extract.extract_response_text(
+    text, kind, _coverage = _extract_fetched_with_coverage(resp, url)
+    return text, kind
+
+
+#: Where an extraction is kept on the response it came from. The page cache
+#: hands every claim citing one URL the same response object, so the text is
+#: extracted once per document per run instead of once per claim. Measured on
+#: the 2026-10-24 replay that raised the PDF page cap to 400: 3,777 s of pypdf
+#: time over 90 PDF claims, 83 of them on 20 documents each cited by several
+#: claims (one 14 times) — the same packet parsed again for every claim.
+_EXTRACTED_ATTR = "_ci_extracted"
+
+
+def _extract_fetched_with_coverage(resp, url):
+    """``_extract_fetched`` plus how much of the document the text covers.
+
+    Returns ``(text, kind, coverage)``. ``coverage`` is ``extract.read_coverage``:
+    for a PDF, how many of its pages were read and whether the extractor's page
+    cap stopped short. A verdict formed on a partial read has to say so — see
+    ``_resolve_known_url``.
+
+    Memoised on ``resp`` (see ``_EXTRACTED_ATTR``), keyed by ``url`` so a
+    response reused under another address is read afresh.
+    """
+    kept = getattr(resp, _EXTRACTED_ATTR, None)
+    if kept is not None and kept[0] == url:
+        return kept[1]
+    extracted = extract.extract_response_text_with_coverage(
         resp.content,
         content_type=resp.headers.get("Content-Type"),
         url=url,
         encoding=resp.encoding or "utf-8",
     )
+    try:
+        setattr(resp, _EXTRACTED_ATTR, (url, extracted))
+    except (AttributeError, TypeError):
+        # A response type that refuses new attributes just loses the memo.
+        pass
+    return extracted
 
 
 def build_checksum_index(history_root=None):
@@ -530,7 +565,7 @@ def _impersonation_fallback_content(url, timeout):
         return None
     final_url = str(getattr(resp, "url", "") or url)
     try:
-        content, kind = _extract_fetched(resp, final_url)
+        content, kind, coverage = _extract_fetched_with_coverage(resp, final_url)
     except Exception:
         # An unreadable body is a failed escalation, not a failed resolution:
         # the archive fallback below still deserves its turn.
@@ -539,7 +574,7 @@ def _impersonation_fallback_content(url, timeout):
         return None
     if len(content.strip()) < _MIN_VERIFIABLE_CHARS:
         return None
-    return final_url, content, kind
+    return final_url, content, kind, coverage
 
 
 def _fetch_following_page(url, timeout=15):
@@ -617,8 +652,8 @@ def _wayback_fallback_content(url, timeout):
         # offer the reader a copy to open by hand even though the pipeline could
         # not fetch one.
         return None, wb
-    text, kind = _extract_fetched(resp, snapshot_url)
-    return (snapshot_url, text, kind), wb
+    text, kind, coverage = _extract_fetched_with_coverage(resp, snapshot_url)
+    return (snapshot_url, text, kind, coverage), wb
 
 
 #: Length of the stored page excerpt. Unchanged; only its shape is sanitised.
@@ -784,7 +819,7 @@ def _verify_relevance(claim, content, api_keys, author=None):
     # calls, 180,165 prompt tokens, averaging 1,566 — the ceiling only binds on
     # genuinely long documents, and mistral-small at $0.15/M input prices even
     # the worst case (every call maxed) at under $0.09 for the pass.
-    excerpt = extract.select_excerpt(
+    excerpt, window = extract.select_excerpt_with_window(
         content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL
     )
     user_prompt = _build_verification_prompt(claim, excerpt, author)
@@ -854,6 +889,10 @@ def _verify_relevance(claim, content, api_keys, author=None):
         "verdict": verdict,
         "reason": data.get("reason", ""),
         "quote": quote,
+        # What the model was shown: the whole text, or a window of it. A
+        # negative verdict on a window is a verdict about the window.
+        "window": window,
+        "quote_grounded": bool(quote) and _quote_is_grounded(quote, content),
     }, call_log_entry
 
 
@@ -932,11 +971,17 @@ def _resolve_known_url(
     # Which URL the archive lookup asks about. Only the escalation path moves it
     # off ``known_url`` — see where it is reassigned below.
     archive_lookup_url = known_url
+    # How much of the document the text below covers. Every path that produces
+    # ``content`` sets it; the verdict at the end reads it before calling a
+    # negative answer evidence.
+    coverage = None
     try:
         _step("fetch")
         resp = _get_page(known_url, timeout, page_cache)
         _step("extract")
-        content, content_kind = _extract_fetched(resp, known_url)
+        content, content_kind, coverage = _extract_fetched_with_coverage(
+            resp, known_url
+        )
         # Where the fetch actually landed. `safe_get` follows redirects one
         # validated hop at a time and returns the last hop's response, so this
         # is the resolved URL and it was being thrown away.
@@ -994,7 +1039,7 @@ def _resolve_known_url(
             _escalate(known_url, timeout, page_cache) if reason == "blocked" else None
         )
         if escalated is not None:
-            final_url, content, content_kind = escalated
+            final_url, content, content_kind, coverage = escalated
             verified_via = "tls_impersonation"
             fallback_reason = reason
             # Ask archive.org about the page that actually served the content,
@@ -1047,7 +1092,7 @@ def _resolve_known_url(
                     # which the renderer says differently.
                     failed["wayback"] = wb
                 return failed
-            _, content, content_kind = fallback
+            _, content, content_kind, coverage = fallback
             verified_via = "wayback_fallback"
             fallback_reason = reason
 
@@ -1205,29 +1250,123 @@ def _resolve_known_url(
         # source, search for this sentence, and see the same evidence the
         # verifier used. It was checked against the page before being stored.
         result["relevance_quote"] = verdict_info["quote"]
+    read = _read_coverage(coverage, verdict_info.get("window"), followed)
+    result["read_coverage"] = read
     if verdict_info["verdict"] not in _SUPPORTING_VERDICTS:
         # The URL loaded and checksummed fine, but content verification says
         # it doesn't actually back the claim — never let that pass silently
         # at checksum-level confidence.
         result["resolved"] = False
-        result["verification"] = "content_mismatch"
-        result["note"] = (
-            f"Source URL loaded, and its extracted article text was read and "
-            f"checked, but content verification found it does not support this "
-            f"specific claim ({verdict_info['verdict']}): {verdict_info['reason']}"
+        # A negative verdict is evidence only when the verifier saw the whole
+        # document. When the pipeline's own limits left part of it unread (the
+        # PDF page cap, the pagination cap, or the excerpt window) a "not
+        # addressed" says the claim was not in the part read, and nothing
+        # more. The one exception is a contradiction the model backed with a
+        # sentence that is actually on the page: text found is evidence
+        # whatever was left unread. Issue #395: 40 of 111 "not supporting"
+        # verdicts on one run were council packets read to page 40.
+        grounded_contradiction = verdict_info["verdict"] == "contradicts" and bool(
+            verdict_info.get("quote_grounded")
         )
-        if followed is not None and followed.stopped == "page cap":
-            result["note"] += (
-                f" Only the first {followed.pages_read} pages of a longer source "
-                "were read, so the claim may sit further on."
+        if read["partial"] and not grounded_contradiction:
+            result["verification"] = "partial_read"
+            result["note"] = (
+                f"Read in part only. {_coverage_sentence(read)} The claim was not "
+                f"found in what was read ({verdict_info['verdict']}: "
+                f"{verdict_info['reason']}). This is a limit of the read, NOT "
+                f"evidence against the claim — open the document at the cited "
+                f"page before treating it as unsupported."
             )
-        elif followed is not None and followed.stopped == "byte budget":
-            result["note"] += (
-                f" Reading stopped at a size limit after {followed.pages_read} "
-                "pages of a longer source, so the claim may sit further on."
+        else:
+            result["verification"] = "content_mismatch"
+            result["note"] = (
+                f"Source URL loaded, and its extracted article text was read in "
+                f"full and checked, but content verification found it does not "
+                f"support this specific claim ({verdict_info['verdict']}): "
+                f"{verdict_info['reason']}"
             )
 
     return _check_drift(result, checksum_index)
+
+
+#: Limits that can leave part of a document unread, as the report names them.
+_LIMIT_NAMES = {
+    "pdf_page_cap": "the PDF page cap",
+    "pagination_cap": "the pagination cap",
+    "byte_budget": "the pagination size budget",
+    "excerpt_window": "the excerpt window",
+}
+
+
+def _read_coverage(coverage, window, followed):
+    """One record of how much of the document the verdict rests on.
+
+    Three limits can leave text unread, and a reader needs all three in one
+    place: ``extract.PDF_MAX_PAGES`` (``coverage``), the pagination follower's
+    page cap or byte budget (``followed``), and the verifier's excerpt window
+    (``window``, from ``extract.select_excerpt_with_window``). ``partial`` is
+    True when any of them did. Every Section 9 entry that reached a verdict
+    carries this, so a reader can tell "not there" from "not found".
+    """
+    coverage = coverage or {}
+    window = window or {}
+    limits = []
+    if coverage.get("partial"):
+        limits.append("pdf_page_cap")
+    if followed is not None and followed.stopped == "page cap":
+        limits.append("pagination_cap")
+    elif followed is not None and followed.stopped == "byte budget":
+        limits.append("byte_budget")
+    if window.get("windowed"):
+        limits.append("excerpt_window")
+    read = {
+        "kind": coverage.get("kind"),
+        "pages_total": coverage.get("pages_total"),
+        "pages_read": coverage.get("pages_read"),
+        "chars_total": window.get("chars_total"),
+        "chars_shown": window.get("chars_read"),
+        "window": window.get("how"),
+        "limits": limits,
+        "partial": bool(limits),
+    }
+    if followed is not None and followed.noteworthy:
+        read["web_pages_read"] = followed.pages_read
+    return read
+
+
+def _coverage_sentence(read):
+    """``read`` as one plain sentence, for notes and the readable report."""
+    parts = []
+    total, done = read.get("pages_total"), read.get("pages_read")
+    if total is not None and done is not None:
+        parts.append(
+            f"{done} of {total} PDF pages were read"
+            if done < total
+            else f"all {total} PDF page(s) were read"
+        )
+    if read.get("web_pages_read"):
+        stopped = ""
+        if "pagination_cap" in read.get("limits", ()):
+            stopped = " before the pagination cap stopped it"
+        elif "byte_budget" in read.get("limits", ()):
+            stopped = " before the size budget stopped it"
+        parts.append(f"{read['web_pages_read']} web page(s) were read{stopped}")
+    shown, chars = read.get("chars_shown"), read.get("chars_total")
+    if chars is not None and shown is not None:
+        if read.get("window") == "whole":
+            parts.append(
+                f"the verifier was shown the whole text ({chars:,} characters)"
+            )
+        else:
+            parts.append(
+                f"the verifier was shown the {shown:,} characters most likely to "
+                f"address the claim out of {chars:,}"
+            )
+    return (
+        (", and ".join(parts) + ".")
+        if parts
+        else "The extent of the read was not recorded."
+    )
 
 
 def verify_source_supports(
@@ -1280,7 +1419,9 @@ _UNRESOLVED_RANK = 1
 def _informativeness(result):
     if result.get("verification") == "content_mismatch":
         return _FAILURE_RANK.get(result.get("relevance_verdict"), _UNRESOLVED_RANK)
-    if result.get("verification") == "unverifiable":
+    if result.get("verification") in ("unverifiable", "partial_read"):
+        # A claim not found in the part of a document that was read says as
+        # little against the claim as a page that could not be read at all.
         return _UNVERIFIABLE_RANK
     return _UNRESOLVED_RANK
 

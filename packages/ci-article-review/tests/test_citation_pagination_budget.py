@@ -240,13 +240,18 @@ class TestTheResolverUsesIt:
         assert result["pagination"]["stopped"] == "byte budget"
         assert result["pagination"]["totals"]["total"] == 15
 
-    def test_a_refutation_from_a_cut_off_collection_says_the_claim_may_sit_further_on(
-        self,
-    ):
+    def test_a_negative_verdict_from_a_cut_off_collection_is_a_partial_read(self):
+        """It used to stay a ``content_mismatch`` with a caveat appended to the
+        note. A reader skimming the mismatch block does not see caveats, and a
+        reading limit was being counted as a refutation (issue #395). Now the
+        cut moves the entry to its own tier, and the note leads with it."""
         _urls, pages = _rest_chain(5, chars=_BUDGET // 2 + 1000)
         result, _content = self._resolve(pages, verdict="not_addressed")
-        assert result["verification"] == "content_mismatch"
-        assert "may sit further on" in result["note"]
+        assert result["verification"] == "partial_read"
+        assert result["note"].startswith("Read in part only.")
+        assert "size budget stopped it" in result["note"]
+        assert "NOT evidence against the claim" in result["note"]
+        assert "byte_budget" in result["read_coverage"]["limits"]
 
     def test_a_refutation_from_a_whole_collection_does_not_say_that(self):
         _urls, pages = _rest_chain(3, chars=_BUDGET // 10)
