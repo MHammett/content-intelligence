@@ -13,6 +13,7 @@ import logging
 import time
 from unittest.mock import patch
 
+from ci_core import extract
 from ci_core.concurrency import run_all_bounded
 
 from ci_article_review.adapters.citation import resolver
@@ -70,10 +71,17 @@ class TestTheCapIsDerived:
         assert resolver._RESOLVE_TIMEOUT_SECONDS == (
             resolver._FETCH_CHAIN_SECONDS
             + resolver._ESCALATION_SECONDS
+            + resolver._EXTRACT_SECONDS
             + resolver._ARCHIVE_SECONDS
             + resolver._PAGINATION_SECONDS
             + resolver._RELEVANCE_SECONDS
         )
+
+    def test_the_cap_covers_a_981_page_packet_read_to_the_time_budget(self):
+        # Measured 2026-10-25: fetch 78 s, the budgeted extraction, then the
+        # relevance call at its measured p90 (81 s, first live replay).
+        assert resolver._EXTRACT_SECONDS == extract.PDF_MAX_SECONDS
+        assert resolver._RESOLVE_TIMEOUT_SECONDS >= 78 + extract.PDF_MAX_SECONDS + 81
 
     def test_the_fetch_chain_counts_every_redirect_hop(self):
         from ci_core.http import _MAX_REDIRECTS

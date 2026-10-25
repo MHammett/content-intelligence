@@ -24,8 +24,9 @@ def _pdf_with_pages(n):
 
 
 class TestOnePageCap:
-    def test_the_cap_is_the_quote_checks_cap(self):
-        assert extract.PDF_MAX_PAGES == 400
+    def test_one_time_budget_and_a_high_page_ceiling_for_every_reader(self):
+        assert extract.PDF_MAX_SECONDS == 180
+        assert extract.PDF_MAX_PAGES == 5000
 
     def test_default_reads_up_to_the_cap(self):
         raw = _pdf_with_pages(5)
@@ -35,6 +36,7 @@ class TestOnePageCap:
             "pages_total": 5,
             "pages_read": 5,
             "partial": False,
+            "stopped_by": None,
         }
 
 
@@ -45,12 +47,47 @@ class TestCoverageSaysWhenTheReadStoppedShort:
         assert coverage["pages_total"] == 5
         assert coverage["pages_read"] == 2
         assert coverage["partial"] is True
+        assert coverage["stopped_by"] == "page_cap"
 
     def test_a_cap_at_or_above_the_page_count_is_whole(self):
         raw = _pdf_with_pages(3)
         _text, coverage = extract.extract_pdf_text_with_coverage(raw, max_pages=3)
         assert coverage["partial"] is False
         assert coverage["pages_read"] == 3
+        assert coverage["stopped_by"] is None
+
+    def test_a_zero_time_budget_still_reads_one_page_and_says_the_budget_stopped_it(
+        self,
+    ):
+        raw = _pdf_with_pages(5)
+        _text, coverage = extract.extract_pdf_text_with_coverage(raw, max_seconds=0)
+        assert coverage["pages_total"] == 5
+        assert coverage["pages_read"] == 1
+        assert coverage["partial"] is True
+        assert coverage["stopped_by"] == "time_budget"
+
+    def test_the_budget_is_checked_between_pages_against_the_clock(self, monkeypatch):
+        raw = _pdf_with_pages(10)
+        ticks = iter(range(1000))
+        monkeypatch.setattr(extract.time, "monotonic", lambda: next(ticks))
+        # One tick to start, one per page checked: a 3 s budget lets pages 0-3 in.
+        _text, coverage = extract.extract_pdf_text_with_coverage(raw, max_seconds=3)
+        assert coverage["pages_read"] == 3
+        assert coverage["stopped_by"] == "time_budget"
+
+    def test_no_time_limit_reads_everything(self):
+        raw = _pdf_with_pages(4)
+        _text, coverage = extract.extract_pdf_text_with_coverage(raw, max_seconds=None)
+        assert coverage["pages_read"] == 4
+        assert coverage["partial"] is False
+
+    def test_a_document_inside_both_limits_is_whole(self):
+        raw = _pdf_with_pages(4)
+        _text, coverage = extract.extract_pdf_text_with_coverage(
+            raw, max_pages=4, max_seconds=60
+        )
+        assert coverage["partial"] is False
+        assert coverage["stopped_by"] is None
 
     def test_an_unreadable_pdf_reports_no_counts_and_is_not_partial(self):
         text, coverage = extract.extract_pdf_text_with_coverage(b"%PDF-1.4 not a pdf")
@@ -80,6 +117,7 @@ class TestCoverageSaysWhenTheReadStoppedShort:
             "pages_total": None,
             "pages_read": None,
             "partial": False,
+            "stopped_by": None,
         }
 
     def test_two_value_form_still_returns_text_and_kind(self):

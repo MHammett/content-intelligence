@@ -184,6 +184,10 @@ _FETCH_TIMEOUT_SECONDS = 15
 #:   time, each hop with its own timeout. A page-cache waiter spends one
 #:   timeout on the leader before fetching for itself.
 #: * Escalation, 403 only: ``impersonating_get`` with the same timeout.
+#: * Extraction: a PDF is parsed for up to ``extract.PDF_MAX_SECONDS`` before the
+#:   read stops and says so. It was not budgeted here while the PDF page cap
+#:   (400) bounded it to ~15 s; the 981-page packet that cap cut off takes
+#:   134 s, so extraction is a step of its own now.
 #: * The archive: ``wayback.check`` (spn_client's 10s default) and, on the
 #:   fallback path, the snapshot fetch. archive.org pacing (a 3s shared clock,
 #:   5s backoff base, shared by every worker) sits on top and is not budgeted.
@@ -202,17 +206,19 @@ _FETCH_TIMEOUT_SECONDS = 15
 #: concurrency, not findings.
 _FETCH_CHAIN_SECONDS = _FETCH_TIMEOUT_SECONDS * (_MAX_REDIRECTS + 1)
 _ESCALATION_SECONDS = _FETCH_TIMEOUT_SECONDS
+_EXTRACT_SECONDS = extract.PDF_MAX_SECONDS
 _ARCHIVE_CHECK_SECONDS = 10
 _ARCHIVE_SECONDS = _ARCHIVE_CHECK_SECONDS + _FETCH_TIMEOUT_SECONDS
 _PAGINATION_SECONDS = _FETCH_TIMEOUT_SECONDS * (pagination.MAX_PAGES - 1)
 _RELEVANCE_SECONDS = 120
 
-#: Per-claim budget for one resolution job: the chain above, summed (310s at
+#: Per-claim budget for one resolution job: the chain above, summed (490s at
 #: the values this was written with). ``batch_ceiling`` sizes the whole batch
 #: from it, so raising a step's timeout raises both.
 _RESOLVE_TIMEOUT_SECONDS = (
     _FETCH_CHAIN_SECONDS
     + _ESCALATION_SECONDS
+    + _EXTRACT_SECONDS
     + _ARCHIVE_SECONDS
     + _PAGINATION_SECONDS
     + _RELEVANCE_SECONDS
@@ -395,10 +401,25 @@ def _extract_fetched(resp, url):
 #: Where an extraction is kept on the response it came from. The page cache
 #: hands every claim citing one URL the same response object, so the text is
 #: extracted once per document per run instead of once per claim. Measured on
-#: the 2026-10-24 replay that raised the PDF page cap to 400: 3,777 s of pypdf
+#: the 2026-10-24 replay that raised the PDF page cap to 400 (since replaced
+#: by a time budget): 3,777 s of pypdf
 #: time over 90 PDF claims, 83 of them on 20 documents each cited by several
 #: claims (one 14 times) — the same packet parsed again for every claim.
 _EXTRACTED_ATTR = "_ci_extracted"
+
+#: One lock per URL, held while its response is extracted. Without it the memo
+#: only helps claims that arrive after the first parse has finished: eight
+#: workers citing one packet at once would all parse it, and a pure-Python
+#: parser under the GIL gives each of them an eighth of the CPU, so every one
+#: hits the PDF time budget with a fraction of the pages the first would have
+#: read. Locks are small and one run cites a few hundred URLs, so they are kept.
+_EXTRACT_LOCKS: dict = {}
+_EXTRACT_LOCKS_GUARD = threading.Lock()
+
+
+def _extract_lock(url):
+    with _EXTRACT_LOCKS_GUARD:
+        return _EXTRACT_LOCKS.setdefault(url, threading.Lock())
 
 
 def _extract_fetched_with_coverage(resp, url):
@@ -415,17 +436,21 @@ def _extract_fetched_with_coverage(resp, url):
     kept = getattr(resp, _EXTRACTED_ATTR, None)
     if kept is not None and kept[0] == url:
         return kept[1]
-    extracted = extract.extract_response_text_with_coverage(
-        resp.content,
-        content_type=resp.headers.get("Content-Type"),
-        url=url,
-        encoding=resp.encoding or "utf-8",
-    )
-    try:
-        setattr(resp, _EXTRACTED_ATTR, (url, extracted))
-    except (AttributeError, TypeError):
-        # A response type that refuses new attributes just loses the memo.
-        pass
+    with _extract_lock(url):
+        kept = getattr(resp, _EXTRACTED_ATTR, None)
+        if kept is not None and kept[0] == url:
+            return kept[1]
+        extracted = extract.extract_response_text_with_coverage(
+            resp.content,
+            content_type=resp.headers.get("Content-Type"),
+            url=url,
+            encoding=resp.encoding or "utf-8",
+        )
+        try:
+            setattr(resp, _EXTRACTED_ATTR, (url, extracted))
+        except (AttributeError, TypeError):
+            # A response type that refuses new attributes just loses the memo.
+            pass
     return extracted
 
 
@@ -1259,9 +1284,9 @@ def _resolve_known_url(
         result["resolved"] = False
         # A negative verdict is evidence only when the verifier saw the whole
         # document. When the pipeline's own limits left part of it unread (the
-        # PDF page cap, the pagination cap, or the excerpt window) a "not
-        # addressed" says the claim was not in the part read, and nothing
-        # more. The one exception is a contradiction the model backed with a
+        # PDF time budget or page ceiling, the pagination cap, or the excerpt
+        # window) a "not addressed" says the claim was not in the part read, and
+        # nothing more. The one exception is a contradiction the model backed with a
         # sentence that is actually on the page: text found is evidence
         # whatever was left unread. Issue #395: 40 of 111 "not supporting"
         # verdicts on one run were council packets read to page 40.
@@ -1292,6 +1317,7 @@ def _resolve_known_url(
 #: Limits that can leave part of a document unread, as the report names them.
 _LIMIT_NAMES = {
     "pdf_page_cap": "the PDF page cap",
+    "pdf_time_budget": "the PDF time budget",
     "pagination_cap": "the pagination cap",
     "byte_budget": "the pagination size budget",
     "excerpt_window": "the excerpt window",
@@ -1302,7 +1328,8 @@ def _read_coverage(coverage, window, followed):
     """One record of how much of the document the verdict rests on.
 
     Three limits can leave text unread, and a reader needs all three in one
-    place: ``extract.PDF_MAX_PAGES`` (``coverage``), the pagination follower's
+    place: the PDF time budget or page ceiling (``coverage``, whose
+    ``stopped_by`` says which), the pagination follower's
     page cap or byte budget (``followed``), and the verifier's excerpt window
     (``window``, from ``extract.select_excerpt_with_window``). ``partial`` is
     True when any of them did. Every Section 9 entry that reached a verdict
@@ -1312,7 +1339,13 @@ def _read_coverage(coverage, window, followed):
     window = window or {}
     limits = []
     if coverage.get("partial"):
-        limits.append("pdf_page_cap")
+        # A coverage record from before ``stopped_by`` existed (a saved run
+        # replayed) was cut by the page cap, the only limit there was.
+        limits.append(
+            "pdf_time_budget"
+            if coverage.get("stopped_by") == "time_budget"
+            else "pdf_page_cap"
+        )
     if followed is not None and followed.stopped == "page cap":
         limits.append("pagination_cap")
     elif followed is not None and followed.stopped == "byte budget":
@@ -1339,8 +1372,12 @@ def _coverage_sentence(read):
     parts = []
     total, done = read.get("pages_total"), read.get("pages_read")
     if total is not None and done is not None:
+        stopped = ""
+        for limit in ("pdf_time_budget", "pdf_page_cap"):
+            if done < total and limit in read.get("limits", ()):
+                stopped = f" before {_LIMIT_NAMES[limit]} stopped it"
         parts.append(
-            f"{done} of {total} PDF pages were read"
+            f"{done} of {total} PDF pages were read{stopped}"
             if done < total
             else f"all {total} PDF page(s) were read"
         )

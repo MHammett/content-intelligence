@@ -87,7 +87,7 @@ _GROUPS = (
         "read_further",
         "Open a document the run read only in part",
         "The fetch succeeded and the reader got real text, but a limit of the "
-        "pipeline's own — the PDF page cap, the pagination cap, or the window "
+        "pipeline's own — the PDF time budget, the pagination cap, or the window "
         "the verifier is shown — left part of the document unread, and the "
         "claim was not in the part read. That is not a finding against the "
         "claim. Open the document at the page the draft cites and look there.",

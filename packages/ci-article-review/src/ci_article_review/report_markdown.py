@@ -2592,8 +2592,9 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
         lines.append(
             f"**A further {len(partial)} had a document fetched and read IN PART, "
             f"and the claim was not in the part read.** Those are not "
-            f"refutations: the pipeline's page cap or excerpt window stopped the "
-            f"read, and each entry below says where. Open the document at the "
+            f"refutations: one of the pipeline's own limits (the PDF time budget, "
+            f"the pagination cap or the excerpt window) stopped the read, and "
+            f"each entry below says where. Open the document at the "
             f"cited page."
         )
     lines.append("")
@@ -2837,15 +2838,15 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
             f"### Read in part only — not found in the part read ({len(partial)}) "
             "— open these at the cited page (NOT evidence against the claim)"
         )
-        from ci_core.extract import PDF_MAX_PAGES
+        from ci_core.extract import PDF_MAX_SECONDS
 
         lines.append(
             "_The document was fetched and part of it read, and the claim was "
             "not in that part. Each entry's `Read:` line says what was read and "
-            "which limit stopped it: the PDF page cap "
-            f"({PDF_MAX_PAGES} pages), the pagination cap, or the excerpt "
-            "window the verifier is shown. A verdict here is a verdict about the "
-            "part read. The claim may sit further on in the document, and the "
+            "which limit stopped it: the PDF time budget "
+            f"({PDF_MAX_SECONDS} seconds of text extraction per document), the "
+            "pagination cap, or the excerpt window the verifier is shown. A "
+            "verdict here is a verdict about the part read. The claim may sit further on in the document, and the "
             "only way to settle it is to open the document at the page the "
             "draft cites._"
         )
