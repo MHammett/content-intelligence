@@ -238,6 +238,21 @@ class CompareInfo:
 
 
 @dataclass(frozen=True)
+class CommitDetail:
+    """One commit as ``get_commit`` reads it: its message, parents and dates."""
+
+    sha: str
+    message: str
+    #: Parent SHAs, first parent first.
+    parents: tuple
+    tree: str
+    #: The author's and committer's dates as GitHub gave them (ISO 8601, with an offset).
+    author_date: str | None
+    committer_date: str | None
+    html_url: str
+
+
+@dataclass(frozen=True)
 class CommitSummary:
     """One commit of a path's history."""
 
@@ -731,6 +746,32 @@ class GitHubRepo:
             date=(commit.get("committer") or {}).get("date"),
         )
 
+    def get_commit(self, sha):
+        """One commit by its full SHA: message, parents, tree and both dates.
+
+        The dates are what the commit carries (a backdated import shows them), not
+        when GitHub received it.
+        """
+        if not _FULL_SHA.match(sha or ""):
+            raise ValueError(f"get_commit wants a full 40-hex SHA, got {sha!r}")
+        resp = self._send("GET", f"/repos/{self.repo}/git/commits/{sha}")
+        if resp.status_code == 404:
+            raise self._error(
+                "not_found", f"{self.repo} has no commit {sha[:12]}", status=404
+            )
+        if not 200 <= resp.status_code < 300:
+            raise self._http_error(resp, f"read commit {sha[:12]}")
+        body = resp.json()
+        return CommitDetail(
+            sha=body.get("sha") or sha,
+            message=body.get("message") or "",
+            parents=tuple(p["sha"] for p in body.get("parents") or []),
+            tree=(body.get("tree") or {}).get("sha") or "",
+            author_date=(body.get("author") or {}).get("date"),
+            committer_date=(body.get("committer") or {}).get("date"),
+            html_url=body.get("html_url") or "",
+        )
+
     # -- writes --------------------------------------------------------------
 
     def commit_files(
@@ -1170,6 +1211,25 @@ class GitHubRepo:
         if made.status_code == 422 and "already_exists" in (made.text or ""):
             return False  # created by someone between the look-up and the create
         raise self._http_error(made, f"create label {name}")
+
+    def add_labels(self, number, labels):
+        """Add labels to an issue or a pull request; returns the names it now carries.
+
+        ``POST /issues/{n}/labels`` adds to what is there and a label already on
+        it is not duplicated, so repeating the call is safe. A label that does not
+        exist in the repository is created by GitHub with a default colour: call
+        ``ensure_label`` first for the ones that should look right.
+        """
+        _number(number, "issue number")
+        labels = list(labels)
+        if not labels:
+            raise ValueError("no labels to add")
+        resp = self._request(
+            "POST",
+            f"/repos/{self.repo}/issues/{number}/labels",
+            body={"labels": labels},
+        )
+        return [item["name"] for item in resp.json()]
 
     def create_issue(self, title, body, labels=()):
         """Open an issue; returns ``(number, html_url)``."""

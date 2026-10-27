@@ -121,9 +121,10 @@ def _runs_text(runs):
     return f", runs {head} and {runs[-1]}"
 
 
-def tag_message(slug, number, pull_number, runs):
-    """``example-article r3: PR #12, runs 6 and 7``."""
-    return f"{slug} r{number}: PR #{pull_number}{_runs_text(runs)}"
+def tag_message(slug, number, pull_number, runs, *, imported=False):
+    """``example-article r3: PR #12, runs 6 and 7``; ``... r3 (imported): PR #12 ...`` for an import."""
+    mark = " (imported)" if imported else ""
+    return f"{slug} r{number}{mark}: PR #{pull_number}{_runs_text(runs)}"
 
 
 def _merged_at(pull):
@@ -207,7 +208,7 @@ def _read_back(client, tag, number, pull):
     )
 
 
-def tag_merged_rounds(client, slug, *, dry_run=False, repo=None):
+def tag_merged_rounds(client, slug, *, dry_run=False, repo=None, imported=None):
     """Tag every merged, untagged round of ``slug``; returns a ``TagResult`` per round touched.
 
     For each merged pull request from ``round/<slug>/rN`` with no tag
@@ -215,6 +216,11 @@ def tag_merged_rounds(client, slug, *, dry_run=False, repo=None):
     token's user, dated at the merge, message ``<slug> rN: PR #n, runs ...`` with
     the runs read from the review markers. A round that already has its tag is
     not in the result, so a second call returns ``[]`` and writes nothing.
+
+    ``imported`` is for the history import: ``{round number: accepted_at}``
+    (timezone-aware datetimes). Only those rounds are tagged, the tag is dated
+    ``accepted_at`` instead of the merge's own time (an import's merge happens
+    now, the round was accepted then), and the message says ``(imported)``.
 
     A ``GitHubRepoError`` never escapes: it becomes a ``failed`` result, and the
     other rounds go on (except after a rate limit or a rejected token, where
@@ -234,7 +240,7 @@ def tag_merged_rounds(client, slug, *, dry_run=False, repo=None):
         ]
     user = None
     for number, pull in sorted(merged.items()):
-        if number in have:
+        if number in have or (imported is not None and number not in imported):
             continue
         tag = round_tag(slug, number)
         commit = pull.merge_commit_sha
@@ -252,7 +258,11 @@ def tag_merged_rounds(client, slug, *, dry_run=False, repo=None):
             continue
         try:
             message = tag_message(
-                slug, number, pull.number, review_runs(client, pull.number)
+                slug,
+                number,
+                pull.number,
+                review_runs(client, pull.number),
+                imported=imported is not None,
             )
             if dry_run:
                 results.append(
@@ -272,7 +282,7 @@ def tag_merged_rounds(client, slug, *, dry_run=False, repo=None):
             tagger = Signature(
                 user.name or user.login,
                 f"{user.id}+{user.login}@users.noreply.github.com",
-                _merged_at(pull),
+                imported[number] if imported is not None else _merged_at(pull),
             )
             client.create_tag(tag, message, commit, tagger=tagger)
             results.append(

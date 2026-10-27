@@ -1143,6 +1143,67 @@ deletes or force-moves anything, and `--dry-run` prints every write. The live
 check runs on `MHammett/ci-docs-scratch`; applying to the real repository is the
 maintainer's word, per article.
 
+**As built (`ci-docs import apply`, issue #421; the issue governs where it
+differs from the sketch above).** The code is `history_apply.py`. What the sketch
+does not say, or says differently:
+
+- **Commits.** One commit per included event, except that a `metadata` or
+  `handoff` event rides in its draft's commit when it is `attached_to` that draft
+  and sits next to it in the round. The round's first commit that carries a draft
+  is `draft: <slug> rN`, later ones `revise: <slug> rN`; a run is `review: <slug>
+  rN run M`; a close-out note is `close-out: <slug> rN to-chat|to-code` (by its
+  `Direction:` line) and a publication handoff `publication: <slug> rN`. A commit
+  that writes `draft.md` deletes a `handoff.md` the folder holds, and one that
+  writes `handoff.md` deletes `draft.md` and `metadata.md`, so the folder is never
+  in two forms. A commit's date is the latest `at` of its events. Trailers:
+  `Imported-from:` (file name, Drive id from `drive-manifest.json`, `chat
+  <conversation>/<message>`, `run <history name>`), `Imported-at:`, `Plan-event:`
+  (the event id, which is how a resume recognises its own commits), and where it
+  applies `Recovered:`, `Source:` (the plan's `note`) and `Corroborated: no`
+  (`corroborated: false`, #430). The bytes written are the source's own, with CRLF
+  turned into LF, checked against the hash the plan recorded; a chat-built text is
+  the rebuilt one.
+- **Run files** are `review.md`, `pipeline/report.json`, `pipeline/worklist.md` and
+  `pipeline/run.json` as `--write-back` writes them (`pipeline/results.json` only
+  when the plan has `"include_capture": true`). `run.json` has `pull_request:
+  null`, because the pull request does not exist when the commit is made, and
+  `imported: true`. A run with no `_review.md` beside its report is refused: exclude
+  it in the plan.
+- **Reviews** use `build_review_body` and the marker, `commit_id` the commit that
+  wrote the version the run reviewed (else the round's latest commit before it). No
+  line comments.
+- **The merge** is `merge_commit("main", branch tip, "<slug> rN (#n)")` dated
+  `accepted_at`, then `get_pull` polled (about a minute at most) until `merged`;
+  this is the path #413's live check found works, and the live check of this
+  phase took it for all seven rounds (`merged_at` is the import's, the merge
+  commit's dates are `accepted_at`). If the flag never appears, the fallback
+  `PUT .../merge` (`merge_method: merge`, dated now) is tried once, and its refusal
+  is an error that leaves `main` where it is; a rerun never tries it, because by
+  then `main` already holds the round.
+- **The tag** is made by `tag_merged_rounds(client, slug, imported={n:
+  accepted_at})`: only the rounds being imported, dated `accepted_at`, message
+  `<slug> rN (imported): PR #n, runs ...`. Without `imported` the function is
+  unchanged.
+- **Refused before a write**, besides those in the issue: an included `review`,
+  `changes` or `unknown` document (no place in the folder: set `include` false), a
+  close-out note whose `Direction:` is not `to-chat` or `to-code`, a file holding a
+  configured API key, a plan inside this checkout, and an `applied` block that
+  names a round the plan no longer has.
+- **Resuming** also adopts what GitHub has and the plan does not record: an
+  unrecorded commit whose `Plan-event` trailers are the next events in the plan, an
+  unrecorded pull request from the round's branch, an unrecorded review with the
+  run's marker, a merged pull request, an existing tag on the merge commit. A
+  recorded step that is gone, a plan whose recorded commits no longer match its
+  events, or a branch with commits that are not this import's is an error.
+- **Dry run** needs the token (it reads the repository to run the refusals), prints
+  `would ...` for every write, and does not touch the plan file. The commit
+  placeholders it shows (`dry-1`) are not SHAs.
+- **Test support** (not product): ci-core gained `GitHubRepo.add_labels` and
+  `get_commit`, and the in-process `FakeGitHub` now marks a pull request merged
+  when its base branch is moved to a commit that holds its head (switch
+  `marks_merged_on_ref_move`, delay `merge_flag_lag`), refuses a review whose
+  `commit_id` is not in the pull request, and adds labels.
+
 **Privacy.** The sources are private: unpublished drafts, chats, and slugs. They
 go from local disk to the private repository and nowhere else. Tests use invented
 slugs and synthetic fixtures (a made-up three-message export, made-up reports);

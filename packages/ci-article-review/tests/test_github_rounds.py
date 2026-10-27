@@ -137,6 +137,26 @@ class TestTagMergedRounds:
         assert obj["type"] == "commit" and obj["object"] == merged.merge_commit_sha
         assert results[0].commit == merged.merge_commit_sha
 
+    def test_an_import_tags_only_its_rounds_dated_at_acceptance_and_says_imported(
+        self, fake, gh
+    ):
+        from datetime import datetime, timezone
+
+        accepted = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+        make_round(fake, gh, 1, merged=True, runs=(4,))
+        make_round(fake, gh, 2, merged=True)
+
+        results = gr.tag_merged_rounds(gh, SLUG, imported={1: accepted})
+
+        assert [(r.round, r.status) for r in results] == [(1, gr.CREATED)]
+        assert sorted(fake.tags) == [
+            "example-article/r1"
+        ]  # round 2 is not the import's
+        obj = tag_obj(fake, "example-article/r1")
+        assert obj["tagger"]["date"] == "2026-06-01T10:00:00+00:00"
+        assert obj["message"].startswith("example-article r1 (imported): PR #")
+        assert obj["message"].endswith(", run 4")
+
     def test_the_tagger_is_the_tokens_user_dated_at_the_merge(self, fake, gh):
         make_round(fake, gh, 1, merged=True)
         gr.tag_merged_rounds(gh, SLUG)
