@@ -22,8 +22,9 @@ The sources, in the order they are trusted for a version's *time*:
 source          what it gives                                        time
 ==============  ==================================================  =========
 saved runs      a run, and the draft it reviewed                     ``generated``
-(claude.ai      in-chat versions                                     message time; issue #422, not built)
-export)
+(claude.ai      in-chat versions: a tool call's whole file, an edit   the tool call's timestamp, else the
+export)         replayed on the file it edited, an attachment, a      message's ``created_at`` (server time)
+                fenced block or a long human message
 ``--drive-dir`` files exactly as submitted                           Drive ``createdTime``
 ``--files``     drafts, metadata, handoffs, close-out, changes       file mtime
 ``--recovered`` versions a chat *reproduced from its context*        the sidecar's ``claimed_at`` only
@@ -48,6 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import chat_export as chat_export_module
 from . import handoff_parser
 from .passage_match import same_passage, tokenise
 
@@ -72,7 +74,9 @@ BYTE_ORDER_MARK = chr(0xFEFF)
 _NEVER_READ = ("_experiments", "_replay", "_nested")
 
 #: Lower is more trusted. Used to choose between source times that are close.
-_TRUST = {"run": 0, "drive": 1, "file": 2, "recovered": 3}
+#: A chat message's time is the server's, like a run's ``generated``: the text
+#: existed then.
+_TRUST = {"run": 0, "chat": 0, "drive": 1, "file": 2, "recovered": 3}
 
 #: Two timestamps this close are the same moment for trust purposes: the version's
 #: time is then the more trusted source's, not merely the earlier one's.
@@ -85,6 +89,22 @@ _EXPERIMENT_WINDOW = timedelta(minutes=30)
 #: its label is allowed to supersede the reproduction. A label shared by several
 #: versions (every run numbered 1) must not swallow a reproduction of another.
 _MIN_CLOSENESS = 0.6
+
+#: A chat text is a version of the draft when at least this share of *its* content
+#: tokens is in some known version of the draft (issue #422)...
+_CHAT_SHARE_OF_CANDIDATE = 0.6
+
+#: ...and it carries at least this share of *that version's* tokens. The first
+#: rule alone passes a two-thousand-character excerpt of a long draft, which is a
+#: fragment and not a version.
+_CHAT_SHARE_OF_VERSION = 0.5
+
+#: How far from a reproduction's claimed time an export version may be and still
+#: stand in for it (the label must match too).
+_REPRODUCTION_WINDOW = timedelta(days=3)
+
+#: Where a chat text came from when the author, not the chat, named the file.
+_AUTHORS_FILES = ("attachment", "project_doc")
 
 _DOCUMENT_SUFFIXES = (".md", ".markdown")
 
@@ -117,11 +137,6 @@ _KIND_ORDER = {
     "review": 7,
     "unknown": 8,
 }
-
-_CHAT_NOT_BUILT = (
-    "reading a claude.ai export is not built yet (issue #422); run the scan "
-    "without --chat-export and --conversation"
-)
 
 
 class ImportScanError(Exception):
@@ -322,7 +337,7 @@ def refuse_out_inside_checkout(out_path):
 class Holder:
     """One place a draft text was seen."""
 
-    source: str  # run | drive | file | recovered
+    source: str  # run | chat | drive | file | recovered
     path: str
     time: object  # aware datetime, or None
     label: object = None
@@ -330,6 +345,8 @@ class Holder:
     lt_undone: bool = False
     run: object = None
     claimed: bool = False
+    via: object = None  # chat only: the tool or place the text came from
+    locator: object = None  # chat only: where in the message
 
     def record(self):
         entry = {
@@ -337,6 +354,9 @@ class Holder:
             "path": self.path,
             "time": _iso(self.time) if self.time else None,
         }
+        if self.via:
+            entry["via"] = self.via
+            entry["locator"] = self.locator
         if self.part:
             entry["part"] = self.part
         if self.lt_undone:
@@ -354,6 +374,7 @@ class Event:
     holders: list = field(default_factory=list)
     include: bool = True
     note: object = None
+    why: object = None  # why an event is left out of the plan for the author to decide
     recovered: bool = False
     superseded_by: object = None
     submitted: bool = False
@@ -462,6 +483,8 @@ class _Collector:
         self.warnings = []
         self.skipped_by_name = 0
         self.seen_paths = set()
+        self.chat = None  # the export's candidates, when --chat-export was given
+        self.terms = frozenset()
 
 
 def _scan_files(collector, directories, terms, include_names):
@@ -699,6 +722,219 @@ def _scan_runs(collector, history_root, keys):
 
 
 # ---------------------------------------------------------------------------
+# The claude.ai export
+# ---------------------------------------------------------------------------
+
+_ARTICLE_RE = re.compile(r"^Article:[ \t]*(\S.*)$", re.MULTILINE)
+
+_MIN_DATE = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _article_title(collector):
+    """The article's title from the newest metadata or handoff document, or ``None``."""
+    documents = sorted(
+        (f for f in collector.found if f.kind in ("metadata", "handoff")),
+        key=lambda f: (f.time or _MIN_DATE, _posix(f.path)),
+        reverse=True,
+    )
+    for document in documents:
+        found = _ARTICLE_RE.search(document.text)
+        if found and not found.group(1).strip().startswith("["):
+            return found.group(1).strip()
+    return None
+
+
+def _prepare_chat(collector, path, listed, terms):
+    """Read the export, link its conversations to the article and list their candidates."""
+    try:
+        export = chat_export_module.load_export(path)
+        pattern = _term_pattern(terms)
+        links = chat_export_module.link_conversations(
+            export, pattern, _article_title(collector), listed
+        )
+    except chat_export_module.ChatExportError as exc:
+        raise ImportScanError(str(exc)) from exc
+    read = {}
+    candidates = []
+    for link in links:
+        found, counts = chat_export_module.extract(link.conversation)
+        for key, value in counts.items():
+            read[key] = read.get(key, 0) + value
+        candidates.extend((c, link.strong) for c in found)
+    candidates.extend(
+        (c, True) for c in chat_export_module.project_candidates(export, pattern)
+    )
+    links.sort(key=lambda link: (link.conversation.get("created_at") or "", link.uuid))
+    if not links:
+        collector.warnings.append(
+            "--chat-export: no conversation in the export names the article "
+            "(its slug, a file name, or its title); pass --conversation UUID"
+        )
+    return {
+        "export": export,
+        "links": links,
+        "candidates": candidates,
+        "read": read,
+        "report": {},
+    }
+
+
+def _chat_text(candidate, terms):
+    """``(normalised text, label, part)`` of a chat candidate.
+
+    The label is the one its file name or artifact title carries (``v27``, ``r3``).
+    A Template A handoff holds the draft inside it, and that draft is the text.
+    """
+    label = None
+    if candidate.name:
+        _, label = _file_kind_and_label(candidate.name, terms, candidate.text)
+    embedded = _embedded_draft(candidate.text)
+    if embedded:
+        return normalise(embedded), label, "draft"
+    return normalise(candidate.text), label, None
+
+
+def _resembles(tokens, refs):
+    """Whether a text is a whole version of the draft: not an excerpt, outline or talk about it."""
+    if not tokens:
+        return False
+    for ref in refs:
+        shared = len(tokens & ref)
+        if shared >= _CHAT_SHARE_OF_CANDIDATE * len(
+            tokens
+        ) and shared >= _CHAT_SHARE_OF_VERSION * len(ref):
+            return True
+    return False
+
+
+def _only_chat(version):
+    """A version whose only non-reproduction sources are chat messages."""
+    real = [h for h in version.holders if h.source != "recovered"]
+    return bool(real) and all(h.source == "chat" for h in real)
+
+
+def _ingest_chat(chat, versions, version_for, ref_texts, terms):
+    """Turn the export's candidates into draft versions (or sources of existing ones).
+
+    A candidate is kept when it resembles a known version (see ``_resembles``);
+    kept ones are added to the references as they come, oldest first, so a draft
+    that grew over a conversation is followed one step at a time. The references
+    grow only from conversations linked by more than the title.
+    """
+    before = set(versions)
+    refs = [tokenise(t) for t in ref_texts]
+    had_references = bool(refs)
+    verdict, grown, weak_only, first_edit = {}, set(), set(), {}
+    kept_shas, kept_by_via, dropped_by_via = set(), {}, {}
+    kept = dropped = 0
+    ordered = sorted(
+        chat["candidates"],
+        key=lambda cs: (
+            cs[0].created,
+            cs[0].conversation,
+            cs[0].message,
+            cs[0].locator,
+        ),
+    )
+    for candidate, strong in ordered:
+        text, label, part = _chat_text(candidate, terms)
+        sha = _sha(text) if text else None
+        if sha is None:
+            dropped += 1
+            dropped_by_via[candidate.via] = dropped_by_via.get(candidate.via, 0) + 1
+            continue
+        tokens = None
+        if sha not in verdict:
+            tokens = tokenise(text)
+            verdict[sha] = _resembles(tokens, refs)
+        if verdict[sha] and strong and sha not in grown:
+            grown.add(sha)
+            refs.append(tokens if tokens is not None else tokenise(text))
+        if not verdict[sha]:
+            dropped += 1
+            dropped_by_via[candidate.via] = dropped_by_via.get(candidate.via, 0) + 1
+            continue
+        kept += 1
+        kept_shas.add(sha)
+        kept_by_via.setdefault(candidate.via, set()).add(sha)
+        first_edit.setdefault(sha, candidate.edit)
+        existed = sha in versions
+        version = version_for(sha, text)
+        version.holders.append(
+            Holder(
+                source="chat",
+                path=candidate.source,
+                time=candidate.created,
+                label=label,
+                part=part,
+                via=candidate.via,
+                locator=candidate.locator,
+            )
+        )
+        if not existed and not strong:
+            version.include = False
+            version.why = "the conversation is linked to the article only by its title"
+            weak_only.add(sha)
+        elif strong and sha in weak_only:
+            version.include = True
+            version.why = None
+            weak_only.discard(sha)
+    new = kept_shas - before
+    chat["report"].update(
+        {
+            "candidates": len(ordered),
+            "kept": kept,
+            "dropped": dropped,
+            "dropped_by_via": dict(sorted(dropped_by_via.items())),
+            "versions_by_via": {k: len(v) for k, v in sorted(kept_by_via.items())},
+            "versions": len(kept_shas),
+            "new": len(new),
+            "duplicates_of_other_sources": len(kept_shas & before),
+            "in_round_edits": sum(1 for sha in new if first_edit.get(sha)),
+            "left_out": len(weak_only),
+            "no_references": not had_references,
+            "confirmed": 0,
+            "replaced": 0,
+        }
+    )
+
+
+def _in_reproduction_window(holder, version, versions):
+    """Whether an export version could be the one a reproduction claims to copy.
+
+    Its time must be near the reproduction's claimed time, if there is one, and
+    between the nearest lower and higher labelled versions that other sources hold.
+    """
+    at = _best_time(version.holders)
+    if at is None:
+        return True
+    if holder.time and abs(at - holder.time) > _REPRODUCTION_WINDOW:
+        return False
+    label = holder.label
+    if not label:
+        return True
+    number = int(label[1:])
+    lower = higher = None
+    for other in versions.values():
+        if other is version or _only_chat(other):
+            continue
+        moment = _best_time(other.holders)
+        if moment is None:
+            continue
+        for found in other.match_labels():
+            if found[0] != label[0]:
+                continue
+            n = int(found[1:])
+            if n < number and (lower is None or moment > lower):
+                lower = moment
+            elif n > number and (higher is None or moment < higher):
+                higher = moment
+    if lower is not None and at <= lower:
+        return False
+    return not (higher is not None and at >= higher)
+
+
+# ---------------------------------------------------------------------------
 # Building events
 # ---------------------------------------------------------------------------
 
@@ -813,12 +1049,28 @@ def _build_events(collector):
             event.sha = _sha(normalise(corrected))
         run_events.append(event)
 
+    # The claude.ai export: texts that resemble a known version, whole.
+    chat = collector.chat
+    if chat is not None:
+        _ingest_chat(
+            chat,
+            versions,
+            version_for,
+            [
+                *(v.text for v in versions.values()),
+                *(text for _, _, text in recovered_drafts),
+            ],
+            collector.terms,
+        )
+
     # Reproductions: any other source holding the version wins.
     for item, holder, text in sorted(
         recovered_drafts, key=lambda r: (r[1].path, r[1].part or "")
     ):
         sha = _sha(text)
         if sha in versions:
+            if chat is not None and _only_chat(versions[sha]):
+                chat["report"]["confirmed"] += 1  # the export holds these exact bytes
             versions[sha].holders.append(holder)  # the same bytes: it is that version
             continue
         # A version is "held" by a real source unless every holder is a reproduction.
@@ -828,9 +1080,15 @@ def _build_events(collector):
                 if any(h.source != "recovered" for h in version.holders) and (
                     holder.label in version.match_labels()
                 ):
+                    if _only_chat(version) and not _in_reproduction_window(
+                        holder, version, versions
+                    ):
+                        continue
                     label_matches.append((_closeness(text, version.text), version))
         best = max(label_matches, key=lambda m: m[0], default=None)
         if best and best[0] >= _MIN_CLOSENESS:
+            if chat is not None and _only_chat(best[1]):
+                chat["report"]["replaced"] += 1  # the export's text stands in for it
             event = Event(
                 kind="draft",
                 sha=sha,
@@ -849,8 +1107,16 @@ def _build_events(collector):
     for version in drafts:
         real = [h for h in version.holders if h.source != "recovered"]
         version.recovered = not real
+        # A file name a chat's tool call chose says which version a draft is, but
+        # a chat edits that file many times: those are revisions, not submissions.
+        # A file the author put in front of the chat (an attachment, a project
+        # file), another source's label, a run or a Drive copy makes it one.
         version.submitted = bool(
-            version.label
+            any(
+                h.label
+                for h in version.holders
+                if h.source != "chat" or h.via in _AUTHORS_FILES
+            )
             or any(h.source in ("run", "drive") for h in real)
             or (version.recovered and any(h.label for h in version.holders))
         )
@@ -992,8 +1258,8 @@ def scan(
 
     ``plan`` is the JSON-ready dict; ``stats`` holds the counts the summary prints.
     """
-    if chat_export or conversations:
-        raise ImportScanError(_CHAT_NOT_BUILT)
+    if conversations and not chat_export:
+        raise ImportScanError("--conversation needs --chat-export")
     if not isinstance(slug, str) or not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]*", slug
     ):
@@ -1012,12 +1278,15 @@ def scan(
 
     terms = {slug.lower(), *(k.lower() for k in keys)}
     collector = _Collector()
+    collector.terms = frozenset(terms)
     _scan_runs(collector, root, keys)
     _scan_files(collector, files, terms, include)
     if drive_dir:
         _scan_drive(collector, drive_dir, terms)
     if recovered:
         _scan_recovered(collector, recovered, terms)
+    if chat_export:
+        collector.chat = _prepare_chat(collector, chat_export, conversations, terms)
 
     drafts, others, run_events = _build_events(collector)
     if not (drafts or others or run_events):
@@ -1084,6 +1353,7 @@ def scan(
     near = [
         sorted([a.id, b.id], key=lambda i: int(i[1:]))
         for a, b in _near_duplicates([d for d in drafts if d.include])
+        if not (_only_chat(a) and _only_chat(b))  # an edit chain, not a duplicate
     ]
     near.sort(key=lambda p: (int(p[0][1:]), int(p[1][1:])))
 
@@ -1107,11 +1377,37 @@ def scan(
     }
     if collector.warnings:
         plan["warnings"] = sorted(collector.warnings)
+    if collector.chat is not None:
+        plan["chat"] = _chat_record(collector.chat)
 
     stats = _stats(
         collector, drafts, others, run_events, rounds, root, root_why, keys, near
     )
     return plan, stats
+
+
+def _chat_record(chat):
+    """The plan's ``chat`` block: where the export is, and which conversations were read.
+
+    Conversation ids, dates, message counts and why each was linked; never a name
+    or any text.
+    """
+    return {
+        "export": chat["export"].path,
+        "linked": [
+            {
+                "conversation": link.uuid,
+                "created_at": link.conversation.get("created_at"),
+                "messages": link.messages,
+                "linked_by": list(link.reasons),
+                "strong": link.strong,
+            }
+            for link in chat["links"]
+        ],
+        "read": dict(sorted(chat["read"].items())),
+        "kept": chat["report"],
+        "skipped": dict(sorted(chat["export"].skipped.items())),
+    }
 
 
 def _event_record(event):
@@ -1157,6 +1453,8 @@ def _event_record(event):
         record["attached_to"] = event.attached_to.id
     if event.note:
         record["note"] = event.note
+    if event.why:
+        record["why"] = event.why
     if event.placement:
         record["placement"] = event.placement
     if event.hint:
@@ -1167,11 +1465,13 @@ def _event_record(event):
 
 
 def _stats(collector, drafts, others, run_events, rounds, root, root_why, keys, near):
-    types = ("run", "drive", "file", "recovered")
+    types = ("run", "chat", "drive", "file", "recovered")
     per_source = {}
     for source in types:
         if source == "run":
             candidates = len(run_events)
+        elif source == "chat":
+            candidates = collector.chat["report"]["kept"] if collector.chat else 0
         else:
             candidates = sum(1 for f in collector.found if f.source == source)
         versions = sum(1 for d in drafts if any(h.source == source for h in d.holders))
@@ -1180,7 +1480,7 @@ def _stats(collector, drafts, others, run_events, rounds, root, root_why, keys, 
     document_files = len(collector.found)
     other_events = [e for e in others if e.superseded_by is None]
     other_holders = sum(len(e.holders) for e in others if e.superseded_by is None)
-    return {
+    stats = {
         "history_root": root.as_posix(),
         "history_root_why": root_why,
         "history_keys": keys,
@@ -1201,6 +1501,26 @@ def _stats(collector, drafts, others, run_events, rounds, root, root_why, keys, 
         "near_duplicate_pairs": len(near),
         "warnings": list(collector.warnings),
     }
+    if collector.chat is not None:
+        chat = collector.chat
+        stats["chat"] = {
+            "conversations": len(chat["export"].conversations),
+            "linked": [
+                {
+                    "uuid": link.uuid,
+                    "created_at": link.conversation.get("created_at"),
+                    "messages": link.messages,
+                    "linked_by": list(link.reasons),
+                    "strong": link.strong,
+                }
+                for link in chat["links"]
+            ],
+            "skipped": dict(chat["export"].skipped),
+            "read": dict(chat["read"]),
+            "rounds": len(rounds),
+            **chat["report"],
+        }
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -1227,7 +1547,7 @@ def _short_sources(sources):
     counts = {}
     for source in sources:
         counts[source["type"]] = counts.get(source["type"], 0) + 1
-    names = [Path(s["path"]).name for s in sources if s["type"] != "run"]
+    names = [Path(s["path"]).name for s in sources if s["type"] not in ("run", "chat")]
     kinds = "+".join(f"{k}({n})" if n > 1 else k for k, n in sorted(counts.items()))
     if names:
         extra = f" +{len(names) - 1}" if len(names) > 1 else ""
@@ -1294,7 +1614,62 @@ def format_summary(stats):
             f"Near-duplicate draft pairs listed: {stats['near_duplicate_pairs']}",
         ]
     )
+    if "chat" in stats:
+        lines.extend(_format_chat(stats["chat"]))
     lines.extend(f"warning: {w}" for w in stats["warnings"])
+    return lines
+
+
+def _format_chat(chat):
+    """The export's part of the summary: counts and conversation ids, never names or text."""
+    strong = sum(1 for link in chat["linked"] if link["strong"])
+    lines = [
+        f"Chat export: {chat['conversations']} conversations searched by content (they "
+        f"carry no project id); {len(chat['linked'])} linked ({strong} by the slug or a "
+        f"file name, {len(chat['linked']) - strong} by the title only)",
+    ]
+    for link in chat["linked"]:
+        lines.append(
+            f"  {link['uuid']}  created {(link['created_at'] or '?')[:10]}  "
+            f"{link['messages']} messages  linked by {', '.join(link['linked_by'])}"
+        )
+    kept_by = ", ".join(f"{k} {n}" for k, n in chat.get("versions_by_via", {}).items())
+    lines.append(
+        f"  Candidates: {chat.get('candidates', 0)}; kept {chat.get('kept', 0)}, "
+        f"dropped {chat.get('dropped', 0)} (an outline, an excerpt, or talk about the draft)"
+    )
+    lines.append(
+        f"  Distinct versions kept: {chat.get('versions', 0)}"
+        + (f" ({kept_by})" if kept_by else "")
+    )
+    lines.append(
+        f"  New: {chat.get('new', 0)}; already held by a run, Drive or a file: "
+        f"{chat.get('duplicates_of_other_sources', 0)}; in-round edits: "
+        f"{chat.get('in_round_edits', 0)}; left out for the author (title only): "
+        f"{chat.get('left_out', 0)}"
+    )
+    lines.append(
+        f"  Reproductions: {chat.get('confirmed', 0)} confirmed by the export, "
+        f"{chat.get('replaced', 0)} replaced by it"
+    )
+    read = chat["read"]
+    lines.append(
+        f"  Tool calls read: {read.get('tool_calls', 0)}; edits rebuilt "
+        f"{read.get('edits_applied', 0)}, not rebuilt {read.get('edits_unanchored', 0)} "
+        f"(file never written in the chat) + {read.get('edits_unapplied', 0)} (old text "
+        f"not found exactly once); failed calls {read.get('failed_calls', 0)}; "
+        f"shapes skipped {read.get('shapes_skipped', 0)}"
+    )
+    if chat["skipped"]:
+        lines.append(
+            "  Skipped in the export: "
+            + ", ".join(f"{n} {what}" for what, n in sorted(chat["skipped"].items()))
+        )
+    if chat.get("no_references"):
+        lines.append(
+            "  warning: no other source holds a draft, so no chat text could be "
+            "compared with one"
+        )
     return lines
 
 
@@ -1307,14 +1682,48 @@ def format_excluded(plan):
 # ---------------------------------------------------------------------------
 
 
-def _load_source(source):
+def _load_chat_source(source, context):
+    """``(text, None)`` for a chat source the export still holds, else ``(None, why)``.
+
+    The export is read once per ``check`` and only if an included event has a chat
+    source. The text is rebuilt the way the scan built it, so a plan whose export
+    was replaced or moved says so instead of passing.
+    """
+    where = source.get("path", "")
+    exported = context.get("export_path")
+    if not exported:
+        return None, f"{where}: the plan names no chat export"
+    if "export" not in context:
+        try:
+            context["export"] = chat_export_module.load_export(exported)
+        except chat_export_module.ChatExportError as exc:
+            context["export"] = str(exc)
+    export = context["export"]
+    if isinstance(export, str):
+        return None, export
+    conversation, _, message = where.removeprefix("chat:").partition("/")
+    found = chat_export_module.recompute(
+        export,
+        conversation,
+        message,
+        source.get("locator", ""),
+        pattern=_term_pattern(context["terms"]),
+    )
+    if found is None:
+        return None, f"{where} is no longer in the export"
+    return _chat_text(found, context["terms"])[0], None
+
+
+def _load_source(source, context=None):
     """``(text, None)`` for a source file that is present, else ``(None, why)``.
 
     The text is the normalised text the event's hash was taken from: the whole
     file, a handoff's embedded draft, or a run's ``corrected_draft`` (with its
     LanguageTool corrections undone when the plan says the run held the submitted
-    version).
+    version), or a chat message's text rebuilt from the export.
     """
+    if source.get("type") == "chat":
+        return _load_chat_source(source, context or {})
     path = Path(source.get("path", ""))
     shown = path.as_posix()
     if not path.is_file():
@@ -1356,6 +1765,14 @@ def check_plan(plan):
         return ["the plan has no rounds"]
 
     problems = []
+    context = {
+        "export_path": (plan.get("chat") or {}).get("export"),
+        "terms": {
+            str(t).lower()
+            for t in [plan.get("slug"), *(plan.get("history_keys") or [])]
+            if t
+        },
+    }
     ids = {}
     for group in rounds:
         for event in group.get("events", []):
@@ -1390,7 +1807,7 @@ def check_plan(plan):
                 problems.append(f"{name} is included but has no usable time ({exc})")
                 continue
             times.append((at, name))
-            problems.extend(_check_event_files(event, name))
+            problems.extend(_check_event_files(event, name, context))
         for (earlier, _), (later, name) in zip(times, times[1:]):
             if later < earlier:
                 problems.append(f"{name}: earlier than the event before it in {label}")
@@ -1413,7 +1830,7 @@ def check_plan(plan):
     return problems
 
 
-def _check_event_files(event, name):
+def _check_event_files(event, name, context):
     """Problems with an included event's files: one source must be present, unchanged."""
     if event.get("kind") == "run":
         sources = [
@@ -1425,8 +1842,9 @@ def _check_event_files(event, name):
         return [f"{name}: included but names no source file"]
     recorded = event.get("sha256")
     reasons = []
-    for source in sources:
-        text, why = _load_source(source)
+    # The export is large: read it only if no file holds the version.
+    for source in sorted(sources, key=lambda s: s.get("type") == "chat"):
+        text, why = _load_source(source, context)
         if why:
             reasons.append(why)
         elif recorded and _sha(text) != recorded:

@@ -754,7 +754,7 @@ uv run ci-docs import apply ~/ci-import/example-article/plan.json --repo MHammet
 | Source | Read how | Gives | Timestamp, and how far it is trusted |
 |---|---|---|---|
 | saved runs: `pipeline_history/<key>/run_N_<ts>_report.json` (and `_review.md`, `_worklist.md`, `_results.json`) in the main checkout or `$CI_HISTORY_ROOT`, for each `--history-key` | locally | each run's review files, and `corrected_draft`, the draft it reviewed after the LanguageTool pass | `generated` (UTC, written by the run): **trusted most**, it is the moment the pipeline had that text |
-| claude.ai export (`conversations.json`) | locally, from the export the maintainer downloads | in-chat versions of the draft and the edits between submissions | each message's `created_at` (server time, UTC): **trusted as much**, the text existed then |
+| claude.ai export (`conversations.json`) | locally, from the export the maintainer downloads | in-chat versions of the draft and the edits between submissions | a tool call's `start_timestamp` where it has one, else its message's `created_at` (server time, UTC): **trusted as much**, the text existed then |
 | Drive article folders (since about 2026-10-25), already named `<slug>-draft-rN.md`, `-metadata-rN.md` | downloaded by a **Code session** before the scan, below | the files as submitted | Drive `createdTime`: trusted next; it is when the file was uploaded, which may be later than when it was written |
 | local files: the gitignored `handoff_templates/` of the main checkout, `~/Downloads/<slug>-vNN/` | `--files DIR`, repeatable | drafts, metadata, handoffs, close-out notes, publication handoffs | file modification time: **trusted least**; a copy or an unzip resets it |
 | versions a chat reproduced from its context on request | `--recovered DIR` | a version no other source kept | the label's or the chat's stated time; the **content** is trusted least of all (below) |
@@ -855,26 +855,110 @@ sketch does not say:
   scripts, `.txt` files and folders of images are not events and are listed in
   `excluded`.
 
-**Matching a chat to an article and a round.** The export is first inspected and
-its schema written into this page (field names only; never content). As
-understood before seeing it, it holds `conversations.json`: conversations with a
-`uuid`, `name`, `created_at` and `chat_messages`, each message with a `sender`
-(`human` or `assistant`), `text`, `content` blocks and `created_at`; whether a
-conversation carries its project, and how artifacts appear, is unverified. The
-matcher:
+**The claude.ai export's schema** (inspected 2026-10-27, issue #422; field names
+and types only, no values). The download is a manifest (`manifest.json`) and one
+ZIP per category; the ones that matter are `conversations-000.zip` and
+`projects-000.zip`, which can be given zipped or extracted.
 
-1. keeps conversations of the drafting project when the export says the project,
-   and otherwise all;
-2. links a conversation to the article when its name or a message names the slug,
-   a file name of the article, or the article's title from its metadata, or when
-   the author lists it (`--conversation UUID`);
-3. extracts **whole-draft candidates**: an artifact's content, or a fenced block
-   or message of at least 2,000 characters, that shares at least 60% of its
-   content tokens (`passage_match.tokenise`) with a known version of this
-   article's draft. Fragments, outlines and discussion are not versions;
-4. places each candidate in the round whose time window holds its `created_at`.
+```text
+conversations.json                    list of conversation
+  conversation = {uuid: str, name: str, summary: str, created_at: str, updated_at: str,
+                  account: object, chat_messages: list of message}
+  message      = {uuid: str, parent_message_uuid: str, sender: "human" | "assistant",
+                  created_at: str, updated_at: str, text: str, content: list of item,
+                  attachments: list of attachment, files: list of {file_uuid, file_name}}
+  item         = {type: "text" | "thinking" | "tool_use" | "tool_result" | "document" | "image" | ...,
+                  start_timestamp: str | null, stop_timestamp: str | null, ...}
+    tool_use   : + {name: str, input: object, id: str | null, integration_name: str | null, ...}
+    tool_result: + {name: str, tool_use_id: str | null, content: list, is_error: bool}
+  attachment   = {file_name: str, file_size: int, file_type: str, extracted_content: str}
+projects/<uuid>.json                  one per project
+  project      = {uuid: str, name: str, description: str, prompt_template: str,
+                  docs: list of {filename: str, content: str, created_at: str}}
+```
 
-Everything it is not sure of goes into the plan for the author, not into the
+* **A conversation carries no project id**, so a conversation is matched to an
+  article by what it says, never by project.
+* **Timestamps** are UTC ISO-8601 with a `Z` and microseconds, on every message.
+  `start_timestamp` / `stop_timestamp` on an item are present for some tool calls
+  and `null` for most; a tool call without its own time takes its message's.
+* **Artifacts and files appear as `tool_use` items**, whose `input` holds the
+  text: `create_file` (`path`, `file_text`) and `str_replace` (`path`, `old_str`,
+  `new_str`) in the chat's sandbox; `artifacts` (`id`, `command`: `create`,
+  `rewrite` or `update`, `content`, or `old_str` / `new_str`, `version_uuid`);
+  Claude Code's `Write` (`file_path`, `content`) and `Edit` (`file_path`,
+  `old_string`, `new_string`); the Google Drive connector's `create_file`
+  (`title`, `textContent`) and `update_file` (`fileId`, `textContent`); and the
+  Dropbox connector's `create_file` (`path`, `content`). Each connector tool
+  occurs under more than one name (`mcp__Google_Drive__create_file`,
+  `Google Drive:create_file`). A file the chat's sandbox got another way (a
+  shell command, an upload) has no `create_file` call, so an edit of it has no
+  base to replay on. The manifest lists no artifacts category, and an artifact's
+  versions are in the export only as these calls.
+* **Attachments** carry their text as `extracted_content`. A project's knowledge
+  files carry theirs as `content`.
+* A conversation list can contain the same conversation twice when a download is
+  kept both zipped and extracted; the scan reads the extracted copy only.
+
+**Matching a chat to an article and a round (as built, `chat_export.py`).** The
+export is read by `ci-docs import scan --chat-export PATH` (a directory, the ZIP,
+or `conversations.json`). The matcher:
+
+1. **links a conversation** to the article when its name or summary, a message, an
+   attachment's name or text, or the file name a tool call wrote carries the slug
+   or a history key as a whole token, or when the author lists it
+   (`--conversation UUID`, repeatable). A conversation that only quotes the
+   article's title (the `Article:` line of the newest metadata or handoff in the
+   scan) is a **weak** link: what it yields is kept in the plan with
+   `include: false` and a `why`. There is no `--project` filter, because there is
+   no project id to filter by. A project's knowledge files whose own file name
+   carries the slug are read as candidates too;
+2. **rebuilds versions** by replaying each linked conversation's tool calls in
+   time order: a whole file is a version, and each `str_replace`, `Edit` or
+   artifact `update` is applied to the text it edited and yields the version it
+   produced. A call the conversation's own result marked as failed is skipped. An
+   edit is counted and left out when the file was never written by a tool call in
+   the conversation (it came from a shell command, an upload or another
+   conversation) or when its old text is not in the file exactly once: a base is
+   never guessed. Then attachments, then a fenced block or a human message of at
+   least 2,000 characters;
+3. **keeps a candidate** only if it is a whole version of the draft: at least 60%
+   of its content tokens (`passage_match.tokenise`) are in some known version of
+   this article's draft (from the other sources, a reproduction, or a chat text
+   kept earlier in time order), **and** it carries at least half of that
+   version's tokens. The second condition goes beyond issue #422's wording: the
+   first alone keeps every excerpt, because an excerpt's tokens are all in the
+   draft. On a long real article, the tool-call texts that passed only the first
+   condition carried about a fifth of a draft (sections and companion files),
+   and the whole versions carried all of one, so the half is far from either.
+   Everything else is counted as dropped, by where it came from;
+4. **merges** a kept text with the version of the same content when another
+   source holds it (the chat is added as a source, and its time becomes the
+   version's if earlier), else adds it as a draft **revision inside the round
+   that is open at its time**. A chat text is a *submission*, starting a round,
+   only when the author named the file: an attachment or project file whose name
+   carries a `vNN` / `rN` label, never a name a tool call chose. The near-duplicate
+   list leaves out pairs where both are chat-only (an edit chain);
+5. **confirms or replaces reproductions** (`--recovered`): a reproduction whose
+   bytes the export holds is that version (the flag is dropped, the chat's time is
+   used); one whose label an export version carries, with a text alike enough and
+   a time that fits (within three days of the reproduction's claimed time, and
+   after the nearest lower and before the nearest higher labelled version that
+   another source holds), is `superseded_by` it. The summary counts both; a
+   reproduction the export cannot speak to stays flagged.
+
+A chat source in the plan reads `{"type": "chat", "path":
+"chat:<conversation uuid>/<message uuid>", "via": "create_file" | "str_replace" |
+"artifacts" | "write" | "edit" | "drive_create_file" | "drive_update_file" |
+"dropbox_create_file" | "attachment" | "fenced_block" | "message_text" |
+"project_doc", "locator": "item:N" | "attachment:N" | "fence:N" | "text" | "doc",
+"time": ...}`. The plan's `chat` block names the export, the linked conversations
+(id, `created_at`, message count, why linked; never a name) and the counts. `check`
+rebuilds a chat-only version from the export and compares its hash, reading the
+export only when no file or run holds the version. The summary prints the linked
+conversations' ids, dates and message counts to the console.
+
+Everything the scan is not sure of goes into the plan for the author, not into the
 repository.
 
 **What Code downloads from Drive before the scan.** The CLI cannot read Drive. A
