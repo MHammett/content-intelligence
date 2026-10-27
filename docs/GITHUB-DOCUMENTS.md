@@ -1304,7 +1304,7 @@ Each is an issue labelled `github-documents`, buildable from the issue alone.
 | [#418](https://github.com/MHammett/content-intelligence/issues/418) | F. automatic tagging in `ci-review --github` and `ci-docs`; `accept` and `tag` as conveniences; `ls`, `put`; CLOSE-OUT.md and the README | #413, #416 (#415 for the docs it points at) | [PR #428](https://github.com/MHammett/content-intelligence/pull/428) |
 | [#419](https://github.com/MHammett/content-intelligence/issues/419) | G. claude.ai end to end on the scratch repository (the maintainer's checks) | #415, #417, #418 | not yet |
 | [#420](https://github.com/MHammett/content-intelligence/issues/420) | H. import, step 1: `ci-docs import scan` over local files, saved runs and a Drive download | nothing (#416's names) | [PR #423](https://github.com/MHammett/content-intelligence/pull/423) (merged) |
-| [#421](https://github.com/MHammett/content-intelligence/issues/421) | I. import, step 2: `ci-docs import apply` | #413, #415, #417, #418, #420 | not yet |
+| [#421](https://github.com/MHammett/content-intelligence/issues/421) | I. import, step 2: `ci-docs import apply` | #413, #415, #417, #418, #420 | [PR #432](https://github.com/MHammett/content-intelligence/pull/432) |
 | [#422](https://github.com/MHammett/content-intelligence/issues/422) | J. import: the claude.ai export as a source | #420; the maintainer's export | [PR #426](https://github.com/MHammett/content-intelligence/pull/426) (merged) |
 | [#405](https://github.com/MHammett/content-intelligence/issues/405) | `ci-docs pull-history`, rewritten (optional) | #413, #417 | not yet |
 
