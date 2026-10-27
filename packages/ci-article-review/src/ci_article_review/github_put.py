@@ -1,215 +1,135 @@
-"""``ci-docs ls`` and ``ci-docs put``: look at an article's folder, and add a file to it.
+"""``ci-docs ls`` and ``ci-docs put``: look at an article's rounds, and add a file to the open one.
 
-``ls`` lists the article folder (the top level, then ``pipeline/``) with each
-file's round and kind read from its name. ``put`` commits one local file into
-the folder, which is how a Code session hands a close-out note
-(``handoff_templates/close_out.md``, Template D) to the drafting side through the
-repository instead of through Drive. It also takes the drafting side's own files,
-for an author who commits on the command line instead of through a connector.
+An article in the document repository is a folder with fixed names, one branch
+and one pull request per round, and a tag for each accepted round (design:
+``docs/GITHUB-DOCUMENTS.md``). ``ls`` shows that: the article's rounds (tags
+with their dates, merged and open pull requests with branch, head and the last
+review's run), then the files of the folder at a ref with each one's last
+commit. It reads and writes nothing.
 
-The names are the ones ``docs/CLOSE-OUT.md`` and the document repository's
-``AGENTS.md`` define::
+``put`` commits **one** local file to the open round's branch, never to the base
+branch. It is how a Code session hands a close-out note
+(``handoff_templates/close_out.md``, Template D) to the drafting chat, and it
+takes the drafting side's own files for an author who commits from the command
+line. The file name is the name it gets::
 
-    <slug>-(draft|metadata|handoff|publication)-rN.md
-    <slug>-close-out-rN-to-(code|chat)[-vM].md          M is 2 or more
+    close-out-to-chat.md   close-out-to-code.md   draft.md   metadata.md   publication.md
 
-``put`` only ever adds a path. A file already there with the same bytes is a
-no-op; one with different bytes is refused, and for a close-out note the refusal
-names the next free ``-vM``. A ``-vM`` whose predecessor is missing is refused.
-One commit, one file, the message ``<kind>: <slug> r<N>[ to-<dir>][ v<M>]``. The
-configured API keys and the token must not appear in the file, and a public
-repository is refused unless ``allow_public_repo`` is set.
+``review.md`` and everything under ``pipeline/`` are written by the pipeline
+(``ci-review --write-back``, ``ci-docs push-run``) and are refused. An existing
+file is replaced only through ``replace={path: blob at the head put read}``, so an
+edit made in between is refused, and identical bytes make no commit. After a
+close-out note's commit it comments on the pull request with a link to the note
+at that commit. The configured API keys and the token must not appear in the
+file, and a public repository is refused unless ``allow_public_repo`` is set.
 
-Every refusal that can be decided locally is a ``GitHubDocumentsError`` raised
-before anything is sent.
+Both ``put`` and ``accept`` tag a merged round first (``github_rounds``); ``ls``
+never does. Every refusal that can be decided locally is a
+``GitHubDocumentsError`` raised before anything is sent.
 """
 
 import re
 from pathlib import Path
 
-from ci_core.github_repo import (
-    GitHubRepo,
-    GitHubRepoError,
-    git_blob_sha,
-    resolve_token,
-)
+from ci_core.github_repo import GitHubRepoError, resolve_token
 
 from .github_documents import (
     GitHubDocumentsError,
     _explain,
     _folder,
     _missing_folder,
+    _open_rounds,
+    _round_of,
+    _tags,
     validate_slug,
+)
+from .github_rounds import (
+    _last_review,
+    check_can_write,
+    open_client,
+    open_round_pull,
+    path_prefix,
+    repo_name,
+    require_token,
+    round_number_of,
+    tag_before_write,
 )
 from .github_writeback import _lf, secret_values
 
-#: Kinds of file the drafting side writes, one per name.
-DRAFTING_KINDS = ("draft", "metadata", "handoff", "publication")
-
-#: How ``ls`` orders kinds within one round.
-_KIND_ORDER = (
-    "handoff",
-    "draft",
-    "metadata",
-    "publication",
-    "close-out",
-    "review",
-    "worklist",
-    "report",
-    "results",
-)
-
-_RUN_FILE = re.compile(
-    r"^run_(?P<run>[1-9][0-9]*)_\d{8}_\d{6}_(?P<what>report|results)\.json$"
+#: The names ``put`` writes, and the commit message prefix of each.
+CLOSE_OUT_NAMES = {
+    "close-out-to-chat.md": "to-chat",
+    "close-out-to-code.md": "to-code",
+}
+PUT_NAMES = (
+    "close-out-to-chat.md",
+    "close-out-to-code.md",
+    "draft.md",
+    "metadata.md",
+    "publication.md",
 )
 
 #: ``pipeline/`` is the one subfolder the pipeline writes.
 PIPELINE_DIR = "pipeline"
 
-
-def parse_name(slug, name):
-    """What an article file's name says: ``{kind, round, direction, version}``, or ``None``.
-
-    ``direction`` and ``version`` are set for a close-out note only (the
-    unsuffixed note is version 1). ``round`` is the round of drafting for a
-    draft, metadata, handoff or publication file and the pipeline run number
-    for a review, worklist, close-out note or run file. The match is exact:
-    ``-r04`` and trailing text are not names.
-    """
-    s = re.escape(slug)
-    m = re.match(
-        rf"^{s}-(draft|metadata|handoff|publication|review|worklist)-r([1-9][0-9]*)\.md$",
-        name,
-    )
-    if m:
-        return {
-            "kind": m.group(1),
-            "round": int(m.group(2)),
-            "direction": None,
-            "version": None,
-        }
-    m = re.match(
-        rf"^{s}-close-out-r([1-9][0-9]*)-to-(code|chat)(?:-v([2-9]|[1-9][0-9]+))?\.md$",
-        name,
-    )
-    if m:
-        return {
-            "kind": "close-out",
-            "round": int(m.group(1)),
-            "direction": m.group(2),
-            "version": int(m.group(3)) if m.group(3) else 1,
-        }
-    m = _RUN_FILE.match(name)
-    if m:
-        return {
-            "kind": m.group("what"),
-            "round": int(m.group("run")),
-            "direction": None,
-            "version": None,
-        }
-    return None
+#: A comment on the pull request, for a note's direction.
+_COMMENT = {"to-chat": "Close-out note to chat", "to-code": "Close-out note to code"}
 
 
-def close_out_name(slug, round_number, direction, version):
-    suffix = f"-v{version}" if version > 1 else ""
-    return f"{slug}-close-out-r{round_number}-to-{direction}{suffix}.md"
-
-
-def commit_message(slug, parsed):
-    """``<kind>: <slug> r<N>[ to-<dir>][ v<M>]``."""
-    text = f"{parsed['kind']}: {slug} r{parsed['round']}"
-    if parsed["direction"]:
-        text += f" to-{parsed['direction']}"
-    if parsed["version"] and parsed["version"] > 1:
-        text += f" v{parsed['version']}"
-    return text
-
-
-def describe(parsed):
-    """The ``ls`` columns for a parsed name: kind and the detail beside it."""
-    if parsed is None:
-        return "other", ""
-    if parsed["kind"] == "close-out":
-        detail = f"to-{parsed['direction']}"
-        if parsed["version"] > 1:
-            detail += f" v{parsed['version']}"
-        return "close-out", detail
-    return parsed["kind"], ""
-
-
-def check_name(slug, name):
-    """The parsed name, or a refusal that shows the accepted patterns."""
-    parsed = parse_name(slug, name)
-    if parsed is None or parsed["kind"] not in DRAFTING_KINDS + ("close-out",):
-        kind = parsed["kind"] if parsed else None
+def check_name(name, local_file):
+    """The file name ``put`` accepts, or a refusal that lists the ones it does."""
+    if name in PUT_NAMES:
+        return name
+    parent = Path(local_file).parent.name
+    if name == "review.md" or parent == PIPELINE_DIR:
         why = (
-            f"{name} is a {kind} file, which the pipeline writes (ci-review "
-            "--write-back, ci-docs push-run), so put will not add it."
-            if kind
-            else f"{name} is not a name put accepts for the article {slug!r}."
+            f"{name} is written by the pipeline (ci-review --write-back, ci-docs "
+            "push-run), so put will not add it."
         )
-        raise GitHubDocumentsError(
-            f"{why} The file name must be one of:\n"
-            f"  {slug}-(draft|metadata|handoff|publication)-rN.md\n"
-            f"  {slug}-close-out-rN-to-(code|chat)[-vM].md   (M is 2 or more)\n"
-            f"with N from 1, and the slug {slug!r} exactly as the article folder "
-            "is named."
-        )
-    return parsed
-
-
-def _versions_present(names, slug, parsed):
-    """Versions of the close-out note for this round and direction already in the folder."""
-    found = set()
-    for name in names:
-        other = parse_name(slug, name)
-        if (
-            other
-            and other["kind"] == "close-out"
-            and other["round"] == parsed["round"]
-            and other["direction"] == parsed["direction"]
-        ):
-            found.add(other["version"])
-    return found
-
-
-def check_close_out(slug, parsed, data, entries):
-    """Refuse a close-out note that would clash with, or skip, an earlier one.
-
-    ``entries`` are the article folder's top-level entries. A note whose exact
-    name is there with the same bytes passes (the commit will find nothing to
-    write); with different bytes it is refused with the next free ``-vM``.
-    """
-    files = {e.name: e for e in entries if e.type == "file"}
-    present = _versions_present(files, slug, parsed)
-    round_number, direction = parsed["round"], parsed["direction"]
-    version = parsed["version"]
-    here = close_out_name(slug, round_number, direction, version)
-
-    if version in present:
-        if files[here].sha == git_blob_sha(data):
-            return
-    elif version == 1:
-        if not present:
-            return  # the first note for this round and direction
-    elif version - 1 in present:
-        return
     else:
-        before = close_out_name(slug, round_number, direction, version - 1)
-        raise GitHubDocumentsError(
-            f"{here} is a rewrite of {before}, which is not in the folder. A -vM "
-            "note supersedes the one before it, so that has to exist first."
-        )
-
-    have = ", ".join(
-        close_out_name(slug, round_number, direction, v) for v in sorted(present)
-    )
-    free = close_out_name(slug, round_number, direction, max(present) + 1)
+        why = f"{name} is not a name put accepts."
     raise GitHubDocumentsError(
-        f"A close-out note for round {round_number} to-{direction} is already in "
-        f"the folder ({have}). Earlier notes are never overwritten. Save this "
-        f"one as {free} and have its Supersedes: line name the note it replaces."
+        f"{why} The file's name is the name it gets in the article's folder, "
+        f"and must be one of: {', '.join(PUT_NAMES)}."
     )
+
+
+def commit_subject(slug, round_number, name):
+    """``close-out: <slug> r<N> to-chat``, or ``<kind>: <slug> r<N>``."""
+    label = f"r{round_number}" if round_number is not None else "round"
+    if name in CLOSE_OUT_NAMES:
+        return f"close-out: {slug} {label} {CLOSE_OUT_NAMES[name]}"
+    return f"{name[: -len('.md')]}: {slug} {label}"
+
+
+_HEADER_LINE = re.compile(r"^(Contains|Article|Round)\s*:\s*(.+)$", re.IGNORECASE)
+
+
+def covers(data, name):
+    """One line on what a note covers, from its header, for the commit's body.
+
+    A close-out note's ``Contains:`` line (the counts of what it carries), else
+    its ``Article:`` line. Any other file gets none: the diff is its change.
+    """
+    if name not in CLOSE_OUT_NAMES:
+        return ""
+    found = {}
+    for line in data.decode("utf-8", "replace").splitlines():
+        m = _HEADER_LINE.match(line.strip())
+        if m and m.group(1).lower() not in found:
+            found[m.group(1).lower()] = " ".join(m.group(2).split())
+    for key in ("contains", "article"):
+        text = found.get(key, "")
+        # An unfilled template still holds its bracketed instruction.
+        if text and not text.startswith("["):
+            return text[:200]
+    return ""
+
+
+def commit_message(slug, round_number, name, data):
+    subject = commit_subject(slug, round_number, name)
+    body = covers(data, name)
+    return f"{subject}\n\n{body}\n" if body else f"{subject}\n"
 
 
 def _read_local(path):
@@ -227,27 +147,6 @@ def _read_local(path):
     return _lf(raw)
 
 
-def _client(repo_name, token, session):
-    try:
-        return GitHubRepo(repo_name, token, session=session)
-    except ValueError as exc:
-        raise GitHubDocumentsError(str(exc)) from exc
-
-
-def _repo_name(settings, repo):
-    name = settings["repo"] if repo is None else repo
-    if not isinstance(name, str) or not name.strip():
-        raise GitHubDocumentsError(
-            "No document repository is set: github_documents.repo is empty. Name "
-            "one as OWNER/NAME there, or pass --github-repo."
-        )
-    return name.strip()
-
-
-def _prefix(settings):
-    return (settings["path_prefix"] or "").strip().strip("/")
-
-
 def put_file(
     slug,
     local_file,
@@ -255,94 +154,167 @@ def put_file(
     settings,
     api_keys,
     repo=None,
-    branch=None,
+    pr=None,
     token_lookup=resolve_token,
     session=None,
     out=print,
 ):
-    """Commit ``local_file`` into the article folder; returns the ``CommitResult``.
+    """Commit ``local_file`` to the open round's branch; returns the ``CommitResult``.
 
     ``settings`` is the normalised ``github_documents`` block; ``api_keys`` is the
-    merged key table, none of whose values may appear in the file.
+    merged key table, none of whose values may appear in the file. ``pr`` names the
+    round's pull request when the article has more than one open.
     """
     validate_slug(slug)
-    name = Path(local_file).name
-    parsed = check_name(slug, name)
+    name = check_name(Path(local_file).name, local_file)
     data = _read_local(local_file)
-    repo_name = _repo_name(settings, repo)
-    token = token_lookup()
-    if not token:
-        raise GitHubDocumentsError(
-            "No GitHub token to commit with. Set GITHUB_TOKEN or run `gh auth login`."
-        )
-    prefix = _prefix(settings)
-    folder = _folder(prefix, slug)
+    repo_full = repo_name(settings, repo)
+    token = require_token(token_lookup)
+    folder = _folder(path_prefix(settings), slug)
+    path = f"{folder}/{name}"
 
-    client = _client(repo_name, token, session)
+    client = open_client(repo_full, token, session)
+    say = out
     try:
-        info = client.info()
-        if not info.private and settings.get("allow_public_repo") is not True:
+        check_can_write(client.info(), repo_full, settings, "ci-docs put")
+        # Before our own work, as every writing command does; never fatal.
+        tag_before_write(
+            client,
+            slug,
+            repo=repo_full,
+            say=say,
+            warn=lambda m: out(f"warning: {m}"),
+        )
+        pull = open_round_pull(client, slug, repo_full, pr)
+        branch = pull.head_ref
+        round_number = round_number_of(slug, pull)
+        # The branch is the truth; the pull request's head pointer can lag a push.
+        head = client.resolve(branch)
+        if name in CLOSE_OUT_NAMES and not client.list_dir(folder, head):
             raise GitHubDocumentsError(
-                f"{repo_name} is a public repository: what is committed there is "
-                "published, so ci-docs put will not write to it. Make it private, "
-                "or set allow_public_repo: true under github_documents."
-            )
-        if not info.can_push:
-            raise GitHubDocumentsError(
-                f"This token cannot push to {repo_name} (no write permission). "
-                "Use a token with Contents read and write."
-            )
-        ref = branch or settings["branch"] or info.default_branch
-        if not client.has_branch(ref):
-            raise GitHubDocumentsError(
-                f"{repo_name} has no branch {ref!r}; a file is committed onto a branch."
-            )
-        head = client.resolve(ref)
-        entries = client.list_dir(folder, head)
-        if parsed["kind"] == "close-out":
-            if not entries:
-                raise GitHubDocumentsError(
-                    _missing_folder(client, repo_name, folder, prefix, ref, head)
-                    + " A close-out note is about an article that is already "
-                    "there; check the slug."
+                _missing_folder(
+                    client, repo_full, folder, path_prefix(settings), branch, head
                 )
-            check_close_out(slug, parsed, data, entries)
-        elif not entries:
-            out(f"Note: {folder}/ is not in {repo_name} yet; this creates it.")
+                + " A close-out note is about an article that is already there; "
+                "check the slug."
+            )
+        replace = {}
+        try:
+            current = client.read(path, head)
+            replace[path] = current.blob_sha
+        except GitHubRepoError as exc:
+            if exc.kind != "not_found":
+                raise
         result = client.commit_files(
-            ref,
-            {f"{folder}/{name}": data},
-            commit_message(slug, parsed) + "\n",
+            branch,
+            {path: data},
+            commit_message(slug, round_number, name, data),
+            replace=replace,
             refuse_if_contains=secret_values(api_keys),
         )
+        if not result.written:
+            out(
+                f"Nothing new to write: {path} is already on {branch} with the "
+                f"same bytes. {result.html_url}".rstrip()
+            )
+        else:
+            verb = "Replaced" if replace else "Added"
+            out(f"{verb} {path} on {branch}: {result.html_url}")
+            if name in CLOSE_OUT_NAMES:
+                _announce_note(
+                    client, repo_full, pull, path, result.commit_sha, name, out
+                )
     except GitHubRepoError as exc:
-        raise GitHubDocumentsError(_put_failure(exc, repo_name, folder, name)) from exc
+        raise GitHubDocumentsError(_put_failure(exc, repo_full, path)) from exc
     finally:
         client.close()
-
-    if not result.written:
-        out(
-            f"Nothing new to write: {folder}/{name} is already in {repo_name} with "
-            f"the same bytes. {result.html_url}".rstrip()
-        )
-    else:
-        out(f"Wrote {folder}/{name} to {repo_name}: {result.html_url}")
     return result
 
 
-def _put_failure(exc, repo_name, folder, name):
+def _announce_note(client, repo_full, pull, path, commit, name, out):
+    """Comment on the pull request with a link to the note at its new commit."""
+    link = f"https://github.com/{repo_full}/blob/{commit}/{path}"
+    text = f"{_COMMENT[CLOSE_OUT_NAMES[name]]}: {link}"
+    try:
+        url = client.comment_on_issue(pull.number, text)
+    except GitHubRepoError as exc:
+        # The note is committed; only the announcement failed.
+        out(
+            f"warning: the note is committed but the comment on pull request "
+            f"#{pull.number} was not posted: {exc}"
+        )
+        return
+    out(f"Commented on pull request #{pull.number}: {url}")
+
+
+def _put_failure(exc, repo_full, path):
     if exc.kind == "exists":
         return (
-            f"{folder}/{name} is already in {repo_name} with different content. "
-            "Nothing was overwritten. A new round is a new file; a close-out note "
-            "that needs rewriting gets the next -vM."
+            f"{path} was changed by someone else after put read it, so nothing "
+            "was overwritten. Run ci-docs put again to start from what is there."
         )
     if exc.kind == "secret":
         return (
             f"{exc}. The file holds a configured API key or the token, so "
             "nothing was sent. Remove it and try again."
         )
-    return _explain(exc, repo_name, has_token=True)
+    return _explain(exc, repo_full, has_token=True)
+
+
+# -- ls ---------------------------------------------------------------------------
+
+
+def _date(text):
+    return (text or "")[:10]
+
+
+def _round_rows(client, slug):
+    """The article's rounds, ascending: tags and round pull requests joined by round number."""
+    prefix = f"round/{slug}/"
+    tags = {}
+    for number, tag in _tags(client, slug).items():
+        tags[number] = client.get_tag(tag)
+    pulls = {}
+    for pull in client.list_pulls("all"):
+        if not pull.head_ref.startswith(prefix):
+            continue
+        pulls.setdefault(_round_of(pull.head_ref, prefix), []).append(pull)
+    rows = []
+    for number in sorted(set(tags) | {n for n in pulls if n is not None}):
+        entry = {"round": number, "tag": tags.get(number), "pulls": []}
+        for pull in sorted(pulls.get(number, []), key=lambda p: p.number):
+            review = _last_review(client, pull.number)
+            entry["pulls"].append(
+                {
+                    "pull": pull,
+                    "state": "merged"
+                    if pull.merged
+                    else ("open" if pull.state == "open" else "closed"),
+                    "run": review[1] if review else None,
+                    "review_commit": review[0].commit_id if review else None,
+                }
+            )
+        rows.append(entry)
+    # Pull requests from a round/<slug>/ branch that is not rN: listed last.
+    for pull in pulls.get(None, []):
+        review = _last_review(client, pull.number)
+        rows.append(
+            {
+                "round": None,
+                "tag": None,
+                "pulls": [
+                    {
+                        "pull": pull,
+                        "state": "merged"
+                        if pull.merged
+                        else ("open" if pull.state == "open" else "closed"),
+                        "run": review[1] if review else None,
+                        "review_commit": review[0].commit_id if review else None,
+                    }
+                ],
+            }
+        )
+    return rows
 
 
 def list_article(
@@ -350,94 +322,139 @@ def list_article(
     *,
     settings,
     repo=None,
-    branch=None,
+    ref=None,
     token_lookup=resolve_token,
     session=None,
 ):
-    """The article folder as ``(header, rows)``.
+    """The article as ``(header, rounds, files)``. Reads only.
 
-    ``header`` is a dict naming the repository, folder, ref and commit; each row
-    is ``{"path", "name", "kind", "detail", "round", "parsed"}``, top level first
-    and ``pipeline/`` after, ordered by round and kind.
+    ``rounds`` are the article's tags and round pull requests, ascending. ``files``
+    are the folder's files at ``ref`` (the open round's branch when there is
+    exactly one, else the base branch), the top level first and ``pipeline/``
+    after, each with its last commit.
     """
     validate_slug(slug)
-    repo_name = _repo_name(settings, repo)
-    prefix = _prefix(settings)
+    name = repo_name(settings, repo)
+    prefix = path_prefix(settings)
     folder = _folder(prefix, slug)
     token = token_lookup()
-    client = _client(repo_name, token, session)
+    client = open_client(name, token, session)
     try:
         info = client.info()
-        ref = branch or settings["branch"] or info.default_branch
+        rounds = _round_rows(client, slug)
+        opened = _open_rounds(client, slug)
+        note = None
+        if ref is None:
+            if len(opened) == 1:
+                ref = opened[0].head_ref
+            else:
+                ref = settings["branch"] or info.default_branch
+                if len(opened) > 1:
+                    note = (
+                        f"{len(opened)} rounds are open, so the files are the "
+                        f"{ref} branch's; --ref round/{slug}/rN lists one round's."
+                    )
         head = client.resolve(ref)
         entries = client.list_dir(folder, head)
-        if not entries:
+        if not entries and not rounds:
             raise GitHubDocumentsError(
-                _missing_folder(client, repo_name, folder, prefix, ref, head)
+                _missing_folder(client, name, folder, prefix, ref, head)
             )
-        piped = client.list_dir(f"{folder}/{PIPELINE_DIR}", head)
+        piped = client.list_dir(f"{folder}/{PIPELINE_DIR}", head) if entries else []
+        files = []
+        for entry in entries + piped:
+            if entry.type != "file":
+                continue
+            last = client.last_commit(entry.path, head)
+            files.append(
+                {
+                    "path": entry.path,
+                    "name": entry.name,
+                    "pipeline": entry.path.startswith(f"{folder}/{PIPELINE_DIR}/"),
+                    "last": last,
+                }
+            )
     except GitHubRepoError as exc:
-        raise GitHubDocumentsError(
-            _explain(exc, repo_name, has_token=bool(token))
-        ) from exc
+        raise GitHubDocumentsError(_explain(exc, name, has_token=bool(token))) from exc
     finally:
         client.close()
-
-    rows = []
-    for entry in entries + piped:
-        if (
-            entry.type == "dir"
-            and entry.name == PIPELINE_DIR
-            and entry.path == f"{folder}/{PIPELINE_DIR}"
-        ):
-            continue
-        parsed = parse_name(slug, entry.name) if entry.type == "file" else None
-        kind, detail = describe(parsed) if entry.type == "file" else (entry.type, "")
-        rows.append(
-            {
-                "path": entry.path,
-                "name": entry.name,
-                "kind": kind,
-                "detail": detail,
-                "round": parsed["round"] if parsed else None,
-                "parsed": parsed,
-                "pipeline": entry.path.startswith(f"{folder}/{PIPELINE_DIR}/"),
-            }
-        )
-
-    def order(row):
-        kind_rank = _KIND_ORDER.index(row["kind"]) if row["kind"] in _KIND_ORDER else 99
-        version = (row["parsed"] or {}).get("version") or 0
-        return (
-            row["pipeline"],
-            row["round"] is None,
-            row["round"] or 0,
-            kind_rank,
-            row["detail"].split()[0] if row["detail"] else "",
-            version,
-            row["name"],
-        )
-
-    rows.sort(key=order)
-    header = {"repo": repo_name, "folder": folder, "ref": ref, "commit_sha": head}
-    return header, rows
+    files.sort(key=lambda f: (f["pipeline"], f["name"]))
+    header = {
+        "repo": name,
+        "folder": folder,
+        "ref": ref,
+        "commit_sha": head,
+        "has_folder": bool(entries),
+        "note": note,
+    }
+    return header, rounds, files
 
 
-def format_listing(header, rows):
+def _round_state(entry):
+    states = [p["state"] for p in entry["pulls"]]
+    if entry["tag"] is not None:
+        return "accepted"
+    if "open" in states:
+        return "open"
+    if "merged" in states:
+        return "merged, not yet tagged"
+    return "closed without a merge"
+
+
+def format_listing(header, rounds, files):
     """The lines ``ci-docs ls`` prints."""
-    lines = [
-        f"{header['repo']}  {header['folder']}/  {header['ref']} "
-        f"({header['commit_sha'][:7]})"
-    ]
-    if not rows:
-        lines.append("  (empty)")
+    lines = [f"{header['repo']}  {header['folder']}/"]
+    lines.append("Rounds")
+    if not rounds:
+        lines.append("  (none: no tag and no pull request from a round branch)")
+    for entry in rounds:
+        label = f"r{entry['round']}" if entry["round"] is not None else "other"
+        tag = entry["tag"]
+        detail = []
+        if tag is not None:
+            when = _date(tag.tagged_at)
+            commit = tag.commit_sha[:7] if tag.commit_sha else "?"
+            detail.append(
+                f"tag {tag.name}" + (f" {when}" if when else "") + f" at {commit}"
+            )
+        lines.append(
+            f"  {label:<6}{_round_state(entry)}" + (f"  {detail[0]}" if detail else "")
+        )
+        for item in entry["pulls"]:
+            pull = item["pull"]
+            parts = [f"#{pull.number} {item['state']}", pull.head_ref]
+            if item["state"] == "open":
+                parts.append(f"head {pull.head_sha[:7]}")
+            elif item["state"] == "merged":
+                parts.append(
+                    f"merge {pull.merge_commit_sha[:7] if pull.merge_commit_sha else '?'}"
+                )
+                if pull.merged_at:
+                    parts.append(_date(pull.merged_at))
+            parts.append(
+                f"last review: run {item['run']} of {item['review_commit'][:7]}"
+                if item["run"] is not None
+                else "no ci-review review"
+            )
+            lines.append("        PR " + ", ".join(parts))
+    shown = f"{header['ref']} ({header['commit_sha'][:7]})"
+    if header["note"]:
+        lines.append(f"Note: {header['note']}")
+    if not header["has_folder"]:
+        lines.append(f"Files: {header['folder']}/ is not at {shown}.")
+        return lines
+    lines.append(f"Files at {shown}")
     section = None
-    for row in rows:
-        if row["pipeline"] != section:
-            section = row["pipeline"]
+    for f in files:
+        if f["pipeline"] != section:
+            section = f["pipeline"]
             if section:
                 lines.append(f"  {PIPELINE_DIR}/")
-        rnd = f"r{row['round']}" if row["round"] else "-"
-        shown = f"{row['kind']} {row['detail']}".rstrip()
-        lines.append(f"    {rnd:<5}{shown:<22}{row['name']}")
+        last = f["last"]
+        tail = (
+            f"{last.sha[:7]}  {_date(last.date)}  {last.subject}"
+            if last
+            else "(no history)"
+        )
+        lines.append(f"    {f['name']:<24}{tail}")
     return lines
