@@ -3180,6 +3180,7 @@ def run_draft_pipeline(
     offline=False,
     api_key_overrides=None,
     expand=False,
+    write_back=False,
 ):
     """Run the full draft review pipeline.
 
@@ -3197,6 +3198,12 @@ def run_draft_pipeline(
     what it does. Off by default: it costs extra calls, and it is useful early
     in a draft's life and actively unhelpful late, when the piece should be
     converging rather than growing.
+
+    ``write_back=True`` (``--github ... --write-back``) commits the saved review
+    back to the article folder the draft was read from, after the run is saved
+    and summarised. The pre-flight (token, push permission, a private
+    repository, taken run numbers) already ran when the handoff was read, so a
+    refusal cost nothing; a failure here leaves the local files and raises.
 
     ``api_key_overrides`` (``{(provider, field): value}``, from ``--api-key``
     on the CLI) is the highest tier of this project's credential precedence —
@@ -3290,6 +3297,10 @@ def run_draft_pipeline(
     # number, and say so rather than silently renumbering.
     run_number = handoff.get("run_number", 1)
     _existing = hist.existing_run_numbers(_history_root(), _history_key(handoff))
+    # With --write-back the review lands in a folder that may already hold
+    # <slug>-review-rN.md for numbers local history never saw (another machine,
+    # another checkout). The same bump moves past those, so the names are free.
+    _existing |= set(handoff.get("taken_run_numbers") or ())
     if run_number in _existing:
         _next = max(_existing) + 1
         log.warning(
@@ -4736,6 +4747,21 @@ def run_draft_pipeline(
         markdown_path=paths.get("markdown_path"),
         worklist_path=paths.get("worklist_path"),
     )
+
+    if write_back:
+        # Imported here so a run without --write-back never loads the GitHub code.
+        from . import github_writeback
+
+        if not paths["report_path"]:
+            raise github_writeback.GitHubDocumentsError(
+                "The report could not be saved, so there is nothing to write back."
+            )
+        github_writeback.write_back_after_run(
+            paths["report_path"],
+            settings=normalize_github_documents(config.get("github_documents")),
+            api_keys=api_keys,
+            config_dir=config_dir,
+        )
 
     return report
 
@@ -6262,6 +6288,18 @@ def build_parser():
         "github_documents.repo, for this run only (a scratch repository, say).",
     )
     parser.add_argument(
+        "--write-back",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="With --github: commit the review back to the article's folder "
+        "(SLUG-review-rN.md, plus the worklist and report under pipeline/) in "
+        "one commit that only adds files. --no-write-back overrides "
+        "github_documents.write_back. Not combinable with --replay, --offline, "
+        "--only-model, --only-domain or --no-timeout, which are not reviews to "
+        "hand back. If the commit fails the review is still saved locally; "
+        "`ci-docs push-run` retries it.",
+    )
+    parser.add_argument(
         "--metadata",
         metavar="METADATA_PATH",
         help="Path to a metadata file (PRIMARY CLAIM, TARGET AUDIENCE, etc., no "
@@ -6400,23 +6438,60 @@ def build_parser():
     return parser
 
 
-def _read_github_handoff(args):
+#: The flags that make a run something other than a review of the article, and
+#: the words the messages use for them.
+_NOT_A_REVIEW = (
+    ("replay", "--replay"),
+    ("offline", "--offline"),
+    ("only_model", "--only-model"),
+    ("only_domain", "--only-domain"),
+    ("no_timeout", "--no-timeout"),
+)
+
+
+def _write_back_conflicts(args):
+    return [flag for attr, flag in _NOT_A_REVIEW if getattr(args, attr)]
+
+
+def _decide_write_back(args, settings):
+    """Whether this run commits its review back: the flag, else the config.
+
+    A replay, an offline run or a calibration run is not a review to hand back,
+    so config's ``write_back: true`` is set aside for those, with one INFO line;
+    asking for it with the flag was already a usage error.
+    """
+    if args.write_back is not None:
+        return args.write_back
+    if settings["write_back"] is not True:
+        return False
+    conflicts = _write_back_conflicts(args)
+    if conflicts:
+        log.info(
+            "github_documents.write_back is set but not used: %s makes this run "
+            "something other than a review of the article, so nothing is "
+            "written back.",
+            ", ".join(conflicts),
+        )
+        return False
+    return True
+
+
+def _read_github_handoff(args, settings, write_back=False):
     """Build the handoff for ``--github`` before any model call.
 
     Imported here, and not at the top, so a run without ``--github`` never
-    imports the GitHub client or looks for a token.
+    imports the GitHub client or looks for a token. With ``write_back`` the
+    read also runs the write-back pre-flight.
     """
     from . import github_documents
 
-    settings = normalize_github_documents(
-        load_user_config(args.config_dir).get("github_documents")
-    )
     return github_documents.load_handoff(
         args.github,
         settings=settings,
         repo=args.github_repo,
         ref=args.github_ref,
         round_number=args.round,
+        write_back=write_back,
     )
 
 
@@ -6446,6 +6521,17 @@ def main():
             "--github does not combine with --metadata — a round's "
             "SLUG-metadata-rN.md is read from the repository"
         )
+    if args.write_back is not None and not args.github:
+        parser.error(
+            ("--write-back" if args.write_back else "--no-write-back")
+            + " requires --github"
+        )
+    if args.write_back:
+        for flag in _write_back_conflicts(args):
+            parser.error(
+                f"--write-back does not combine with {flag} — that is not a "
+                "review of the article to hand back"
+            )
 
     if args.retry_failed and args.replay:
         parser.error(
@@ -6574,7 +6660,11 @@ def main():
                 api_key_overrides=api_key_overrides,
             )
         elif args.github:
-            handoff = _read_github_handoff(args)
+            settings = normalize_github_documents(
+                load_user_config(args.config_dir).get("github_documents")
+            )
+            write_back = _decide_write_back(args, settings)
+            handoff = _read_github_handoff(args, settings, write_back)
             run_draft_pipeline(
                 None,
                 args.publication,
@@ -6590,6 +6680,7 @@ def main():
                 offline=args.offline,
                 handoff=handoff,
                 api_key_overrides=api_key_overrides,
+                write_back=write_back,
             )
         elif args.publish:
             run_publish_pipeline(

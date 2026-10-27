@@ -373,3 +373,266 @@ class TestDocumentSourceInTheReport:
 
         with _stubbed_run(tmp_path) as report:
             assert "document_source" not in report
+
+
+NOT_A_REVIEW = [
+    ("--replay", "r.json"),
+    ("--offline",),
+    ("--only-model", "openai"),
+    ("--only-domain", "fact_check"),
+    ("--no-timeout",),
+]
+
+
+class TestWriteBackFlags:
+    """``--write-back`` / ``--no-write-back`` (#403): usage errors and the config default."""
+
+    @pytest.mark.parametrize(
+        "argv, mentions",
+        [
+            (["--raw-draft", "d.md", "--write-back"], "--write-back requires --github"),
+            (
+                ["--raw-draft", "d.md", "--no-write-back"],
+                "--no-write-back requires --github",
+            ),
+            (["--draft", "h.md", "--write-back"], "--write-back requires --github"),
+        ]
+        + [
+            (
+                ["--github", SLUG, "--write-back", *flag],
+                f"does not combine with {flag[0]}",
+            )
+            for flag in NOT_A_REVIEW
+        ],
+    )
+    def test_each_usage_error_comes_before_any_work(
+        self, run_main, capsys, argv, mentions
+    ):
+        assert run_main(*argv, load=pytest.fail) == 2
+        assert mentions in capsys.readouterr().err
+        run_main.run.assert_not_called()
+
+    def test_the_flag_turns_it_on_for_the_read_and_the_run(self, run_main):
+        seen = {}
+        run_main(
+            "--github",
+            SLUG,
+            "--write-back",
+            load=lambda slug, **kw: seen.update(kw) or fake_handoff(),
+        )
+        assert seen["write_back"] is True
+        assert run_main.run.call_args.kwargs["write_back"] is True
+
+    def test_it_is_off_unless_asked_for(self, run_main):
+        seen = {}
+        run_main(
+            "--github",
+            SLUG,
+            load=lambda slug, **kw: seen.update(kw) or fake_handoff(),
+        )
+        assert seen["write_back"] is False
+        assert run_main.run.call_args.kwargs["write_back"] is False
+
+    def test_config_turns_it_on(self, run_main):
+        seen = {}
+        run_main(
+            "--github",
+            SLUG,
+            settings={"repo": "owner/docs", "write_back": True},
+            load=lambda slug, **kw: seen.update(kw) or fake_handoff(),
+        )
+        assert seen["write_back"] is True
+        assert run_main.run.call_args.kwargs["write_back"] is True
+
+    def test_no_write_back_beats_the_config(self, run_main):
+        run_main(
+            "--github",
+            SLUG,
+            "--no-write-back",
+            settings={"repo": "owner/docs", "write_back": True},
+            load=lambda slug, **kw: fake_handoff(),
+        )
+        assert run_main.run.call_args.kwargs["write_back"] is False
+
+    @pytest.mark.parametrize("flag", NOT_A_REVIEW, ids=lambda f: f[0])
+    def test_config_is_set_aside_with_one_info_line_for_a_run_that_is_no_review(
+        self, run_main, caplog, flag
+    ):
+        seen = {}
+        with caplog.at_level(logging.INFO):
+            code = run_main(
+                "--github",
+                SLUG,
+                *flag,
+                settings={"repo": "owner/docs", "write_back": True},
+                load=lambda slug, **kw: seen.update(kw) or fake_handoff(),
+            )
+        assert code == 0
+        assert seen["write_back"] is False
+        assert run_main.run.call_args.kwargs["write_back"] is False
+        lines = [
+            r for r in caplog.records if "write_back is set but not used" in r.message
+        ]
+        assert len(lines) == 1 and lines[0].levelno == logging.INFO
+        assert flag[0] in lines[0].getMessage()
+
+    def test_no_info_line_when_the_config_does_not_ask(self, run_main, caplog):
+        with caplog.at_level(logging.INFO):
+            run_main(
+                "--github", SLUG, "--offline", load=lambda slug, **kw: fake_handoff()
+            )
+        assert "write_back is set" not in caplog.text
+
+    def test_the_explicit_off_flag_is_fine_with_a_replay(self, run_main):
+        code = run_main(
+            "--github",
+            SLUG,
+            "--no-write-back",
+            "--replay",
+            "r.json",
+            load=lambda slug, **kw: fake_handoff(),
+        )
+        assert code == 0
+
+    def test_retry_failed_may_write_back(self, run_main):
+        code = run_main(
+            "--github",
+            SLUG,
+            "--write-back",
+            "--retry-failed",
+            "r.json",
+            load=lambda slug, **kw: fake_handoff(),
+        )
+        assert code == 0
+        assert run_main.run.call_args.kwargs["write_back"] is True
+
+    def test_nothing_is_looked_up_for_write_back_without_github(self, run_main):
+        def fail(*a, **k):
+            pytest.fail("write-back code ran without --github")
+
+        with (
+            patch("ci_article_review.github_writeback.push_saved_run", fail),
+            patch("ci_article_review.github_writeback.write_back_after_run", fail),
+            patch("ci_core.github_repo.resolve_token", fail),
+            patch(
+                "ci_article_review.pipeline._read_handoff_file",
+                return_value="# A Draft Title" + "\n" * 2 + "Body.",
+            ),
+        ):
+            assert run_main("--raw-draft", "d.md") == 0
+        assert "write_back" not in run_main.run.call_args.kwargs
+
+
+class TestWriteBackPreflight:
+    """Every refusal comes before a model is called, from the real ``load_handoff``."""
+
+    TOKEN = "ghp_exampleSECRETtoken0123456789"
+
+    @pytest.fixture
+    def github(self):
+        from .test_documents_init import REPO, FakeGitHub
+
+        fake = FakeGitHub()
+        files = {
+            f"articles/{SLUG}/{SLUG}-draft-r2.md": b"# Example\n\nA draft.\n",
+            f"articles/{SLUG}/{SLUG}-metadata-r2.md": b"metadata\n",
+            f"articles/{SLUG}/{SLUG}-review-r1.md": b"first review\n",
+            f"articles/{SLUG}/{SLUG}-review-r3.md": b"third review\n",
+            f"articles/{SLUG}/{SLUG}-review-r3-old.md": b"not a run name\n",
+            f"articles/{SLUG}/{SLUG}-review-r04.md": b"not a run name\n",
+        }
+        fake.external_commit("main", files, "round 2")
+        return fake, REPO
+
+    def read(self, run_main, github, *argv, token=TOKEN, settings=None):
+        from ci_core.github_repo import GitHubRepo
+
+        fake, repo = github
+        seen = {}
+
+        def build(name, tok):
+            return GitHubRepo(name, tok, session=fake)
+
+        def spy(*a, **k):
+            seen["handoff"] = pipeline_load(*a, token_lookup=lambda: token, **k)
+            return seen["handoff"]
+
+        from ci_article_review import github_documents
+
+        pipeline_load = github_documents.load_handoff
+        with (
+            patch("ci_article_review.github_documents.GitHubRepo", build),
+            patch("ci_article_review.pipeline._run_domain", pytest.fail),
+        ):
+            code = run_main(
+                "--github",
+                SLUG,
+                "--github-repo",
+                repo,
+                *argv,
+                settings=settings or {"repo": repo},
+                load=spy,
+            )
+        return code, seen.get("handoff"), fake
+
+    def test_taken_review_names_are_carried_to_the_run_number_bump(
+        self, run_main, github
+    ):
+        code, handoff, _ = self.read(run_main, github, "--write-back")
+        assert code == 0
+        assert handoff["taken_run_numbers"] == [1, 3]  # not -r3-old, not -r04
+        assert run_main.run.call_args.kwargs["handoff"] is handoff
+
+    def test_without_write_back_nothing_is_listed_for_it(self, run_main, github):
+        code, handoff, _ = self.read(run_main, github)
+        assert code == 0 and "taken_run_numbers" not in handoff
+
+    @pytest.mark.parametrize(
+        "setup, argv, message",
+        [
+            (lambda f: setattr(f, "push", False), [], "cannot push"),
+            (lambda f: setattr(f, "private", False), [], "public repository"),
+            (lambda f: None, ["--github-ref", "v1"], "'v1' is not one"),
+        ],
+        ids=["no-push", "public", "not-a-branch"],
+    )
+    def test_each_refusal_exits_one_before_any_model_call(
+        self, run_main, github, caplog, setup, argv, message
+    ):
+        setup(github[0])
+        with caplog.at_level(logging.ERROR):
+            code, _, fake = self.read(run_main, github, "--write-back", *argv)
+        assert code == 1 and message in caplog.text
+        run_main.run.assert_not_called()
+        assert fake.writes == []
+
+    def test_a_public_repository_is_fine_when_allowed(self, run_main, github):
+        github[0].private = False
+        code, _, _ = self.read(
+            run_main,
+            github,
+            "--write-back",
+            settings={"repo": github[1], "allow_public_repo": True},
+        )
+        assert code == 0
+
+    def test_a_commit_sha_is_not_a_branch(self, run_main, github, caplog):
+        sha = github[0].branches["main"]
+        with caplog.at_level(logging.ERROR):
+            code, _, _ = self.read(
+                run_main, github, "--write-back", "--github-ref", sha
+            )
+        assert code == 1 and "is not one" in caplog.text
+
+    def test_no_token_stops_before_the_repository_is_even_reached(
+        self, run_main, github, caplog
+    ):
+        with caplog.at_level(logging.ERROR):
+            code, _, fake = self.read(run_main, github, "--write-back", token=None)
+        assert code == 1 and "needs a GitHub token" in caplog.text
+        assert fake.requests == []
+
+    def test_a_read_alone_still_works_without_push_permission(self, run_main, github):
+        github[0].push = False
+        code, _, _ = self.read(run_main, github)
+        assert code == 0

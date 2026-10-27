@@ -292,7 +292,7 @@ in YAML read as unset, and a block that is not a mapping ignored, so a mistake i
 it never stops a run that does not use `--github`. `repo: ""` is the exception:
 it is an instruction, and `--github` refuses it. `test_github_documents_wiring.py`
 proves the block survives `merge_configs` under every cost preset. `write_back`,
-`include_capture` and `allow_public_repo` are carried and not yet read (#403).
+`include_capture` and `allow_public_repo` are read by write-back (#403).
 
 **Token.** Not in YAML: an unset `${VAR}` stops config loading for every run, and a
 token has no business in a config file. Resolution order: the `GITHUB_TOKEN`
@@ -311,7 +311,7 @@ New flags, none of which changes an existing one:
 | `--round N` | With `--github`: which round to read. Default: the highest N with a draft or handoff file |
 | `--github-ref REF` | With `--github`: a branch, tag or commit SHA to read at. Default: the configured branch |
 | `--github-repo OWNER/NAME` | Override `github_documents.repo` for this run (a scratch repository for testing, for one) |
-| `--write-back` / `--no-write-back` | With `--github`: commit the review back, or don't, overriding `write_back`. **Not built yet (#403).** |
+| `--write-back` / `--no-write-back` | With `--github`: commit the review back, or don't, overriding `write_back`. **Built in #403**, below. |
 
 `--round`, `--github-ref` and `--github-repo` are usage errors without `--github`,
 `--round` must be 1 or more, and `--github` is also a usage error with `--metadata`
@@ -409,6 +409,51 @@ taken path) does not lose the review: the local files are already saved. The run
 prints the error and how to retry, exits 1, and the retry is
 `ci-docs push-run <path to run_N_<ts>_report.json>`, which writes back a saved
 run without re-running it.
+
+**As built (#403)**, in `github_writeback.py`. Where this section and the issue
+differ, the issue won:
+
+- **One code path.** `ci-review --github SLUG --write-back` and
+  `ci-docs push-run REPORT_JSON` both call `push_saved_run`. Neither reads the
+  other's state: the folder, the branch, the run number and the timestamp come
+  from the saved report and its file name, so the retry needs no `path_prefix`.
+  `ci-docs` already existed (#408), so `push-run` is a subcommand of it, not a
+  new console script.
+- **Pre-flight is part of the read.** `github_documents.load_handoff(...,
+  write_back=True)` already holds the client, the repository info and the folder
+  listing, so it checks the token, `can_push`, a private repository (or
+  `allow_public_repo`) and that the branch is a branch there
+  (`GitHubRepo.has_branch`; a tag or a SHA given to `--github-ref` cannot be
+  committed onto) without a second client. The taken `<slug>-review-rN.md` names
+  go to the handoff as `taken_run_numbers`, and `run_draft_pipeline` unions them
+  with `hist.existing_run_numbers` before its one bump and its one warning.
+  Only the review names are counted, as the issue says; a worklist or report
+  name that is taken in `pipeline/` fails at write-back with `exists`.
+- **Calibration flags.** The issue makes `--write-back` with `--only-model`,
+  `--only-domain` or `--no-timeout` a usage error as well as `--replay` and
+  `--offline`; the sentence above that says calibration runs are "treated like a
+  replay" is now exact. With config's `write_back: true` those runs ignore it and
+  log one INFO line. `--no-write-back` is accepted with any of them.
+- **When it runs.** After `hist.save_run`, after the capture is saved and after
+  the summary is printed, so the commit URL is the last line. A failure raises
+  `GitHubDocumentsError`, which `main()` turns into one logged message and exit
+  1; the message ends with the saved report's path and the `ci-docs push-run`
+  line to retry, with `--config-dir` when it is not `configs`.
+- **What push-run refuses.** A report with `_replay` in its path, one not named
+  `run_N_<timestamp>_report.json`, one without a GitHub `document_source`, a
+  missing `_review.md` or report, a branch that has gone, a public repository
+  without `allow_public_repo`, and no push permission. A missing `_worklist.md`
+  (or `_results.json` with `include_capture`) is a warning and the file is left
+  out. A report that carries `replayed_from` but sits outside `_replay/` is
+  pushed: copying it out is the explicit act the check is for.
+- **Secrets.** `refuse_if_contains` is every non-empty string in the merged
+  `api_keys`. `push-run` rebuilds that table from `--config-dir`, using the
+  publication named in the report, and stops if the configuration cannot be
+  loaded rather than skipping the scan.
+- **The note about an edited draft** lists each draft file whose blob at the
+  branch head differs from the blob the report recorded, one line each:
+  `Note: <name> changed at its own path since it was read (blob a1b2c3d then,
+  e4f5a6b now).`
 
 ## Replay, offline and experiments
 
