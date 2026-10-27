@@ -955,6 +955,8 @@ content-intelligence/
 │   │   │   ├── text_repair.py    undoes Perplexity's low-byte narrowing of
 │   │   │   │                     General Punctuation (U+2019 arriving as 0x19)
 │   │   │   ├── http.py           USER_AGENT + DEFAULT_HEADERS for all outbound calls
+│   │   │   ├── github_repo.py    thin GitHub REST client: read at a ref, list a directory,
+│   │   │   │                     fast-forward-only multi-file commit (no clone, no library)
 │   │   │   ├── concurrency.py    run_with_timeout — the wall-clock backstop both
 │   │   │   │                     applications run their provider calls under
 │   │   │   ├── redact.py         scrubs API keys from error output before logging;
