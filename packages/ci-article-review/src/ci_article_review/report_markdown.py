@@ -487,6 +487,42 @@ def _consensus_bands(consensus_flags, comparable_runs):
     ]
 
 
+def numbered_consensus_bands(consensus_flags, comparable_runs=0):
+    """Section 1's non-empty bands, each entry with the number the review prints.
+
+    ``[(title, note, [(number, entry), ...]), ...]``. The numbers run on across
+    the bands (1, 2, 3 ... with no restart), which is what ``#### N.`` in
+    ``review.md`` shows and what the pull request review's ``F<N>`` items cite,
+    so both are built from this one function and cannot drift apart.
+    ``consensus_flags`` is the list of entries that could be read (``_dicts``).
+    """
+    counter = 0
+    bands = []
+    for title, note, entries in _consensus_bands(consensus_flags, comparable_runs):
+        if not entries:
+            continue
+        numbered = []
+        for entry in entries:
+            counter += 1
+            numbered.append((counter, entry))
+        bands.append((title, note, numbered))
+    return bands
+
+
+def consensus_findings(report):
+    """Section 1's findings of a saved report as ``[(number, entry)]``, in review order.
+
+    ``number`` is the one ``review.md`` prints before the passage.
+    """
+    entries, _dropped = _dicts(report.get("section_1_consensus", []))
+    runs = (report.get("reproducibility") or {}).get("comparable_run_count") or 0
+    return [
+        item
+        for _title, _note, numbered in numbered_consensus_bands(entries, runs)
+        for item in numbered
+    ]
+
+
 def _render_section_1(consensus_flags, comparable_runs=0):
     lines = ["## SECTION 1: Consensus Flags", ""]
     consensus_flags, dropped = _dicts(consensus_flags)
@@ -507,16 +543,14 @@ def _render_section_1(consensus_flags, comparable_runs=0):
     )
     lines.append("")
 
-    counter = 0
-    for title, note, entries in _consensus_bands(consensus_flags, comparable_runs):
-        if not entries:
-            continue
-        lines.append(f"### {title} ({len(entries)})")
+    for title, note, numbered in numbered_consensus_bands(
+        consensus_flags, comparable_runs
+    ):
+        lines.append(f"### {title} ({len(numbered)})")
         if note:
             lines.append(f"_{note}_")
         lines.append("")
-        for entry in entries:
-            counter += 1
+        for counter, entry in numbered:
             passage = entry.get("passage", "")
             models = entry.get("models") or []
             weight = entry.get("weight_sum")

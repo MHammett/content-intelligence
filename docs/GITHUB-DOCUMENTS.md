@@ -342,10 +342,12 @@ missing.
 limit on a body, which is undocumented but consistently reported, e.g.
 [dead-claudia/github-limits](https://github.com/dead-claudia/github-limits)):
 
-- A first line the pipeline can find again: `<!-- ci-review run=7 commit=3f2a91c… -->`.
+- A first line the pipeline can find again: `<!-- ci-review run=7 commit=<S> -->`,
+  with `S` the full 40-character SHA of the commit reviewed.
   `push-run` lists the pull request's reviews (`GET .../reviews`) and posts
-  nothing when one carries its marker, so a retry never duplicates a review; the
-  tagging step and `ci-docs accept` read the same marker to name a round's runs.
+  nothing when one starts with its marker, so a retry never duplicates a review; the
+  tagging step and `ci-docs accept` read the same marker to name a round's runs
+  (`review_body.parse_marker`).
 - **The summary**: the run, the preset and cost, the commit reviewed and the drift
   line if any; the "Reading this report" caveat in one sentence (a single run is
   not a measurement); and one line per section with its count of findings.
@@ -362,6 +364,23 @@ limit on a body, which is undocumented but consistently reported, e.g.
 - When the body would pass 60,000 characters, the per-section lines are cut
   first, then checklist items from the end (whole items); the body ends with what
   was cut and that `review.md` has it all. Nothing is cut from `review.md`.
+- A checklist line clips the passage to 120 characters and the finding to 180,
+  takes the finding from the first flag that says what is wrong (`problem`,
+  `logical_problem`, `risk`, `attack_vector`, a fact-check's `type` and
+  `current_value`), and shows a raw `<` as `&lt;` so a passage cannot open an HTML
+  comment that swallows the lines after it. The numbers come from
+  `report_markdown.numbered_consensus_bands`, the function `review.md`'s Section 1
+  is rendered from.
+
+**Built in #417** (`github_writeback.py`, `review_body.py`). The pre-flight is
+#416's `load_handoff(write_back=True)`. At write-back the pull request is read
+again; if it is merged or closed nothing is written (`PullRequestClosed`: no retry
+line, since `push-run` would refuse it too) and the run exits 1. Each file the
+pipeline owns that existed at `S` goes in `commit_files`'s `replace` with its blob
+at `S`, and one absent at `S` is left out of it, so it must still be absent. The
+body is built and scanned for the token and every configured API key *before* the
+commit, so a hit sends nothing at all; the final body differs from the scanned one
+only in the SHA of the link.
 
 **The worklist stays away from the drafting chat.** README ("The worklist") and
 `revise_after_review_prompt.md` keep it out of the revision model, because it lists
@@ -729,8 +748,10 @@ reason and `ci-docs push-run <report.json>`, and exits 1, as #410 built.
 identical make no commit, and a review whose marker is already on the pull request
 is not posted again. It refuses what #410's refuses (a `_replay/` report, one
 without a GitHub `document_source`, a public repository without
-`allow_public_repo`, no push permission), and also a report whose pull request is
-merged or closed.
+`allow_public_repo`, no push permission), and also a report whose
+`document_source` names no `pull_request` (it was read from a tag or a ref) and one
+whose pull request is merged or closed. It prints the commit URL and then the
+review URL.
 
 ## Replay, offline and experiments
 
@@ -1100,12 +1121,11 @@ them.
 
 ## Today's behaviour, until the redesign lands
 
-Until the phases below merge, `ci-review --github SLUG` reads
-`articles/<slug>/<slug>-(handoff|draft|metadata)-rN.md` from `main`,
-`--write-back` commits `<slug>-review-rN.md` and `pipeline/` files to `main`, and
-`ci-docs put` adds per-round names with the `-vM` rules. No article should be put
-into the repository that way: the first redesign phase to touch the reader
-retires those names without migrating anything.
+Until the phases below merge, `ci-docs put` adds per-round names
+(`<slug>-draft-rN.md`, `-vM` rules) to the folder. No article should be put into
+the repository that way: the first redesign phase to touch it retires those names
+without migrating anything. `ci-review --github` and `--write-back` already work
+on a round's pull request (#416, #417).
 
 ## What does not change
 

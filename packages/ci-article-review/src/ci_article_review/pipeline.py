@@ -6309,13 +6309,14 @@ def build_parser():
         "--write-back",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="With --github: commit the review back to the article's folder "
-        "(SLUG-review-rN.md, plus the worklist and report under pipeline/) in "
-        "one commit that only adds files. --no-write-back overrides "
-        "github_documents.write_back. Not combinable with --replay, --offline, "
-        "--only-model, --only-domain or --no-timeout, which are not reviews to "
-        "hand back, nor with --github-ref, which never writes back. If the "
-        "commit fails the review is still saved locally; `ci-docs push-run` "
+        help="With --github: deliver the review to the round's pull request: "
+        "one commit to its branch (review.md, and run.json, report.json and "
+        "worklist.md under pipeline/), then one pull request review with the "
+        "summary and a checklist of the Section 1 findings. --no-write-back "
+        "overrides github_documents.write_back. Not combinable with --replay, "
+        "--offline, --only-model, --only-domain or --no-timeout, which are not "
+        "reviews to hand back, nor with --github-ref, which never writes back. "
+        "If it fails the review is still saved locally; `ci-docs push-run` "
         "retries it.",
     )
     parser.add_argument(
