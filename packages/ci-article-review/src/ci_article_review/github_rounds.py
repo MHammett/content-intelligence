@@ -582,8 +582,10 @@ def accept_round(
     except GitHubRepoError as exc:
         if exc.kind == "conflict":
             raise GitHubDocumentsError(
-                f"{exc} Nothing was merged. Run `ci-docs accept {slug}` again to "
-                "see the head as it is now."
+                f"{exc}. Nothing was merged. If the head moved after it was shown, "
+                f"run `ci-docs accept {slug}` again to see it as it is now; "
+                "otherwise the pull request cannot be merged as it stands "
+                "(a conflict with the base branch, or a required check)."
             ) from exc
         raise GitHubDocumentsError(_explain(exc, name, has_token=bool(token))) from exc
     finally:
