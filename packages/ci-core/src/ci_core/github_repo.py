@@ -510,6 +510,33 @@ class GitHubRepo:
             raise self._http_error(resp, f"look up branch {branch}")
         return True
 
+    def merge_base(self, base, head):
+        """The commit a pull request's diff is taken from: the merge base of two commits.
+
+        ``GET /compare/{base}...{head}`` names it as ``merge_base_commit``.
+        Returns ``None`` when the two share no history (GitHub answers 404 "no
+        common ancestor"), which no pull request into this repository can.
+        """
+        resp = self._send(
+            "GET",
+            f"/repos/{self.repo}/compare/{_quote(base)}...{_quote(head)}",
+            params={"per_page": 1},
+        )
+        if (
+            resp.status_code == 404
+            and "no common ancestor" in self._message(resp).lower()
+        ):
+            return None
+        if not 200 <= resp.status_code < 300:
+            raise self._http_error(resp, f"compare {base[:12]}...{head[:12]}")
+        sha = ((resp.json() or {}).get("merge_base_commit") or {}).get("sha")
+        if not isinstance(sha, str) or not _FULL_SHA.match(sha):
+            raise self._error(
+                "other",
+                f"compare {base[:12]}...{head[:12]}: no merge_base_commit in the answer",
+            )
+        return sha
+
     def read(self, path, ref):
         """The bytes of ``path`` as of ``ref``, pinned to the commit ``ref`` names."""
         _check_path(path)

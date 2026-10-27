@@ -268,7 +268,23 @@ once, and every read is at that SHA, as #409 built.
 `document_source` in `report.json` gains the pull request and both ends of it:
 `{kind: "github", repo, ref, commit_sha, round, pull_request, base_sha, files:
 [{path, blob_sha}]}`, where `ref` is the branch (or the tag or `REF`) and
-`base_sha` is the merge base the pull request's diff is taken from.
+`base_sha` is the merge base the pull request's diff is taken from. It is the
+merge base of the pull request's own `base.sha` and the commit read
+(`GET /compare/{base}...{head}`, `merge_base_commit`), so for a merged round it is
+the base the round had, not the merge commit's. `round` is the `N` of the branch
+or tag (`None` for `--github-ref`, and for a pull request whose branch is not
+`rN`); `pull_request` and `base_sha` are `None` for a tag or a `REF`.
+
+**A pull request's head pointer can lag a push.** An open pull request is read at
+the tip of its branch when the two differ (GitHub's branch ref is the truth; see
+the lag seen on #45), with one WARNING naming both. A closed or merged one keeps
+the head it ended with.
+
+**What a round's folder must hold** (built in #416): `draft.md`, with `metadata.md`
+if present (without it the draft is read as `--raw-draft` reads one, with its
+lost-context warning), or `handoff.md` alone. With both a `draft.md` and a
+`handoff.md`, the draft wins and the run warns that `handoff.md` is stale.
+Neither is an error naming the folder and the ref.
 
 **When the head moves during a run.** A review takes minutes, and the chat may
 commit in the meantime. The run reviews the commit it read, `S`, and nothing

@@ -557,7 +557,8 @@ pipeline:
 #     tokens_per_minute: 400000
 
 # GitHub as an optional place to read a draft from: `ci-review --github SLUG`
-# reads the latest round of articles/SLUG/ from a separate, private repository
+# reads the article's open round (the pull request from a branch round/SLUG/rN)
+# of articles/SLUG/ from a separate, private repository
 # (see the README, "Reading a draft from GitHub"). Every key is optional and the whole block can
 # stay commented out; nothing reads it unless a run passes --github.
 #
@@ -566,7 +567,7 @@ pipeline:
 # this file would travel with every copy of it.
 # github_documents:
 #   repo: MHammett/mikehammett.net-articles  # OWNER/NAME; --github-repo overrides it per run
-#   branch: main            # default: the repository's default branch; --github-ref overrides
+#   branch: main            # the base branch rounds merge into; default: the repository's default branch
 #   path_prefix: articles   # the folder holding one folder per article
 #   write_back: false       # commit the review back after every --github run (--write-back / --no-write-back override); needs a token with Contents read and write
 #   include_capture: false  # with write_back: also commit run_N_*_results.json under pipeline/

@@ -31,7 +31,9 @@ SOURCE = {
     "ref": "main",
     "commit_sha": "a" * 40,
     "round": 3,
-    "files": [{"path": f"articles/{SLUG}/{SLUG}-draft-r3.md", "blob_sha": "b" * 40}],
+    "pull_request": 7,
+    "base_sha": "c" * 40,
+    "files": [{"path": f"articles/{SLUG}/draft.md", "blob_sha": "b" * 40}],
 }
 
 
@@ -176,6 +178,8 @@ class TestUsageErrors:
         "argv, mentions",
         [
             (["--raw-draft", "d.md", "--round", "2"], "--round requires --github"),
+            (["--raw-draft", "d.md", "--pr", "7"], "--pr requires --github"),
+            (["--draft", "h.md", "--pr", "7"], "--pr requires --github"),
             (
                 ["--raw-draft", "d.md", "--github-ref", "x"],
                 "--github-ref requires --github",
@@ -187,6 +191,22 @@ class TestUsageErrors:
             (["--draft", "h.md", "--round", "2"], "--round requires --github"),
             (["--github", SLUG, "--round", "0"], "--round must be 1 or more"),
             (["--github", SLUG, "--round", "-2"], "--round must be 1 or more"),
+            (["--github", SLUG, "--pr", "0"], "--pr must be 1 or more"),
+            (["--github", SLUG, "--pr", "x"], "invalid int value"),
+            (["--github", SLUG, "--pr", "7", "--round", "2"], "not allowed with"),
+            (["--github", SLUG, "--round", "2", "--pr", "7"], "not allowed with"),
+            (
+                ["--github", SLUG, "--pr", "7", "--github-ref", "main"],
+                "not allowed with",
+            ),
+            (
+                ["--github", SLUG, "--round", "2", "--github-ref", "main"],
+                "not allowed with",
+            ),
+            (
+                ["--github", SLUG, "--github-ref", "main", "--write-back"],
+                "--write-back does not combine with --github-ref",
+            ),
             (["--github", SLUG, "--metadata", "m.md"], "--metadata"),
             (["--github", SLUG, "--archive-only"], "--archive-only"),
             (["--github", SLUG, "--publish", "p.md"], "not allowed with"),
@@ -221,8 +241,6 @@ class TestGithubReachesThePipeline:
             SLUG,
             "--round",
             "3",
-            "--github-ref",
-            "drafts",
             "--github-repo",
             "owner/scratch",
             "--cost-preset",
@@ -234,9 +252,10 @@ class TestGithubReachesThePipeline:
         assert seen["slug"] == SLUG
         assert (seen["round_number"], seen["ref"], seen["repo"]) == (
             3,
-            "drafts",
+            None,
             "owner/scratch",
         )
+        assert seen["pull_request"] is None
         assert seen["settings"]["path_prefix"] == "docs"
         # Defaults the block did not mention are filled in.
         assert seen["settings"]["write_back"] is False
@@ -254,6 +273,27 @@ class TestGithubReachesThePipeline:
             load=lambda slug, **kw: seen.update(kw) or fake_handoff(),
         )
         assert (seen["round_number"], seen["ref"], seen["repo"]) == (None, None, None)
+        assert seen["pull_request"] is None
+
+    def test_pr_and_ref_reach_load_handoff_each_on_its_own(self, run_main):
+        seen = {}
+
+        def load(slug, **kw):
+            seen.update(kw)
+            return fake_handoff()
+
+        run_main("--github", SLUG, "--pr", "7", load=load)
+        assert (seen["pull_request"], seen["round_number"], seen["ref"]) == (
+            7,
+            None,
+            None,
+        )
+        run_main("--github", SLUG, "--github-ref", "main", load=load)
+        assert (seen["pull_request"], seen["round_number"], seen["ref"]) == (
+            None,
+            None,
+            "main",
+        )
 
     @pytest.mark.parametrize(
         "extra, kwarg, value",
@@ -375,6 +415,81 @@ class TestDocumentSourceInTheReport:
             assert "document_source" not in report
 
 
+class TestRunNumbers:
+    """Round and run are separate numbers: the run is one past everything known.
+
+    "Known" is local history plus ``taken_run_numbers`` (``pipeline/run.json`` at
+    the round's head and at the base branch), unless the handoff declares its own
+    ``Pipeline run:``.
+    """
+
+    def run(self, tmp_path, monkeypatch, *, history=(), taken=(), declared=None):
+        from .test_pipeline_end_to_end import _HANDOFF, _stubbed_run
+
+        folder = tmp_path / "history" / SLUG
+        folder.mkdir(parents=True)
+        for n in history:
+            (folder / f"run_{n}_20260101_000000_report.json").write_text(
+                "{}", encoding="utf-8"
+            )
+        monkeypatch.setitem(_HANDOFF, "history_key", SLUG)
+        monkeypatch.setitem(_HANDOFF, "taken_run_numbers", list(taken))
+        monkeypatch.setitem(_HANDOFF, "run_number_declared", declared is not None)
+        monkeypatch.setitem(_HANDOFF, "run_number", declared or 1)
+        with _stubbed_run(tmp_path) as report:
+            return report["run_number"]
+
+    def test_run_json_says_6_and_history_has_1_to_4_the_run_is_7(
+        self, tmp_path, monkeypatch
+    ):
+        assert self.run(tmp_path, monkeypatch, history=[1, 2, 3, 4], taken=[6]) == 7
+
+    def test_a_declared_pipeline_run_is_used_as_written(self, tmp_path, monkeypatch):
+        got = self.run(
+            tmp_path, monkeypatch, history=[1, 2, 3, 4], taken=[6], declared=9
+        )
+        assert got == 9
+
+    def test_no_run_json_and_no_history_is_run_1(self, tmp_path, monkeypatch):
+        assert self.run(tmp_path, monkeypatch) == 1
+
+    def test_a_taken_number_alone_moves_the_run_past_it(self, tmp_path, monkeypatch):
+        # Run 1 is free locally and in the repository's list; the run is still
+        # 7, because another machine made 6 and an absent line means "next".
+        assert self.run(tmp_path, monkeypatch, taken=[6]) == 7
+
+    def test_local_history_alone_moves_the_run_past_it(self, tmp_path, monkeypatch):
+        assert self.run(tmp_path, monkeypatch, history=[2, 5]) == 6
+
+    def test_a_declared_number_that_is_taken_is_bumped_with_a_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        with caplog.at_level(logging.WARNING):
+            got = self.run(tmp_path, monkeypatch, taken=[3, 4], declared=3)
+        assert got == 5 and "Run 3 already exists" in caplog.text
+
+    def test_an_absent_line_is_not_a_warning(self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING):
+            self.run(tmp_path, monkeypatch, history=[1, 2], taken=[6])
+        assert "already exists" not in caplog.text
+
+    def test_a_handoff_from_a_file_still_bumps_only_on_a_clash(
+        self, tmp_path, monkeypatch
+    ):
+        # Not --github: no run_number_declared key, so run 1 stands while it is free.
+        from .test_pipeline_end_to_end import _HANDOFF, _stubbed_run
+
+        monkeypatch.setitem(_HANDOFF, "history_key", SLUG)
+        monkeypatch.delitem(_HANDOFF, "run_number_declared", raising=False)
+        folder = tmp_path / "history" / SLUG
+        folder.mkdir(parents=True)
+        (folder / "run_2_20260101_000000_report.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        with _stubbed_run(tmp_path) as report:
+            assert report["run_number"] == 1
+
+
 NOT_A_REVIEW = [
     ("--replay", "r.json"),
     ("--offline",),
@@ -476,6 +591,35 @@ class TestWriteBackFlags:
         assert len(lines) == 1 and lines[0].levelno == logging.INFO
         assert flag[0] in lines[0].getMessage()
 
+    def test_config_is_set_aside_with_one_info_line_for_a_ref(self, run_main, caplog):
+        seen = {}
+        with caplog.at_level(logging.INFO):
+            code = run_main(
+                "--github",
+                SLUG,
+                "--github-ref",
+                "main",
+                settings={"repo": "owner/docs", "write_back": True},
+                load=lambda slug, **kw: seen.update(kw) or fake_handoff(),
+            )
+        assert code == 0 and seen["write_back"] is False
+        lines = [
+            r for r in caplog.records if "write_back is set but not used" in r.message
+        ]
+        assert len(lines) == 1 and "--github-ref" in lines[0].getMessage()
+
+    def test_a_round_read_by_pr_or_round_still_takes_the_config(self, run_main):
+        for argv in (["--pr", "7"], ["--round", "2"], []):
+            seen = {}
+            run_main(
+                "--github",
+                SLUG,
+                *argv,
+                settings={"repo": "owner/docs", "write_back": True},
+                load=lambda slug, **kw: seen.update(kw) or fake_handoff(),
+            )
+            assert seen["write_back"] is True
+
     def test_no_info_line_when_the_config_does_not_ask(self, run_main, caplog):
         with caplog.at_level(logging.INFO):
             run_main(
@@ -523,6 +667,69 @@ class TestWriteBackFlags:
         assert "write_back" not in run_main.run.call_args.kwargs
 
 
+def _round_fake():
+    """The ``ci-docs init`` fake plus the routes a round read adds.
+
+    One open pull request, #1, from ``round/example-article/r2``; ``main`` and
+    the round both hold a ``pipeline/run.json``.
+    """
+    from .test_documents_init import REPO, FakeGitHub, Resp
+
+    class Fake(FakeGitHub):
+        pulls = ()
+
+        def _pull(self, number, branch, state="open"):
+            return {
+                "number": number,
+                "state": state,
+                "merged_at": None,
+                "merge_commit_sha": None,
+                "head": {
+                    "ref": branch,
+                    "sha": self.branches[branch],
+                    "repo": {"full_name": REPO},
+                },
+                "base": {"ref": "main", "sha": self.branches["main"]},
+                "title": f"{SLUG} round",
+                "html_url": f"https://github.com/{REPO}/pull/{number}",
+            }
+
+        def _route(self, method, path, headers, params, body):
+            if method == "GET" and path == "/pulls":
+                items = [self._pull(n, b) for n, b in self.pulls]
+                return Resp(200, items)
+            if method == "GET" and path.startswith("/pulls/"):
+                number = int(path.rsplit("/", 1)[1])
+                for n, b in self.pulls:
+                    if n == number:
+                        return Resp(200, {**self._pull(n, b), "merged": False})
+                return Resp(404, {"message": "Not Found"})
+            if method == "GET" and path.startswith("/git/matching-refs/"):
+                return Resp(200, [])
+            if method == "GET" and path.startswith("/compare/"):
+                return Resp(
+                    200,
+                    {
+                        "status": "ahead",
+                        "merge_base_commit": {"sha": self.branches["main"]},
+                    },
+                )
+            return super()._route(method, path, headers, params, body)
+
+    fake = Fake()
+    fake.external_commit(
+        "main", {f"articles/{SLUG}/pipeline/run.json": b'{"run_number": 5}'}, "run 5"
+    )
+    round_files = {
+        f"articles/{SLUG}/draft.md": b"# Example\n\nA draft.\n",
+        f"articles/{SLUG}/metadata.md": b"metadata\n",
+        f"articles/{SLUG}/pipeline/run.json": b'{"run_number": 3}',
+    }
+    fake.external_commit(f"round/{SLUG}/r2", round_files, "round 2")
+    fake.pulls = [(1, f"round/{SLUG}/r2")]
+    return fake, REPO
+
+
 class TestWriteBackPreflight:
     """Every refusal comes before a model is called, from the real ``load_handoff``."""
 
@@ -530,19 +737,7 @@ class TestWriteBackPreflight:
 
     @pytest.fixture
     def github(self):
-        from .test_documents_init import REPO, FakeGitHub
-
-        fake = FakeGitHub()
-        files = {
-            f"articles/{SLUG}/{SLUG}-draft-r2.md": b"# Example\n\nA draft.\n",
-            f"articles/{SLUG}/{SLUG}-metadata-r2.md": b"metadata\n",
-            f"articles/{SLUG}/{SLUG}-review-r1.md": b"first review\n",
-            f"articles/{SLUG}/{SLUG}-review-r3.md": b"third review\n",
-            f"articles/{SLUG}/{SLUG}-review-r3-old.md": b"not a run name\n",
-            f"articles/{SLUG}/{SLUG}-review-r04.md": b"not a run name\n",
-        }
-        fake.external_commit("main", files, "round 2")
-        return fake, REPO
+        return _round_fake()
 
     def read(self, run_main, github, *argv, token=TOKEN, settings=None):
         from ci_core.github_repo import GitHubRepo
@@ -575,26 +770,35 @@ class TestWriteBackPreflight:
             )
         return code, seen.get("handoff"), fake
 
-    def test_taken_review_names_are_carried_to_the_run_number_bump(
-        self, run_main, github
+    @pytest.mark.parametrize("argv", [[], ["--write-back"]], ids=["read", "write-back"])
+    def test_taken_run_numbers_are_carried_to_the_run_number_bump(
+        self, run_main, github, argv
     ):
-        code, handoff, _ = self.read(run_main, github, "--write-back")
+        code, handoff, _ = self.read(run_main, github, *argv)
         assert code == 0
-        assert handoff["taken_run_numbers"] == [1, 3]  # not -r3-old, not -r04
+        # run.json at the round's head (3) and at main (5), with or without
+        # --write-back: a run made on another machine is known only there.
+        assert handoff["taken_run_numbers"] == [3, 5]
         assert run_main.run.call_args.kwargs["handoff"] is handoff
+        source = handoff["document_source"]
+        assert (source["ref"], source["round"], source["pull_request"]) == (
+            f"round/{SLUG}/r2",
+            2,
+            1,
+        )
 
-    def test_without_write_back_nothing_is_listed_for_it(self, run_main, github):
-        code, handoff, _ = self.read(run_main, github)
-        assert code == 0 and "taken_run_numbers" not in handoff
+    def test_a_read_alone_makes_no_write(self, run_main, github):
+        code, _, fake = self.read(run_main, github)
+        assert code == 0 and fake.writes == []
 
     @pytest.mark.parametrize(
         "setup, argv, message",
         [
             (lambda f: setattr(f, "push", False), [], "cannot push"),
             (lambda f: setattr(f, "private", False), [], "public repository"),
-            (lambda f: None, ["--github-ref", "v1"], "'v1' is not one"),
+            (lambda f: None, ["--round", "9"], "no round 9"),
         ],
-        ids=["no-push", "public", "not-a-branch"],
+        ids=["no-push", "public", "no-such-round"],
     )
     def test_each_refusal_exits_one_before_any_model_call(
         self, run_main, github, caplog, setup, argv, message
@@ -615,14 +819,6 @@ class TestWriteBackPreflight:
             settings={"repo": github[1], "allow_public_repo": True},
         )
         assert code == 0
-
-    def test_a_commit_sha_is_not_a_branch(self, run_main, github, caplog):
-        sha = github[0].branches["main"]
-        with caplog.at_level(logging.ERROR):
-            code, _, _ = self.read(
-                run_main, github, "--write-back", "--github-ref", sha
-            )
-        assert code == 1 and "is not one" in caplog.text
 
     def test_no_token_stops_before_the_repository_is_even_reached(
         self, run_main, github, caplog
