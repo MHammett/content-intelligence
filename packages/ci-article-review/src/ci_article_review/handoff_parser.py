@@ -345,6 +345,16 @@ def parse_publication_handoff(text):
     }
 
 
+def declares_run_number(text):
+    """Whether ``text`` carries a ``Pipeline run:`` line with a number on it.
+
+    The parsers answer 1 both for a missing line and for one that says 1, so a
+    caller that wants to default the run number to something else (a round read
+    from a document store) cannot tell the two apart from the handoff dict.
+    """
+    return _extract_raw_field(text, "Pipeline run:").isdigit()
+
+
 def _extract_raw_field(text, label):
     """The single-line, first-occurrence value of a label — placeholder or not.
 

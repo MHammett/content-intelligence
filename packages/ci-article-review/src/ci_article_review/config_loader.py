@@ -809,6 +809,43 @@ PIPELINE_DEFAULTS = {
 }
 
 
+#: The document repository, when ``github_documents.repo`` is not set. The one
+#: place the name is written down in code.
+DEFAULT_GITHUB_DOCUMENTS_REPO = "MHammett/mikehammett.net-articles"
+
+#: ``github_documents:`` -- GitHub as an optional place to read a draft from
+#: (``--github``). ``branch`` None means the repository's default branch. The
+#: last three are read by write-back (#403); they are carried now so the block
+#: has one shape. No token key: an unset ``${VAR}`` stops config loading for
+#: every run, so the token comes from ``ci_core.github_repo.resolve_token``.
+GITHUB_DOCUMENTS_DEFAULTS = {
+    "repo": DEFAULT_GITHUB_DOCUMENTS_REPO,
+    "branch": None,
+    "path_prefix": "articles",
+    "write_back": False,
+    "include_capture": False,
+    "allow_public_repo": False,
+}
+
+
+def normalize_github_documents(block):
+    """The ``github_documents`` block with a default for every key it omits.
+
+    Per-key, so a partial block keeps the defaults it did not mention, and a
+    key left empty in YAML (``branch:``) reads as unset. An empty *string*
+    (``repo: ""``) is kept, because that is an instruction rather than an
+    absence; the ``--github`` path refuses it. This never raises: the block is
+    read only by runs that pass ``--github``, so a mistake in it must not stop
+    a run that does not.
+    """
+    if not isinstance(block, dict):
+        block = {}
+    return {
+        **GITHUB_DOCUMENTS_DEFAULTS,
+        **{k: v for k, v in block.items() if v is not None},
+    }
+
+
 def _merge_api_keys(user_keys, pub_keys):
     """Publication-level api_keys override user.yaml's, per provider/field —
     a partial override (e.g. one provider, one field) leaves everything else
@@ -870,6 +907,12 @@ def merge_configs(user_config, pub_config):
         # of its own because the cost presets rewrite ``models:`` and the limit
         # belongs to the account, not to a model.
         "rate_limits": user_config.get("rate_limits", {}),
+        # Where --github reads a draft from. Its own block for the same reason:
+        # a cost preset rewrites ``models:``, and the document repository has
+        # nothing to do with a model.
+        "github_documents": normalize_github_documents(
+            user_config.get("github_documents")
+        ),
         "models": models,
         "publication": pub_config,
     }
