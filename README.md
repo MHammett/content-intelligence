@@ -661,7 +661,7 @@ It reads every URL out of the draft's own citation block (`## Sources` / `## Cit
 
 ## The document repository (`ci-docs`)
 
-An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design, and has the steps for connecting a claude.ai project to it. `ci-docs` has four subcommands: `init` (below), `push-run`, `ls` and `put`. `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here.
+An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design, and has the steps for connecting a claude.ai project to it. `ci-docs` has five subcommands: `init` (below), `push-run`, `ls`, `put` and `import` (`scan` and `check`, last). `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here.
 
 ```powershell
 uv run ci-docs init --dry-run                            # print the plan; write nothing
@@ -716,6 +716,31 @@ The file's own name is the name in the repository, and it must be `<slug>-(draft
 | `--branch NAME` | the branch to read or commit to; default `github_documents.branch`, else the repository's default branch |
 | `--config-dir DIR` | where `user.yaml` is read from (default `configs`); `put` also needs it for the API keys the file must not contain |
 | `--publication NAME` | `put` only: also scan for the keys in `configs/NAME.yaml` |
+
+### `ci-docs import scan` and `ci-docs import check`
+
+Step 1 of importing an article's history that predates the repository (the design is [Decision 7](docs/GITHUB-DOCUMENTS.md#importing-an-articles-history)). `scan` merges one article's local sources into an editable `plan.json` and prints a timeline; `check` validates the plan after you have edited it. Neither writes to GitHub or calls a model, and neither prints a file's contents: the plan holds paths, hashes, times and counts.
+
+```powershell
+uv run ci-docs import scan my-article --history-key my-article --history-key an-older-title-derived-key `
+    --files $HOME\Downloads\my-article-v27 --drive-dir D:\import\drive --recovered D:\import\recovered `
+    --out D:\private\my-article-plan.json
+uv run ci-docs import check D:\private\my-article-plan.json
+```
+
+A draft that is the same text in two places is one version (CRLF and trailing whitespace do not count), dated by its earliest source unless a more trusted one is within five minutes: a saved run (`generated`) beats a Drive `createdTime` beats a file's modification time. A run is linked to the submitted draft it reviewed, after undoing its LanguageTool corrections. A new round starts at each submitted draft (one a run reviewed, one with a `vNN`/`rN` label in its name, or one from Drive); later drafts are revisions inside it. A run that matches no other source, or that is one of several on one draft within 30 minutes, is marked `suspect: "experiment?"` and kept: the author sets `include: false`. A version a chat reproduced from its context (`--recovered`) is the least trusted source: it is dated only by a `<file>.json` sidecar's `claimed_at`, dropped in favour of any other source holding that version, and otherwise kept and flagged `recovered: true`. `--out` inside this checkout is refused, as are a Drive file whose MD5 differs from `drive-manifest.json` and any `--history-key` that names `_experiments`, `_replay` or `_nested`.
+
+| Flag | Meaning |
+|---|---|
+| `SLUG` | the article's slug; a file is considered only if its name mentions it (or a history key) |
+| `--history-key KEY` | a `pipeline_history/` directory that belongs to the article; repeatable; default `SLUG` |
+| `--history-root DIR` | where the keys live; default `$CI_HISTORY_ROOT`, else the main checkout's `pipeline_history/`; the output says which |
+| `--files DIR` | a directory to scan, non-recursive plus one level; repeatable |
+| `--include NAME` | also read this file name from `--files`, whatever it is called; repeatable |
+| `--drive-dir DIR` | files a Code session downloaded with `download_file_content`, plus `drive-manifest.json` |
+| `--recovered DIR` | versions a chat reproduced from its context, with optional `<file>.json` sidecars |
+| `--chat-export PATH`, `--conversation UUID` | accepted; fail with "not built yet" until issue #422 |
+| `--out PLAN.json` | where the plan goes; must be outside the checkout |
 
 ---
 
@@ -1001,6 +1026,7 @@ content-intelligence/
 │   │   │   ├── github_writeback.py    commits a run's review back to that folder (--write-back, ci-docs push-run)
 │   │   │   ├── github_put.py          ci-docs ls and put: list an article folder, add a close-out note or drafting file
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
+│   │   │   ├── history_import.py      ci-docs import scan/check: merge an article's local sources into an editable plan
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
 │   │   │   ├── passage_match.py       decides when two quoted passages are the same passage
 │   │   │   ├── voice_pattern_report.py  recurring voice patterns across articles (ci-voice-patterns)

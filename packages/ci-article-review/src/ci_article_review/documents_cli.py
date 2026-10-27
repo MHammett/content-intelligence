@@ -21,6 +21,15 @@ close-out note or a drafting file to it, never overwriting (``github_put``).
     ci-docs ls example-article
     ci-docs put example-article example-article-close-out-r4-to-chat.md
 
+``ci-docs import scan SLUG ... --out PLAN.json`` is step 1 of importing an
+article's history from local files (``history_import``): it merges the sources
+into an editable plan and prints a timeline, and ``ci-docs import check
+PLAN.json`` validates the plan after it is edited. Both read local files only.
+
+    ci-docs import scan example-article --files ~/Downloads/example-article-v27 \\
+        --out ~/private/example-article-plan.json
+    ci-docs import check ~/private/example-article-plan.json
+
 The token is ``GITHUB_TOKEN``, else ``gh auth token``. It is never printed.
 """
 
@@ -181,6 +190,112 @@ def build_parser():
             "must not contain (default: user.yaml's keys)"
         ),
     )
+    imp = sub.add_parser(
+        "import",
+        help="import an article's local history: scan its sources into an editable plan, then check it",
+        description=(
+            "Step 1 of the history import (docs/GITHUB-DOCUMENTS.md, Decision 7): "
+            "`scan` reads one article's local sources, de-duplicates by content, "
+            "orders them by the best timestamp, groups them into rounds, prints a "
+            "timeline and writes plan.json; `check` validates the plan after the "
+            "author has edited it. Neither writes to GitHub."
+        ),
+    )
+    imp_sub = imp.add_subparsers(dest="import_command", required=True)
+    scan = imp_sub.add_parser(
+        "scan",
+        help="read the sources, print a timeline and write an editable plan.json",
+        description=(
+            "Read one article's local sources and write plan.json. The sources are "
+            "private: nothing is printed from inside a file, and --out inside the "
+            "content-intelligence checkout is refused. A run is read from "
+            "pipeline_history/<key>/run_N_<ts>_report.json (never _experiments/, "
+            "_replay/ or _nested/)."
+        ),
+    )
+    scan.add_argument("slug", metavar="SLUG", help="the article's slug")
+    scan.add_argument(
+        "--history-key",
+        action="append",
+        metavar="KEY",
+        dest="history_keys",
+        help=(
+            "a pipeline_history/ directory that belongs to the article; repeat for "
+            "a title-derived key (default: SLUG)"
+        ),
+    )
+    scan.add_argument(
+        "--history-root",
+        metavar="DIR",
+        help=(
+            "where the history keys live (default: $CI_HISTORY_ROOT, else the main "
+            "checkout's pipeline_history/, found from this code's location)"
+        ),
+    )
+    scan.add_argument(
+        "--files",
+        action="append",
+        metavar="DIR",
+        default=[],
+        help=(
+            "a directory to scan, non-recursive plus one level (for "
+            "~/Downloads/<slug>-vNN/); only files whose names mention the slug or a "
+            "history key are read. Repeatable."
+        ),
+    )
+    scan.add_argument(
+        "--include",
+        action="append",
+        metavar="NAME",
+        default=[],
+        help="also read this file name from --files, whatever it is called. Repeatable.",
+    )
+    scan.add_argument(
+        "--drive-dir",
+        metavar="DIR",
+        help=(
+            "files a Code session downloaded from Drive with download_file_content, "
+            "plus drive-manifest.json; each file's MD5 is checked against it"
+        ),
+    )
+    scan.add_argument(
+        "--recovered",
+        metavar="DIR",
+        help=(
+            "versions a drafting chat reproduced from its context. The least "
+            "trusted source: dated only by a <file>.json sidecar's claimed_at, "
+            "and dropped when a run or a file holds the same version"
+        ),
+    )
+    scan.add_argument(
+        "--chat-export",
+        metavar="PATH",
+        help="a claude.ai export (not built yet: issue #422)",
+    )
+    scan.add_argument(
+        "--conversation",
+        action="append",
+        metavar="UUID",
+        default=[],
+        dest="conversations",
+        help="a conversation of the export that belongs to the article (not built yet: issue #422)",
+    )
+    scan.add_argument(
+        "--out",
+        required=True,
+        metavar="PLAN.json",
+        help="where to write the plan; must be outside the content-intelligence checkout",
+    )
+    check = imp_sub.add_parser(
+        "check",
+        help="validate an edited plan and print its timeline again",
+        description=(
+            "Check that an edited plan.json is consistent (times in order within a "
+            "round, rounds in order, every included event's source file present "
+            "with the recorded hash) and print the timeline. Exits 1 on a problem."
+        ),
+    )
+    check.add_argument("plan", metavar="PLAN.json", help="the plan to check")
     return parser
 
 
@@ -333,6 +448,9 @@ def main(
 ):
     """Entry point. ``environ``, ``run``, ``session`` and ``sleep`` are for tests."""
     args = build_parser().parse_args(argv)
+    if args.command == "import":
+        # Local files only: no token, no network, nothing to catch from GitHub.
+        return _import(args, environ, out)
     try:
         if args.command == "push-run":
             return _push_run(args, environ, run, session, out)
@@ -348,6 +466,73 @@ def main(
             when = time.strftime("%H:%M:%S", time.localtime(exc.reset_at))
             return _fail(f"{exc} The limit lifts at {when}.")
         return _fail(str(exc))
+
+
+def _import(args, environ, out):
+    from . import history_import as hi
+
+    try:
+        if args.import_command == "check":
+            return _import_check(args, hi, out)
+        return _import_scan(args, environ, hi, out)
+    except hi.ImportScanError as exc:
+        return _fail(str(exc))
+
+
+def _import_scan(args, environ, hi, out):
+    # Refuse before reading anything: a wrong --out should cost nothing.
+    hi.refuse_out_inside_checkout(args.out)
+    plan, stats = hi.scan(
+        args.slug,
+        history_keys=args.history_keys,
+        history_root=args.history_root,
+        files=args.files,
+        include=args.include,
+        drive_dir=args.drive_dir,
+        recovered=args.recovered,
+        chat_export=args.chat_export,
+        conversations=args.conversations,
+        environ=environ,
+    )
+    hi.write_plan(plan, args.out)
+    for line in hi.format_summary(stats):
+        out(line)
+    out("")
+    for line in hi.format_timeline(plan):
+        out(line)
+    excluded = hi.format_excluded(plan)
+    if excluded:
+        out("")
+        out("Excluded (not events):")
+        for line in excluded:
+            out(line)
+    out("")
+    out(f"Wrote {args.out}")
+    out(
+        "Edit it (include: false, move an event, set accepted_at), then: "
+        f"ci-docs import check {args.out}"
+    )
+    return 0
+
+
+def _import_check(args, hi, out):
+    try:
+        with open(args.plan, encoding="utf-8") as handle:
+            plan = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return _fail(f"cannot read the plan {args.plan}: {exc}")
+    problems = hi.check_plan(plan)
+    if isinstance(plan, dict) and plan.get("rounds"):
+        for line in hi.format_timeline(plan):
+            out(line)
+    if problems:
+        out("")
+        for problem in problems:
+            out(f"problem: {problem}")
+        return _fail(f"{len(problems)} problem(s) in {args.plan}")
+    out("")
+    out(f"{args.plan}: ok")
+    return 0
 
 
 def _push_run(args, environ, run, session, out):
