@@ -4,7 +4,9 @@ The document repository (a private GitHub repository holding the articles) has t
 describe itself to whatever attaches to it: Codex reads ``AGENTS.md``, Claude Code
 reads ``CLAUDE.md``, a claude.ai project reads what is pasted into its
 instructions. This module renders those files from sources packaged here, and
-decides, file by file, what a re-run may write.
+decides, file by file, what a re-run may write. It also says which repository
+settings and issue labels the round-per-pull-request design needs
+(``DOCUMENT_REPO_SETTINGS``, ``LABELS``); ``documents_cli`` applies them.
 
 No network and no ``gh`` in this module: it renders bytes and compares blob SHAs.
 ``documents_cli`` does the talking. That split is what lets the never-clobber
@@ -14,17 +16,17 @@ Managed paths and their sources:
 
 * the five templates come from ``handoff_templates/``, the same files ``ci-setup``
   copies, so each template has exactly one source;
-* ``AGENTS.md``, ``CLAUDE.md``, ``README.md``, ``.gitattributes`` and
-  ``instructions/claude-project.md`` come from ``document_repo/``. Those sources
+* ``AGENTS.md``, ``CLAUDE.md``, ``README.md``, ``.gitattributes``,
+  ``articles/README.md`` and ``instructions/claude-project.md`` come from
+  ``document_repo/``. Those sources
   carry a ``.tmpl`` suffix on purpose: a file called ``AGENTS.md`` or ``CLAUDE.md``
   inside this package would be read by Codex and Claude Code as instructions for
   working on *this* repository, and a ``.gitattributes`` there would apply to the
   directory it sits in.
 
-Two paths are written once and never managed: ``articles/README.md`` (only while
-``articles/`` is empty) and ``instructions/publication.md`` (only from
-``--seed-instructions``, and only if absent). Nothing else under ``articles/`` is
-ever touched.
+One path is written once and never managed: ``instructions/publication.md`` (only
+from ``--seed-instructions``, and only if absent). Apart from ``articles/README.md``
+nothing under ``articles/`` is ever touched.
 """
 
 import json
@@ -33,7 +35,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ci_core.github_repo import git_blob_sha
+from ci_core.github_repo import RepoInfo, git_blob_sha
 
 from .config_loader import DEFAULT_GITHUB_DOCUMENTS_REPO
 
@@ -47,6 +49,67 @@ MANIFEST_PATH = ".ci-docs/manifest.json"
 PUBLICATION_PATH = "instructions/publication.md"
 ARTICLES_README_PATH = "articles/README.md"
 SEED_PATH = "README.md"
+
+#: What the document repository must allow. A squash merge replaces a round's
+#: draft, review and revision commits with one, and a rebase merge rewrites them,
+#: so only merge commits are left on. Branches are not deleted on merge: nothing
+#: in this design deletes, and the merge commit and the tag keep a round
+#: reachable either way.
+DOCUMENT_REPO_SETTINGS = {
+    "allow_merge_commit": True,
+    "allow_squash_merge": False,
+    "allow_rebase_merge": False,
+    "delete_branch_on_merge": False,
+}
+
+#: What GitHub gives a repository that has just been created, for ``--dry-run`` on
+#: one that does not exist yet.
+NEW_REPO_INFO = RepoInfo(
+    default_branch="main",
+    private=True,
+    can_push=True,
+    allow_merge_commit=True,
+    allow_squash_merge=True,
+    allow_rebase_merge=True,
+    delete_branch_on_merge=False,
+)
+
+
+@dataclass(frozen=True)
+class Label:
+    name: str
+    color: str
+    description: str
+
+
+#: Created when missing and never edited afterwards. ``article:<slug>`` is not
+#: here: the drafting chat creates one per article, and ``ci-docs`` creates it
+#: when it needs it. Descriptions are within GitHub's 100 characters.
+LABELS = (
+    Label("round", "1d76db", "A round of an article: its pull request"),
+    Label("known-gap", "fbca04", "Something an article does not cover yet and should"),
+    Label(
+        "research", "5319e7", "A question to answer before an article can say something"
+    ),
+    Label("decision", "d93f0b", "A choice only the author can make"),
+    Label(
+        "correction", "b60205", "An error found after publication; fixed by a new round"
+    ),
+    Label(
+        "from-review",
+        "0e8a16",
+        "A review finding a round deferred, so it outlives the pull request",
+    ),
+)
+
+#: Blob SHAs of earlier renders of a managed file that the manifest never
+#: recorded, because the file was not managed when it was written. Such a blob is
+#: an unedited earlier render, not the author's edit, so a re-run may replace it.
+#: ``articles/README.md`` was written once, unmanaged, by the first bootstrap
+#: (#406), from a template that had not changed before it became managed.
+EARLIER_RENDERS = {
+    ARTICLES_README_PATH: ("846fff5eb9e153a719ba92021831d02e28481c23",),
+}
 
 _PACKAGE_DIR = Path(__file__).parent
 TEMPLATE_DIR = _PACKAGE_DIR / "handoff_templates"
@@ -77,6 +140,7 @@ REPO_FILES = (
     ("README.md", "README.md.tmpl", "html"),
     (".gitattributes", "gitattributes.tmpl", "hash"),
     ("instructions/claude-project.md", "claude-project.md.tmpl", "html"),
+    (ARTICLES_README_PATH, "articles_README.md.tmpl", "html"),
 )
 
 
@@ -112,11 +176,6 @@ def render_managed(repo, branch, *, template_dir=None, document_repo_dir=None):
         marker = _marker(style, source)
         out[path] = body + marker if style == "hash" else marker + body
     return out
-
-
-def render_articles_readme(repo, branch, *, document_repo_dir=None):
-    path = Path(document_repo_dir or DOCUMENT_REPO_DIR) / "articles_README.md.tmpl"
-    return _fill(path.read_bytes(), repo, branch)
 
 
 def _fill(data, repo, branch):
@@ -180,7 +239,6 @@ class RepoState:
     manifest_sha: str | None = None
     manifest_source_commit: str | None = None
     manifest_unreadable: bool = False
-    articles_empty: bool = True
 
 
 @dataclass
@@ -201,7 +259,7 @@ class Plan:
     needs_commit: bool = False
 
 
-def make_plan(rendered, state, *, source_full, articles_readme, seed, overwrite_edited):
+def make_plan(rendered, state, *, source_full, seed, overwrite_edited):
     """Decide, path by path, what a run writes. Pure: no network."""
     plan = Plan()
     new_manifest = {}
@@ -209,6 +267,7 @@ def make_plan(rendered, state, *, source_full, articles_readme, seed, overwrite_
         want = git_blob_sha(data)
         have = state.blobs.get(path)
         recorded = state.manifest_files.get(path)
+        unedited = have == recorded or have in EARLIER_RENDERS.get(path, ())
         if have is None:
             plan.add.append(path)
             plan.files[path] = data
@@ -216,23 +275,17 @@ def make_plan(rendered, state, *, source_full, articles_readme, seed, overwrite_
         elif have == want:
             plan.unchanged.append(path)
             new_manifest[path] = want
-        elif have == recorded or overwrite_edited:
+        elif unedited or overwrite_edited:
             plan.replace.append(path)
             plan.files[path] = data
             plan.expect[path] = have
             new_manifest[path] = want
-            if have != recorded:
+            if not unedited:
                 plan.overwritten.append(path)
         else:
             plan.edited.append(path)
             if recorded:
                 new_manifest[path] = recorded
-
-    if state.articles_empty and ARTICLES_README_PATH not in state.blobs:
-        plan.add.append(ARTICLES_README_PATH)
-        plan.files[ARTICLES_README_PATH] = articles_readme
-    elif ARTICLES_README_PATH not in state.blobs:
-        plan.notes.append("articles/ has content; articles/README.md is not created.")
 
     if PUBLICATION_PATH in state.blobs:
         if seed is not None:
@@ -269,6 +322,26 @@ def make_plan(rendered, state, *, source_full, articles_readme, seed, overwrite_
     return plan
 
 
+def settings_changes(info):
+    """``[(setting, have, want)]`` for each repository setting that is not as wanted.
+
+    ``have`` is ``None`` when GitHub did not say, which counts as different: the
+    run cannot tell that the repository refuses a squash merge.
+    """
+    return [
+        (name, getattr(info, name), want)
+        for name, want in DOCUMENT_REPO_SETTINGS.items()
+        if getattr(info, name) is not want
+    ]
+
+
+def format_settings(changes):
+    def word(value):
+        return "unknown" if value is None else str(value).lower()
+
+    return "; ".join(f"{n} {word(h)} -> {word(w)}" for n, h, w in changes)
+
+
 def manifest_bytes(source_full, files):
     return (
         json.dumps(
@@ -296,13 +369,10 @@ def parse_manifest(data):
 def read_state(gh, branch, managed_paths):
     """Look at the document repository once and return a ``RepoState``."""
     state = RepoState()
-    dirs = {"", "articles", ".ci-docs", "instructions"}
+    dirs = {"", ".ci-docs", "instructions"}
     dirs.update(p.rsplit("/", 1)[0] for p in managed_paths if "/" in p)
     for d in sorted(dirs):
-        entries = gh.list_dir(d, branch)
-        if d == "articles":
-            state.articles_empty = not entries
-        for e in entries:
+        for e in gh.list_dir(d, branch):
             if e.type == "file":
                 state.blobs[e.path] = e.sha
     state.manifest_sha = state.blobs.get(MANIFEST_PATH)

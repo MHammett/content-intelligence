@@ -33,12 +33,17 @@ CLOSE-OUT HANDOFF
 Direction: [to-code | to-chat. Who has to act on this note. to-code is written
 by the drafting chat for the Code session, to-chat by Code for the drafting
 chat. The file name repeats it, so a listing of the article's folder shows which
-notes are waiting on whom.]
+notes are waiting on whom. For an article kept in the document repository the
+name is fixed, `close-out-to-code.md` or `close-out-to-chat.md`, and says the
+same.]
 Prepared: [YYYY-MM-DD, and who wrote it: Claude Code | the drafting chat | the
 author]
 Round: [rN, where N is the last pipeline run this note takes into account, the
 same N as in `<slug>-review-rN.md`. Without it a note cannot be placed among the
-drafts and reports around it, and notes about different runs look alike.]
+drafts and reports around it, and notes about different runs look alike. For an
+article kept in the document repository: the round whose pull request the note
+is committed to, then the last run it takes into account, e.g. `r3, run 7`; the
+run is the M of the pipeline's `review: <slug> rN run M` commit.]
 Article: [the title as it stands today]
 Publication: [your publication config name, i.e. the NAME in configs/NAME.yaml]
 History key: [the directory name under pipeline_history/, read off the Code
@@ -50,8 +55,9 @@ Drive folder: [the article's folder in the shared Drive, named exactly as Drive
 shows it. For an article kept in the document repository, the folder's
 `<owner>/<repo>:<path>` instead, e.g. `example-owner/example-articles:articles/<slug>`]
 Drive folder id: [the folder's id, so a session can list it without searching
-by name. For an article kept in the document repository, the commit SHA this note
-was written against, so a session can read the folder as the sender saw it]
+by name. For an article kept in the document repository, the commit SHA on the
+round's branch this note was written against, so a session can read the folder
+as the sender saw it]
 Names match: [yes | no, left as it is on purpose: why, decided by whom, on what
 date. Compare Drive folder with History key on the first note of every article,
 in whichever direction it goes, before filling in anything else. A mismatch is
@@ -61,17 +67,27 @@ or "unknown": if nobody has decided, the first item under DECISIONS is that
 decision. Later notes copy the line forward.]
 Draft revision: [the file every FIND below was copied from, and its word count,
 e.g. `<slug>-draft-r4.md`, 3,210 words. A FIND that matches nothing is usually
-the draft having moved on; this says which version the sender was looking at.]
+the draft having moved on; this says which version the sender was looking at.
+For an article kept in the document repository: `draft.md` and the commit it was
+read at, e.g. `draft.md` at 3f2a91c, 3,210 words.]
 In reply to: [the file name of the note this one answers, or "first note for
-this article". Ids cited as answered (Q2, D1) are that note's ids.]
+this article". Ids cited as answered (Q2, D1) are that note's ids. In the
+document repository the file name is the same every time, so give the commit of
+the note this one answers (`list_commits` with `path` finds it).]
 Supersedes: [the file name of an earlier note in this same direction and round
 that this one replaces, or "none". Two notes on the same ground with no word on
-which counts is how a receiver applies the wrong one.]
+which counts is how a receiver applies the wrong one. For an article kept in
+the document repository: the commit SHA of the note it replaces (`list_commits`
+with `path` finds it), since the file name does not change; "none" for the
+first note.]
 File: [this note's own name: `<slug>-close-out-rN-to-<code|chat>.md`, or ending
 -v2, -v3 for a rewrite of the same round and direction. The slug is the
 article's Drive folder name. Save it in that folder, next to the metadata file,
 and nowhere else. The Drive file is the record; a pasted copy or a summary of it
-is not, and a FIND taken from either may not match.]
+is not, and a FIND taken from either may not match. For an article kept in the
+document repository the name is fixed, `articles/<slug>/close-out-to-<code|chat>.md`,
+committed to the open round's branch; the commit is the record, and the Drive
+names above do not apply.]
 Contains: [counts, so a truncated paste is caught: N edits, N optional, N
 questions, N decisions, N checks, N locks. The receiver counts what it can see;
 if the numbers differ it fetches the file and does not work from the paste.]

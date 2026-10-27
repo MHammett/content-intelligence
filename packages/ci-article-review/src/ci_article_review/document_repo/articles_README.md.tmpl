@@ -1,5 +1,7 @@
 # articles
 
-One folder per article, named by its slug: `articles/<slug>/`. The slug never changes and is the stem of every file in the folder.
+One folder per article, named by its slug: `articles/<slug>/`. The slug is lowercase words joined by hyphens, and it never changes.
 
-The file names, the commit messages and what never to do are in [../AGENTS.md](../AGENTS.md). Nothing in this folder is rewritten by the bootstrap; this page was created once, when the folder was empty.
+A folder holds fixed file names: `draft.md`, `metadata.md`, `publication.md`, `close-out-to-code.md`, `close-out-to-chat.md`, `review.md` and `pipeline/`. A round is a branch `round/<slug>/rN` and a pull request, so on `main` a folder holds the accepted text, and the history of a file is its git history.
+
+The rules for who writes which file, the commit messages and what never to do are in [../AGENTS.md](../AGENTS.md).

@@ -4,8 +4,10 @@
 is missing (only with ``--create``), then commits the onboarding files and
 templates rendered from sources packaged here, in one commit. Re-running it
 refreshes them: a managed file is replaced only if nobody has edited it in the
-document repository since the last run. The design is docs/GITHUB-DOCUMENTS.md;
-what each file is for is in ``documents_init``.
+document repository since the last run. It also sets the repository to merge
+commits only (one ``PATCH``, only when a setting differs) and creates the issue
+labels that are missing, never editing one that exists. The design is
+docs/GITHUB-DOCUMENTS.md; what each file is for is in ``documents_init``.
 
 ``ci-docs push-run`` writes a run that is already saved on disk back to its
 article folder, which is the retry for a ``ci-review --github SLUG --write-back``
@@ -66,12 +68,14 @@ def build_parser():
         "init",
         help="create the document repository if missing and commit its onboarding files",
         description=(
-            "Render AGENTS.md, CLAUDE.md, README.md, .gitattributes, templates/ and "
-            "instructions/claude-project.md from this repository's packaged sources "
-            "and commit them to the document repository in one commit. A managed "
-            "file is replaced only if its current blob is the one the manifest "
-            "recorded. Nothing under articles/ and no existing "
-            "instructions/publication.md is ever touched."
+            "Render AGENTS.md, CLAUDE.md, README.md, .gitattributes, templates/, "
+            "articles/README.md and instructions/claude-project.md from this "
+            "repository's packaged sources and commit them to the document "
+            "repository in one commit. A managed file is replaced only if its "
+            "current blob is the one the manifest recorded. Also set the "
+            "repository to allow merge commits only, and create the issue labels "
+            "that are missing (an existing label is never edited). No article and "
+            "no existing instructions/publication.md is ever touched."
         ),
     )
     init.add_argument(
@@ -410,11 +414,22 @@ def _is_empty(gh, branch):
     return False
 
 
-def _print_plan(out, repo, branch, short, existence, seed_needed, plan):
+def _print_plan(
+    out, repo, branch, short, existence, seed_needed, plan, settings, labels
+):
+    """``settings`` is ``di.settings_changes``; ``labels`` the names to create."""
     out(f"Repository: {repo}, branch {branch}")
     out(f"Rendered from content-intelligence {short}")
     if existence is not None:
         out(f"  {existence}")
+    if settings:
+        out(f"  settings: {di.format_settings(settings)}")
+    else:
+        out("  settings: already merge commits only; nothing to change")
+    if labels:
+        out(f"  labels  create {', '.join(labels)}")
+    else:
+        out("  labels  all present; nothing to create")
     if seed_needed:
         out(
             f"  seed the empty repository with {di.SEED_PATH} (one Contents API commit)"
@@ -683,7 +698,6 @@ def _init(args, environ, run, session, out, sleep):
 def _init_with(gh, args, repo, branch, seed, run, out, sleep):
     full, short = di.source_commit(run)
     rendered = di.render_managed(repo, branch)
-    articles_readme = di.render_articles_readme(repo, branch)
 
     existence = None
     try:
@@ -709,11 +723,20 @@ def _init_with(gh, args, repo, branch, seed, run, out, sleep):
                 rendered,
                 di.RepoState(),
                 source_full=full,
-                articles_readme=articles_readme,
                 seed=seed,
                 overwrite_edited=args.overwrite_edited,
             )
-            _print_plan(out, repo, branch, short, existence, seed_needed, plan)
+            _print_plan(
+                out,
+                repo,
+                branch,
+                short,
+                existence,
+                seed_needed,
+                plan,
+                di.settings_changes(di.NEW_REPO_INFO),
+                [label.name for label in di.LABELS],
+            )
             out("Dry run: nothing was created or written.")
             return 0
         if not args.create:
@@ -722,7 +745,11 @@ def _init_with(gh, args, repo, branch, seed, run, out, sleep):
             out("or run this command again with --create. Nothing was created.")
             return 1
         _create(gh, repo, run, sleep, out)
-        _check_access(gh, gh.info())
+        info = gh.info()
+        _check_access(gh, info)
+
+    changes = di.settings_changes(info)
+    missing = [label for label in di.LABELS if not gh.label_exists(label.name)]
 
     seed_needed = (not exists) or _is_empty(gh, branch)
     if seed_needed and args.dry_run:
@@ -743,28 +770,57 @@ def _init_with(gh, args, repo, branch, seed, run, out, sleep):
         rendered,
         state,
         source_full=full,
-        articles_readme=articles_readme,
         seed=seed,
         overwrite_edited=args.overwrite_edited,
     )
-    _print_plan(out, repo, branch, short, None, seed_needed and args.dry_run, plan)
+    _print_plan(
+        out,
+        repo,
+        branch,
+        short,
+        None,
+        seed_needed and args.dry_run,
+        plan,
+        changes,
+        [label.name for label in missing],
+    )
 
     if args.dry_run:
         out("Dry run: nothing was written.")
         return 0
-    if not plan.needs_commit:
-        return 0
-
-    result = gh.commit_files(
-        branch,
-        plan.files,
-        di.commit_message(short, plan),
-        replace=plan.expect,
-    )
-    out(
-        f"Committed {len(result.written)} file(s): {result.html_url or result.commit_sha}"
-    )
+    # The commit goes first: a file the secret scan refuses, or a path that
+    # changed under us, stops the run before the repository's settings are touched.
+    if plan.needs_commit:
+        result = gh.commit_files(
+            branch,
+            plan.files,
+            di.commit_message(short, plan),
+            replace=plan.expect,
+        )
+        out(
+            f"Committed {len(result.written)} file(s): {result.html_url or result.commit_sha}"
+        )
+    _apply_settings(gh, changes, out)
+    for label in missing:
+        if gh.ensure_label(label.name, label.color, label.description):
+            out(f"Created label {label.name}")
     return 0
+
+
+def _apply_settings(gh, changes, out):
+    """One ``PATCH`` when any setting differs; none when they are all as wanted."""
+    if not changes:
+        return
+    after = gh.update_repo(**di.DOCUMENT_REPO_SETTINGS)
+    left = di.settings_changes(after)
+    if left:
+        raise GitHubRepoError(
+            "other",
+            f"GitHub accepted the settings change but {gh.repo} still has "
+            f"{di.format_settings(left)}. An organisation policy can override a "
+            "repository's merge settings; check the repository's Settings page.",
+        )
+    out(f"Changed settings: {di.format_settings(changes)}")
 
 
 def _create(gh, repo, run, sleep, out):

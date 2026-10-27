@@ -1484,6 +1484,14 @@ def test_ensure_label_quotes_a_name_with_spaces_and_colons(gh, fake):
     assert gh.ensure_label("from-review: deferred", "ededed") is False
 
 
+def test_label_exists_only_reads(gh, fake):
+    assert gh.label_exists("from-review") is False
+    assert _posts(fake, "/labels") == []
+    gh.ensure_label("from-review", "ededed")
+    assert gh.label_exists("from-review") is True
+    assert len(_posts(fake, "/labels")) == 1  # the one ensure_label made
+
+
 def test_a_label_needs_a_name(gh):
     with pytest.raises(ValueError):
         gh.ensure_label(" ", "ededed")

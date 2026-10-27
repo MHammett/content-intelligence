@@ -1,27 +1,31 @@
 # {{repo}}
 
-Articles for one publication: drafts, metadata, hand-offs and `ci-review` reviews, one folder per article, every round a commit. This repository is private.
+Articles for one publication: drafts, metadata, hand-offs and `ci-review` reviews, one folder per article. Each round of an article is a branch and a pull request, so `main` holds only accepted text and the history shows what changed in each round, why, and in answer to which review. This repository is private.
 
 The full rules are in [AGENTS.md](AGENTS.md). This page is the short version for a person.
 
 ## Layout
 
-- `articles/<slug>/` holds everything for one article. Files are named `<slug>-draft-rN.md`, `<slug>-metadata-rN.md`, `<slug>-handoff-rN.md`, `<slug>-publication-rN.md`, `<slug>-close-out-rN-to-(code|chat)[-vM].md` and `<slug>-review-rN.md`.
-- `articles/<slug>/pipeline/` holds the worklist and the run reports. They are for the author.
+- `articles/<slug>/` holds one article, with fixed file names: `draft.md`, `metadata.md`, `publication.md`, `close-out-to-code.md`, `close-out-to-chat.md`, `review.md` and `pipeline/`. The round and the run are not in the names; they are in git.
+- `articles/<slug>/review.md` and `pipeline/` are written by `ci-review` only. `pipeline/` holds the run's report and the worklist, which are for the author.
 - `templates/` holds the shapes of those files.
 - `instructions/claude-project.md` is pasted at the top of the claude.ai project's instructions. `instructions/publication.md` holds the publication's own drafting rules and belongs to the author.
-- `AGENTS.md`, `CLAUDE.md`, `README.md`, `.gitattributes`, `templates/` and `instructions/claude-project.md` are written by `ci-docs init` from the content-intelligence repository. Edit them there, not here.
+- `AGENTS.md`, `CLAUDE.md`, `README.md`, `.gitattributes`, `articles/README.md`, `templates/` and `instructions/claude-project.md` are written by `ci-docs init` from the content-intelligence repository. Edit them there, not here.
 
-## The review loop
+## The round loop
 
-1. The drafting side commits `<slug>-draft-rN.md` and `<slug>-metadata-rN.md` together (`draft: <slug> rN`).
-2. The author runs `ci-review --github <slug>`.
-3. `ci-review` commits `<slug>-review-rN.md` to `main` (`review: <slug> rN`), with the worklist and report under `pipeline/`.
-4. The drafting side revises with `templates/revise_after_review_prompt.md` and commits round `rN+1`.
+1. The drafting chat creates the branch `round/<slug>/rN` from `main`, commits `draft.md` and `metadata.md` to it in one commit (`draft: <slug> rN`) and opens a pull request titled `<slug> rN`. The description says what changed since the last accepted round, and why.
+2. The author runs `ci-review --github <slug> --write-back`. It commits `review.md` and `pipeline/` to the branch and posts one pull request review: a summary and a checklist of the main findings, F1, F2 and so on.
+3. The chat reads the review and revises on the same branch. Each revision commit (`revise: <slug> rN after run M`) says which findings it addressed, which it deferred (each deferred one is an issue) and which it did not act on. The author can ask for another review.
+4. When the author says so in the chat, the chat merges the pull request with a merge commit. The next command that writes to the article tags the merge `<slug>/rN`. Nothing is tagged by hand.
 
-Nothing is renamed, overwritten or deleted. A new round is a new file.
+The branch `round/<slug>/rN` and the tag `<slug>/rN` are different strings on purpose.
 
-## Refreshing the managed files
+## Merge commits only
+
+`ci-docs init` sets this repository to allow merge commits and nothing else. A squash merge would replace a round's draft, review and revision commits with one, and a rebase merge would rewrite them; either loses the history this repository exists to keep. Merged branches are left in place.
+
+## Refreshing the managed files and settings
 
 From a checkout of content-intelligence:
 
@@ -29,4 +33,4 @@ From a checkout of content-intelligence:
 uv run ci-docs init --repo {{repo}}
 ```
 
-It adds what is missing, skips what is identical, replaces a managed file only if nobody has edited it here, and lists the ones that were edited. It never touches `articles/` or `instructions/publication.md`.
+It adds what is missing, skips what is identical, replaces a managed file only if nobody has edited it here, and lists the ones that were edited. It also sets the merge-method settings above and creates the issue labels (`round`, `known-gap`, `research`, `decision`, `correction`, `from-review`) when they are missing; it never edits or deletes a label that exists. It never touches an article or `instructions/publication.md`. Add `--dry-run` to see the plan first.
