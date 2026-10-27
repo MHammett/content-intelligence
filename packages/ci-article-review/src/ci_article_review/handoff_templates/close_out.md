@@ -7,9 +7,12 @@ still open before it publishes. Where the files live, how they are named, and
 what the receiver does with them: docs/CLOSE-OUT.md.
 
 IF YOU ARE EDITING THIS TEMPLATE: it has a consumer this repo cannot see. The
-drafting project works from its own copy of this shape, not from this file (in
-this deployment that copy is its instructions in Google Drive; docs/CLOSE-OUT.md
-says what to put there). Nothing in the repo parses a close-out note, so when a
+drafting project works from its own copy of this shape, not from this file. That
+copy is rendered from this file by `ci-docs init` into the document repository's
+templates/ folder, and refreshed by re-running it (docs/CLOSE-OUT.md, "The
+drafting project's copy"); a project that has not moved to that repository keeps
+one by hand, in this deployment in its instructions in Google Drive. Nothing in
+the repo parses a close-out note, so when a
 section header, a field label or the file name pattern here drifts from that
 copy, nothing errors and nothing is logged: the drafting side writes a worse
 note and the receiving side reads it worse. A renamed "Occurrences:" label, for

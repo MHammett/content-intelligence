@@ -588,6 +588,30 @@ It reads every URL out of the draft's own citation block (`## Sources` / `## Cit
 
 ---
 
+## The document repository (`ci-docs`)
+
+An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design. `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here.
+
+```powershell
+uv run ci-docs init --dry-run                            # print the plan; write nothing
+uv run ci-docs init --create --seed-instructions PATH    # first run: make the repository and fill it
+uv run ci-docs init                                      # later: refresh the managed files
+```
+
+| Flag | Meaning |
+|---|---|
+| `--repo OWNER/NAME` | the document repository; default `github_documents.repo` in `user.yaml`, else `MHammett/mikehammett.net-articles` |
+| `--branch NAME` | the branch to commit to; default `github_documents.branch`, else `main` |
+| `--dry-run` | print the plan, including the `gh repo create` command a missing repository would get; make no request that writes and run no `gh` command |
+| `--create` | if the repository does not exist, create it, always private. Without it a missing repository is reported and nothing is made |
+| `--seed-instructions PATH` | commit this local file once as `instructions/publication.md`, the publication's own drafting rules. It stays out of this repository; once it exists it is the author's file and is never touched again |
+| `--overwrite-edited` | also replace managed files that were edited in the document repository |
+| `--config-dir DIR` | where `user.yaml` is read from (default `configs`) |
+
+The token is `GITHUB_TOKEN`, else the output of `gh auth token`. A re-run adds what is missing, skips what is identical, and replaces a managed file only if the repository still holds the version the last run wrote (`.ci-docs/manifest.json` records it); one edited there is listed and left alone. Nothing under `articles/` and no existing `instructions/publication.md` is ever touched. It refuses a public repository.
+
+---
+
 ## Running the tests
 
 ```powershell
@@ -870,6 +894,8 @@ content-intelligence/
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
 │   │   │   ├── passage_match.py       decides when two quoted passages are the same passage
 │   │   │   ├── voice_pattern_report.py  recurring voice patterns across articles (ci-voice-patterns)
+│   │   │   ├── documents_cli.py       ci-docs: the entry point for the private document repository
+│   │   │   ├── documents_init.py      what `ci-docs init` renders, and its never-clobber plan
 │   │   │   ├── markers.py           reports/strips machine-authorship markers in a
 │   │   │   │                        draft (ci-markers); --fix removes, default only reports
 │   │   │   ├── report_markdown.py     renders the readable run_N_*_review.md from the report
@@ -919,6 +945,8 @@ content-intelligence/
 │   │   │   ├── configs/               committed defaults: presets.yaml + *.example.yaml
 │   │   │   │                          (real user.yaml + publication.yaml are gitignored;
 │   │   │   │                          pricing/timeouts/model_registry live in ci-core)
+│   │   │   ├── document_repo/         sources (*.tmpl) for the files `ci-docs init` commits
+│   │   │   │                          to the document repository
 │   │   │   └── handoff_templates/     fill these out to submit drafts, publish, and
 │   │   │                              hand an article between sessions
 │   │   └── tests/                     pipeline test suite, all external calls mocked

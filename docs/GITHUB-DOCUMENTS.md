@@ -1,6 +1,7 @@
 # GitHub as a document store (design)
 
-Status: **design, not built.** The build is split into phases, each a GitHub
+Status: **design, partly built.** The client (#401) and `ci-docs init` (#406)
+are built; the rest is not. The build is split into phases, each a GitHub
 issue labelled `github-documents`; the issues are the specification a builder
 works from, and this page is the reasoning behind them.
 
@@ -192,30 +193,74 @@ retires.
 
 ## Bootstrapping the repository: `ci-docs init`
 
-This code repository owns the scaffolding. `ci-docs init` (a console script #406 adds) creates the
-document repository when it is missing and keeps its onboarding files current:
+Built (#406). This code repository owns the scaffolding: `ci-docs init` creates
+the document repository when it is missing and keeps its onboarding files
+current.
 
-1. If the repository does not exist, create it with `gh repo create
-   MHammett/mikehammett.net-articles --private` (the account's own `gh` login,
-   as the author asked). An empty repository answers the Git Data API with 409, so
-   the first file goes in with one Contents API `PUT`; everything after uses the
-   normal commit path.
-2. Render the managed files from **packaged sources in this repository**: the
-   templates from `handoff_templates/` (the same files `ci-setup` copies, so each
-   template has one source), and `AGENTS.md`, `CLAUDE.md`, `README.md`,
-   `.gitattributes` and `instructions/claude-project.md` from a new packaged
-   `document_repo/` directory. Each rendered file carries a first-line marker
-   naming its source and this repository's commit, and says to edit it here, not
-   there.
-3. Commit them in one commit (`onboarding: refresh from content-intelligence
-   <short sha>`) with `.ci-docs/manifest.json`, which records each managed path
-   and the blob SHA written. A re-run adds what is missing, skips what is
-   identical, and replaces a managed file **only if its current blob is the one
-   the manifest recorded**. A managed file edited in the document repository is
-   left alone and listed, unless `--overwrite-edited`. Nothing under `articles/`
-   or `instructions/publication.md` is ever touched after seeding.
-4. `--dry-run` prints the plan and writes nothing; `--seed-instructions PATH`
-   supplies `instructions/publication.md` the first time.
+```bash
+uv run ci-docs init --dry-run                           # the plan; writes nothing
+uv run ci-docs init --create --seed-instructions PATH   # first run
+uv run ci-docs init                                     # refresh, any time after
+```
+
+`--repo OWNER/NAME` defaults to `github_documents.repo` in `user.yaml` (read
+defensively, so the block may be absent), else `MHammett/mikehammett.net-articles`;
+`--branch` defaults to `github_documents.branch`, else `main`; `--config-dir`
+says where `user.yaml` is. The token is `GITHUB_TOKEN`, else `gh auth token`, and
+is never printed.
+
+1. **Create if missing.** A 404 from the repository is "missing" (GitHub also
+   answers 404 for a repository the token cannot see, and the message says so).
+   Without `--create` the run stops and prints the command; with it, after
+   `gh auth status` succeeds, it runs `gh repo create OWNER/NAME --private
+   --description "..."`. It never creates a public repository, and **refuses an
+   existing public one**. `--dry-run` prints the same command and runs no `gh`
+   command at all.
+2. **Seed if empty.** A new repository, or an existing one with no commit, answers
+   the Git Data API with 409, so `README.md` goes in with one Contents API `PUT`
+   (`seed_empty`), which creates the branch. Everything after uses `commit_files`.
+3. **Render and commit.** The managed files are rendered from packaged sources
+   (below) and committed in **one commit** with `.ci-docs/manifest.json`,
+   `onboarding: refresh from content-intelligence <short sha>`. The sha is
+   `git rev-parse HEAD` in a checkout (`+dirty` appended when the sources have
+   uncommitted changes), else the package version.
+4. **Per managed path:** absent, add it; identical bytes, skip it; its current
+   blob is the one the manifest recorded, replace it (nobody edited it there);
+   anything else, leave it and list it as edited in the document repository,
+   unless `--overwrite-edited`. The replace is compare-and-swap in
+   `commit_files` (`replace={path: expected_blob_sha}`), so a file edited between
+   the run's read and its commit is refused, not overwritten. With no manifest,
+   every file that differs counts as edited. A re-run changes nothing, and makes
+   no commit, when nothing differs; a newer source commit alone does not.
+5. **Never touched.** Nothing under `articles/` is changed, except that
+   `articles/README.md` is created once, while `articles/` is empty (it is not in
+   the manifest and is never replaced). `instructions/publication.md` is created
+   once from `--seed-instructions PATH` if it is absent, and never touched again;
+   without the flag it is not created and the run says how to seed it. That file
+   holds the editorial and voice rules, goes from a local path straight to the
+   private repository, and must never be committed to this one. Line endings are
+   normalised to LF.
+
+**Where the files come from.** The five templates (`draft_submission.template.md`,
+`metadata_only.md`, `publication.md`, `close_out.md`,
+`revise_after_review_prompt.md`) are rendered from `handoff_templates/`, the files
+`ci-setup` copies, so each has one source; they differ from it only by the
+marker line. `AGENTS.md`, `CLAUDE.md`, `README.md`, `.gitattributes` and
+`instructions/claude-project.md` come from
+`packages/ci-article-review/src/ci_article_review/document_repo/`, where each has
+a `.tmpl` suffix (`AGENTS.md.tmpl`, ...): a file called `AGENTS.md` or `CLAUDE.md`
+in the package would be read by Codex and Claude Code as instructions for working
+on *this* repository, and a `.gitattributes` there would apply to its directory.
+`{{repo}}` and `{{branch}}` in them are filled from the run.
+
+**Markers.** Each managed Markdown file starts with an HTML comment naming its
+source path in this repository and saying to edit it there. `.gitattributes` has
+its marker on a `#` line after the one rule. `CLAUDE.md` is exactly `@AGENTS.md`
+and has no marker; it is recorded in the manifest only. The marker names the
+source *path* and not the commit, on purpose: a commit in the marker would change
+every managed file on every run and make every re-run a commit. The commit is in
+the manifest's `source_commit` (the commit that last changed a managed file) and
+in the commit message.
 
 A change to Template A or D then reaches the drafting side by merging it here and
 re-running `ci-docs init`. That replaces the hand-kept Drive copy that

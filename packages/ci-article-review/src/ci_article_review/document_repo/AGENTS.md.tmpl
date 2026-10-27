@@ -1,0 +1,87 @@
+# AGENTS.md
+
+Rules for any AI client or person working in this repository: Codex, Claude Code, a claude.ai project, or someone using github.com. Read this file first and follow it.
+
+This repository holds articles for one publication, from first draft to published post. Drafts are written here, `ci-review` (from the content-intelligence project) reviews them, and the review comes back into the same folder. Every round is a commit, so the history shows who did what and when.
+
+## Layout
+
+```
+AGENTS.md              these rules (managed)
+CLAUDE.md              one line, "@AGENTS.md", for Claude Code (managed)
+README.md              the same layout and review loop, for people (managed)
+.gitattributes         "* text=auto eol=lf" (managed)
+templates/             the file shapes: draft_submission.template.md, metadata_only.md,
+                       publication.md, close_out.md, revise_after_review_prompt.md (managed)
+instructions/
+  claude-project.md    the stanza pasted at the top of the claude.ai project's instructions (managed)
+  publication.md       the publication's own drafting rules: voice and editorial (the author's)
+.ci-docs/manifest.json what the bootstrap wrote, and from which source commit
+articles/<slug>/       one folder per article
+  <slug>-draft-rN.md
+  <slug>-metadata-rN.md
+  <slug>-handoff-rN.md
+  <slug>-publication-rN.md
+  <slug>-close-out-rN-to-code.md, <slug>-close-out-rN-to-chat.md
+  <slug>-review-rN.md
+  pipeline/            the worklist and the run reports
+```
+
+"Managed" means the file is written by `ci-docs init` from the content-intelligence repository. Do not edit a managed file here: the edit is lost or refused the next time the bootstrap runs. Change its source in content-intelligence and re-run `ci-docs init`. Everything else in this repository is yours to edit as these rules allow. `instructions/publication.md` is the exception to "managed": it was seeded once and belongs to the author.
+
+## Names
+
+`<slug>` is the article's folder name and the stem of every file in it. It is lowercase words joined by hyphens, and it never changes.
+
+| File | Name | Written by |
+|---|---|---|
+| draft | `<slug>-draft-rN.md` | the drafting side |
+| metadata | `<slug>-metadata-rN.md` | the drafting side |
+| draft and metadata in one file | `<slug>-handoff-rN.md` | the drafting side |
+| publication handoff | `<slug>-publication-rN.md` | the drafting side |
+| review | `<slug>-review-rN.md` | `ci-review` |
+
+A close-out note is named `<slug>-close-out-rN-to-(code|chat)[-vM].md` and either side may write it: `to-code` is addressed to a Code session, `to-chat` to the drafting chat.
+
+`N` is a round number, counted from 1. On a draft, a metadata file, a handoff and a publication handoff it is the round of drafting. On a review and on a close-out note `N` is the pipeline run number: `<slug>-review-r4.md` is run 4's review. `-vM` on a close-out note is a rewrite of the same round and direction, `-v2`, `-v3`, and the note says which one it supersedes.
+
+## Where to commit
+
+- Commit to `main` only. Do not create branches, and never force-push.
+- One commit per step, with these messages:
+
+| Commit | Message |
+|---|---|
+| a draft and its metadata, together in one commit | `draft: <slug> rN` |
+| a close-out note | `close-out: <slug> rN to-code` or `close-out: <slug> rN to-chat` |
+| a publication handoff | `publication: <slug> rN` |
+| a review | `review: <slug> rN`, which is the pipeline's |
+
+## Submitting a round for review
+
+1. Write `<slug>-draft-rN.md` and `<slug>-metadata-rN.md` (or one `<slug>-handoff-rN.md`) from the shapes in `templates/`.
+2. Commit them together in one commit: `draft: <slug> rN`.
+3. Ask the author to run `ci-review --github <slug>`. You cannot run the review yourself.
+
+## Where the review comes back
+
+The review is `<slug>-review-rN.md` at the top level of the article's folder, in a commit the pipeline makes. In the claude.ai project it appears after "Sync now". Revise the draft with `templates/revise_after_review_prompt.md`: paste the review under that prompt, and write the result as the next round's files, `rN+1`.
+
+The pipeline also writes `pipeline/<slug>-worklist-rN.md` and the run's `report.json` under `pipeline/`. Those are the author's. Do not read them into a revision.
+
+## Reading a pipeline commit
+
+A commit whose message starts `review: <slug> rN` was made by the pipeline. Its `Reviewed:` line names the draft files it reviewed and the commit they were at, so you can tell which version of the draft a review is about even after the draft has changed. If the draft at that commit is not the draft in front of you, the review may not apply to it.
+
+## Never
+
+- Rename or move an article folder.
+- Modify or delete a numbered file. A new round is a new file. A close-out note that needs rewriting gets a `-vM` successor; the old one stays.
+- Rewrite history or force-push.
+- Commit a secret, a token or a credential. This repository is private, and a secret committed once stays in its history.
+- Read `pipeline/` (the worklist and the reports) into a revision.
+- Edit a managed file here. Its source is in content-intelligence.
+
+## Publication-specific rules
+
+Voice, editorial standards and anything else particular to this publication are in `instructions/publication.md`, when it exists. This file covers the workflow; that one covers the writing.
