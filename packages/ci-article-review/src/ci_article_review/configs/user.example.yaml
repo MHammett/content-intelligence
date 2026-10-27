@@ -556,6 +556,22 @@ pipeline:
 #   mistral:                       # every other Mistral model
 #     tokens_per_minute: 400000
 
+# GitHub as an optional place to read a draft from: `ci-review --github SLUG`
+# reads the latest round of articles/SLUG/ from a separate, private repository
+# (see the README, "Reading a draft from GitHub"). Every key is optional and the whole block can
+# stay commented out; nothing reads it unless a run passes --github.
+#
+# There is no token key. The token is GITHUB_TOKEN (a fine-grained token limited
+# to that one repository, with Contents read), else `gh auth token`. A token in
+# this file would travel with every copy of it.
+# github_documents:
+#   repo: MHammett/mikehammett.net-articles  # OWNER/NAME; --github-repo overrides it per run
+#   branch: main            # default: the repository's default branch; --github-ref overrides
+#   path_prefix: articles   # the folder holding one folder per article
+#   write_back: false       # reserved: committing the review back (not built yet)
+#   include_capture: false  # reserved, with write_back
+#   allow_public_repo: false  # reserved, with write_back
+
 # Delta assessment thresholds for re-run recommendation
 delta:
   word_change_threshold_pct: 15

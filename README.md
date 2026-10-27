@@ -521,13 +521,17 @@ It is a suggestion report only. Nothing is written to `pipeline_history/` or to 
 uv run ci-review --draft HANDOFF --publication NAME [options]
 ```
 
-Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required — they are mutually exclusive.
+Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is required — they are mutually exclusive.
 
 | Flag | Purpose |
 |---|---|
 | `--draft PATH` | Run the review pipeline on a draft handoff document |
 | `--raw-draft PATH` | Run on a plain article file with no handoff headers (e.g. pasted straight out of a chat session) — the whole file becomes the article body |
 | `--url URL` | Fetch a published web page and run the review on its extracted content |
+| `--github SLUG` | Read the article folder `SLUG` from the GitHub document repository (`github_documents` in `user.yaml`) — the latest round unless `--round` says otherwise. See [Reading a draft from GitHub](#reading-a-draft-from-github). Not combinable with `--metadata` or `--archive-only`. |
+| `--round N` | With `--github`: read round `N` instead of the highest the folder has |
+| `--github-ref REF` | With `--github`: a branch, tag or commit SHA to read at (default: `github_documents.branch`, else the repository's default branch) |
+| `--github-repo OWNER/NAME` | With `--github`: read from this repository instead of `github_documents.repo`, for this run only |
 | `--publish PATH` | Publish an approved publication handoff (saves as draft unless `--publish-live`) |
 | `--metadata PATH` | Metadata-only file (PRIMARY CLAIM, TARGET AUDIENCE, etc., no DRAFT section) to pair with `--raw-draft`. Requires `--raw-draft`. |
 | `--publication NAME` | Publication config to use (`configs/NAME.yaml`) — **required** |
@@ -540,7 +544,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--wp-password APPLICATION_PASSWORD` | Override the WordPress application password for this run only (`--publish` mode). |
 | `--expand` | Add the **expansion pass**: a sixth review domain that proposes additional sources, topics, angles and data fitting the draft's existing primary claim, instead of judging what is already there. Its output is SECTION 10, and every URL it proposes is fetched and marked resolved or not. Off by default — it costs extra model calls, and it earns them early in a draft rather than on a final revision. See [Expansion pass](#expansion-pass). |
 | `--no-seo-suggestions` | Skip both SEO model calls for this run — the [metadata suggestions](docs/CONFIGURATION.md#seo-suggestions) (focus keyword candidates, meta description, OG title, OG description, schema type) and the [structure review](docs/CONFIGURATION.md#seo-structure-review). Deterministic on-page checks still run. Permanent off: `seo_rules.suggestions` / `seo_rules.content_review`. |
-| `--retry-failed RESULTS_JSON` | Fill in the gaps from a prior run: make model calls only for the (model, domain) pairs marked failed in a `run_N_results.json`, merging the new attempts onto everything that already succeeded. Requires the same draft-loading flags (`--draft`/`--url`/`--raw-draft`) as the original run. Mutually exclusive with `--replay`, which makes no model calls at all. |
+| `--retry-failed RESULTS_JSON` | Fill in the gaps from a prior run: make model calls only for the (model, domain) pairs marked failed in a `run_N_results.json`, merging the new attempts onto everything that already succeeded. Requires the same draft-loading flags (`--draft`/`--url`/`--raw-draft`/`--github`) as the original run. Mutually exclusive with `--replay`, which makes no model calls at all. |
 | `--archive-only` | Submit/verify Wayback snapshots for every URL in the draft's own citation block, then exit — zero model-provider calls, only HTTP to archive.org. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`. See [Archiving citations without the rest of the pipeline](#archiving-citations-without-the-rest-of-the-pipeline). |
 | `--verbose`, `-v` | DEBUG logging |
 
@@ -553,6 +557,43 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--only-domain DOMAIN` | Run only one domain (`fact_check`, `voice_style`, `completeness`, `argument_integrity`, `red_team`, or `expansion` with `--expand`) |
 | `--replay RESULTS_JSON` | Replay a captured ensemble instead of calling any models — free |
 | `--offline` | Skip every pass that reaches the network (LanguageTool grammar, link validation, Wayback, citation resolution, the SEO model calls) |
+
+### Reading a draft from GitHub
+
+`--github SLUG` reads a draft from a separate GitHub repository instead of a local file, so the drafting side and the review share one versioned copy. It is additive: `--draft`, `--raw-draft`, `--url` and the Drive-and-paste workflow work exactly as before, and a run without `--github` never imports the GitHub client or looks for a token.
+
+Each article is a folder named by its slug, under `path_prefix` (default `articles`). The file names are the ones the close-out notes already use:
+
+```
+articles/<slug>/<slug>-handoff-r4.md     Template A in one file (read as --draft reads it)
+articles/<slug>/<slug>-draft-r4.md       the two-file form: the draft ...
+articles/<slug>/<slug>-metadata-r4.md    ... and its metadata (read as --raw-draft --metadata reads them)
+```
+
+```powershell
+uv run ci-review --github my-article --publication your_publication_name
+uv run ci-review --github my-article --round 3 --github-ref main --publication your_publication_name
+```
+
+- **Which round.** The highest `rN` the folder has, or `--round N`. For that round, the handoff file wins; otherwise the draft is read with its metadata file; otherwise the draft alone is read as `--raw-draft` reads one, with the same warning about lost context. A name that only resembles the pattern, such as `my-article-draft-r4-old.md`, is not a round.
+- **One commit.** The ref is resolved to a commit SHA once, and every file is read at that SHA, so a draft and its metadata cannot come from two different commits.
+- **History key.** When the handoff has no `History key:`, it is set to the slug, so `pipeline_history/<slug>/` and the document folder are one string. When it has one that is not the slug, the run warns, names both, and keeps the `History key:`, because history is the fixed point.
+- **Run number.** A `Pipeline run:` line in the handoff (or metadata) is used as written. When there is none, the run number is the round. The usual bump past run numbers already in local history still applies.
+- **Provenance.** `report.json` gains a `document_source` block: `kind`, `repo`, `ref`, `commit_sha`, `round`, and each file's `path` and git `blob_sha`.
+- **Offline and replay.** `--offline` still reads from GitHub (the read is the input, as the page fetch is for `--url`); `--replay` and `--retry-failed` work as they do with `--raw-draft`. Nothing is written back to the repository.
+
+Configuration is an optional `github_documents` block in `configs/user.yaml` (commented out in `user.example.yaml`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `repo` | `MHammett/mikehammett.net-articles` | `OWNER/NAME` of the document repository. `--github-repo` overrides it. An empty string is an error. |
+| `branch` | the repository's default branch | The ref to read when `--github-ref` is absent |
+| `path_prefix` | `articles` | The folder that holds the article folders (empty: the repository root) |
+| `write_back`, `include_capture`, `allow_public_repo` | `false` | Reserved for committing the review back, which is not built yet |
+
+There is no token key. The token is `GITHUB_TOKEN` if set, else the output of `gh auth token`; a fine-grained personal access token limited to the one repository, with Contents read, is the narrowest choice. A public repository needs no token, but the run warns because drafts committed there are published.
+
+Every failure stops the run before a model is called, with one message and exit status 1: an empty `repo`, a private repository and no token (set `GITHUB_TOKEN` or run `gh auth login`), a rejected token (401), a repository that is "missing, or not visible to this token" (GitHub answers 404 for both), a missing article folder (the message lists the article folders that exist), a missing round (it lists the rounds that exist), and an exhausted rate limit (it names the reset time).
 
 ### Iterating on the code without paying for the ensemble
 
@@ -866,6 +907,7 @@ content-intelligence/
 │   │   │   │                          citation resolution
 │   │   │   ├── handoff_parser.py      parses Template A and Template C documents
 │   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
+│   │   │   ├── github_documents.py    reads one round of an article from a GitHub repository (--github)
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
 │   │   │   ├── passage_match.py       decides when two quoted passages are the same passage

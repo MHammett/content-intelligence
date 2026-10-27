@@ -1963,6 +1963,8 @@ History key: dc-environment
 
 Set it once, when you start the piece, and leave it alone however much the headline moves. Omit it and the title is used exactly as before, so existing handoffs keep working.
 
+A run read with `--github SLUG` sets the key to the slug when the handoff has none, so the history directory and the document folder are one string; see [GitHub document source](#github-document-source).
+
 ---
 
 ## History location
@@ -1988,6 +1990,27 @@ export CI_HISTORY_ROOT="$HOME/ci-history"
 - **Why a variable and not a `user.yaml` key:** `configs/` is git-ignored and per checkout too, so a key there would have to be copied into every new worktree, and `main()` opens the history directory (for its log file) before it loads any config. The variable is shared by every checkout and read first.
 - **Moving history you already have:** copy each checkout's `pipeline_history/` into the new directory without overwriting, as described in [Replaying a run, and where run history lives](REPLAY-AND-HISTORY.md#where-a-runs-output-lives). `run_N` is per article key, and two worktrees can have written the same `run_N`.
 - **Sharing has a cost:** the run number and the delta baseline are read from the shared directory, so two sessions reviewing the same article at the same moment can pick the same `run_N`. Nothing is overwritten (file names carry a timestamp), but the numbers are not guaranteed unique.
+
+---
+
+## GitHub document source
+
+`--github SLUG` reads a draft from a separate GitHub repository. The command line, the file layout and the failure messages are in the README's [Reading a draft from GitHub](../README.md#reading-a-draft-from-github); the configuration is an optional top-level block in `user.yaml`:
+
+```yaml
+github_documents:
+  repo: MHammett/mikehammett.net-articles   # OWNER/NAME; --github-repo overrides it
+  branch: main            # default: the repository's default branch; --github-ref overrides
+  path_prefix: articles   # the folder holding one folder per article
+  write_back: false       # reserved: committing the review back (not built yet)
+  include_capture: false  # reserved, with write_back
+  allow_public_repo: false  # reserved, with write_back
+```
+
+- Every key has a default, so the block, and every key in it, is optional. A key left empty counts as unset; `repo: ""` is an error, raised when `--github` is used and not before.
+- The block is carried through the config merge by its own line in `merge_configs` (as `rate_limits` is). A top-level key that merge does not name is dropped without a word, and a cost preset rewrites `models:` and `pipeline:`, so a test (`test_github_documents_wiring.py`) proves the block survives both.
+- **No token key, and no `${VAR}`.** An unset `${VAR}` stops config loading for every run, and a token has no business in a config file. The token is `GITHUB_TOKEN`, then `gh auth token`.
+- Nothing reads the block unless a run passes `--github`; a mistake in it does not stop a run that does not.
 
 ---
 

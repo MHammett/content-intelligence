@@ -54,6 +54,7 @@ from .config_loader import (
     load_user_config,
     load_publication_config,
     merge_configs,
+    normalize_github_documents,
     parse_api_key_overrides,
     preset_names,
     retired_preset_names,
@@ -4661,6 +4662,11 @@ def run_draft_pipeline(
         has_prior_run=prior_report is not None,
         citations=report.get("section_9_citations") or (),
     )
+    # Which committed draft this review read, when it came from a document
+    # repository (--github): the repository, the ref, the commit it was pinned
+    # to, the round, and each file's blob SHA.
+    if handoff.get("document_source"):
+        report["document_source"] = handoff["document_source"]
     if gaps:
         report["handoff_gaps"] = gaps
         log.warning(
@@ -6226,6 +6232,35 @@ def build_parser():
         "with a full handoff document for full review context, or pair with "
         "--metadata to supply that context from a separate file.",
     )
+    group.add_argument(
+        "--github",
+        metavar="SLUG",
+        help="Read an article from the GitHub document repository "
+        "(github_documents in user.yaml): the folder SLUG, latest round unless "
+        "--round says otherwise. Needs GITHUB_TOKEN or `gh auth login` for a "
+        "private repository. Not combinable with --metadata, --archive-only "
+        "or --publish.",
+    )
+    parser.add_argument(
+        "--round",
+        type=int,
+        metavar="N",
+        help="With --github: read round N (SLUG-handoff-rN.md, or "
+        "SLUG-draft-rN.md with SLUG-metadata-rN.md). Default: the highest round "
+        "the folder has.",
+    )
+    parser.add_argument(
+        "--github-ref",
+        metavar="REF",
+        help="With --github: a branch, tag or commit SHA to read at. Default: "
+        "github_documents.branch, else the repository's default branch.",
+    )
+    parser.add_argument(
+        "--github-repo",
+        metavar="OWNER/NAME",
+        help="With --github: read from this repository instead of "
+        "github_documents.repo, for this run only (a scratch repository, say).",
+    )
     parser.add_argument(
         "--metadata",
         metavar="METADATA_PATH",
@@ -6337,7 +6372,7 @@ def build_parser():
         help="Fill in the gaps from a prior run: make model calls only for the "
         "(model, domain) pairs marked failed in a run_N_<ts>_results.json, "
         "merging the new attempts onto everything that already succeeded. "
-        "Requires the same draft-loading flags (--draft/--url/--raw-draft) as "
+        "Requires the same draft-loading flags (--draft/--url/--raw-draft/--github) as "
         "the original run, so the same runners and prompts can be rebuilt. "
         "Mutually exclusive with --replay, which makes no model calls at all.",
     )
@@ -6365,6 +6400,26 @@ def build_parser():
     return parser
 
 
+def _read_github_handoff(args):
+    """Build the handoff for ``--github`` before any model call.
+
+    Imported here, and not at the top, so a run without ``--github`` never
+    imports the GitHub client or looks for a token.
+    """
+    from . import github_documents
+
+    settings = normalize_github_documents(
+        load_user_config(args.config_dir).get("github_documents")
+    )
+    return github_documents.load_handoff(
+        args.github,
+        settings=settings,
+        repo=args.github_repo,
+        ref=args.github_ref,
+        round_number=args.round,
+    )
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -6377,6 +6432,21 @@ def main():
     if args.metadata and not args.raw_draft:
         parser.error("--metadata requires --raw-draft")
 
+    for flag, value in (
+        ("--round", args.round),
+        ("--github-ref", args.github_ref),
+        ("--github-repo", args.github_repo),
+    ):
+        if value is not None and not args.github:
+            parser.error(f"{flag} requires --github")
+    if args.round is not None and args.round < 1:
+        parser.error("--round must be 1 or more")
+    if args.github and args.metadata:
+        parser.error(
+            "--github does not combine with --metadata — a round's "
+            "SLUG-metadata-rN.md is read from the repository"
+        )
+
     if args.retry_failed and args.replay:
         parser.error(
             "--retry-failed and --replay are mutually exclusive — --replay "
@@ -6386,6 +6456,11 @@ def main():
     if args.retry_failed and args.publish:
         parser.error("--retry-failed only applies to draft review runs, not --publish")
 
+    if args.archive_only and args.github:
+        parser.error(
+            "--archive-only does not read from GitHub — it requires --draft or "
+            "--raw-draft"
+        )
     if args.archive_only and not (args.draft or args.raw_draft):
         parser.error("--archive-only requires --draft or --raw-draft")
     if args.archive_only and args.offline:
@@ -6482,6 +6557,24 @@ def main():
                 handoff = build_handoff_from_raw_text(
                     raw_text, source_name=Path(args.raw_draft).stem
                 )
+            run_draft_pipeline(
+                None,
+                args.publication,
+                config_dir=args.config_dir,
+                cost_preset=args.cost_preset,
+                no_timeout=args.no_timeout,
+                only_model=args.only_model,
+                only_domain=args.only_domain,
+                expand=args.expand,
+                seo_suggestions=False if args.no_seo_suggestions else None,
+                replay_results=args.replay,
+                retry_failed_results=args.retry_failed,
+                offline=args.offline,
+                handoff=handoff,
+                api_key_overrides=api_key_overrides,
+            )
+        elif args.github:
+            handoff = _read_github_handoff(args)
             run_draft_pipeline(
                 None,
                 args.publication,
