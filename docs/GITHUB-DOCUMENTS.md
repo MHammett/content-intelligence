@@ -10,7 +10,7 @@ in phases, each a GitHub issue labelled `github-documents`:
 | `ci-docs init` | creates the document repository and keeps its onboarding files current | [#408](https://github.com/MHammett/content-intelligence/pull/408) |
 | `--github SLUG` | reads a round from the repository | [#409](https://github.com/MHammett/content-intelligence/pull/409) |
 | `--write-back`, `ci-docs push-run` | commits the review back | [#410](https://github.com/MHammett/content-intelligence/pull/410) |
-| `ci-docs ls` and `put`, the docs, the claude.ai check | close-out notes from a Code session | [#PRNUM](https://github.com/MHammett/content-intelligence/pull/PRNUM) (issue #404) |
+| `ci-docs ls` and `put`, the docs, the claude.ai check | close-out notes from a Code session | [#411](https://github.com/MHammett/content-intelligence/pull/411) (issue #404) |
 
 Copying runs from the document repository into a history root (#405) is not
 built. The issues are the specification a builder worked from, and where this
