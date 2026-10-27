@@ -669,7 +669,7 @@ It reads every URL out of the draft's own citation block (`## Sources` / `## Cit
 
 ## The document repository (`ci-docs`)
 
-An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design, and has the steps for connecting a claude.ai project to it. `ci-docs` has five subcommands: `init` (below), `push-run`, `ls`, `put` and `import` (`scan` and `check`, last). `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here.
+An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design, and has the steps for connecting a claude.ai project to it. `ci-docs` has five subcommands: `init` (below), `push-run`, `ls`, `put` and `import` (`scan` and `check`, last). `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here. `AGENTS.md` teaches the drafting side the round loop: a branch and a pull request per round, a revision commit message that says which review findings it addressed, deferred and declined, and a merge only on the author's word.
 
 ```powershell
 uv run ci-docs init --dry-run                            # print the plan; write nothing
@@ -681,13 +681,15 @@ uv run ci-docs init                                      # later: refresh the ma
 |---|---|
 | `--repo OWNER/NAME` | the document repository; default `github_documents.repo` in `user.yaml`, else `MHammett/mikehammett.net-articles` |
 | `--branch NAME` | the branch to commit to; default `github_documents.branch`, else `main` |
-| `--dry-run` | print the plan, including the `gh repo create` command a missing repository would get; make no request that writes and run no `gh` command |
+| `--dry-run` | print the plan, including the `gh repo create` command a missing repository would get, the settings it would change and the labels it would create; make no request that writes and run no `gh` command |
 | `--create` | if the repository does not exist, create it, always private. Without it a missing repository is reported and nothing is made |
 | `--seed-instructions PATH` | commit this local file once as `instructions/publication.md`, the publication's own drafting rules. It stays out of this repository; once it exists it is the author's file and is never touched again |
 | `--overwrite-edited` | also replace managed files that were edited in the document repository |
 | `--config-dir DIR` | where `user.yaml` is read from (default `configs`) |
 
-The token is `GITHUB_TOKEN`, else the output of `gh auth token`. A re-run adds what is missing, skips what is identical, and replaces a managed file only if the repository still holds the version the last run wrote (`.ci-docs/manifest.json` records it); one edited there is listed and left alone. Nothing under `articles/` and no existing `instructions/publication.md` is ever touched. It refuses a public repository.
+The token is `GITHUB_TOKEN`, else the output of `gh auth token`. A re-run adds what is missing, skips what is identical, and replaces a managed file only if the repository still holds the version the last run wrote (`.ci-docs/manifest.json` records it); one edited there is listed and left alone. `articles/README.md` is managed like the other files; no article and no existing `instructions/publication.md` is ever touched. It refuses a public repository.
+
+It also sets the repository's merge settings, once, and only when they differ: merge commits on, squash and rebase merges off, branches kept after a merge (one `PATCH`; a squash merge would replace a round's draft, review and revision commits with one, and a rebase merge would rewrite them). And it creates the issue labels `round`, `known-gap`, `research`, `decision`, `correction` and `from-review` when they are missing, never editing or deleting one that exists. The run prints both before it writes anything, and a re-run on a repository already set up sends neither.
 
 ### `ci-docs push-run`
 

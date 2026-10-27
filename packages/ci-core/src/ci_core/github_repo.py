@@ -996,18 +996,24 @@ class GitHubRepo:
 
     # -- labels and issues ---------------------------------------------------
 
+    def label_exists(self, name):
+        """True when the repository has a label called ``name``; reads only."""
+        if not name or not name.strip():
+            raise ValueError("a label needs a name")
+        found = self._send("GET", f"/repos/{self.repo}/labels/{quote(name, safe='')}")
+        if 200 <= found.status_code < 300:
+            return True
+        if found.status_code != 404:
+            raise self._http_error(found, f"look up label {name}")
+        return False
+
     def ensure_label(self, name, color, description=""):
         """Create the label ``name`` if it is missing; True when this call made it.
 
         An existing label is never edited, whatever its colour or description.
         """
-        if not name or not name.strip():
-            raise ValueError("a label needs a name")
-        found = self._send("GET", f"/repos/{self.repo}/labels/{quote(name, safe='')}")
-        if 200 <= found.status_code < 300:
+        if self.label_exists(name):
             return False
-        if found.status_code != 404:
-            raise self._http_error(found, f"look up label {name}")
         made = self._send(
             "POST",
             f"/repos/{self.repo}/labels",

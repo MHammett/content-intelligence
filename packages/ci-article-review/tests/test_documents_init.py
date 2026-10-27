@@ -58,10 +58,33 @@ def _sha(*parts):
 class FakeGitHub:
     """``REPO`` behind the REST routes the client uses."""
 
-    def __init__(self, *, exists=True, empty=False, private=True, push=True):
+    def __init__(
+        self,
+        *,
+        exists=True,
+        empty=False,
+        private=True,
+        push=True,
+        settings=None,
+        stubborn_settings=False,
+        labels=None,
+    ):
         self.exists = exists
         self.private = private
         self.push = push
+        #: GitHub's defaults for a new repository, unless a test says otherwise.
+        #: ``None`` as a value leaves the key out of the answer, as GitHub does
+        #: for a token without push access.
+        self.settings = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
+            **(settings or {}),
+        }
+        #: A PATCH that is accepted and changes nothing (an organisation policy).
+        self.stubborn_settings = stubborn_settings
+        self.labels = dict(labels or {})  # name -> {"color", "description"}
         self.requests = []
         self.blobs, self.trees, self.commits, self.branches = {}, {}, {}, {}
         self._n = 0
@@ -124,17 +147,31 @@ class FakeGitHub:
             return Resp(404, {"message": "Not Found"})
         return self._route(method, path[len(base) :], headers or {}, params or {}, json)
 
+    def _repo_body(self):
+        return {
+            "default_branch": "main",
+            "private": self.private,
+            "permissions": {"push": self.push},
+            **{k: v for k, v in self.settings.items() if v is not None},
+        }
+
     def _route(self, method, path, headers, params, body):
         accept = headers.get("Accept", "")
         if (method, path) == ("GET", ""):
-            return Resp(
-                200,
-                {
-                    "default_branch": "main",
-                    "private": self.private,
-                    "permissions": {"push": self.push},
-                },
-            )
+            return Resp(200, self._repo_body())
+        if (method, path) == ("PATCH", ""):
+            if not self.stubborn_settings:
+                self.settings.update(body)
+            return Resp(200, self._repo_body())
+        if method == "GET" and path.startswith("/labels/"):
+            label = self.labels.get(path[len("/labels/") :])
+            return Resp(200, label) if label else Resp(404, {"message": "Not Found"})
+        if (method, path) == ("POST", "/labels"):
+            self.labels[body["name"]] = {
+                "color": body["color"],
+                "description": body["description"],
+            }
+            return Resp(201, body)
         if self.empty and path.startswith(("/git/", "/commits")):
             return Resp(409, {"message": "Git Repository is empty."})
         if method == "GET" and path == "/commits":
@@ -321,7 +358,12 @@ def test_claude_md_and_gitattributes_keep_their_exact_content():
 
 def test_markdown_files_start_with_a_marker_naming_their_source():
     rendered = di.render_managed(REPO, "main")
-    for path in ("AGENTS.md", "README.md", "instructions/claude-project.md"):
+    for path in (
+        "AGENTS.md",
+        "README.md",
+        "articles/README.md",
+        "instructions/claude-project.md",
+    ):
         first = rendered[path].split(b"\n")[0].decode()
         assert first.startswith("<!-- Managed by content-intelligence"), path
         assert "document_repo/" in first, path
@@ -340,52 +382,258 @@ def test_the_repository_name_and_branch_reach_the_files_that_name_them():
     assert b"{{" not in b"".join(ours)
 
 
-def test_agents_md_states_every_name_and_commit_message_the_pipeline_depends_on():
+def _agents():
+    return di.render_managed(REPO, "main")["AGENTS.md"].decode()
+
+
+def _missing(text, needles):
+    return [n for n in needles if n not in text]
+
+
+def test_agents_md_states_every_path_branch_tag_and_commit_message_the_pipeline_depends_on():
     """The doc and the code are two statements of one convention; keep them in step."""
-    text = di.render_managed(REPO, "main")["AGENTS.md"].decode()
-    for needle in (
-        "<slug>-draft-rN.md",
-        "<slug>-metadata-rN.md",
-        "<slug>-handoff-rN.md",
-        "<slug>-publication-rN.md",
-        "<slug>-close-out-rN-to-(code|chat)[-vM].md",
-        "<slug>-review-rN.md",
-        "draft: <slug> rN",
-        "close-out: <slug> rN to-code",
-        "publication: <slug> rN",
-        "review: <slug> rN",
-        "ci-review --github <slug>",
-        "pipeline/",
-        "Reviewed:",
-        "Sync now",
-        "templates/revise_after_review_prompt.md",
-        "main",
-        "force",
-        # Committing the pair in one commit needs the connector's push_files.
-        "`push_files`",
-        "`create_or_update_file` makes one commit per file",
-        # Under --github a missing History key is the folder's slug, not the title.
-        "uses the article's folder name, `<slug>`, as its history key",
-        "does not apply to a round read from this repository",
-        # Close-out notes: list first, the naming rules, never overwrite, ci-docs put.
-        "List the folder first",
-        "`ci-docs ls <slug>`",
-        "`-v2` needs the plain note",
-        "Never overwrite one",
-        "`ci-docs put <slug> <file>`",
-        "`handoff: <slug> rN`",
+    assert not _missing(
+        _agents(),
+        (
+            # the fixed names
+            "articles/<slug>/",
+            "draft.md",
+            "metadata.md",
+            "publication.md",
+            "close-out-to-code.md",
+            "close-out-to-chat.md",
+            "review.md",
+            "pipeline/",
+            "run.json, report.json, worklist.md",
+            "articles/README.md",
+            # branch, pull request and tag
+            "`round/<slug>/rN`",
+            "`<slug>/rN`",
+            "titled `<slug> rN`",
+            "deliberately different strings",
+            # commit messages
+            "`draft: <slug> rN`",
+            "`revise: <slug> rN after run M`",
+            "`close-out: <slug> rN to-code`",
+            "`close-out: <slug> rN to-chat`",
+            "`publication: <slug> rN`",
+            "`review: <slug> rN run M`",
+            "ci-review --github <slug> --write-back",
+            "templates/revise_after_review_prompt.md",
+            # Under --github a missing History key is the folder's slug, not the title.
+            "uses the article's folder name, `<slug>`, as its history key",
+            "does not apply to a round read from this repository",
+        ),
+    )
+
+
+def test_agents_md_names_the_connector_tools_with_their_parameters():
+    """GitHub MCP server, default toolsets, as of 2026-10-27 (issue #415)."""
+    assert not _missing(
+        _agents(),
+        (
+            # finding N
+            "`list_tags`",
+            "`list_branches`",
+            "`list_pull_requests`",
+            "`state: open`",
+            "one more than the highest `rK`",
+            # starting the round
+            "`create_branch`",
+            "`branch: round/<slug>/rN`",
+            "`from_branch: main`",
+            "`get_file_contents`",
+            "`ref: refs/heads/main`",
+            "`push_files`",
+            "files: [{path: articles/<slug>/draft.md, content}, "
+            "{path: articles/<slug>/metadata.md, content}]",
+            "`message: draft: <slug> rN`",
+            "Both files, whole, in the one call",
+            "Never use `create_or_update_file` for the pair",
+            "`create_pull_request`",
+            "`head: round/<slug>/rN`",
+            "`base: main`",
+            "`title: <slug> rN`",
+            "`issue_write`",
+            "`method: update`",
+            "`issue_number`",
+            "`labels: [round, article:<slug>]`",
+            "`get_label`",
+            "`label_write`",
+            "`method: create`",
+            # after a review
+            "`pull_request_read`",
+            "`method: get_reviews`",
+            "`ref: refs/pull/<n>/head`",
+            "There are no line comments to read or resolve",
+            # close-out notes
+            "`add_issue_comment`",
+            "`list_commits`",
+            "`path`",
+            # accepting
+            "`merge_pull_request`",
+            "`merge_method: merge`",
+            "`expectedHeadSha`",
+            # when a name has changed
+            "If a tool name fails, list the connector's tools",
+            "the one with the same purpose",
+        ),
+    )
+
+
+def test_agents_md_holds_the_drafting_side_to_the_changelog_rules():
+    """The goal is an AI-readable changelog: these rules are what delivers it."""
+    text = _agents()
+    assert not _missing(
+        text,
+        (
+            # the pull request description
+            "what changed since the last accepted round",
+            '`<slug>/r(N-1)`, or "first draft"',
+            "and why",
+            "section by section",
+            "`Closes #n`",
+            # the revision commit shape
+            "Responds to: run M review (<link to the review>)",
+            "Addressed:",
+            "- F2: <what the finding asked> -> <what changed, and where in the draft>",
+            '- Section 3, "<first words of the finding>": <what changed>',
+            "Deferred:",
+            "- F1: <why it cannot be done in this round> -> #<issue>",
+            "- F4: needs the author (<what exactly>)",
+            "Not acted on:",
+            "- F5: <why not, in one line>",
+            "Every F-numbered finding appears under Addressed, Deferred or Not acted on",
+            "numbered F1, F2",
+            "Findings of other sections are listed",
+            # deferred work
+            "opened as an issue before the commit that defers it",
+            "`from-review`",
+            "`research`",
+            "`decision`",
+            "the finding quoted, and the run named",
+            "(`-> #<issue>`)",
+            # the goal itself
+            "a history an AI client can read",
+        ),
+    )
+    # The issue labels.
+    for label in (
+        "article:<slug>",
+        "round",
+        "known-gap",
+        "research",
+        "decision",
+        "correction",
+        "from-review",
     ):
-        assert needle in text, needle
-    # The "never" list.
-    for needle in (
-        "Rename or move an article folder",
-        "Modify or delete a numbered file",
-        "Rewrite history",
-        "secret, a token or a credential",
-        "Read `pipeline/`",
-        "Edit a managed file",
+        assert f"`{label}`" in text, label
+
+
+def test_agents_md_keeps_the_worklist_and_pipeline_away_from_a_revision():
+    text = _agents()
+    assert "read anything under `pipeline/`" in text.lower()
+    assert not _missing(
+        text,
+        (
+            "Skip the WORKLIST block at the top of the file, above SECTION 1",
+            "Start at SECTION 1",
+            "Edit `review.md` or anything under `pipeline/`",
+        ),
+    )
+
+
+def test_agents_md_lets_the_chat_merge_only_on_the_authors_word():
+    text = _agents()
+    assert not _missing(
+        text,
+        (
+            "Only when the author says in this chat to merge the round",
+            "`merge_pull_request` with `merge_method: merge` and `expectedHeadSha`",
+            "Do not tag: the pipeline tags merged rounds itself",
+            "Call `merge_pull_request` unless the author said in this chat to merge "
+            "that pull request, or with any `merge_method` but `merge`",
+        ),
+    )
+
+
+def test_agents_md_never_list_and_fallback():
+    text = _agents()
+    assert not _missing(
+        text,
+        (
+            "Commit to `main`",
+            "Force-push",
+            "Delete a branch or a tag, or call `delete_file` or `delete_repository`",
+            "Rename an article folder or change a slug",
+            "never contains `/`",
+            "secret, a token or a credential",
+            "Edit a managed file here",
+            # the by-hand round
+            "Do a round by hand on github.com",
+            "upload `draft.md` and `metadata.md` in one commit",
+        ),
+    )
+
+
+def test_none_of_the_retired_patterns_survive_in_what_the_drafting_side_reads():
+    rendered = di.render_managed(REPO, "main")
+    retired = (
+        "-draft-rN",
+        "-metadata-rN",
+        "-handoff-rN",
+        "-publication-rN",
+        "-review-rN",
+        "-vM",
+        "Do not create branches",
+        "get_review_comments",
+        "resolve_thread",
+        "W1",
+        "Commit to `main` only",
+    )
+    for path in (
+        "AGENTS.md",
+        "README.md",
+        "articles/README.md",
+        "instructions/claude-project.md",
     ):
-        assert needle in text, needle
+        text = rendered[path].decode()
+        assert [r for r in retired if r in text] == [], path
+
+
+def test_the_claude_project_stanza_says_main_only_and_needs_the_connector():
+    text = di.render_managed(REPO, "main")["instructions/claude-project.md"].decode()
+    assert not _missing(
+        text,
+        (
+            "read `AGENTS.md`",
+            "syncs only `main`",
+            "`templates/`",
+            "`instructions/publication.md`",
+            "accepted `draft.md` and `metadata.md`",
+            "Every round needs the GitHub connector",
+            "Never add an article's `pipeline/` folder or the whole repository",
+        ),
+    )
+
+
+def test_the_readme_teaches_the_loop_merge_commits_and_automatic_tags():
+    text = di.render_managed(REPO, "main")["README.md"].decode()
+    assert not _missing(
+        text,
+        (
+            "round/<slug>/rN",
+            "ci-review --github <slug> --write-back",
+            "F1, F2",
+            "revise: <slug> rN after run M",
+            "merges the pull request with a merge commit",
+            "tags the merge `<slug>/rN`",
+            "Merge commits only",
+            "squash merge would replace",
+            "rebase merge would rewrite",
+            "ci-docs init --repo " + REPO,
+        ),
+    )
 
 
 def test_the_packaged_sources_exist_and_are_not_named_like_instructions():
@@ -434,9 +682,9 @@ def test_a_missing_repository_is_created_seeded_and_filled_in_one_further_commit
     )
     expected = set(di.render_managed(REPO, "main")) | {
         di.MANIFEST_PATH,
-        di.ARTICLES_README_PATH,
         di.PUBLICATION_PATH,
     }
+    assert di.ARTICLES_README_PATH in expected
     assert set(fake.tree()) == expected
 
 
@@ -447,8 +695,9 @@ def test_the_manifest_records_the_blob_of_every_managed_file(seed_file):
     body = manifest(fake)
     assert body["source_commit"] == HEAD
     assert body["files"] == {p: git_blob_sha(d) for p, d in sorted(rendered.items())}
-    # Written once, never managed: not in the manifest.
-    assert di.ARTICLES_README_PATH not in body["files"]
+    # articles/README.md is managed now, so it is recorded; the publication
+    # instructions are written once and never managed: not in the manifest.
+    assert di.ARTICLES_README_PATH in body["files"]
     assert di.PUBLICATION_PATH not in body["files"]
     assert fake.file(di.MANIFEST_PATH).endswith(b"\n")
 
@@ -660,11 +909,10 @@ def test_articles_and_the_publication_instructions_are_never_in_a_later_commit(
 ):
     fake = FakeGitHub(exists=False)
     run_init(fake, "--create", "--seed-instructions", str(seed_file))
-    article = f"articles/{SLUG}/{SLUG}-draft-r1.md"
+    article = f"articles/{SLUG}/draft.md"
     fake.external_commit(
         "main", {article: b"A draft.\n", di.PUBLICATION_PATH: b"the author's own\n"}
     )
-    fake.external_commit("main", {di.ARTICLES_README_PATH: b"edited\n"})
     before = fake.head()
 
     templates = tmp_path / "t"
@@ -684,16 +932,68 @@ def test_articles_and_the_publication_instructions_are_never_in_a_later_commit(
     assert changed_paths(fake, before) == {"templates/publication.md", di.MANIFEST_PATH}
     assert fake.file(article) == b"A draft.\n"
     assert fake.file(di.PUBLICATION_PATH) == b"the author's own\n"
-    assert fake.file(di.ARTICLES_README_PATH) == b"edited\n"
     assert "already exists" in out
 
 
-def test_the_articles_readme_is_only_created_while_articles_is_empty():
+# -- articles/README.md is managed ---------------------------------------------
+
+#: The text the first bootstrap (#406) wrote there, before the file was managed.
+EARLIER_ARTICLES_README = (
+    b"# articles\n\n"
+    b"One folder per article, named by its slug: `articles/<slug>/`. The slug never "
+    b"changes and is the stem of every file in the folder.\n\n"
+    b"The file names, the commit messages and what never to do are in "
+    b"[../AGENTS.md](../AGENTS.md). Nothing in this folder is rewritten by the "
+    b"bootstrap; this page was created once, when the folder was empty.\n"
+)
+
+
+def test_the_earlier_unmanaged_articles_readme_is_a_known_render():
+    """The constant is the blob the first bootstrap wrote; pin it so it cannot rot."""
+    assert (
+        git_blob_sha(EARLIER_ARTICLES_README)
+        in di.EARLIER_RENDERS[di.ARTICLES_README_PATH]
+    )
+
+
+def test_the_articles_readme_is_added_even_when_articles_has_content():
     fake = FakeGitHub()
-    fake.external_commit("main", {f"articles/{SLUG}/{SLUG}-draft-r1.md": b"A draft.\n"})
+    fake.external_commit("main", {f"articles/{SLUG}/draft.md": b"A draft.\n"})
+    code, out, _ = run_init(fake)
+    assert code == 0, out
+    assert (
+        fake.file(di.ARTICLES_README_PATH)
+        == di.render_managed(REPO, "main")[di.ARTICLES_README_PATH]
+    )
+    assert fake.file(f"articles/{SLUG}/draft.md") == b"A draft.\n"
+
+
+def test_the_first_bootstrap_articles_readme_is_replaced_without_overwrite_edited():
+    """Written before the manifest recorded it: unedited, not the author's edit."""
+    fake = FakeGitHub()
+    fake.external_commit("main", {di.ARTICLES_README_PATH: EARLIER_ARTICLES_README})
+    code, out, _ = run_init(fake)
+    assert code == 0, out
+    assert f"EDITED  {di.ARTICLES_README_PATH}" not in out
+    assert (
+        fake.file(di.ARTICLES_README_PATH)
+        == di.render_managed(REPO, "main")[di.ARTICLES_README_PATH]
+    )
+    assert di.ARTICLES_README_PATH in manifest(fake)["files"]
+    message = fake.commits[fake.head()]["message"]
+    assert "Replaced: " in message and "although edited" not in message
+
+
+def test_an_articles_readme_the_author_edited_is_left_alone_until_overwrite_edited():
+    fake = FakeGitHub()
+    fake.external_commit("main", {di.ARTICLES_README_PATH: b"the author's page\n"})
     code, out, _ = run_init(fake)
     assert code == 0
-    assert di.ARTICLES_README_PATH not in fake.tree()
+    assert fake.file(di.ARTICLES_README_PATH) == b"the author's page\n"
+    assert f"EDITED  {di.ARTICLES_README_PATH}" in out
+    code, out, _ = run_init(fake, "--overwrite-edited")
+    assert code == 0
+    assert fake.file(di.ARTICLES_README_PATH) != b"the author's page\n"
 
 
 def test_without_seed_instructions_the_file_is_not_created_and_the_run_says_how():
@@ -819,3 +1119,188 @@ def test_the_commit_message_lists_what_changed():
         "Replaced although edited here: c",
         "Left alone, edited here: d",
     ]
+
+
+# -- repository settings: merge commits only -----------------------------------
+
+WANTED = {
+    "allow_merge_commit": True,
+    "allow_squash_merge": False,
+    "allow_rebase_merge": False,
+    "delete_branch_on_merge": False,
+}
+
+
+def patches(fake):
+    return [r for r in fake.requests if r[0] == "PATCH" and r[1] == f"/repos/{REPO}"]
+
+
+def test_a_new_repository_gets_one_patch_with_all_four_settings():
+    fake = FakeGitHub()  # GitHub's defaults: all three merge methods allowed
+    code, out, _ = run_init(fake)
+    assert code == 0, out
+    assert [p[3] for p in patches(fake)] == [WANTED]
+    assert fake.settings == WANTED
+    assert (
+        "Changed settings: allow_squash_merge true -> false; "
+        "allow_rebase_merge true -> false"
+    ) in out
+
+
+def test_settings_that_are_already_right_send_no_patch():
+    fake = FakeGitHub(settings=WANTED)
+    code, out, _ = run_init(fake)
+    assert code == 0, out
+    assert patches(fake) == []
+    assert "settings: already merge commits only; nothing to change" in out
+
+
+def test_one_wrong_setting_still_sends_a_single_patch_with_all_four():
+    fake = FakeGitHub(settings={**WANTED, "delete_branch_on_merge": True})
+    code, out, _ = run_init(fake)
+    assert code == 0, out
+    assert [p[3] for p in patches(fake)] == [WANTED]
+    assert "delete_branch_on_merge true -> false" in out
+
+
+def test_a_setting_github_did_not_report_counts_as_different():
+    """A token without push access gets no flags; the run cannot assume they are right."""
+    fake = FakeGitHub(settings={**WANTED, "allow_squash_merge": None})
+    code, out, _ = run_init(fake, "--dry-run")
+    assert code == 0, out
+    assert "settings: allow_squash_merge unknown -> false" in out
+
+
+def test_a_rerun_makes_no_settings_call_and_creates_no_label():
+    fake = FakeGitHub()
+    run_init(fake)
+    before = len(fake.writes)
+    code, out, _ = run_init(fake)
+    assert code == 0, out
+    assert len(fake.writes) == before
+    assert "settings: already merge commits only" in out
+    assert "labels  all present; nothing to create" in out
+
+
+def test_dry_run_prints_the_settings_and_the_labels_first_and_writes_nothing():
+    fake = FakeGitHub()
+    code, out, _ = run_init(fake, "--dry-run")
+    assert code == 0, out
+    assert fake.writes == []
+    lines = out.splitlines()
+    first_file = next(i for i, ln in enumerate(lines) if ln.startswith("  add"))
+    settings = next(i for i, ln in enumerate(lines) if ln.startswith("  settings:"))
+    labels = next(i for i, ln in enumerate(lines) if ln.startswith("  labels"))
+    assert settings < first_file and labels < first_file
+    assert (
+        "  settings: allow_squash_merge true -> false; allow_rebase_merge true -> false"
+        in lines
+    )
+    assert (
+        "  labels  create round, known-gap, research, decision, correction, from-review"
+        in lines
+    )
+    assert fake.settings["allow_squash_merge"] is True and fake.labels == {}
+
+
+def test_dry_run_on_a_missing_repository_shows_the_settings_and_every_label(seed_file):
+    fake = FakeGitHub(exists=False)
+    code, out, _ = run_init(fake, "--dry-run", "--seed-instructions", str(seed_file))
+    assert code == 0, out
+    assert fake.writes == []
+    assert "settings: allow_squash_merge true -> false" in out
+    assert "labels  create round, known-gap" in out
+
+
+def test_a_missing_repository_is_created_then_gets_its_settings_and_labels(seed_file):
+    fake = FakeGitHub(exists=False)
+    code, out, _ = run_init(fake, "--create", "--seed-instructions", str(seed_file))
+    assert code == 0, out
+    assert fake.settings == WANTED
+    assert set(fake.labels) == {label.name for label in di.LABELS}
+
+
+def test_a_refused_commit_leaves_the_settings_alone(tmp_path):
+    fake = FakeGitHub()
+    leaky = tmp_path / "leaky.md"
+    leaky.write_text(f"key: {TOKEN}\n", encoding="utf-8")
+    code, _, _ = run_init(fake, "--seed-instructions", str(leaky))
+    assert code == 1
+    assert patches(fake) == []
+    assert fake.labels == {}
+
+
+def test_settings_github_accepts_but_does_not_apply_are_reported():
+    fake = FakeGitHub(stubborn_settings=True)
+    code, out, _ = run_init(fake)
+    assert code == 1
+    assert len(patches(fake)) == 1
+
+
+def test_a_stubborn_setting_is_named_in_the_error(capsys):
+    fake = FakeGitHub(stubborn_settings=True)
+    run_init(fake)
+    err = capsys.readouterr().err
+    assert "allow_squash_merge true -> false" in err
+    assert "organisation policy" in err
+
+
+# -- labels --------------------------------------------------------------------
+
+
+def test_the_six_labels_are_created_with_fixed_colours_and_descriptions():
+    fake = FakeGitHub()
+    code, out, _ = run_init(fake)
+    assert code == 0, out
+    assert list(fake.labels) == [
+        "round",
+        "known-gap",
+        "research",
+        "decision",
+        "correction",
+        "from-review",
+    ]
+    for label in di.LABELS:
+        made = fake.labels[label.name]
+        assert made == {"color": label.color, "description": label.description}
+        assert len(label.color) == 6 and int(label.color, 16) >= 0
+        assert not label.color.startswith("#")
+        assert 0 < len(label.description) <= 100  # GitHub's limit
+        assert f"Created label {label.name}" in out
+    assert len({label.color for label in di.LABELS}) == len(di.LABELS)
+
+
+def test_an_existing_label_is_never_edited_and_the_rest_are_still_created():
+    mine = {"color": "ffffff", "description": "my own words"}
+    fake = FakeGitHub(labels={"round": dict(mine), "decision": dict(mine)})
+    code, out, _ = run_init(fake)
+    assert code == 0, out
+    assert fake.labels["round"] == mine and fake.labels["decision"] == mine
+    created = [
+        r[3]["name"]
+        for r in fake.requests
+        if r[:2] == ("POST", "/repos/" + REPO + "/labels")
+    ]
+    assert created == ["known-gap", "research", "correction", "from-review"]
+    assert not [
+        r for r in fake.requests if r[0] in ("PUT", "DELETE") and "/labels" in r[1]
+    ]
+    assert not [r for r in fake.requests if r[0] == "PATCH" and "/labels" in r[1]]
+
+
+def test_the_article_label_is_not_one_init_creates():
+    assert all(not label.name.startswith("article:") for label in di.LABELS)
+    assert [label.name for label in di.LABELS] == [
+        "round",
+        "known-gap",
+        "research",
+        "decision",
+        "correction",
+        "from-review",
+    ]
+
+
+def test_the_labels_agents_md_names_are_the_ones_init_creates():
+    text = di.render_managed(REPO, "main")["AGENTS.md"].decode()
+    for label in di.LABELS:
+        assert f"`{label.name}`" in text, label.name

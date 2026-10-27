@@ -623,16 +623,25 @@ never touching `articles/` or `instructions/publication.md` after creating them.
 
 - `AGENTS.md.tmpl`, `README.md.tmpl`, `claude-project.md.tmpl` and
   `articles_README.md.tmpl` are rewritten for the new layout and the round loop
-  above. `articles/README.md` is created only while `articles/` is empty, so on
-  the existing repository the new text needs `--overwrite-edited` for that one
-  file or a manual edit; the phase issue says which.
+  above. `articles/README.md` is now a managed file (in the manifest, like the
+  others), because nothing else writes it and the old rule, created only while
+  `articles/` was empty, would have kept the new text out of the existing
+  repository. The first bootstrap wrote it before the manifest recorded it, so its
+  blob is not "what the last run wrote"; `ci-docs init` knows that earlier render
+  (`EARLIER_RENDERS`) and replaces it without `--overwrite-edited`, which would
+  also overwrite any other file someone edited. A page the author changed is still
+  left alone and listed.
 - `close_out.md`'s bracketed notes (not its labels) and
   `revise_after_review_prompt.md` follow the new names; both are rendered from
   `handoff_templates/` as before.
 - **Repository settings.** `init` reads `GET /repos/{o}/{r}` and, when they differ,
   sets `allow_merge_commit: true`, `allow_squash_merge: false`,
   `allow_rebase_merge: false`, `delete_branch_on_merge: false` with one
-  `PATCH /repos/{o}/{r}`, shown first in `--dry-run`.
+  `PATCH /repos/{o}/{r}`, shown first in `--dry-run`. The real run makes the
+  commit first and the `PATCH` after it, so a commit the secret scan refuses
+  stops the run before the settings change; if GitHub accepts the `PATCH` but the
+  repository still reports another value (an organisation policy), the run says
+  so and exits 1.
 - **Labels.** It creates `round`, `known-gap`, `research`, `decision`,
   `correction` and `from-review` when missing (`POST /repos/{o}/{r}/labels`), and
   never edits or deletes a label that exists.
