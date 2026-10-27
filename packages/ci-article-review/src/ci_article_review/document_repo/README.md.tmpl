@@ -1,0 +1,32 @@
+# {{repo}}
+
+Articles for one publication: drafts, metadata, hand-offs and `ci-review` reviews, one folder per article, every round a commit. This repository is private.
+
+The full rules are in [AGENTS.md](AGENTS.md). This page is the short version for a person.
+
+## Layout
+
+- `articles/<slug>/` holds everything for one article. Files are named `<slug>-draft-rN.md`, `<slug>-metadata-rN.md`, `<slug>-handoff-rN.md`, `<slug>-publication-rN.md`, `<slug>-close-out-rN-to-(code|chat)[-vM].md` and `<slug>-review-rN.md`.
+- `articles/<slug>/pipeline/` holds the worklist and the run reports. They are for the author.
+- `templates/` holds the shapes of those files.
+- `instructions/claude-project.md` is pasted at the top of the claude.ai project's instructions. `instructions/publication.md` holds the publication's own drafting rules and belongs to the author.
+- `AGENTS.md`, `CLAUDE.md`, `README.md`, `.gitattributes`, `templates/` and `instructions/claude-project.md` are written by `ci-docs init` from the content-intelligence repository. Edit them there, not here.
+
+## The review loop
+
+1. The drafting side commits `<slug>-draft-rN.md` and `<slug>-metadata-rN.md` together (`draft: <slug> rN`).
+2. The author runs `ci-review --github <slug>`.
+3. `ci-review` commits `<slug>-review-rN.md` to `main` (`review: <slug> rN`), with the worklist and report under `pipeline/`.
+4. The drafting side revises with `templates/revise_after_review_prompt.md` and commits round `rN+1`.
+
+Nothing is renamed, overwritten or deleted. A new round is a new file.
+
+## Refreshing the managed files
+
+From a checkout of content-intelligence:
+
+```
+uv run ci-docs init --repo {{repo}}
+```
+
+It adds what is missing, skips what is identical, replaces a managed file only if nobody has edited it here, and lists the ones that were edited. It never touches `articles/` or `instructions/publication.md`.

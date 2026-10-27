@@ -73,6 +73,10 @@ ci-review = "ci_article_review.pipeline:cli"
 ci-history-report = "ci_article_review.history_analytics:main"
 ci-voice-patterns = "ci_article_review.voice_pattern_report:main"
 ci-markers = "ci_article_review.markers:main"
+# The private GitHub document repository: `ci-docs init` creates it and keeps its
+# onboarding files current (docs/GITHUB-DOCUMENTS.md). Later phases add
+# subcommands to this entry point.
+ci-docs = "ci_article_review.documents_cli:main"
 
 [tool.uv.sources]
 ci-core = { workspace = true }
