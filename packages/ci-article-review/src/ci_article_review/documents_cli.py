@@ -7,14 +7,20 @@ refreshes them: a managed file is replaced only if nobody has edited it in the
 document repository since the last run. The design is docs/GITHUB-DOCUMENTS.md;
 what each file is for is in ``documents_init``.
 
+``ci-docs push-run`` writes a run that is already saved on disk back to its
+article folder, which is the retry for a ``ci-review --github SLUG --write-back``
+whose commit failed (``github_writeback``).
+
     ci-docs init --dry-run                  # the plan; writes nothing
     ci-docs init --create                   # make the repository too, if missing
     ci-docs init --seed-instructions PATH   # first run: instructions/publication.md
+    ci-docs push-run pipeline_history/example-article/run_4_<ts>_report.json
 
 The token is ``GITHUB_TOKEN``, else ``gh auth token``. It is never printed.
 """
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -28,6 +34,7 @@ from ci_core.console import force_utf8_stdio
 from ci_core.github_repo import GitHubRepo, GitHubRepoError, resolve_token
 
 from . import documents_init as di
+from .github_documents import GitHubDocumentsError
 
 # The plan lists paths and the author's repository name, not article text, but a
 # repository name or an error body can hold anything; keep the console from
@@ -97,6 +104,38 @@ def build_parser():
         default="configs",
         metavar="DIR",
         help="where user.yaml is read from, for github_documents (default: configs)",
+    )
+    push = sub.add_parser(
+        "push-run",
+        help="write a saved run's review back to its article folder (the retry for --write-back)",
+        description=(
+            "Commit a run already saved under pipeline_history/ to the article "
+            "folder its report says it was read from: the review beside the "
+            "draft, the worklist and the report under pipeline/. One commit, new "
+            "files only: a file already there with the same bytes is left alone "
+            "(running it twice is a no-op) and one with different bytes stops "
+            "it. A report under _replay/ or one that was not read from --github "
+            "is refused."
+        ),
+    )
+    push.add_argument(
+        "report",
+        metavar="REPORT_JSON",
+        help="the run's pipeline_history/<key>/run_N_<timestamp>_report.json",
+    )
+    push.add_argument(
+        "--github-repo",
+        metavar="OWNER/NAME",
+        help="commit to this repository instead of the one the report names",
+    )
+    push.add_argument(
+        "--config-dir",
+        default="configs",
+        metavar="DIR",
+        help=(
+            "where user.yaml is read from, for github_documents and the API "
+            "keys the commit must not contain (default: configs)"
+        ),
     )
     return parser
 
@@ -229,12 +268,66 @@ def main(
     """Entry point. ``environ``, ``run``, ``session`` and ``sleep`` are for tests."""
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "push-run":
+            return _push_run(args, environ, run, session, out)
         return _init(args, environ, run, session, out, sleep)
+    except GitHubDocumentsError as exc:
+        return _fail(str(exc))
     except GitHubRepoError as exc:
         if exc.kind == "rate_limited" and exc.reset_at:
             when = time.strftime("%H:%M:%S", time.localtime(exc.reset_at))
             return _fail(f"{exc} The limit lifts at {when}.")
         return _fail(str(exc))
+
+
+def _push_run(args, environ, run, session, out):
+    # Imported here: only this command needs the whole config machinery.
+    from .config_loader import (
+        load_publication_config,
+        load_user_config,
+        merge_configs,
+        normalize_github_documents,
+    )
+    from .github_writeback import push_saved_run
+
+    # The commit must not contain a configured API key, so the keys have to be
+    # known. A config that cannot be loaded stops the command rather than
+    # quietly skipping the scan.
+    try:
+        user = load_user_config(args.config_dir)
+    except (OSError, ValueError) as exc:
+        return _fail(
+            f"cannot read the configuration in {args.config_dir} ({exc}); push-run "
+            "needs it to check the commit for API keys. Pass --config-dir."
+        )
+    publication = _report_publication(args.report)
+    try:
+        pub = (
+            load_publication_config(publication, args.config_dir) if publication else {}
+        )
+    except (OSError, ValueError):
+        pub = {}
+    config = merge_configs(user, pub)
+    push_saved_run(
+        args.report,
+        settings=normalize_github_documents(config.get("github_documents")),
+        api_keys=config["api_keys"],
+        repo=args.github_repo,
+        token_lookup=lambda: resolve_token(environ, run),
+        session=session,
+        out=out,
+    )
+    return 0
+
+
+def _report_publication(path):
+    """The publication a saved report was made for, if it can be read."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            name = json.load(f).get("publication")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return name if isinstance(name, str) and name.strip() else None
 
 
 def _init(args, environ, run, session, out, sleep):

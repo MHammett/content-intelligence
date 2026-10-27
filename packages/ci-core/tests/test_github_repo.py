@@ -421,6 +421,17 @@ def test_a_full_sha_is_not_looked_up_again(gh, fake):
     assert len(fake.requests) == before
 
 
+def test_has_branch_tells_a_branch_from_a_tag_a_sha_and_a_missing_name(gh, fake):
+    assert gh.has_branch("main") is True
+    assert gh.has_branch("no-such-branch") is False
+    assert gh.has_branch(fake.branches["main"]) is False  # a SHA is not a branch
+
+
+def test_has_branch_on_an_empty_repository_is_false():
+    fake = FakeGitHub(empty=True)
+    assert GitHubRepo(REPO, TOKEN, session=fake).has_branch("main") is False
+
+
 # -- commit_files ------------------------------------------------------------
 
 

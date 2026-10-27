@@ -568,9 +568,9 @@ pipeline:
 #   repo: MHammett/mikehammett.net-articles  # OWNER/NAME; --github-repo overrides it per run
 #   branch: main            # default: the repository's default branch; --github-ref overrides
 #   path_prefix: articles   # the folder holding one folder per article
-#   write_back: false       # reserved: committing the review back (not built yet)
-#   include_capture: false  # reserved, with write_back
-#   allow_public_repo: false  # reserved, with write_back
+#   write_back: false       # commit the review back after every --github run (--write-back / --no-write-back override); needs a token with Contents read and write
+#   include_capture: false  # with write_back: also commit run_N_*_results.json under pipeline/
+#   allow_public_repo: false  # with write_back: allow committing to a public repository (the review is then published)
 
 # Delta assessment thresholds for re-run recommendation
 delta:

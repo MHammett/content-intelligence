@@ -8,7 +8,9 @@ An article is a folder named by its slug, under an optional ``path_prefix``::
 
 This module turns that folder into the same handoff dict ``--draft``,
 ``--raw-draft`` and ``--url`` hand to ``run_draft_pipeline``, so the review
-itself does not change. Nothing is written back here.
+itself does not change. Nothing is written back here (``github_writeback``
+does that); with ``write_back=True`` the read also runs the write-back
+pre-flight, so a refusal happens before any model is called.
 
 Every read is pinned to one commit SHA, resolved once, so a draft and its
 metadata can never come from two different commits even if the branch moves
@@ -38,6 +40,17 @@ log = logging.getLogger(__name__)
 #: A slug is a folder name and the stem of every file in it, so it may not carry
 #: a path separator, whitespace, or start with a dot.
 _SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def review_name(slug, run_number):
+    """Where a run's review goes in the article folder: ``<slug>-review-rN.md``."""
+    return f"{slug}-review-r{run_number}.md"
+
+
+def taken_run_numbers(names, slug):
+    """Run numbers whose ``<slug>-review-rN.md`` is already in a folder listing."""
+    pattern = re.compile(rf"^{re.escape(slug)}-review-r([1-9][0-9]*)\.md$")
+    return {int(m.group(1)) for m in map(pattern.match, names) if m}
 
 
 class GitHubDocumentsError(ValueError):
@@ -202,6 +215,7 @@ def load_handoff(
     client=None,
     has_token=True,
     token_lookup=resolve_token,
+    write_back=False,
 ):
     """Read round ``round_number`` (default: the highest) of ``slug`` as a handoff.
 
@@ -212,6 +226,12 @@ def load_handoff(
 
     The handoff carries a ``document_source`` entry naming the repository, the
     ref, the commit it was read at, the round and each file's blob SHA.
+
+    ``write_back=True`` also checks, before anything else is paid for, that the
+    review can be committed back: a token, push permission, a private repository
+    (unless ``allow_public_repo``), a branch to commit to, and the run numbers
+    whose ``<slug>-review-rN.md`` is already taken, which the handoff carries as
+    ``taken_run_numbers`` for the run-number bump.
     """
     validate_slug(slug)
     settings = normalize_github_documents(settings)
@@ -227,6 +247,11 @@ def load_handoff(
     if client is None:
         token = token_lookup()
         has_token = bool(token)
+        if write_back and not has_token:
+            raise GitHubDocumentsError(
+                "--write-back needs a GitHub token to commit with. Set "
+                "GITHUB_TOKEN or run `gh auth login`."
+            )
         try:
             client = GitHubRepo(repo_name, token)
         except ValueError as exc:
@@ -240,6 +265,8 @@ def load_handoff(
             ref=ref or settings["branch"],
             round_number=round_number,
             has_token=has_token,
+            write_back=write_back,
+            allow_public_repo=settings["allow_public_repo"] is True,
         )
     except GitHubRepoError as exc:
         raise GitHubDocumentsError(
@@ -251,15 +278,34 @@ def load_handoff(
             close()
 
 
-def _load(client, slug, *, repo_name, prefix, ref, round_number, has_token):
+def _load(
+    client,
+    slug,
+    *,
+    repo_name,
+    prefix,
+    ref,
+    round_number,
+    has_token,
+    write_back=False,
+    allow_public_repo=False,
+):
     started = time.monotonic()
     info = client.info()
-    if not info.private:
+    if write_back:
+        _check_can_write(info, repo_name, allow_public_repo)
+    elif not info.private:
         log.warning(
             "%s is a public repository: drafts committed there are published.",
             repo_name,
         )
     ref = ref or info.default_branch
+    if write_back and not client.has_branch(ref):
+        raise GitHubDocumentsError(
+            f"--write-back commits to a branch, and {ref!r} is not one in "
+            f"{repo_name} (a tag or a commit cannot be committed onto). Pass a "
+            "branch with --github-ref, or drop --write-back."
+        )
     try:
         commit = client.resolve(ref)
     except GitHubRepoError as exc:
@@ -300,6 +346,10 @@ def _load(client, slug, *, repo_name, prefix, ref, round_number, has_token):
 
     handoff = _build_handoff(slug, chosen, {k: kinds[k] for k in wanted}, texts)
     _set_history_key(handoff, slug)
+    if write_back:
+        handoff["taken_run_numbers"] = sorted(
+            taken_run_numbers([e.name for e in entries if e.type == "file"], slug)
+        )
     handoff["document_source"] = {
         "kind": "github",
         "repo": repo_name,
@@ -319,6 +369,27 @@ def _load(client, slug, *, repo_name, prefix, ref, round_number, has_token):
         time.monotonic() - started,
     )
     return handoff
+
+
+def _check_can_write(info, repo_name, allow_public_repo):
+    if not info.private:
+        if not allow_public_repo:
+            raise GitHubDocumentsError(
+                f"{repo_name} is a public repository: drafts committed there are "
+                "published, so --write-back will not write to it. Make it "
+                "private, or set allow_public_repo: true under github_documents."
+            )
+        log.warning(
+            "%s is a public repository and allow_public_repo is set: the review "
+            "will be published.",
+            repo_name,
+        )
+    if not info.can_push:
+        raise GitHubDocumentsError(
+            f"This token cannot push to {repo_name} (no write permission), so "
+            "--write-back cannot commit the review. Use a token with Contents "
+            "read and write, or drop --write-back."
+        )
 
 
 def _missing_folder(client, repo_name, folder, prefix, ref, commit):

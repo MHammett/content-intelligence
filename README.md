@@ -532,6 +532,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is 
 | `--round N` | With `--github`: read round `N` instead of the highest the folder has |
 | `--github-ref REF` | With `--github`: a branch, tag or commit SHA to read at (default: `github_documents.branch`, else the repository's default branch) |
 | `--github-repo OWNER/NAME` | With `--github`: read from this repository instead of `github_documents.repo`, for this run only |
+| `--write-back` / `--no-write-back` | With `--github`: commit the review back to the article's folder, or don't, overriding `github_documents.write_back`. A usage error without `--github`, and `--write-back` is one with `--replay`, `--offline`, `--only-model`, `--only-domain` or `--no-timeout`. See [Writing the review back](#writing-the-review-back-to-github) |
 | `--publish PATH` | Publish an approved publication handoff (saves as draft unless `--publish-live`) |
 | `--metadata PATH` | Metadata-only file (PRIMARY CLAIM, TARGET AUDIENCE, etc., no DRAFT section) to pair with `--raw-draft`. Requires `--raw-draft`. |
 | `--publication NAME` | Publication config to use (`configs/NAME.yaml`) — **required** |
@@ -580,7 +581,7 @@ uv run ci-review --github my-article --round 3 --github-ref main --publication y
 - **History key.** When the handoff has no `History key:`, it is set to the slug, so `pipeline_history/<slug>/` and the document folder are one string. When it has one that is not the slug, the run warns, names both, and keeps the `History key:`, because history is the fixed point.
 - **Run number.** A `Pipeline run:` line in the handoff (or metadata) is used as written. When there is none, the run number is the round. The usual bump past run numbers already in local history still applies.
 - **Provenance.** `report.json` gains a `document_source` block: `kind`, `repo`, `ref`, `commit_sha`, `round`, and each file's `path` and git `blob_sha`.
-- **Offline and replay.** `--offline` still reads from GitHub (the read is the input, as the page fetch is for `--url`); `--replay` and `--retry-failed` work as they do with `--raw-draft`. Nothing is written back to the repository.
+- **Offline and replay.** `--offline` still reads from GitHub (the read is the input, as the page fetch is for `--url`); `--replay` and `--retry-failed` work as they do with `--raw-draft`. Nothing is written back to the repository unless you ask for it with `--write-back`, which a replay or an offline run can never do.
 
 Configuration is an optional `github_documents` block in `configs/user.yaml` (commented out in `user.example.yaml`):
 
@@ -589,11 +590,40 @@ Configuration is an optional `github_documents` block in `configs/user.yaml` (co
 | `repo` | `MHammett/mikehammett.net-articles` | `OWNER/NAME` of the document repository. `--github-repo` overrides it. An empty string is an error. |
 | `branch` | the repository's default branch | The ref to read when `--github-ref` is absent |
 | `path_prefix` | `articles` | The folder that holds the article folders (empty: the repository root) |
-| `write_back`, `include_capture`, `allow_public_repo` | `false` | Reserved for committing the review back, which is not built yet |
+| `write_back` | `false` | Commit the review back after every `--github` run, as if `--write-back` were given. `--no-write-back` overrides it; it is set aside, with one INFO line, on a replay, an offline run or a calibration run |
+| `include_capture` | `false` | Also commit `run_N_<ts>_results.json` (the raw ensemble) under `pipeline/` |
+| `allow_public_repo` | `false` | Let write-back commit to a public repository, where the review and the worklist would be published |
 
 There is no token key. The token is `GITHUB_TOKEN` if set, else the output of `gh auth token`; a fine-grained personal access token limited to the one repository, with Contents read, is the narrowest choice. A public repository needs no token, but the run warns because drafts committed there are published.
 
 Every failure stops the run before a model is called, with one message and exit status 1: an empty `repo`, a private repository and no token (set `GITHUB_TOKEN` or run `gh auth login`), a rejected token (401), a repository that is "missing, or not visible to this token" (GitHub answers 404 for both), a missing article folder (the message lists the article folders that exist), a missing round (it lists the rounds that exist), and an exhausted rate limit (it names the reset time).
+
+### Writing the review back to GitHub
+
+`--write-back` commits the run's review to the folder the draft was read from, so the drafting side reads it without anybody pasting a file. It is off unless the flag or `write_back: true` turns it on, and it needs `--github`.
+
+```powershell
+uv run ci-review --github my-article --write-back --publication your_publication_name
+```
+
+One commit on the branch the draft was read from, holding new files only, from run N (the run number the run actually used):
+
+| Local file in `pipeline_history/<key>/` | Path in the document repository |
+|---|---|
+| `run_N_<ts>_review.md` | `<slug>/<slug>-review-rN.md` |
+| `run_N_<ts>_worklist.md` | `<slug>/pipeline/<slug>-worklist-rN.md` |
+| `run_N_<ts>_report.json` | `<slug>/pipeline/run_N_<ts>_report.json` |
+| `run_N_<ts>_results.json` (only with `include_capture: true`) | `<slug>/pipeline/run_N_<ts>_results.json` |
+
+The paths are relative to `path_prefix`. The review is at the top level, where the chat project reads; `pipeline/` is not, because the worklist lists documents nobody has read yet. Line endings are converted to LF. The commit message names the draft files and the commit they were read at, the run, its preset and reported cost, and the files, and says so when the reviewed draft has since been edited at its own path.
+
+- **Checked before any model call.** A token, push permission on the repository, a branch to commit to (a tag or a commit SHA given to `--github-ref` is refused), and a private repository unless `allow_public_repo: true`. Each refusal is one message and exit status 1 and costs nothing. The run number also moves past every `<slug>-review-rN.md` already in the folder, with the same warning it gives for a number local history already has, so the names are free.
+- **Never over anything.** A file already there with the same bytes is left alone; one with different bytes stops the write-back and nothing is overwritten. There is no force. If the drafting side commits while the review is being written, the commit is rebuilt on top of theirs, up to three more times.
+- **No secrets.** Every outgoing file and the message are scanned for the token and for every configured API key value; a hit refuses the whole commit.
+- **If it fails after the review,** the local files are already saved. The run prints the reason, says so, gives the retry command, and exits 1.
+- **Never from a replay.** A replay's report goes to `_replay/` and is a code test, not a review of the article. `--write-back` with `--replay`, `--offline`, `--only-model`, `--only-domain` or `--no-timeout` is a usage error; with `write_back: true` in config those runs ignore it and log one INFO line. `--retry-failed` may write back.
+
+The retry, and the way to hand over a run whose commit failed, is `ci-docs push-run`: see [`ci-docs`](#the-document-repository-ci-docs).
 
 ### Iterating on the code without paying for the ensemble
 
@@ -650,6 +680,22 @@ uv run ci-docs init                                      # later: refresh the ma
 | `--config-dir DIR` | where `user.yaml` is read from (default `configs`) |
 
 The token is `GITHUB_TOKEN`, else the output of `gh auth token`. A re-run adds what is missing, skips what is identical, and replaces a managed file only if the repository still holds the version the last run wrote (`.ci-docs/manifest.json` records it); one edited there is listed and left alone. Nothing under `articles/` and no existing `instructions/publication.md` is ever touched. It refuses a public repository.
+
+### `ci-docs push-run`
+
+`push-run` writes back a run that is already saved on disk, without running it again. It is the retry for a `ci-review --github ... --write-back` whose commit failed (the error prints the exact command), and the way to hand over a run you decided about later.
+
+```powershell
+uv run ci-docs push-run pipeline_history/my-article/run_4_20261026_143022_report.json
+```
+
+It reads `document_source` from the report to find the repository, the branch and the article folder, maps the files beside the report as in [Writing the review back](#writing-the-review-back-to-github), and applies the same refusals and the same commit. Running it twice is a no-op. A report under `_replay/`, one not named `run_N_<timestamp>_report.json`, and one without a `document_source` are refused.
+
+| Flag | Meaning |
+|---|---|
+| `REPORT_JSON` | the run's `pipeline_history/<key>/run_N_<timestamp>_report.json` |
+| `--github-repo OWNER/NAME` | commit to this repository instead of the one the report names |
+| `--config-dir DIR` | where `user.yaml` is read from, for `github_documents` and the API keys the commit must not contain (default `configs`) |
 
 ---
 
@@ -932,6 +978,7 @@ content-intelligence/
 │   │   │   ├── handoff_parser.py      parses Template A and Template C documents
 │   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
 │   │   │   ├── github_documents.py    reads one round of an article from a GitHub repository (--github)
+│   │   │   ├── github_writeback.py    commits a run's review back to that folder (--write-back, ci-docs push-run)
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
 │   │   │   ├── passage_match.py       decides when two quoted passages are the same passage
