@@ -9,7 +9,9 @@ sides exchange files through a shared Drive folder and by pasting (see
 [CLOSE-OUT.md](CLOSE-OUT.md)). This design adds a GitHub repository, separate from
 this code repository, as an optional place where the drafting side commits drafts,
 metadata and hand-offs, `ci-review` reads a draft, and `ci-review` commits its
-review back. Versioning becomes git's: every round is a commit, nothing is
+review back. The repository is the private `MHammett/mikehammett.net-articles`.
+This repository creates it and keeps its onboarding files current, so any AI client
+attached to it learns the rules from the repository itself. Versioning becomes git's: every round is a commit, nothing is
 overwritten, and either side can see what the other did and when.
 
 It is **optional and additive.** It is selected per run with a new flag. The
@@ -97,21 +99,29 @@ it replaces. Revisit if the surface grows past about a dozen endpoints; PyGithub
 would then be the candidate. `gh` is used for one thing only, as a token source
 (below).
 
-**Size limits that shape the client.** The Contents API returns a file inline up
-to 1 MB; from 1 to 100 MB only with the raw media type
-(`application/vnd.github.raw+json`); not above 100 MB
-([contents API](https://docs.github.com/en/rest/repos/contents)). The client
-always reads with the raw media type and writes through the blobs API, so a
-2 MB report is not a special case.
+**Size.** The Contents API returns a file inline only up to 1 MB, and up to
+100 MB with the raw media type ([contents API](https://docs.github.com/en/rest/repos/contents)),
+so the client always reads raw and writes through the blobs API.
 
 ## The document repository
 
-One repository, named in config, ideally **private** and owned by a personal
-account (the connector above reportedly cannot reach organization repositories).
-Layout, under an optional `path_prefix`:
+**`MHammett/mikehammett.net-articles`**: private, owned by the author's personal
+account (the connector above reportedly cannot reach organization repositories),
+default branch `main`. It is the default of `github_documents.repo` and can be
+overridden there or per run. Its root describes itself to whatever attaches to it
+(next section); the articles live under `articles/`:
 
 ```
-<path_prefix>/<slug>/
+AGENTS.md            the working rules for any AI client or person (managed)
+CLAUDE.md            one line, `@AGENTS.md`, for Claude Code (managed)
+README.md            the layout and the review loop, for people (managed)
+.gitattributes       `* text=auto eol=lf` (managed)
+templates/           Templates A, C and D and the revise prompt (managed copies)
+instructions/
+  claude-project.md  the stanza pasted into the chat project's instructions (managed)
+  publication.md     the publication-specific drafting instructions (seeded once, then the author's)
+.ci-docs/manifest.json  what the bootstrap wrote, from which source commit
+articles/<slug>/
   <slug>-draft-r4.md                  drafting side
   <slug>-metadata-r4.md               drafting side (the two-file form)
   <slug>-handoff-r4.md                drafting side (Template A in one file, if used instead)
@@ -134,7 +144,82 @@ Layout, under an optional `path_prefix`:
   the README says never to hand to the revision model. The report keeps its
   `pipeline_history` file name so a run can be copied back into a history
   directory unchanged.
-- No file is ever modified or deleted by the pipeline. A new round is a new file.
+- No file under `articles/` is ever modified or deleted by the pipeline. A new
+  round is a new file. Only the bootstrap rewrites anything, and only the files it
+  manages.
+
+## Making the repository self-describing
+
+Every client that attaches to the repository has to learn the same rules: the
+layout, the names, the branch, the commit messages, how a round is submitted and
+where its review comes back, and what never to do. They go in **`AGENTS.md`**, the
+tool-neutral name, written once. What each client reads on its own differs, so
+the design meets each one where it looks:
+
+| Client | What it reads by itself | What makes it read `AGENTS.md` |
+|---|---|---|
+| Codex and other agents following the AGENTS.md convention | `AGENTS.md` at the root | nothing more |
+| Claude Code | `CLAUDE.md`; recent releases fall back to `AGENTS.md` only when no `CLAUDE.md` exists, behind a setting | a root `CLAUDE.md` holding `@AGENTS.md`, the import form, which works on every release |
+| claude.ai project, built-in GitHub integration | **nothing automatically**: only the files and folders picked for project knowledge, refreshed by "Sync now"; project instructions are a separate field ([Anthropic's page](https://claude.com/docs/connectors/github)) | the project's instructions start with `instructions/claude-project.md`, which says to read `AGENTS.md` first; `AGENTS.md`, `templates/` and the current article's folder are the files picked for knowledge |
+| claude.ai with GitHub's MCP connector | nothing until a tool call reads a file | the same stanza: it names the repository and tells the model to `get_file_contents` `AGENTS.md` before anything else |
+
+Pick knowledge narrowly. Knowledge that outgrows the context window switches the
+project to retrieval, where a rule in `AGENTS.md` is found only if a search hits
+it. `AGENTS.md`, `templates/` and one article's top level stay small; the whole
+repository, with `pipeline/` reports of up to 2 MB, would not.
+
+`AGENTS.md` covers: the layout above; the names (`<slug>-draft-rN.md`,
+`<slug>-metadata-rN.md`, `<slug>-handoff-rN.md`, `<slug>-publication-rN.md`,
+close-out notes, `<slug>-review-rN.md`); commit only to `main`, never with force;
+the commit messages (`draft: <slug> rN`, `close-out: <slug> rN to-code`;
+`review: <slug> rN` is the pipeline's); **submitting a round** (commit the draft
+and its metadata together in one commit, then ask the author to run
+`ci-review --github <slug>`); **where the review comes back**
+(`<slug>-review-rN.md` at the folder's top level, after "Sync now"; paste it with
+`templates/revise_after_review_prompt.md`); **never** rename an article folder,
+modify or delete a numbered file, rewrite history, force-push, commit a secret or
+read `pipeline/` into a revision; and how to read the pipeline's commits
+(message, `Reviewed:` line, `document_source` in the report).
+
+**Publication-specific instructions stay the author's.** The drafting project's
+instructions in Drive (`mikehammett-project-instructions.md`) carry voice and
+editorial rules, not workflow, and this code repository is public. So the
+bootstrap seeds `instructions/publication.md` from a file the author supplies, once,
+and never touches it again; it is edited in the document repository like an
+article. The workflow half of those instructions (file storage, naming, the
+close-out list CLOSE-OUT.md asks for) moves into `AGENTS.md`, and the Drive copy
+retires.
+
+## Bootstrapping the repository: `ci-docs init`
+
+This code repository owns the scaffolding. `uv run ci-docs init` creates the
+document repository when it is missing and keeps its onboarding files current:
+
+1. If the repository does not exist, create it with `gh repo create
+   MHammett/mikehammett.net-articles --private` (the account's own `gh` login,
+   as the author asked). An empty repository answers the Git Data API with 409, so
+   the first file goes in with one Contents API `PUT`; everything after uses the
+   normal commit path.
+2. Render the managed files from **packaged sources in this repository**: the
+   templates from `handoff_templates/` (the same files `ci-setup` copies, so each
+   template has one source), and `AGENTS.md`, `CLAUDE.md`, `README.md`,
+   `.gitattributes` and `instructions/claude-project.md` from a new packaged
+   `document_repo/` directory. Each rendered file carries a first-line marker
+   naming its source and this repository's commit, and says to edit it here, not
+   there.
+3. Commit them in one commit (`onboarding: refresh from content-intelligence
+   <short sha>`) with `.ci-docs/manifest.json`, which records each managed path
+   and the blob SHA written. A re-run adds what is missing, skips what is
+   identical, and replaces a managed file **only if its current blob is the one
+   the manifest recorded**. A managed file edited in the document repository is
+   left alone and listed, unless `--overwrite-edited`. Nothing under `articles/`
+   or `instructions/publication.md` is ever touched after seeding.
+4. `--dry-run` prints the plan and writes nothing; `--seed-instructions PATH`
+   supplies `instructions/publication.md` the first time.
+
+A change to Template A or D then reaches the drafting side by merging it here and
+re-running `ci-docs init`. That replaces the hand-kept Drive copy that
+`close_out.md`'s header comment and CLOSE-OUT.md warn about.
 
 ## Configuration
 
@@ -143,15 +228,16 @@ A new top-level block in `configs/user.yaml`, also added, commented out, to
 
 ```yaml
 github_documents:
-  repo: your-github-user/article-documents   # owner/name; the block is inert without it
+  repo: MHammett/mikehammett.net-articles   # the default; owner/name
   branch: main            # optional; default: the repository's default branch
-  path_prefix: ""         # optional; folder holding the article folders
+  path_prefix: articles   # the default; folder holding the article folders
   write_back: false       # default for runs that read from GitHub; --write-back overrides
   include_capture: false  # also commit run_N_*_results.json under pipeline/
   allow_public_repo: false  # refuse to write to a public repository unless true
 ```
 
-`merge_configs` builds its result key by key, so the block has to be carried
+Every key has a default, so the block is optional; nothing reads it unless a run
+passes `--github` or `ci-docs` is called. `merge_configs` builds its result key by key, so the block has to be carried
 through it explicitly or it is silently dropped (the same trap as `rate_limits`).
 
 **Token.** Not in YAML: an unset `${VAR}` stops config loading for every run, and a
@@ -264,7 +350,6 @@ A replay's report is a code test, not a review of the article (it goes to
 
 | Condition | When it is caught | What happens |
 |---|---|---|
-| `--github` with no `repo` configured or given | argument check | usage error |
 | no token (private repository) | pre-flight | exit 1: set `GITHUB_TOKEN` or run `gh auth login` |
 | 401 | pre-flight | exit 1: token rejected (expired or revoked) |
 | 404 on the repository | pre-flight | exit 1: missing, or not visible to this token (GitHub answers 404 for both) |
@@ -286,24 +371,19 @@ A replay's report is a code test, not a review of the article (it goes to
   error text from providers, which is how a secret would get there.
 - Drafts are unpublished work: the document repository should be private, the
   pipeline warns when it is public and refuses to write to it unless told to.
-- This code repository is public. Its tests, examples and PRs use invented
-  repository names and slugs; the real repository name lives only in the
-  git-ignored `configs/user.yaml`.
+- This code repository is public. The document repository's name is in it (as
+  a config default) by the author's choice; article slugs and contents are not.
+  Tests and examples use invented slugs, and live tests use a scratch repository.
+- The bootstrap commits only rendered files from packaged sources and the one
+  file the author supplies; it scans them for secrets like any other write.
 - Commits are authored by the token's owner. Nothing in this design deletes a
   file, rewrites history or uses `force`.
 
 ## The drafting side
 
-What the chat project does (its own instructions text is written in the docs
-phase, beside the `close_out.md` copy CLOSE-OUT.md already asks for):
-
-- Read the article folder through the GitHub integration (or the connector) and
-  re-sync after the pipeline commits; read only the top level, never `pipeline/`.
-- Commit to the configured branch, never to another and never with force. Commit a
-  draft and its metadata together (`push_files`), message `draft: <slug> rN`;
-  a close-out note as `close-out: <slug> rN to-code`.
-- Never modify or delete a numbered file. A new round is a new file; a rewrite of
-  a close-out note is its `-v<M>` successor.
+Everything the chat project must do is in the document repository's
+`AGENTS.md` ([above](#making-the-repository-self-describing)), so the chat
+follows the repository and not a copy of these rules kept somewhere else.
 
 **Close-out notes from a Code session.** CLOSE-OUT.md says Code has no standing
 permission to write to the author's Drive. Here the configured repository is that
@@ -328,11 +408,13 @@ Each phase is an issue labelled `github-documents`, buildable from the issue
 alone, in this order:
 
 1. #401: the `ci_core` GitHub client.
-2. #402: reading a draft with `--github`.
-3. #403: write-back and `ci-docs push-run`.
-4. #404: `ci-docs put` and `ls`, the README, CLOSE-OUT.md and the drafting
-   project's instructions text.
-5. #405 (optional): copying runs from the document repository into a history
+2. #406: `ci-docs init`, which creates the document repository and keeps its
+   onboarding files and templates current.
+3. #402: reading a draft with `--github`.
+4. #403: write-back and `ci-docs push-run`.
+5. #404: `ci-docs put` and `ls`, the README, CLOSE-OUT.md, and the check that a
+   claude.ai project follows the repository's `AGENTS.md`.
+6. #405 (optional): copying runs from the document repository into a history
    root for `ci-history-report`.
 
 ## Not decided here
