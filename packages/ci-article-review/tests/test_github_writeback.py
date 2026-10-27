@@ -120,6 +120,20 @@ class RoundGitHub(StrictGitHub):
         }
 
     def _route(self, method, path, headers, params, body):
+        if (method, path) == ("GET", "/pulls"):
+            # The listing the automatic tagging step (#418) reads before a
+            # push-run writes; a merged pull request is "closed" there.
+            wanted = (params or {}).get("state", "open")
+            return Resp(
+                200,
+                [
+                    self._pull_json(n)
+                    for n, p in sorted(self.pulls.items())
+                    if wanted == "all" or (p["state"] == "open") == (wanted == "open")
+                ],
+            )
+        if method == "GET" and path.startswith("/git/matching-refs/"):
+            return Resp(200, [])  # no tags: nothing to tell from a tagged round
         found = re.fullmatch(r"/pulls/(\d+)(/reviews)?", path)
         if not found:
             return super()._route(method, path, headers, params, body)
