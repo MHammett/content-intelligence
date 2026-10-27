@@ -159,7 +159,13 @@ class FakeGitHub:
     def _resolve(self, ref):
         if ref in self.commits:
             return ref
-        return self.branches.get(ref)
+        if ref in self.branches:
+            return self.branches[ref]
+        # GET /commits/{tag} peels an annotated tag to the commit it points at.
+        sha = self.tags.get(ref)
+        if sha in self.tag_objects:
+            return self.tag_objects[sha]["object"]
+        return sha
 
     def _next_number(self):
         self._numbers += 1
@@ -186,6 +192,26 @@ class FakeGitHub:
                 parts.append(f'<{base}?{query(page - 1)}>; rel="prev"')
             headers["Link"] = ", ".join(parts)
         return Resp(200, chunk, headers=headers)
+
+    def _ancestors(self, sha):
+        """``sha`` and every commit reachable from it."""
+        seen, todo = set(), [sha]
+        while todo:
+            cur = todo.pop()
+            if cur not in seen:
+                seen.add(cur)
+                todo.extend(self.commits[cur]["parents"])
+        return seen
+
+    def _merge_base(self, a, b):
+        """The best common ancestor: one no other common ancestor descends from."""
+        common = self._ancestors(a) & self._ancestors(b)
+        best = [
+            c
+            for c in common
+            if not any(c != o and c in self._ancestors(o) for o in common)
+        ]
+        return best[0] if len(best) == 1 else None
 
     def _is_ancestor(self, old, new):
         seen, todo = set(), [new]
@@ -353,9 +379,13 @@ class FakeGitHub:
 
     def _compare(self, basehead):
         base, _, head = basehead.partition("...")
+        base, head = self._resolve(unquote(base)), self._resolve(unquote(head))
         for sha in (base, head):
             if sha not in self.commits:
                 return Resp(404, {"message": f"No commit found for SHA: {sha}"})
+        merge_base = self._merge_base(base, head)
+        if merge_base is None:
+            return Resp(404, {"message": "No common ancestor between the two."})
         if base == head:
             status = "identical"
         elif self._is_ancestor(base, head):
@@ -364,7 +394,7 @@ class FakeGitHub:
             status = "behind"
         else:
             status = "diverged"
-        return Resp(200, {"status": status})
+        return Resp(200, {"status": status, "merge_base_commit": {"sha": merge_base}})
 
     def _collab(self, method, path, params, body):
         """Pull requests, reviews, labels and issues."""
@@ -1258,6 +1288,51 @@ def test_a_review_body_holding_the_token_is_refused_before_sending(gh, fake):
     assert len(fake.requests) == before
 
 
+# -- merge base ----------------------------------------------------------------
+
+
+def test_merge_base_is_the_commit_a_branch_was_cut_from(gh, fake):
+    cut = fake.branches["main"]
+    tip = _round_branch(fake)
+    moved = fake.external_commit("main", {"later.md": b"later\n"}, "main moves on")
+    assert gh.merge_base(moved, tip) == cut
+    method, path, params, _ = fake.requests[-1]
+    assert (method, path.endswith(f"/compare/{moved}...{tip}")) == ("GET", True)
+    assert params == {"per_page": 1}
+
+
+def test_merge_base_of_a_commit_and_itself_or_its_ancestor(gh, fake):
+    main = fake.branches["main"]
+    tip = _round_branch(fake)
+    assert gh.merge_base(tip, tip) == tip
+    assert gh.merge_base(main, tip) == main
+    assert gh.merge_base(tip, main) == main
+
+
+def test_merge_base_takes_branch_and_tag_names(gh, fake):
+    cut = fake.branches["main"]
+    tip = _round_branch(fake)
+    gh.create_tag("example-article/r1", "accepted", tip, tagger=_sig())
+    assert gh.merge_base("main", "example-article/r1") == cut
+    assert gh.merge_base("round/example-article/r1", "main") == cut
+
+
+def test_merge_base_of_unrelated_histories_is_none(gh, fake):
+    root = fake.external_commit("orphan", {"x.md": b"x\n"}, "another root")
+    assert gh.merge_base(fake.branches["main"], root) is None
+
+
+def test_merge_base_of_a_missing_commit_is_an_error(gh, fake):
+    err = raises("not_found", gh.merge_base, fake.branches["main"], "f" * 40)
+    assert err.status == 404
+
+
+def test_merge_base_without_the_field_is_an_error(gh, fake):
+    tip = _round_branch(fake)
+    fake.inject("GET", "/compare/", Resp(200, {"status": "ahead"}))
+    raises("other", gh.merge_base, fake.branches["main"], tip)
+
+
 # -- refs and tags -------------------------------------------------------------
 
 
@@ -1691,6 +1766,7 @@ def test_no_new_error_log_or_repr_holds_the_token(gh, fake, caplog):
         ("POST", "/comments", lambda: gh.comment_on_issue(1, "b")),
         ("PATCH", f"/repos/{REPO}", lambda: gh.update_repo(allow_merge_commit=True)),
         ("GET", "/compare/", lambda: gh.merge_commit("main", tip, "m")),
+        ("GET", "/compare/", lambda: gh.merge_base("main", tip)),
     ]
     for method, part, call in calls:
         fake.inject(method, part, echo)

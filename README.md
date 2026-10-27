@@ -528,11 +528,12 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is 
 | `--draft PATH` | Run the review pipeline on a draft handoff document |
 | `--raw-draft PATH` | Run on a plain article file with no handoff headers (e.g. pasted straight out of a chat session) — the whole file becomes the article body |
 | `--url URL` | Fetch a published web page and run the review on its extracted content |
-| `--github SLUG` | Read the article folder `SLUG` from the GitHub document repository (`github_documents` in `user.yaml`) — the latest round unless `--round` says otherwise. See [Reading a draft from GitHub](#reading-a-draft-from-github). Not combinable with `--metadata` or `--archive-only`. |
-| `--round N` | With `--github`: read round `N` instead of the highest the folder has |
-| `--github-ref REF` | With `--github`: a branch, tag or commit SHA to read at (default: `github_documents.branch`, else the repository's default branch) |
+| `--github SLUG` | Read the article folder `SLUG` from the GitHub document repository (`github_documents` in `user.yaml`) at the head of the article's one open round (an open pull request from a branch `round/SLUG/rN`) unless `--pr`, `--round` or `--github-ref` says otherwise. See [Reading a draft from GitHub](#reading-a-draft-from-github). Not combinable with `--metadata` or `--archive-only`. |
+| `--pr N` | With `--github`: read pull request `N`, which must be from a branch `round/SLUG/rN` of the document repository. Use it when the article has more than one open round. |
+| `--round N` | With `--github`: read round `N`: the open pull request from `round/SLUG/rN` if there is one, else the tag `SLUG/rN`. Only the open pull request can be written back to. |
+| `--github-ref REF` | With `--github`: read a branch, tag or commit SHA as it is. Never written back: a usage error with `--write-back`. |
 | `--github-repo OWNER/NAME` | With `--github`: read from this repository instead of `github_documents.repo`, for this run only |
-| `--write-back` / `--no-write-back` | With `--github`: commit the review back to the article's folder, or don't, overriding `github_documents.write_back`. A usage error without `--github`, and `--write-back` is one with `--replay`, `--offline`, `--only-model`, `--only-domain` or `--no-timeout`. See [Writing the review back](#writing-the-review-back-to-github) |
+| `--write-back` / `--no-write-back` | With `--github`: commit the review back to the article's folder, or don't, overriding `github_documents.write_back`. A usage error without `--github`, and `--write-back` is one with `--replay`, `--offline`, `--only-model`, `--only-domain`, `--no-timeout` or `--github-ref`. See [Writing the review back](#writing-the-review-back-to-github) |
 | `--publish PATH` | Publish an approved publication handoff (saves as draft unless `--publish-live`) |
 | `--metadata PATH` | Metadata-only file (PRIMARY CLAIM, TARGET AUDIENCE, etc., no DRAFT section) to pair with `--raw-draft`. Requires `--raw-draft`. |
 | `--publication NAME` | Publication config to use (`configs/NAME.yaml`) — **required** |
@@ -563,24 +564,27 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is 
 
 `--github SLUG` reads a draft from a separate GitHub repository instead of a local file, so the drafting side and the review share one versioned copy. It is additive: `--draft`, `--raw-draft`, `--url` and the Drive-and-paste workflow work exactly as before, and a run without `--github` never imports the GitHub client or looks for a token.
 
-Each article is a folder named by its slug, under `path_prefix` (default `articles`). The file names are the ones the close-out notes already use:
+A round is a branch `round/<slug>/rN` with an open pull request into the base branch; an accepted round is tagged `<slug>/rN`. Each article is a folder named by its slug, under `path_prefix` (default `articles`), with fixed file names:
 
 ```
-articles/<slug>/<slug>-handoff-r4.md     Template A in one file (read as --draft reads it)
-articles/<slug>/<slug>-draft-r4.md       the two-file form: the draft ...
-articles/<slug>/<slug>-metadata-r4.md    ... and its metadata (read as --raw-draft --metadata reads them)
+articles/<slug>/draft.md       the two-file form: the draft ...
+articles/<slug>/metadata.md    ... and its metadata (read as --raw-draft --metadata reads them)
+articles/<slug>/handoff.md     Template A in one file (read as --draft reads it), when there is no draft.md
 ```
 
 ```powershell
 uv run ci-review --github my-article --publication your_publication_name
-uv run ci-review --github my-article --round 3 --github-ref main --publication your_publication_name
+uv run ci-review --github my-article --round 3 --publication your_publication_name
+uv run ci-review --github my-article --pr 12 --publication your_publication_name
+uv run ci-review --github my-article --github-ref main --publication your_publication_name
 ```
 
-- **Which round.** The highest `rN` the folder has, or `--round N`. For that round, the handoff file wins; otherwise the draft is read with its metadata file; otherwise the draft alone is read as `--raw-draft` reads one, with the same warning about lost context. A name that only resembles the pattern, such as `my-article-draft-r4-old.md`, is not a round.
-- **One commit.** The ref is resolved to a commit SHA once, and every file is read at that SHA, so a draft and its metadata cannot come from two different commits.
+- **Which round.** With no flag, the head of the article's one open pull request from a branch `round/<slug>/...`; none open is an error that lists the article's tags, and two open is an error that lists them and asks for `--pr N`. `--pr N` reads that pull request. `--round N` reads the open pull request from `round/<slug>/rN`, else the tag `<slug>/rN`, else lists the rounds that exist. `--github-ref REF` reads any branch, tag or commit as it is. The three are mutually exclusive, and a pull request from a fork is refused. Only an open pull request can be written back to.
+- **Which files.** `draft.md` wins, read with `metadata.md` if present, otherwise as `--raw-draft` reads one, with the same warning about lost context; with a `handoff.md` beside it the run warns that it is stale. A folder with only `handoff.md` is read as Template A. The old per-round names (`<slug>-draft-r4.md`) are not read.
+- **One commit.** The pull request, tag or ref is resolved to a commit SHA once, and every file is read at that SHA, so a draft and its metadata cannot come from two different commits.
 - **History key.** When the handoff has no `History key:`, it is set to the slug, so `pipeline_history/<slug>/` and the document folder are one string. When it has one that is not the slug, the run warns, names both, and keeps the `History key:`, because history is the fixed point.
-- **Run number.** A `Pipeline run:` line in the handoff (or metadata) is used as written. When there is none, the run number is the round. The usual bump past run numbers already in local history still applies.
-- **Provenance.** `report.json` gains a `document_source` block: `kind`, `repo`, `ref`, `commit_sha`, `round`, and each file's `path` and git `blob_sha`.
+- **Run number.** A `Pipeline run:` line in the handoff (or metadata) is used as written. When there is none, the run is one more than the highest run number in local history and in `articles/<slug>/pipeline/run.json` at the commit read and at the base branch (a run made on another machine is known only there), or 1 when there are none. The round is not the run number.
+- **Provenance.** `report.json` gains a `document_source` block: `kind`, `repo`, `ref` (the branch, tag or `REF`), `commit_sha`, `round` (the `N` of the branch or tag), `pull_request`, `base_sha` (the merge base of the pull request's base and the commit read), and each file's `path` and git `blob_sha`.
 - **Offline and replay.** `--offline` still reads from GitHub (the read is the input, as the page fetch is for `--url`); `--replay` and `--retry-failed` work as they do with `--raw-draft`. Nothing is written back to the repository unless you ask for it with `--write-back`, which a replay or an offline run can never do.
 
 Configuration is an optional `github_documents` block in `configs/user.yaml` (commented out in `user.example.yaml`):
@@ -588,7 +592,7 @@ Configuration is an optional `github_documents` block in `configs/user.yaml` (co
 | Key | Default | Meaning |
 |---|---|---|
 | `repo` | `MHammett/mikehammett.net-articles` | `OWNER/NAME` of the document repository. `--github-repo` overrides it. An empty string is an error. |
-| `branch` | the repository's default branch | The ref to read when `--github-ref` is absent |
+| `branch` | the repository's default branch | The base branch rounds merge into; its head is where `pipeline/run.json` is read for run numbers already taken |
 | `path_prefix` | `articles` | The folder that holds the article folders (empty: the repository root) |
 | `write_back` | `false` | Commit the review back after every `--github` run, as if `--write-back` were given. `--no-write-back` overrides it; it is set aside, with one INFO line, on a replay, an offline run or a calibration run |
 | `include_capture` | `false` | Also commit `run_N_<ts>_results.json` (the raw ensemble) under `pipeline/` |
@@ -617,7 +621,7 @@ One commit on the branch the draft was read from, holding new files only, from r
 
 The paths are relative to `path_prefix`. The review is at the top level, where the chat project reads; `pipeline/` is not, because the worklist lists documents nobody has read yet. Line endings are converted to LF. The commit message names the draft files and the commit they were read at, the run, its preset and reported cost, and the files, and says so when the reviewed draft has since been edited at its own path.
 
-- **Checked before any model call.** A token, push permission on the repository, a branch to commit to (a tag or a commit SHA given to `--github-ref` is refused), and a private repository unless `allow_public_repo: true`. Each refusal is one message and exit status 1 and costs nothing. The run number also moves past every `<slug>-review-rN.md` already in the folder, with the same warning it gives for a number local history already has, so the names are free.
+- **Checked before any model call.** A token, push permission on the repository, an open pull request to commit to (a tag, a merged or closed round, a fork, or `--github-ref` is refused), and a private repository unless `allow_public_repo: true`. Each refusal is one message and exit status 1 and costs nothing. The run number also moves past every number in `pipeline/run.json` at the round's head and at the base branch, so the names are free.
 - **Never over anything.** A file already there with the same bytes is left alone; one with different bytes stops the write-back and nothing is overwritten. There is no force. If the drafting side commits while the review is being written, the commit is rebuilt on top of theirs, up to three more times.
 - **No secrets.** Every outgoing file and the message are scanned for the token and for every configured API key value; a hit refuses the whole commit.
 - **If it fails after the review,** the local files are already saved. The run prints the reason, says so, gives the retry command, and exits 1.

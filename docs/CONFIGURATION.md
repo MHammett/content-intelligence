@@ -2000,7 +2000,7 @@ export CI_HISTORY_ROOT="$HOME/ci-history"
 ```yaml
 github_documents:
   repo: MHammett/mikehammett.net-articles   # OWNER/NAME; --github-repo overrides it
-  branch: main            # default: the repository's default branch; --github-ref overrides
+  branch: main            # the base branch rounds merge into; default: the repository's default branch
   path_prefix: articles   # the folder holding one folder per article
   write_back: false       # reserved: committing the review back (not built yet)
   include_capture: false  # reserved, with write_back

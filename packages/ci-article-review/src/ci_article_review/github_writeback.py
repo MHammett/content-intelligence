@@ -38,11 +38,19 @@ from .github_documents import (
     GitHubDocumentsError,
     _check_can_write,
     _explain,
-    review_name,
     validate_slug,
 )
 
 log = logging.getLogger(__name__)
+
+
+def review_name(slug, run_number):
+    """Where a run's review goes in the article folder: ``<slug>-review-rN.md``.
+
+    The write-back keeps this name until #417 moves it to a fixed ``review.md``
+    on the round's branch.
+    """
+    return f"{slug}-review-r{run_number}.md"
 
 
 def worklist_name(slug, run_number):

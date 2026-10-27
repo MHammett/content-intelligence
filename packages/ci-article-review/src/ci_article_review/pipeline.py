@@ -3297,11 +3297,19 @@ def run_draft_pipeline(
     # number, and say so rather than silently renumbering.
     run_number = handoff.get("run_number", 1)
     _existing = hist.existing_run_numbers(_history_root(), _history_key(handoff))
-    # With --write-back the review lands in a folder that may already hold
-    # <slug>-review-rN.md for numbers local history never saw (another machine,
-    # another checkout). The same bump moves past those, so the names are free.
+    # A run read from a document repository (--github) may have been made on
+    # another machine or another checkout; local history never saw it, but the
+    # repository's pipeline/run.json (at the round's head and at the base branch)
+    # did. The handoff carries those numbers as taken_run_numbers, and the same
+    # bump moves past them, so run numbers keep counting up across rounds.
     _existing |= set(handoff.get("taken_run_numbers") or ())
-    if run_number in _existing:
+    if handoff.get("run_number_declared") is False:
+        # The handoff has no 'Pipeline run:' line, and the parser's 1 stands for
+        # "no line" there. Nothing was declared, so there is nothing to warn
+        # about: the run is one past the highest number known, local or taken
+        # (1 when there are none), not 1 unless 1 happens to be taken.
+        run_number = max(_existing, default=0) + 1
+    elif run_number in _existing:
         _next = max(_existing) + 1
         log.warning(
             "Run %d already exists for this article; using %d instead. Update "
@@ -6262,24 +6270,34 @@ def build_parser():
         "--github",
         metavar="SLUG",
         help="Read an article from the GitHub document repository "
-        "(github_documents in user.yaml): the folder SLUG, latest round unless "
-        "--round says otherwise. Needs GITHUB_TOKEN or `gh auth login` for a "
-        "private repository. Not combinable with --metadata, --archive-only "
-        "or --publish.",
+        "(github_documents in user.yaml): the folder SLUG, as it is at the head "
+        "of the article's one open round (an open pull request from a branch "
+        "round/SLUG/rN) unless --pr, --round or --github-ref says otherwise. "
+        "Needs GITHUB_TOKEN or `gh auth login` for a private repository. Not "
+        "combinable with --metadata, --archive-only or --publish.",
     )
-    parser.add_argument(
+    github_read = parser.add_mutually_exclusive_group()
+    github_read.add_argument(
+        "--pr",
+        type=int,
+        metavar="N",
+        help="With --github: read pull request N, which must be from a branch "
+        "round/SLUG/rN of the document repository. Use it when the article has "
+        "more than one open round.",
+    )
+    github_read.add_argument(
         "--round",
         type=int,
         metavar="N",
-        help="With --github: read round N (SLUG-handoff-rN.md, or "
-        "SLUG-draft-rN.md with SLUG-metadata-rN.md). Default: the highest round "
-        "the folder has.",
+        help="With --github: read round N: the open pull request from "
+        "round/SLUG/rN if there is one, else the tag SLUG/rN. Only the open "
+        "pull request can be written back to.",
     )
-    parser.add_argument(
+    github_read.add_argument(
         "--github-ref",
         metavar="REF",
-        help="With --github: a branch, tag or commit SHA to read at. Default: "
-        "github_documents.branch, else the repository's default branch.",
+        help="With --github: read a branch, tag or commit SHA as it is. Never "
+        "written back: a usage error with --write-back.",
     )
     parser.add_argument(
         "--github-repo",
@@ -6296,8 +6314,9 @@ def build_parser():
         "one commit that only adds files. --no-write-back overrides "
         "github_documents.write_back. Not combinable with --replay, --offline, "
         "--only-model, --only-domain or --no-timeout, which are not reviews to "
-        "hand back. If the commit fails the review is still saved locally; "
-        "`ci-docs push-run` retries it.",
+        "hand back, nor with --github-ref, which never writes back. If the "
+        "commit fails the review is still saved locally; `ci-docs push-run` "
+        "retries it.",
     )
     parser.add_argument(
         "--metadata",
@@ -6464,6 +6483,12 @@ def _decide_write_back(args, settings):
         return args.write_back
     if settings["write_back"] is not True:
         return False
+    if args.github_ref is not None:
+        log.info(
+            "github_documents.write_back is set but not used: --github-ref reads "
+            "a ref as it is and never writes back."
+        )
+        return False
     conflicts = _write_back_conflicts(args)
     if conflicts:
         log.info(
@@ -6491,6 +6516,7 @@ def _read_github_handoff(args, settings, write_back=False):
         repo=args.github_repo,
         ref=args.github_ref,
         round_number=args.round,
+        pull_request=args.pr,
         write_back=write_back,
     )
 
@@ -6508,6 +6534,7 @@ def main():
         parser.error("--metadata requires --raw-draft")
 
     for flag, value in (
+        ("--pr", args.pr),
         ("--round", args.round),
         ("--github-ref", args.github_ref),
         ("--github-repo", args.github_repo),
@@ -6516,15 +6543,23 @@ def main():
             parser.error(f"{flag} requires --github")
     if args.round is not None and args.round < 1:
         parser.error("--round must be 1 or more")
+    if args.pr is not None and args.pr < 1:
+        parser.error("--pr must be 1 or more")
     if args.github and args.metadata:
         parser.error(
             "--github does not combine with --metadata — a round's "
-            "SLUG-metadata-rN.md is read from the repository"
+            "metadata.md is read from the repository"
         )
     if args.write_back is not None and not args.github:
         parser.error(
             ("--write-back" if args.write_back else "--no-write-back")
             + " requires --github"
+        )
+    if args.write_back and args.github_ref is not None:
+        parser.error(
+            "--write-back does not combine with --github-ref — a ref is read as "
+            "it is and never written back; review the round's pull request "
+            "(--pr N, --round N or no flag) to write the review to it"
         )
     if args.write_back:
         for flag in _write_back_conflicts(args):
