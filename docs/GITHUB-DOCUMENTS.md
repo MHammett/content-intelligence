@@ -325,11 +325,15 @@ note with the same never-overwrite rule and checks its name against the pattern;
 ## Build phases
 
 Each phase is an issue labelled `github-documents`, buildable from the issue
-alone. In order: (1) the `ci_core` GitHub client; (2) reading a draft with
-`--github`; (3) write-back and `ci-docs push-run`; (4) `ci-docs put` and `ls`,
-README, CLOSE-OUT.md and the drafting project's instructions text; (5, optional)
-copying runs from the document repository into a history root for
-`ci-history-report`.
+alone, in this order:
+
+1. #401: the `ci_core` GitHub client.
+2. #402: reading a draft with `--github`.
+3. #403: write-back and `ci-docs push-run`.
+4. #404: `ci-docs put` and `ls`, the README, CLOSE-OUT.md and the drafting
+   project's instructions text.
+5. #405 (optional): copying runs from the document repository into a history
+   root for `ci-history-report`.
 
 ## Not decided here
 
