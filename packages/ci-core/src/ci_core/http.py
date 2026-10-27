@@ -126,6 +126,16 @@ def _os_trust_session():
     return session
 
 
+def os_trust_session():
+    """A ``requests.Session`` that verifies TLS against the OS trust store.
+
+    For callers that make many requests to one API and want connection reuse
+    (``ci_core.github_repo``); the caller owns it and should close it. A one-off
+    fetch should use ``os_trust_get``.
+    """
+    return _os_trust_session()
+
+
 def os_trust_get(url, **kwargs):
     """``requests.get``, verifying TLS against the operating system's trust store.
 
@@ -332,6 +342,7 @@ __all__ = [
     "is_public_host",
     "os_trust_get",
     "os_trust_head",
+    "os_trust_session",
     "safe_get",
     "safe_head",
     "impersonation_available",
