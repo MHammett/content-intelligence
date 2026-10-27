@@ -633,7 +633,7 @@ lightweight tag is a bare pointer.
 - **Why here and not in a GitHub Action**: the repository stays passive (no
   workflow file, no Actions minutes), and the next write to the article (a
   review written back, a note put, the next round accepted) runs it. A round
-  merged and never written to again stays untagged until then (
+  merged and never written to again stays untagged until then (`ci-docs tag`
   tags it on demand); the merge commit is the record either way.
 
 **Conveniences, not steps.** The round loop needs neither:
