@@ -240,6 +240,15 @@ Every key has a default, so the block is optional; nothing reads it unless a run
 passes `--github` or `ci-docs` is called. `merge_configs` builds its result key by key, so the block has to be carried
 through it explicitly or it is silently dropped (the same trap as `rate_limits`).
 
+**Built in #402.** The defaults are `config_loader.GITHUB_DOCUMENTS_DEFAULTS`, and
+the default repository is the one constant `DEFAULT_GITHUB_DOCUMENTS_REPO`.
+`merge_configs` returns the block normalised: every key filled, a key left empty
+in YAML read as unset, and a block that is not a mapping ignored, so a mistake in
+it never stops a run that does not use `--github`. `repo: ""` is the exception:
+it is an instruction, and `--github` refuses it. `test_github_documents_wiring.py`
+proves the block survives `merge_configs` under every cost preset. `write_back`,
+`include_capture` and `allow_public_repo` are carried and not yet read (#403).
+
 **Token.** Not in YAML: an unset `${VAR}` stops config loading for every run, and a
 token has no business in a config file. Resolution order: the `GITHUB_TOKEN`
 environment variable (`.env` is loaded before this runs), then the output of
@@ -257,7 +266,11 @@ New flags, none of which changes an existing one:
 | `--round N` | With `--github`: which round to read. Default: the highest N with a draft or handoff file |
 | `--github-ref REF` | With `--github`: a branch, tag or commit SHA to read at. Default: the configured branch |
 | `--github-repo OWNER/NAME` | Override `github_documents.repo` for this run (a scratch repository for testing, for one) |
-| `--write-back` / `--no-write-back` | With `--github`: commit the review back, or don't, overriding `write_back` |
+| `--write-back` / `--no-write-back` | With `--github`: commit the review back, or don't, overriding `write_back`. **Not built yet (#403).** |
+
+`--round`, `--github-ref` and `--github-repo` are usage errors without `--github`,
+`--round` must be 1 or more, and `--github` is also a usage error with `--metadata`
+(the round's metadata file is read from the repository) or `--archive-only`.
 
 ```bash
 uv run ci-review --github pjm-capacity-auction --publication mikehammett --write-back
@@ -269,7 +282,30 @@ uv run ci-review --github pjm-capacity-auction --publication mikehammett --write
 `--raw-draft`, with the same warning about lost context). The handoff is built in
 `main()` and passed to `run_draft_pipeline(handoff=...)`, the route `--url` and
 `--raw-draft` already take, so the review itself does not change. When the handoff
-has no `Run:` line, the run number defaults to N.
+has no `Pipeline run:` line, the run number defaults to N.
+
+As built (#402, `github_documents.py`):
+
+- **Rounds** are read from the folder listing: names matching
+  `^<slug>-(handoff|draft)-r([1-9][0-9]*)\.md$`. A lone metadata file is not a
+  round, and `<slug>-draft-r4-old.md` or `-r04` are ignored. The highest round is
+  numeric, so r10 follows r9.
+- **One commit.** The ref is resolved to a commit SHA once, and every listing and
+  read is at that SHA, so a draft and its metadata cannot come from two commits.
+- **"No `Pipeline run:` line"** is read from the text
+  (`handoff_parser.declares_run_number`), because the parsers answer 1 both for a
+  missing line and for a line that says 1. The usual bump past run numbers already
+  in local history still applies afterwards.
+- **A public repository** logs one WARNING and the read continues; refusing a
+  public repository is write-back's rule (`allow_public_repo`, #403).
+- **Failures** are one plain message and exit 1, before any model call: an empty
+  `repo`, no token for a private repository, a rejected token (401), a repository
+  that is "missing, or not visible to this token", a missing ref, a missing folder
+  (the message lists the article folders that exist), a missing round (it lists
+  the rounds that exist), and a rate limit (it names the reset time).
+- **`document_source`** in `report.json` is
+  `{kind: "github", repo, ref, commit_sha, round, files: [{path, blob_sha}]}`, and
+  is also present in a replay's report.
 
 ## The history key
 
