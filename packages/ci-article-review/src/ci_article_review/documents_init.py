@@ -35,7 +35,9 @@ from pathlib import Path
 
 from ci_core.github_repo import git_blob_sha
 
-DEFAULT_REPO = "MHammett/mikehammett.net-articles"
+from .config_loader import DEFAULT_GITHUB_DOCUMENTS_REPO
+
+DEFAULT_REPO = DEFAULT_GITHUB_DOCUMENTS_REPO
 DEFAULT_BRANCH = "main"
 REPO_DESCRIPTION = (
     "Articles for mikehammett.net: drafts, metadata, hand-offs and ci-review reviews"
