@@ -40,12 +40,13 @@ they do (see [What does not change](#what-does-not-change)).
   opened by the drafting chat.
 - `ci-review --github <slug>` reviews the pull request's head commit, commits the
   full review to the branch as `review.md`, and posts one **pull request review**
-  whose body is a summary and the run's worklist as a task list. No line comments.
+  whose body is a summary and a checklist of the review's consensus findings
+  (F1, F2, …). No line comments.
 - The chat revises on the branch, with commit messages that say which review run
-  each revision answers and which worklist items it addressed or deferred, and
-  may ask for another review. **The chat merges the round when the maintainer
-  says so in that chat**; the next `ci-review --github` or `ci-docs` command on the
-  article tags the merge `<slug>/rN`. Nobody has to do anything on github.com.
+  each revision answers and which findings it addressed or deferred, and may ask
+  for another review. **The chat merges the round when the maintainer says so in
+  that chat**; the next command that writes to the article (a write-back, `ci-docs
+  put` or `accept`) tags the merge `<slug>/rN`. Nobody has to do anything on github.com.
 - **The history is the changelog.** The maintainer expects to read GitHub rarely;
   it exists so that any AI client can read an article's history (what changed in
   each round, why, in answer to which review) and to replace carrying files
@@ -207,8 +208,8 @@ below), and `AGENTS.md` tells every other client never to touch those files.
    same pull request.
 4. **Accept.** When the author says so in the chat, the chat merges the pull
    request with a merge commit (`merge_pull_request`, `merge_method: merge`). The
-   round is tagged `<slug>/rN` automatically by the next `ci-review --github` or
-   `ci-docs` command that touches the article
+   round is tagged `<slug>/rN` automatically by the next command that writes to
+   the article
    ([Tagging](#tagging-automatic-and-ci-docs-accept-and-tag-as-conveniences)).
 
 **Why a branch per round.** The maintainer asked for git versioning and pull
@@ -293,7 +294,7 @@ else:
 
 ## Delivering the review
 
-### Decision 3: `review.md` on the branch, and one pull request review holding the summary and the worklist
+### Decision 3: `review.md` on the branch, and one pull request review holding the summary and a findings checklist
 
 One run writes back, in this order:
 
@@ -331,31 +332,28 @@ limit on a body, which is undocumented but consistently reported, e.g.
   tagging step and `ci-docs accept` read the same marker to name a round's runs.
 - **The summary**: the run, the preset and cost, the commit reviewed and the drift
   line if any; the "Reading this report" caveat in one sentence (a single run is
-  not a measurement); Section 1 (consensus findings) as `report_markdown` renders
-  it; and one line per other section with its count of findings.
-- **The worklist as a task list**: each item of `worklist.md` as a Markdown task
-  (`- [ ] …`), in the worklist's own order and grouping, with its `[you]` or
-  `[tool gap]` mark kept. GitHub renders the boxes, and the chat's revision
-  commits refer to items by their position (W1, W2, …), which the body numbers.
+  not a measurement); and one line per section with its count of findings.
+- **The findings as a checklist**: each Section 1 (consensus) finding as a
+  Markdown task, `- [ ] **F<k>** "<quoted passage>": <the finding, one line>`,
+  where `k` is the finding's number in `review.md`'s Section 1 (which
+  `report_markdown` numbers continuously across its bands), so `F3` in the body
+  and item 3 in `review.md` are one finding. GitHub renders the boxes, and the
+  chat's revision commits refer to findings by these numbers. The other sections'
+  findings are cited by section and first words.
 - **Where the whole review is**: `articles/<slug>/review.md` on the branch, as a
   link to the blob at the review commit, and the exact connector call to read it
   (`get_file_contents`, `path` that file, `ref` `refs/pull/12/head`).
-- When the body would pass 60,000 characters, Section 1 is cut first (whole
-  findings), then the per-section lines; the worklist is never cut, and the body
-  ends with what was cut and that `review.md` has it all. Nothing is cut from
-  `review.md`.
+- When the body would pass 60,000 characters, the per-section lines are cut
+  first, then checklist items from the end (whole items); the body ends with what
+  was cut and that `review.md` has it all. Nothing is cut from `review.md`.
 
-**The worklist was kept from the revision model until now, and still needs a
-guard.** README ("The worklist") and `revise_after_review_prompt.md` say not to
-paste it into the revision model, because it lists documents nobody has read yet,
-"an invitation to invent them". This design puts it in front of the chat on
-purpose, so the changelog can say which items each revision dealt with. The guard
-moves into `AGENTS.md`: the chat tracks worklist items, it does not resolve them
-from imagination. It may mark an item addressed only when the author has done it
-or has given the chat the text it needs, it never writes into the draft anything
-that rests on a document it has not been given, and every other item is deferred
-(to the author, or to an issue). The revise prompt's instruction not to paste the
-worklist stays for the Drive-and-paste flow.
+**The worklist stays away from the drafting chat.** README ("The worklist") and
+`revise_after_review_prompt.md` keep it out of the revision model, because it lists
+documents nobody has read yet, "an invitation to invent them". So it is not in the
+review body. It is committed only as `pipeline/worklist.md`, which `AGENTS.md`
+tells the chat never to read into a revision; it is also rendered at the top of
+`review.md`, above SECTION 1, and `AGENTS.md` repeats the revise prompt's rule to
+skip that WORKLIST block. The worklist is the author's, as it always was.
 
 **Line comments were considered and dropped.** An earlier draft of this design
 anchored each finding to its line in the pull request's diff. The readers here are
@@ -370,10 +368,9 @@ branch, because the full review (Sections 1 to 10, the SEO blocks) averages
 451 KB and cannot be a review body. It is replaced by each run on the branch and
 reaches `main` with the merge, so `main` always holds the review of the last run
 before acceptance, and `git log -- articles/<slug>/review.md` holds every review.
-The worklist is rendered at its top as well.
 
 **What the chat reads**, through the connector: `pull_request_read` with `method:
-get_reviews` (the bodies: summary and worklist), and `get_file_contents` on
+get_reviews` (the bodies: summary and findings checklist), and `get_file_contents` on
 `articles/<slug>/review.md` with `ref: refs/pull/<n>/head` for everything else.
 It revises with `templates/revise_after_review_prompt.md` as before, given
 `review.md`'s text. Not verified: that `get_file_contents` returns a file over
@@ -391,13 +388,12 @@ It revises with `templates/revise_after_review_prompt.md` as before, given
 | `research` | the chat or the author | a question to answer before the article can say something |
 | `decision` | either side | a choice only the author can make (a close-out note's DECISIONS, for one) |
 | `correction` | the author | an error found after publication; fixed by a new round |
-| `from-review` | the chat | a review finding or worklist item the round could not fix, deferred so it outlives the merged pull request |
+| `from-review` | the chat | a review finding the round could not fix, deferred so it outlives the merged pull request |
 
 - **The pipeline opens no issue.** A run has dozens of findings, and a single run
   is about 25% reproducible; issues opened per finding would be mostly noise.
-- **The chat must open one for what it defers.** A finding or worklist item the
-  round cannot fix (it needs a document nobody has, a decision, research, a later
-  round) is opened by the chat as an issue (`issue_write`, `method: create`,
+- **The chat must open one for what it defers.** A finding the round cannot fix
+  (it needs a source, a decision, research, a later round) is opened by the chat as an issue (`issue_write`, `method: create`,
   labels `article:<slug>` and `from-review`, or `research` / `decision` where that
   fits), quoting the item and naming the run and the review it came from. The
   revision commit that defers it links the issue. This is what keeps deferred
@@ -480,7 +476,7 @@ github.com (Settings, Applications).
 from the articles repository; committed one file to the scratch repository with
 `create_or_update_file`; and committed two files in **one** commit with
 `push_files`. The checks the redesign adds are in the claude.ai phase issue:
-`create_branch`, `create_pull_request`, reading a review body and its worklist, a
+`create_branch`, `create_pull_request`, reading a review body and its findings checklist, a
 merge on the author's word, a file over 1 MB through `get_file_contents`.
 
 **The connector's tool names** used below are those of GitHub's MCP server as its
@@ -520,8 +516,10 @@ drafting side reads.
    the review.
 
 **After a review**: `pull_request_read` with `method: get_reviews` (the summary
-and the worklist, numbered W1, W2, …), then `get_file_contents` for
-`articles/<slug>/review.md` with `ref: refs/pull/<n>/head`. Revise with
+and the findings checklist, F1, F2, …), then `get_file_contents` for
+`articles/<slug>/review.md` with `ref: refs/pull/<n>/head`. Skip the WORKLIST
+block at the top of `review.md`, above SECTION 1, as the revise prompt says: it is
+the author's. Revise with
 `templates/revise_after_review_prompt.md` and commit the revision with
 `push_files` to the same branch. **Every revision commit message** has this
 shape:
@@ -531,27 +529,22 @@ revise: <slug> rN after run M
 
 Responds to: run M review (<link to the review>)
 Addressed:
-- W2: <what was needed> -> <what changed, and where in the draft>
-- Section 1, "<first words of the finding>": <what changed>
+- F2: <what the finding asked> -> <what changed, and where in the draft>
+- Section 3, "<first words of the finding>": <what changed>
 Deferred:
-- W1: <why it cannot be done in this round> -> #<issue>
-- W4: needs the author (<what exactly>)
+- F1: <why it cannot be done in this round> -> #<issue>
+- F4: needs the author (<what exactly>)
 Not acted on:
-- Section 3, "<first words>": <why not, in one line>
+- F5: <why not, in one line>
 ```
 
-Every worklist item appears under Addressed or Deferred. A finding is listed when
-the revision acted on it or decided not to; findings the revision did not consider
-need not be listed. **A deferred item that the author will not settle in this
-chat is opened as an issue first** (`issue_write`, `method: create`, labels
-`article:<slug>` and `from-review`, or `research` / `decision`), quoting the item
-and naming the run, and the commit links it.
-
-**The worklist lists documents nobody has read yet.** Mark an item addressed only
-when the author has done it or has given you the text it needs. Never write into
-the draft anything that rests on a document, page or source you have not been
-given; defer the item instead. Ask the author for another review, or say the
-round is ready to accept.
+Every F-numbered finding appears under Addressed, Deferred or Not acted on.
+Findings of other sections are listed when the revision acted on them or decided
+not to. **A deferred finding that the author will not settle in this chat is
+opened as an issue first** (`issue_write`, `method: create`, labels
+`article:<slug>` and `from-review`, or `research` / `decision`), quoting the
+finding and naming the run, and the commit links it. Ask the author for another
+review, or say the round is ready to accept.
 
 **Accepting.** When, and only when, the author says in this chat to merge the
 round, call `merge_pull_request` with `merge_method: merge` and `expectedHeadSha`
@@ -571,9 +564,9 @@ and the new note's `Supersedes:` names the commit of the one it replaces
 **Never**: commit to `main`; merge a pull request unless the author has said, in
 this chat, to merge that pull request; merge any way but `merge`; force-push,
 delete a branch or a tag, or call `delete_file` or `delete_repository`; edit
-`review.md` or anything under `pipeline/`; read `pipeline/report.json` into a
-revision; rename an article folder or change a slug; commit a secret; edit a
-managed file. A slug is lowercase words joined by hyphens and never contains `/`.
+`review.md` or anything under `pipeline/`; read anything under `pipeline/` (the
+worklist, the report) into a revision; rename an article folder or change a
+slug; commit a secret; edit a managed file. A slug is lowercase words joined by hyphens and never contains `/`.
 
 **Fallback.** If the connector is not worth its scope or stops working, the author
 does a round by hand on github.com: create the branch, upload `draft.md` and
@@ -614,9 +607,12 @@ is rewritten for the new names, commit messages and tool names.
 
 ## Tagging: automatic, and `ci-docs accept` and `tag` as conveniences
 
-**Automatic tagging.** Before it does its own work, every `ci-review --github` run
-and every `ci-docs` command that names an article (`ls`, `put`, `push-run`,
-`accept`, `tag`; not `init` or `import`) runs one step, `tag_merged_rounds(slug)`:
+**Automatic tagging.** Before it does its own work, every command that already
+writes to an article runs one step, `tag_merged_rounds(slug)`: `ci-review --github
+--write-back` (and `ci-docs push-run`, its retry), `ci-docs put` and `ci-docs
+accept`; the import tags each round it writes, and `ci-docs tag` runs the step
+alone. `ci-docs ls` and a `ci-review --github` run without `--write-back` stay
+read-only. The step:
 it finds every merged pull request of the article whose branch is
 `round/<slug>/rN` and for which no tag `<slug>/rN` exists, and creates an
 **annotated** tag on the pull request's merge commit (`POST /git/tags` with `type:
@@ -631,15 +627,14 @@ lightweight tag is a bare pointer.
   once cannot both win, and the loser reads the tag back. A tag that exists and
   points at that merge commit is success; one that points elsewhere is reported
   and left alone. No tag is ever moved or deleted.
-- **When it does not run.** It writes, so it is skipped, with one INFO line, when
-  the token cannot push, and on runs that never write to the document repository:
-  `--replay`, `--offline`, `--only-model`, `--only-domain`, `--no-timeout`, and
-  `ci-docs ls --no-tag`. A failure to tag is a WARNING and never stops the
-  command's own work.
+- **Only where the command writes anyway**, so no read-only command gains a
+  write, and replays, `--offline` and calibration runs (which cannot write back)
+  never tag. A failure to tag is a WARNING and never stops the command's own work.
 - **Why here and not in a GitHub Action**: the repository stays passive (no
-  workflow file, no Actions minutes), and every path by which the maintainer next
-  touches an article runs it. A round merged and never touched again stays
-  untagged until then; the merge commit is the record either way.
+  workflow file, no Actions minutes), and the next write to the article (a
+  review written back, a note put, the next round accepted) runs it. A round
+  merged and never written to again stays untagged until then (
+  tags it on demand); the merge commit is the record either way.
 
 **Conveniences, not steps.** The round loop needs neither:
 
@@ -873,7 +868,7 @@ interleaves with live rounds):
    contents;
 3. the pull request (`<slug> rN`, its body saying it was imported and listing the
    events), and for each run a pull request review with the run's body (summary
-   and worklist), built as write-back builds it. A pull request's own timestamps are the
+   and findings checklist), built as write-back builds it. A pull request's own timestamps are the
    import's, which GitHub does not let anyone set; the commits carry the real
    dates;
 4. the merge: a merge commit built with the Git Data API (the round branch's tree,
@@ -915,7 +910,7 @@ hashes and is written outside the repository.
 | | `--round` | **changed** (round = pull request or tag); `--pr` **added** |
 | #410 write-back | `push_saved_run`'s refusals, secret scan, retry message, `_drift_lines`, the replay rules | **stay** |
 | | target names `<slug>-review-rN.md`, `pipeline/<slug>-worklist-rN.md`, `pipeline/run_N_<ts>_report.json`, committing to `main`, `taken_run_numbers` from review names | **retired**: fixed names on the round's branch, run numbers from `pipeline/run.json` |
-| | the pull request review (summary and worklist task list), `push-run` idempotency by marker, automatic tagging (`tag_merged_rounds`) | **added** |
+| | the pull request review (summary and findings checklist), `push-run` idempotency by marker, automatic tagging (`tag_merged_rounds`) | **added** |
 | #411 `ci-docs ls` / `put` | `ls` | **changed**: shows the article's rounds (tags, open pull request, its last run) and the files at a ref |
 | | `put`'s name patterns, the `-vM` rules, committing to `main` | **retired** |
 | | `put` | **changed**: commits `close-out-to-chat.md` (or a drafting file) to the open round's branch, with `replace` on the blob it read, and comments on the pull request |
@@ -989,7 +984,7 @@ Each is an issue labelled `github-documents`, buildable from the issue alone.
 | [#414](https://github.com/MHammett/content-intelligence/issues/414) | ~~B. `review_anchor.py`~~: closed, moot once line comments were dropped | — |
 | [#415](https://github.com/MHammett/content-intelligence/issues/415) | C. `ci-docs init`: new `AGENTS.md` and templates, merge settings, labels | #413 |
 | [#416](https://github.com/MHammett/content-intelligence/issues/416) | D. `--github` reads a round's pull request; `--pr`, `--round`; run numbers from `pipeline/run.json` | #413 |
-| [#417](https://github.com/MHammett/content-intelligence/issues/417) | E. write-back to the round's branch and the pull request review (summary and worklist); `push-run` | #413, #416 |
+| [#417](https://github.com/MHammett/content-intelligence/issues/417) | E. write-back to the round's branch and the pull request review (summary and findings checklist); `push-run` | #413, #416 |
 | [#418](https://github.com/MHammett/content-intelligence/issues/418) | F. automatic tagging in `ci-review --github` and `ci-docs`; `accept` and `tag` as conveniences; `ls`, `put`; CLOSE-OUT.md and the README | #413, #416 (#415 for the docs it points at) |
 | [#419](https://github.com/MHammett/content-intelligence/issues/419) | G. claude.ai end to end on the scratch repository (the maintainer's checks) | #415, #417, #418 |
 | [#420](https://github.com/MHammett/content-intelligence/issues/420) | H. import, step 1: `ci-docs import scan` over local files, saved runs and a Drive download | nothing (#416's names) |
@@ -1010,7 +1005,3 @@ closed: its last check is moot here, and #419 holds the claude.ai checks.
   asks with `--write-back`. The default stays the cautious one.
 - **Reading a Template C publication handoff and its images from GitHub** for
   `--publish`.
-- **Whether `ci-docs ls` should tag.** Automatic tagging makes `ls` (and a
-  `ci-review --github` run without `--write-back`) write a tag where it used to
-  only read. The design accepts that, with `ls --no-tag` as the way out; the
-  alternative is to tag only from commands that already write.
