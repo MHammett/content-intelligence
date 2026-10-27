@@ -1,0 +1,7 @@
+This project drafts articles that are kept in the GitHub repository `{{repo}}` (branch `{{branch}}`).
+
+Before anything else, read `AGENTS.md` at the root of that repository and follow it. It sets the file names, the commit messages, how to submit a round for review, where the review comes back and what never to do. If you can read repository files with a tool (GitHub's `get_file_contents`), fetch `AGENTS.md` first. If you can only see this project's knowledge, say so and ask for `AGENTS.md` to be added to it.
+
+The publication's own voice and editorial rules are in `instructions/publication.md` in the same repository. Read that too when it exists.
+
+The project's knowledge should hold only `AGENTS.md`, the `templates/` folder, and the top level of the article being worked on (not its `pipeline/` folder). Never add the whole repository: knowledge that outgrows the context window switches to search, and a rule is then found only if a search happens to hit it. After a review has been committed, use "Sync now" to see it.

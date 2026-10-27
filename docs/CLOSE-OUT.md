@@ -164,15 +164,25 @@ states, and a note can override it.
 
 ## The drafting project's copy
 
-The drafting project does not read this repo. Its instructions (in this
-deployment `Claude Docs/mikehammett-project-instructions.md` in Drive, last
-modified 2026-09-09) list the kinds of file it writes into an article's folder,
-and none is a close-out note. Until that changes, the drafting side improvises,
-which is how the first two notes got two names and two shapes. As of 2026-09-27
-the Drive copy has not been edited.
+The drafting project does not read this repo, so it works from a copy of
+`close_out.md` and of the rules for naming the note. **`ci-docs init` now renders
+that copy.** It commits `close_out.md` into the document repository's `templates/`
+folder, and the file-name pattern and the `close-out: <slug> rN to-code` commit
+message into the repository's `AGENTS.md`, from sources kept here
+([docs/GITHUB-DOCUMENTS.md](GITHUB-DOCUMENTS.md#bootstrapping-the-repository-ci-docs-init)).
+A change to a header, a label or the name pattern in `close_out.md` therefore
+reaches the drafting side by merging it here and re-running `ci-docs init`; a copy
+someone edited in the document repository is left alone and listed, and
+`--overwrite-edited` replaces it. The template's header comment says so.
 
-To bring it in line, add `close_out.md` to the project in full, and add this to
-the file list under "File and artifact storage":
+A project that has not moved to the document repository still works from a copy in
+its own instructions (in this deployment `Claude Docs/mikehammett-project-instructions.md`
+in Drive, last modified 2026-09-09), which lists the kinds of file it writes into
+an article's folder and has no close-out note among them. Until it is replaced,
+the drafting side improvises, which is how the first two notes got two names and
+two shapes. As of 2026-09-27 that Drive copy has not been edited. To bring it in
+line by hand, add `close_out.md` to the project in full, and add this to the file
+list under "File and artifact storage":
 
 ```
 - `<slug>-close-out-rN-to-code.md` and `<slug>-close-out-rN-to-chat.md`: a
@@ -183,7 +193,7 @@ the file list under "File and artifact storage":
 ```
 
 After that, a change to a header, a label or the name pattern in `close_out.md`
-means the same change to that copy. The template's header comment says so.
+means the same change to that copy.
 
 ## Not built
 
@@ -195,4 +205,4 @@ means the same change to that copy. The template's header comment says so.
   (`_WORKING_TEMPLATES` in `setup.py`). Whether other users want it is undecided.
 - `DRAFT_HEADERS` in `handoff_parser.py` has the same out-of-repo consumer and
   carries no comment saying so.
-- The Drive copy, above.
+- The hand-kept Drive copy, above, for a project not yet on the document repository.
