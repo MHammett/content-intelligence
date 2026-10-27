@@ -379,7 +379,7 @@ Two things it does deliberately:
 
 6. Repeat until the findings are ones you're content to ship, then publish with `--publish`.
 
-**Drafting in a separate chat project?** When the article changes hands between that project and a Code session, write the hand-off from `handoff_templates/close_out.md` (Template D) instead of free-hand: settled edits as exact find-and-replace text, decisions kept apart from edits, and a check that the Drive folder and the pipeline's `History key` name the same article. See [docs/CLOSE-OUT.md](docs/CLOSE-OUT.md). The files can also go through a private GitHub repository instead of Drive and paste: the chat project commits a draft there, `ci-review --github SLUG` reads it and commits the review back, and a Code session adds a close-out note with `ci-docs put`. See [The document repository](#the-document-repository-ci-docs) and [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md).
+**Drafting in a separate chat project?** When the article changes hands between that project and a Code session, write the hand-off from `handoff_templates/close_out.md` (Template D) instead of free-hand: settled edits as exact find-and-replace text, decisions kept apart from edits, and a check that the Drive folder and the pipeline's `History key` name the same article. See [docs/CLOSE-OUT.md](docs/CLOSE-OUT.md). The files can also go through a private GitHub repository instead of Drive and paste: the chat project commits a draft to a branch and opens a pull request, `ci-review --github SLUG` reads it and commits the review back to the branch, a Code session puts a close-out note on the branch with `ci-docs put`, and the chat merges the pull request when the author says so (the merge is tagged for you). See [The document repository](#the-document-repository-ci-docs) and [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md).
 
 `--raw-draft` on its own works too — it just uses the whole file as the article body and skips the metadata context, which means the review models lose the author-supplied framing. Pair it with `--metadata` whenever you have that context to give.
 
@@ -669,7 +669,7 @@ It reads every URL out of the draft's own citation block (`## Sources` / `## Cit
 
 ## The document repository (`ci-docs`)
 
-An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design, and has the steps for connecting a claude.ai project to it. `ci-docs` has five subcommands: `init` (below), `push-run`, `ls`, `put` and `import` (`scan` and `check`, last). `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here. `AGENTS.md` teaches the drafting side the round loop: a branch and a pull request per round, a revision commit message that says which review findings it addressed, deferred and declined, and a merge only on the author's word.
+An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design, and has the steps for connecting a claude.ai project to it. `ci-docs` has seven subcommands: `init` (below), `push-run`, `ls`, `put`, `tag`, `accept` and `import` (`scan` and `check`, last). `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here. `AGENTS.md` teaches the drafting side the round loop: a branch and a pull request per round, a revision commit message that says which review findings it addressed, deferred and declined, and a merge only on the author's word.
 
 ```powershell
 uv run ci-docs init --dry-run                            # print the plan; write nothing
@@ -699,7 +699,7 @@ It also sets the repository's merge settings, once, and only when they differ: m
 uv run ci-docs push-run pipeline_history/my-article/run_4_20261026_143022_report.json
 ```
 
-It reads `document_source` from the report to find the repository, the pull request and the article folder, maps the files beside the report as in [Writing the review back](#writing-the-review-back-to-github), and does the same two steps with the same refusals. Both are safe to repeat: when every file is already identical it makes no commit, and when the pull request already has a review with this run's marker it posts none. So after a failed review post it posts only the review, and run twice it does nothing. A report under `_replay/`, one not named `run_N_<timestamp>_report.json`, one without a `document_source` or whose `document_source` names no pull request, and one whose pull request is merged or closed are refused. It prints the commit URL and then the review URL.
+It reads `document_source` from the report to find the repository, the pull request and the article folder, maps the files beside the report as in [Writing the review back](#writing-the-review-back-to-github), and does the same two steps with the same refusals. It first tags any merged, untagged round of the article ([Tagging an accepted round](#tagging-an-accepted-round)). Both are safe to repeat: when every file is already identical it makes no commit, and when the pull request already has a review with this run's marker it posts none. So after a failed review post it posts only the review, and run twice it does nothing. A report under `_replay/`, one not named `run_N_<timestamp>_report.json`, one without a `document_source` or whose `document_source` names no pull request, and one whose pull request is merged or closed are refused. It prints the commit URL and then the review URL.
 
 | Flag | Meaning |
 |---|---|
@@ -707,23 +707,54 @@ It reads `document_source` from the report to find the repository, the pull requ
 | `--github-repo OWNER/NAME` | commit to this repository instead of the one the report names |
 | `--config-dir DIR` | where `user.yaml` is read from, for `github_documents` and the API keys the commit must not contain (default `configs`) |
 
-### `ci-docs ls` and `ci-docs put`
+### Tagging an accepted round
 
-`ls` lists an article's folder, the top level and then `pipeline/`, with the round and kind each file name says. `put` adds one local file to that folder, in one commit: it is how a Code session hands a close-out note (Template D) to the drafting side through the repository, and it takes the drafting side's own files too.
+A round is accepted by merging its pull request (a merge commit), and the merge is marked by an annotated tag `<slug>/rN`, dated at the merge and tagged by the token's user, with a message such as `my-article r3: PR #12, runs 6 and 7` (the runs are read from the `<!-- ci-review run=N -->` markers of the pull request's reviews). **Nobody has to do this by hand:** the drafting chat merges the pull request when the author says so, and the next command that writes to the article tags any merged, untagged round of it first.
+
+- **When it runs.** Before their own work, in `ci-review --github SLUG --write-back` (after the permission check, before any model call), `ci-docs push-run`, `ci-docs put` and `ci-docs accept --yes` (before and after its merge).
+- **When it never runs.** In `ci-docs ls`, in a `ci-review --github` run without `--write-back`, and in `--replay`, `--offline` and calibration runs, which cannot write back. No read-only command gains a write. A round that is merged and never written to again stays untagged until the next write, or until `ci-docs tag`; the merge commit is the record either way.
+- **Safe to repeat and to race.** A round that has its tag is skipped, so a second run writes nothing. Creating the tag's ref is the compare-and-swap: if two commands tag at once, one wins and the other reads the tag back and counts it as done. A tag that exists but points at another commit is reported and left alone. No tag is ever moved or deleted.
+- **A failure is a warning.** A network error, a rate limit or a token that cannot read `GET /user` prints a warning and the command goes on with its own work.
+
+`ci-docs tag` and `ci-docs accept` are conveniences. The round loop needs neither.
 
 ```powershell
-uv run ci-docs ls my-article
-uv run ci-docs put my-article my-article-close-out-r4-to-chat.md
-uv run ci-docs put my-article my-article-close-out-r4-to-chat-v2.md      # a rewrite; -v2 needs the plain note
+uv run ci-docs tag my-article --dry-run     # say which tags would be made; write nothing
+uv run ci-docs tag my-article               # tag now, without doing anything else
+uv run ci-docs accept my-article            # show the open round; merge nothing
+uv run ci-docs accept my-article --yes      # merge it (merge commit), then tag it
 ```
 
-The file's own name is the name in the repository, and it must be `<slug>-(draft|metadata|handoff|publication)-rN.md` or `<slug>-close-out-rN-to-(code|chat)[-vM].md` with the same slug; anything else is refused before a request is sent. `put` only adds: the same bytes again is a no-op, other bytes under an existing name are refused, a `-vM` without its predecessor is refused, and a second plain note for a round and direction is refused with the next free `-vM` named. The commit message is `close-out: my-article r4 to-chat` (`<kind>: <slug> rN[ to-<dir>][ vM]`). The file is checked for the token and every configured API key, and a public repository is refused unless `allow_public_repo` is set.
+`accept` shows the article's one open round pull request, its head, the run of the newest `ci-review` review and whether any commit has landed since that review's commit. With `--yes` it merges with `sha` set to the head it showed, so a commit pushed after that is not merged unseen (GitHub answers 409 and nothing merges), then tags. **A merge is the author's acceptance:** a Code session passes `--yes` only when the author has said to accept the round. The normal path is the chat merging on the author's word.
 
 | Flag | Meaning |
 |---|---|
-| `SLUG`, `FILE` | the article's folder name; the local file to add (`put` only) |
+| `SLUG` | the article's folder name |
+| `--dry-run` | `tag` only: say what would be tagged and write nothing |
+| `--pr N` | `accept` only: the round's pull request, when the article has more than one open |
+| `--yes` | `accept` only: merge (without it, only show) |
 | `--github-repo OWNER/NAME` | the document repository; default `github_documents.repo` in `user.yaml`, else `MHammett/mikehammett.net-articles` |
-| `--branch NAME` | the branch to read or commit to; default `github_documents.branch`, else the repository's default branch |
+| `--config-dir DIR` | where `user.yaml` is read from (default `configs`) |
+
+### `ci-docs ls` and `ci-docs put`
+
+`ls` shows an article: its rounds (tags with their dates, merged and open pull requests with branch, head and the run of the last review), then the files of `articles/<slug>/` at a ref with each file's last commit. It reads and writes nothing, tagging included. `put` commits **one** local file to the open round's branch, never to `main`: it is how a Code session hands a close-out note (Template D) to the drafting chat, and it takes the drafting side's own files too.
+
+```powershell
+uv run ci-docs ls my-article
+uv run ci-docs ls my-article --ref main
+uv run ci-docs put my-article close-out-to-chat.md
+uv run ci-docs put my-article draft.md --pr 12     # when two rounds are open
+```
+
+The file's own name is the name it gets, and it must be `close-out-to-chat.md`, `close-out-to-code.md`, `draft.md`, `metadata.md` or `publication.md`. `review.md` and everything under `pipeline/` belong to the pipeline and are refused, as is any other name, before a request is sent. An existing file is replaced only if it is still the blob `put` read (an edit in between is refused), and the same bytes make no commit, so the history of the file in git is the history of its versions. The commit message is `close-out: my-article r4 to-chat` (`<kind>: <slug> rN` for the others), with the note's `Contains:` line as its body. After a close-out note's commit, `put` comments on the pull request with a link to the note at that commit, which is how the other side finds out. The file is checked for the token and every configured API key, and a public repository is refused unless `allow_public_repo` is set. The old per-round names (`my-article-close-out-r4-to-chat-v2.md`) are gone.
+
+| Flag | Meaning |
+|---|---|
+| `SLUG`, `FILE` | the article's folder name; the local file to commit (`put` only) |
+| `--ref REF` | `ls` only: list the files at this branch, tag or commit (default: the open round's branch if exactly one is open, else the base branch) |
+| `--pr N` | `put` only: the round's pull request, when the article has more than one open |
+| `--github-repo OWNER/NAME` | the document repository; default `github_documents.repo` in `user.yaml`, else `MHammett/mikehammett.net-articles` |
 | `--config-dir DIR` | where `user.yaml` is read from (default `configs`); `put` also needs it for the API keys the file must not contain |
 | `--publication NAME` | `put` only: also scan for the keys in `configs/NAME.yaml` |
 
@@ -1036,7 +1067,8 @@ content-intelligence/
 │   │   │   ├── github_documents.py    reads one round of an article from a GitHub repository (--github)
 │   │   │   ├── github_writeback.py    commits a run's review to the round's branch and posts the pull request review (--write-back, ci-docs push-run)
 │   │   │   ├── review_body.py         the body of that review: summary and a checklist of the Section 1 findings
-│   │   │   ├── github_put.py          ci-docs ls and put: list an article folder, add a close-out note or drafting file
+│   │   │   ├── github_put.py          ci-docs ls and put: an article's rounds and files; one file onto the open round's branch
+│   │   │   ├── github_rounds.py       automatic round tagging, and ci-docs tag and accept
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── chat_export.py         reads a claude.ai data export for ci-docs import scan (--chat-export)
 │   │   │   ├── history_import.py      ci-docs import scan/check: merge an article's local sources into an editable plan

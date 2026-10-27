@@ -434,13 +434,18 @@ def _load(
 
 
 def _tag_accepted_rounds(client, slug, *, repo_name):
-    """The place where #418 tags rounds whose pull request has been merged.
+    """Tag the article's rounds whose pull request has been merged, before the run.
 
     Called from a read only when it is about to write back, after the
     push-permission check and before the round is chosen, so a ``--github`` run
-    without ``--write-back`` never reaches it and makes no write. It does nothing
-    until #418 fills it.
+    without ``--write-back`` never reaches it and makes no write. A problem is a
+    WARNING, never an error: the review goes on (``github_rounds.tag_before_write``).
     """
+    # Imported here: github_rounds imports this module for the names and the
+    # round listing, and a plain read never needs the tagging code.
+    from .github_rounds import tag_before_write
+
+    tag_before_write(client, slug, repo=repo_name, say=log.info, warn=log.warning)
 
 
 def _try_resolve(client, ref):

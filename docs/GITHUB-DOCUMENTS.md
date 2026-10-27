@@ -680,6 +680,24 @@ lightweight tag is a bare pointer.
   merged and never written to again stays untagged until then (`ci-docs tag`
   tags it on demand); the merge commit is the record either way.
 
+**As built (#418).** `tag_merged_rounds(client, slug)` is in
+`github_rounds.py`; the hook #416 left in `github_documents.load_handoff` calls it
+only when `write_back=True`. Where the build differs from the text above or from
+the issue:
+
+- `tag_merged_rounds` takes no `prefix`: the tag's name, the branch it reads and
+  the review markers it parses need none. It does take `repo=` (skip a pull request
+  from a fork) and `dry_run=`.
+- `ci-docs accept --yes` tags twice: before the merge (a round merged earlier
+  and never tagged) and after it. Without `--yes` it writes nothing and tags
+  nothing. `push-run` tags from the CLI, before `push_saved_run`, by reading the
+  article from the report's `document_source`, and tags nothing for a report that
+  command will refuse (a replay, one not read from GitHub).
+- A token that cannot read `GET /user` (a GitHub App installation token) cannot
+  name a tagger; that is a warning for the round, and the command goes on.
+- `ci-docs ls` and `put` lose `--branch` (`ls` gains `--ref`, `put` gains
+  `--pr`).
+
 **Conveniences, not steps.** The round loop needs neither:
 
 ```bash
@@ -1085,9 +1103,9 @@ hashes and is written outside the repository.
 | #410 write-back | `push_saved_run`'s refusals, secret scan, retry message, `_drift_lines`, the replay rules | **stay** |
 | | target names `<slug>-review-rN.md`, `pipeline/<slug>-worklist-rN.md`, `pipeline/run_N_<ts>_report.json`, committing to `main`, `taken_run_numbers` from review names | **retired**: fixed names on the round's branch, run numbers from `pipeline/run.json` |
 | | the pull request review (summary and findings checklist), `push-run` idempotency by marker, automatic tagging (`tag_merged_rounds`) | **added** |
-| #411 `ci-docs ls` / `put` | `ls` | **changed**: shows the article's rounds (tags, open pull request, its last run) and the files at a ref |
-| | `put`'s name patterns, the `-vM` rules, committing to `main` | **retired** |
-| | `put` | **changed**: commits `close-out-to-chat.md` (or a drafting file) to the open round's branch, with `replace` on the blob it read, and comments on the pull request |
+| #411 `ci-docs ls` / `put` | `ls` | **changed (built in #418)**: shows the article's rounds (tags, open pull request, its last run) and the files at a ref |
+| | `put`'s name patterns, the `-vM` rules, committing to `main` | **retired (#418)** |
+| | `put` | **changed (built in #418)**: commits `close-out-to-chat.md` (or a drafting file) to the open round's branch, with `replace` on the blob it read, and comments on the pull request |
 | #405 (open, not built) | `ci-docs pull-history` | **rewritten**: walks the commits that changed `pipeline/report.json` |
 | #404 (open) | the last unchecked box, "Sync now shows `<slug>-review-rN.md`" | **moot**: reviews live on branches, which the built-in integration does not sync; closed |
 
@@ -1130,11 +1148,11 @@ them.
 
 ## Today's behaviour, until the redesign lands
 
-Until the phases below merge, `ci-docs put` adds per-round names
-(`<slug>-draft-rN.md`, `-vM` rules) to the folder. No article should be put into
-the repository that way: the first redesign phase to touch it retires those names
-without migrating anything. `ci-review --github` and `--write-back` already work
-on a round's pull request (#416, #417).
+Until the phases below merge, the reader and the write-back already work on a
+round's pull request (#416, #417) and `ci-docs ls`, `put`, `tag` and `accept` use
+the fixed names (#418). What is not built yet is the import's `apply` step (#421)
+and the phases marked "not yet" in the table below. No article should be put into
+the repository under the retired per-round names (`<slug>-draft-rN.md`, `-vM`).
 
 ## What does not change
 
@@ -1151,19 +1169,19 @@ on a round's pull request (#416, #417).
 
 Each is an issue labelled `github-documents`, buildable from the issue alone.
 
-| Issue | Phase | Depends on |
-|---|---|---|
-| [#413](https://github.com/MHammett/content-intelligence/issues/413) | A. client: pull requests, reviews, tags, labels, issues, dated commits, deletes, merge commits | nothing |
-| [#414](https://github.com/MHammett/content-intelligence/issues/414) | ~~B. `review_anchor.py`~~: closed, moot once line comments were dropped | — |
-| [#415](https://github.com/MHammett/content-intelligence/issues/415) | C. `ci-docs init`: new `AGENTS.md` and templates, merge settings, labels | #413 |
-| [#416](https://github.com/MHammett/content-intelligence/issues/416) | D. `--github` reads a round's pull request; `--pr`, `--round`; run numbers from `pipeline/run.json` | #413 |
-| [#417](https://github.com/MHammett/content-intelligence/issues/417) | E. write-back to the round's branch and the pull request review (summary and findings checklist); `push-run` | #413, #416 |
-| [#418](https://github.com/MHammett/content-intelligence/issues/418) | F. automatic tagging in `ci-review --github` and `ci-docs`; `accept` and `tag` as conveniences; `ls`, `put`; CLOSE-OUT.md and the README | #413, #416 (#415 for the docs it points at) |
-| [#419](https://github.com/MHammett/content-intelligence/issues/419) | G. claude.ai end to end on the scratch repository (the maintainer's checks) | #415, #417, #418 |
-| [#420](https://github.com/MHammett/content-intelligence/issues/420) | H. import, step 1: `ci-docs import scan` over local files, saved runs and a Drive download | nothing (#416's names) |
-| [#421](https://github.com/MHammett/content-intelligence/issues/421) | I. import, step 2: `ci-docs import apply` | #413, #415, #417, #418, #420 |
-| [#422](https://github.com/MHammett/content-intelligence/issues/422) | J. import: the claude.ai export as a source | #420; the maintainer's export |
-| [#405](https://github.com/MHammett/content-intelligence/issues/405) | `ci-docs pull-history`, rewritten (optional) | #413, #417 |
+| Issue | Phase | Depends on | Built in |
+|---|---|---|---|
+| [#413](https://github.com/MHammett/content-intelligence/issues/413) | A. client: pull requests, reviews, tags, labels, issues, dated commits, deletes, merge commits | nothing | [PR #424](https://github.com/MHammett/content-intelligence/pull/424) (merged) |
+| [#414](https://github.com/MHammett/content-intelligence/issues/414) | ~~B. `review_anchor.py`~~: closed, moot once line comments were dropped | — | |
+| [#415](https://github.com/MHammett/content-intelligence/issues/415) | C. `ci-docs init`: new `AGENTS.md` and templates, merge settings, labels | #413 | [PR #425](https://github.com/MHammett/content-intelligence/pull/425) |
+| [#416](https://github.com/MHammett/content-intelligence/issues/416) | D. `--github` reads a round's pull request; `--pr`, `--round`; run numbers from `pipeline/run.json` | #413 | [PR #427](https://github.com/MHammett/content-intelligence/pull/427) |
+| [#417](https://github.com/MHammett/content-intelligence/issues/417) | E. write-back to the round's branch and the pull request review (summary and findings checklist); `push-run` | #413, #416 | |
+| [#418](https://github.com/MHammett/content-intelligence/issues/418) | F. automatic tagging in `ci-review --github` and `ci-docs`; `accept` and `tag` as conveniences; `ls`, `put`; CLOSE-OUT.md and the README | #413, #416 (#415 for the docs it points at) | [PR #428](https://github.com/MHammett/content-intelligence/pull/428) |
+| [#419](https://github.com/MHammett/content-intelligence/issues/419) | G. claude.ai end to end on the scratch repository (the maintainer's checks) | #415, #417, #418 | not yet |
+| [#420](https://github.com/MHammett/content-intelligence/issues/420) | H. import, step 1: `ci-docs import scan` over local files, saved runs and a Drive download | nothing (#416's names) | [PR #423](https://github.com/MHammett/content-intelligence/pull/423) (merged) |
+| [#421](https://github.com/MHammett/content-intelligence/issues/421) | I. import, step 2: `ci-docs import apply` | #413, #415, #417, #418, #420 | not yet |
+| [#422](https://github.com/MHammett/content-intelligence/issues/422) | J. import: the claude.ai export as a source | #420; the maintainer's export | [PR #426](https://github.com/MHammett/content-intelligence/pull/426) (merged) |
+| [#405](https://github.com/MHammett/content-intelligence/issues/405) | `ci-docs pull-history`, rewritten (optional) | #413, #417 | not yet |
 
 #413 and #420 can start at once. #404 (the first design's phase 5) is
 closed: its last check is moot here, and #419 holds the claude.ai checks.

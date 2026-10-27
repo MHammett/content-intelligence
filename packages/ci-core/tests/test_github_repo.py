@@ -86,6 +86,11 @@ class FakeGitHub:
         self.commits = {}  # sha -> {"tree", "parents", "message"}
         self.branches = {}
         self.before_ref_update = None  # called with the fake, on every ref update
+        self.before_create_ref = (
+            None  # called with the fake and the body, on POST /git/refs
+        )
+        # What GET /user answers: the user the token belongs to.
+        self.user = {"login": "example-user", "id": 4242, "name": "Example User"}
         self.injected = []  # [(method, path part, Resp, times left)]
         self.closed = False
         self.tags = {}  # tag name -> sha it points at (a tag object, or a commit)
@@ -248,6 +253,8 @@ class FakeGitHub:
             and headers.get("Authorization") != f"Bearer {self.token}"
         ):
             return Resp(401, {"message": "Bad credentials"})
+        if (method, path) == ("GET", "/user"):
+            return Resp(200, dict(self.user))
         base = f"/repos/{REPO}"
         if not (path == base or path.startswith(base + "/")):
             return Resp(404, {"message": "Not Found"})
@@ -265,6 +272,8 @@ class FakeGitHub:
         if self.empty and git_routes:
             # https://docs.github.com/en/rest/guides/using-the-rest-api-to-interact-with-your-git-database
             return Resp(409, {"message": "Git Repository is empty."})
+        if method == "GET" and path == "/commits" and "path" in params:
+            return self._path_history(params)
         if method == "GET" and path == "/commits":
             return Resp(200, [{"sha": s} for s in list(self.commits)[:1]])
         if method == "GET" and path.startswith("/commits/"):
@@ -301,7 +310,23 @@ class FakeGitHub:
                 if r.startswith(prefix)
             ]
             return self._page(path, found, params)
+        if method == "GET" and path.startswith("/git/tags/"):
+            obj = self.tag_objects.get(path[len("/git/tags/") :])
+            if obj is None:
+                return Resp(404, {"message": "Not Found"})
+            return Resp(
+                200,
+                {
+                    "sha": path[len("/git/tags/") :],
+                    "tag": obj["tag"],
+                    "message": obj["message"],
+                    "tagger": obj["tagger"],
+                    "object": {"sha": obj["object"], "type": obj["type"]},
+                },
+            )
         if (method, path) == ("POST", "/git/refs"):
+            if self.before_create_ref:
+                self.before_create_ref(self, body)
             return self._create_ref(body)
         if (method, path) == ("POST", "/git/tags"):
             assert body["type"] == "commit" and body["object"] in self.commits
@@ -377,6 +402,47 @@ class FakeGitHub:
         table[name] = sha
         return Resp(201, {"ref": ref, "object": {"sha": sha}})
 
+    def _path_history(self, params):
+        """``GET /commits?path=&sha=&per_page=1``: the newest commit that changed the path.
+
+        Follows GitHub's default history simplification: a commit whose path
+        matches one of its parents is not a change, and the walk goes on through
+        that parent. So a merged round's file is attributed to the commit on the
+        round's branch, not to the merge.
+        """
+        path = params["path"]
+        sha = self._resolve(params.get("sha", "main"))
+        if sha is None:
+            return Resp(404, {"message": "No commit found for the ref"})
+
+        def blob(commit):
+            return self.trees[self.commits[commit]["tree"]].get(path)
+
+        while sha:
+            parents = self.commits[sha]["parents"]
+            same = [p for p in parents if blob(p) == blob(sha)]
+            if same:
+                sha = same[0]
+                continue
+            if blob(sha) is None:
+                return Resp(200, [])
+            committer = self.commits[sha].get("committer") or {}
+            return Resp(
+                200,
+                [
+                    {
+                        "sha": sha,
+                        "commit": {
+                            "message": self.commits[sha]["message"],
+                            "committer": {
+                                "date": committer.get("date", "2026-10-27T12:00:00Z")
+                            },
+                        },
+                    }
+                ],
+            )
+        return Resp(200, [])
+
     def _compare(self, basehead):
         base, _, head = basehead.partition("...")
         base, head = self._resolve(unquote(base)), self._resolve(unquote(head))
@@ -394,7 +460,15 @@ class FakeGitHub:
             status = "behind"
         else:
             status = "diverged"
-        return Resp(200, {"status": status, "merge_base_commit": {"sha": merge_base}})
+        return Resp(
+            200,
+            {
+                "status": status,
+                "merge_base_commit": {"sha": merge_base},
+                "ahead_by": len(self._ancestors(head) - self._ancestors(base)),
+                "behind_by": len(self._ancestors(base) - self._ancestors(head)),
+            },
+        )
 
     def _collab(self, method, path, params, body):
         """Pull requests, reviews, labels and issues."""
@@ -1433,6 +1507,92 @@ def test_create_tag_checks_its_name_and_hides_the_token(gh, fake):
         fake.branches["main"],
         tagger=_sig(),
     )
+
+
+def test_current_user_reads_login_id_and_name(gh, fake):
+    user = gh.current_user()
+    assert (user.login, user.id, user.name) == ("example-user", 4242, "Example User")
+    fake.user = {"login": "example-user", "id": 4242, "name": None}
+    assert gh.current_user().name == ""
+
+
+def test_get_tag_reads_back_an_annotated_tag_to_its_commit(gh, fake):
+    tip = fake.branches["main"]
+    tag_sha = gh.create_tag("example-article/r1", "accepted r1", tip, tagger=_sig())
+    got = gh.get_tag("example-article/r1")
+    assert got.commit_sha == tip and got.tag_sha == tag_sha
+    assert got.tagged_at == "2026-06-14T18:02:11+00:00"
+    assert got.message == "accepted r1"
+
+
+def test_get_tag_reads_a_lightweight_tag_as_its_commit(gh, fake):
+    tip = fake.branches["main"]
+    gh.create_ref("refs/tags/example-article/r1", tip)
+    got = gh.get_tag("example-article/r1")
+    assert got.commit_sha == tip and got.tag_sha is None and got.tagged_at is None
+
+
+def test_get_tag_peels_a_tag_of_a_tag(gh, fake):
+    tip = fake.branches["main"]
+    inner = gh.create_tag("example-article/r1", "inner", tip, tagger=_sig())
+    outer = "f" * 40
+    fake.tag_objects[outer] = {
+        "tag": "outer",
+        "message": "outer",
+        "object": inner,
+        "type": "tag",
+        "tagger": {"name": "n", "email": "e", "date": "2026-06-15T00:00:00+00:00"},
+    }
+    fake.tags["example-article/r2"] = outer
+    assert gh.get_tag("example-article/r2").commit_sha == tip
+
+
+def test_get_tag_of_a_missing_tag_is_none_and_a_bad_name_is_refused(gh, fake):
+    assert gh.get_tag("example-article/r9") is None
+    with pytest.raises(ValueError):
+        gh.get_tag("../x")
+
+
+def test_compare_counts_the_commits_each_side_has_alone(gh, fake):
+    base = fake.branches["main"]
+    fake.branches["side"] = base
+    one = fake.external_commit("side", {"a.md": b"1"}, "one")
+    two = fake.external_commit("side", {"a.md": b"2"}, "two")
+    got = gh.compare(base, two)
+    assert (got.status, got.ahead_by, got.behind_by) == ("ahead", 2, 0)
+    back = gh.compare(two, one)
+    assert (back.status, back.ahead_by, back.behind_by) == ("behind", 0, 1)
+    assert gh.compare(two, two).status == "identical"
+
+
+def test_compare_of_unrelated_histories_is_unrelated(gh, fake):
+    fake.external_commit("orphan", {"x.md": b"x"}, "orphan root")
+    assert gh.compare(fake.branches["main"], fake.branches["orphan"]).status == (
+        "unrelated"
+    )
+
+
+def test_last_commit_is_the_newest_that_changed_the_path(gh, fake):
+    fake.external_commit("main", {"a/one.md": b"1"}, "add one")
+    second = fake.external_commit("main", {"a/two.md": b"2"}, "add two\n\nbody")
+    fake.external_commit("main", {"a/one.md": b"1b"}, "change one")
+    got = gh.last_commit("a/two.md", "main")
+    assert got.sha == second and got.subject == "add two"
+    assert got.date == "2026-10-27T12:00:00Z"
+    assert gh.last_commit("a/never.md", "main") is None
+
+
+def test_last_commit_of_a_merged_round_file_is_the_commit_on_the_branch(gh, fake):
+    tip = _round_branch(fake)
+    pull = gh.create_pull("round/example-article/r1", "main", "t", "b")
+    merge = gh.merge_pull(pull.number, sha=tip)
+    got = gh.last_commit("articles/example-article/draft.md", "main")
+    assert got.sha == tip != merge
+
+
+def test_last_commit_checks_its_path(gh):
+    with pytest.raises(ValueError):
+        gh.last_commit("../x", "main")
 
 
 def test_a_signature_must_be_timezone_aware_and_keeps_its_offset():

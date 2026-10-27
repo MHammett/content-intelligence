@@ -39,7 +39,7 @@ same.]
 Prepared: [YYYY-MM-DD, and who wrote it: Claude Code | the drafting chat | the
 author]
 Round: [rN, where N is the last pipeline run this note takes into account, the
-same N as in `<slug>-review-rN.md`. Without it a note cannot be placed among the
+same N as in a Drive review file `<slug>-review-rN.md`. Without it a note cannot be placed among the
 drafts and reports around it, and notes about different runs look alike. For an
 article kept in the document repository: the round whose pull request the note
 is committed to, then the last run it takes into account, e.g. `r3, run 7`; the
