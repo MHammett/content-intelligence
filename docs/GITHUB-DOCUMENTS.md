@@ -822,6 +822,39 @@ The author can move an event, split or join rounds, exclude anything, and set
 `accepted_at`; `apply` validates the plan (times in order, every included event's
 content present on disk) before it writes.
 
+**As built (`ci-docs import scan` and `check`, issue #420; the issue's spec
+governs where it differs from the sketch above).** The plan is `version: 1`, with
+sorted keys, UTF-8 and LF endings, and byte-identical for the same inputs. Events
+carry an `id` (`e1`, `e2`, ... in plan order); a draft carries `label` (`v27`,
+`r3`), `submitted` and `sources` (type, path, time, and `lt_undone` or `part`
+where the text is a run's `corrected_draft` or a handoff's embedded draft); a run
+carries `report`, `preset`, `cost_usd`, `draft` (the id of the version it reviewed)
+and `suspect`. `near_duplicates` lists pairs of draft ids that
+`passage_match.same_passage` calls the same; nothing is merged. Details the
+sketch does not say:
+
+- A file is read only when its name mentions the slug or a history key as a whole
+  token (`example-article-v2-draft.md` does; `example-articles.md` does not), or
+  `--include` names it, or it sits in a subfolder whose own name mentions the slug
+  (`~/Downloads/example-article-v27/`, whose label `v27` it inherits).
+- A handoff that is a Template A document also holds a draft: that embedded draft
+  is a source of the same version as a draft file or a run with the same text.
+- A run is linked to a version by the text it reviewed: `corrected_draft` with its
+  `lt_corrections_applied` undone (by offset, and only when every replacement is
+  found where the log says), else `corrected_draft` as it is, else a new version
+  noted `LanguageTool-corrected; the submitted bytes were not found`.
+- A reproduction is matched to the version it claims by label, and a run's
+  `Pipeline run:` number stands in as `rN` for a version no file labels. Any
+  non-reproduction source (a run, Drive, or a file) supersedes it, provided the
+  texts are alike (Jaccard over content tokens at least 0.6); a label shared by
+  several versions picks the most alike. A kept reproduction with no `claimed_at`
+  is placed one second after the nearest lower label of the same prefix, or one
+  second before the nearest higher; with neither it has no time (`at: null`) and
+  `check` will not pass the plan until the author sets one.
+- A file with no recognisable kind (`unknown`) is an event with `include: false`;
+  scripts, `.txt` files and folders of images are not events and are listed in
+  `excluded`.
+
 **Matching a chat to an article and a round.** The export is first inspected and
 its schema written into this page (field names only; never content). As
 understood before seeing it, it holds `conversations.json`: conversations with a
