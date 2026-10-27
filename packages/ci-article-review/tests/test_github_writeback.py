@@ -374,7 +374,13 @@ class TestFailureAfterTheRun:
             )
         message = str(err.value)
         assert "saved" in message
-        assert f'ci-docs push-run "{path}" --config-dir "my configs"' in message
+        # Quoting of the path depends on the platform's separators; the line
+        # that is printed is the one retry_command builds, and a config
+        # directory with a space in it is quoted everywhere.
+        retry = gw.retry_command(path, "my configs")
+        assert retry in message
+        assert retry.startswith("ci-docs push-run ") and str(path) in retry
+        assert retry.endswith('--config-dir "my configs"')
 
     def test_the_default_config_dir_is_left_off_the_retry(self):
         assert gw.retry_command("a/run_1_x_report.json") == (
