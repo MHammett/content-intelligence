@@ -162,7 +162,7 @@ git keeps every version. `run.json` is small and says which run they belong to:
 
 ```json
 {"run_number": 7, "history_key": "example-article", "history_name": "run_7_20261026_143022",
- "reviewed_commit": "3f2a91c…", "round": 3, "pull_request": 12, "review_id": 2468013579,
+ "reviewed_commit": "3f2a91c…", "round": 3, "pull_request": 12,
  "preset": "wide", "cost_reported_usd": 0.73}
 ```
 
@@ -336,8 +336,8 @@ limit on a body, which is undocumented but consistently reported, e.g.
   is cut from `review.md`.
 
 **Line comments.** One per finding that quotes the draft, in this order: Section 1
-(by weight), then fact-check claims (Section 2), argument (4), voice (3), red team
-(6) and citation mismatches (9). Each is `{path: "articles/<slug>/draft.md", side:
+(by weight), then fact-check claims (Section 2), argument (4), voice (3),
+completeness (5), red team (6) and citation mismatches (9). Each is `{path: "articles/<slug>/draft.md", side:
 "RIGHT", line, [start_line, start_side: "RIGHT"], body}`, where the body names the
 section, the models that raised it, the finding, and its quotation, so a comment
 reads on its own. Rules:
@@ -712,8 +712,9 @@ uv run ci-docs import scan example-article \
     --drive-dir ~/ci-import/example-article/drive \
     --chat-export ~/ci-import/claude-export \
     --out ~/ci-import/example-article/plan.json
-# read the timeline it prints; edit plan.json (exclude, regroup, relabel)
-uv run ci-docs import apply ~/ci-import/example-article/plan.json --dry-run
+# read the timeline it prints; edit plan.json (exclude, regroup, relabel), then:
+uv run ci-docs import check ~/ci-import/example-article/plan.json
+uv run ci-docs import apply ~/ci-import/example-article/plan.json --repo MHammett/ci-docs-scratch --dry-run
 uv run ci-docs import apply ~/ci-import/example-article/plan.json --repo MHammett/ci-docs-scratch
 ```
 
@@ -768,7 +769,9 @@ is marked `suspect: experiment?`. Nothing is dropped silently: the author sets
 The scan groups events into rounds: a new round starts at each submitted draft
 version (a file the drafting side named as a round or version, or the draft a run
 reviewed), and in-chat versions between two submissions are revisions inside the
-earlier round. `accepted_at` defaults to the time of the next round's first event.
+earlier round. `accepted_at` defaults to just before the next round's first event.
+`--repo` is required by `apply`, so the real repository is never written by
+default.
 The author can move an event, split or join rounds, exclude anything, and set
 `accepted_at`; `apply` validates the plan (times in order, every included event's
 content present on disk) before it writes.
@@ -928,24 +931,24 @@ retires those names without migrating anything.
 
 ## Build phases
 
-Each is an issue labelled `github-documents`, buildable from the issue alone. The
-numbers below are the issues'.
+Each is an issue labelled `github-documents`, buildable from the issue alone.
 
-| # | Phase | Depends on |
+| Issue | Phase | Depends on |
 |---|---|---|
-| A | client: pull requests, reviews, tags, labels, issues, dated commits, deletes, merge commits | nothing |
-| B | `review_anchor.py`: locating a finding's quotation in the draft and in the diff | nothing |
-| C | `ci-docs init`: new `AGENTS.md` and templates, merge settings, labels | A |
-| D | `--github` reads a round's pull request; `--pr`, `--round`; run numbers from `pipeline/run.json` | A |
-| E | write-back to the round's branch and the pull request review; `push-run` | A, B, D |
-| F | `ci-docs accept`, `tag`, `ls`, `put`; CLOSE-OUT.md and the README | A, D (C for the docs it points at) |
-| G | claude.ai end to end on the scratch repository (the maintainer's checks) | C, E, F |
-| H | import, step 1: `ci-docs import scan` over local files, saved runs and a Drive download | nothing (D's names) |
-| I | import, step 2: `ci-docs import apply` | A, C, E, F, H |
-| J | import: the claude.ai export as a source | H; the maintainer's export |
-| #405 | `ci-docs pull-history`, rewritten (optional) | A, E |
+| [#413](https://github.com/MHammett/content-intelligence/issues/413) | A. client: pull requests, reviews, tags, labels, issues, dated commits, deletes, merge commits | nothing |
+| [#414](https://github.com/MHammett/content-intelligence/issues/414) | B. `review_anchor.py`: locating a finding's quotation in the draft and in the diff | nothing |
+| [#415](https://github.com/MHammett/content-intelligence/issues/415) | C. `ci-docs init`: new `AGENTS.md` and templates, merge settings, labels | #413 |
+| [#416](https://github.com/MHammett/content-intelligence/issues/416) | D. `--github` reads a round's pull request; `--pr`, `--round`; run numbers from `pipeline/run.json` | #413 |
+| [#417](https://github.com/MHammett/content-intelligence/issues/417) | E. write-back to the round's branch and the pull request review; `push-run` | #413, #414, #416 |
+| [#418](https://github.com/MHammett/content-intelligence/issues/418) | F. `ci-docs accept`, `tag`, `ls`, `put`; CLOSE-OUT.md and the README | #413, #416 (#415 for the docs it points at) |
+| [#419](https://github.com/MHammett/content-intelligence/issues/419) | G. claude.ai end to end on the scratch repository (the maintainer's checks) | #415, #417, #418 |
+| [#420](https://github.com/MHammett/content-intelligence/issues/420) | H. import, step 1: `ci-docs import scan` over local files, saved runs and a Drive download | nothing (#416's names) |
+| [#421](https://github.com/MHammett/content-intelligence/issues/421) | I. import, step 2: `ci-docs import apply` | #413, #415, #417, #418, #420 |
+| [#422](https://github.com/MHammett/content-intelligence/issues/422) | J. import: the claude.ai export as a source | #420; the maintainer's export |
+| [#405](https://github.com/MHammett/content-intelligence/issues/405) | `ci-docs pull-history`, rewritten (optional) | #413, #417 |
 
-A, B and H can start at once.
+#413, #414 and #420 can start at once. #404 (the first design's phase 5) is
+closed: its last check is moot here, and #419 holds the claude.ai checks.
 
 ## Not decided here
 
