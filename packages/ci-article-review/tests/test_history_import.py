@@ -761,13 +761,6 @@ def test_the_main_checkout_is_off_limits_too(sources, monkeypatch):
     hi.refuse_out_inside_checkout(sources.base / "elsewhere" / "plan.json")
 
 
-def test_a_chat_export_is_not_built_yet(sources):
-    with pytest.raises(hi.ImportScanError, match="issue #422"):
-        sources.scan(chat_export=sources.base / "export")
-    with pytest.raises(hi.ImportScanError, match="issue #422"):
-        sources.scan(conversations=["0000"])
-
-
 def test_nothing_found_is_an_error_not_an_empty_plan(tmp_path):
     with pytest.raises(hi.ImportScanError, match="nothing found"):
         hi.scan(SLUG, history_root=tmp_path / "none", files=[])

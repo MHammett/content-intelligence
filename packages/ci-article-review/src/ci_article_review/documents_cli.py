@@ -270,7 +270,12 @@ def build_parser():
     scan.add_argument(
         "--chat-export",
         metavar="PATH",
-        help="a claude.ai export (not built yet: issue #422)",
+        help=(
+            "a claude.ai data export (the directory, the ZIP, or conversations.json). "
+            "Conversations carry no project id, so they are matched to the article by "
+            "what they say; versions are rebuilt from tool calls, attachments and "
+            "long messages and kept only if they resemble a version another source holds"
+        ),
     )
     scan.add_argument(
         "--conversation",
@@ -278,7 +283,10 @@ def build_parser():
         metavar="UUID",
         default=[],
         dest="conversations",
-        help="a conversation of the export that belongs to the article (not built yet: issue #422)",
+        help=(
+            "a conversation of the export that belongs to the article even though it "
+            "does not name it; repeatable"
+        ),
     )
     scan.add_argument(
         "--out",
