@@ -26,13 +26,27 @@ all-or-nothing edit needs the literal text.
 
 **Or in the document repository.** An article kept in the private GitHub document
 repository ([GITHUB-DOCUMENTS.md](GITHUB-DOCUMENTS.md)) has its article folder,
-`articles/<slug>/`, instead of the Drive folder, and the notes live there with the
-same names, beside the draft and the pipeline's review. The committed file is the
-record, just as the Drive file is, and `Drive folder:` and `Drive folder id:` in
-the note hold `<owner>/<repo>:<path>` and the commit SHA the note was written
-against. `ci-docs ls <slug>` lists the folder.
+`articles/<slug>/`, instead of the Drive folder, and its notes are committed to the
+**open round's branch** (`round/<slug>/rN`) under **fixed names**, beside the draft
+and the pipeline's review:
 
-Name each note:
+```
+articles/<slug>/close-out-to-chat.md    the latest note to the drafting chat (written by a Code session)
+articles/<slug>/close-out-to-code.md    the latest note to a Code session (written by the chat)
+```
+
+There is one file per direction. A newer note **replaces the older one in place**;
+the older versions are in git, so `git log -- articles/<slug>/close-out-to-chat.md`
+is the sequence of notes, and the round (`rN`) and the run a note takes into account
+are in the commit message and the note's `Round:` line, not in the file name. The
+committed file is the record, just as the Drive file is. The branch reaches `main`
+when the round's pull request is merged, so `main` holds the notes of the last
+accepted round. In such a note `Drive folder:` holds `<owner>/<repo>:<path>` and
+`Drive folder id:` the commit SHA the note was written against.
+`ci-docs ls <slug>` shows the article's rounds and the files of the open round's
+branch, each with its last commit.
+
+**In Drive**, name each note:
 
 ```
 <slug>-close-out-r<N>-to-<code|chat>[-v<M>].md
@@ -57,6 +71,8 @@ pjm-capacity-auction-close-out-r3-to-code-v2.md
 There is no date in the name. The first two notes were written about 16 minutes
 apart on one day, so a date could not tell them apart, and the drafting project
 already numbers rounds. The date is in `Prepared:` and in Drive's own timestamps.
+(Everything about names in this section applies to Drive. In the document
+repository the names are fixed, above, and git keeps the versions.)
 
 ## Check the names first
 
@@ -99,9 +115,13 @@ makes the rename dearer. That is why this is a step at the first run.
 
 ## Writing a note
 
-- List the folder first. If a note for this round and direction exists, you are
-  writing its `-v` successor and `Supersedes:` names it. The first close-out came
-  out twice, about 16 minutes apart, and neither note mentions the other.
+- List the folder first. In Drive, if a note for this round and direction
+  exists, you are writing its `-v` successor and `Supersedes:` names it. The first
+  close-out came out twice, about 16 minutes apart, and neither note mentions the
+  other. In the document repository, read the current note at its fixed path (on
+  the round's branch, and on `main`) before writing: yours replaces it, and
+  `Supersedes:` names the **commit** of the note it replaces
+  (`list_commits` with `path` gives it, or `git log -1 --format=%h -- <path>`).
 - Copy the identity block forward from the last note and re-derive only what may
   have changed.
 - Code has no standing permission to write to the author's Drive. It saves a
@@ -109,10 +129,17 @@ makes the rename dearer. That is why this is a step at the first run.
   hands the file to the author, who saves it there. **The Drive rule is
   unchanged.** For an article in the document repository the configured
   repository (`github_documents.repo`) is that standing permission, limited to
-  *adding* files: Code runs `ci-docs put <slug> <file>`, which commits the one
-  file and refuses a name that does not fit, a `-vM` with no predecessor and an
-  existing note (naming the next free `-vM`), and never overwrites or deletes
-  anything. Code does not edit that repository by any other route.
+  committing one file to the open round's branch: Code runs
+  `ci-docs put <slug> close-out-to-chat.md`, which commits the file under that
+  fixed name (the local file's own name is the name it gets), refuses any other
+  name, `review.md` and anything under `pipeline/`, never writes to `main`, and
+  replaces an existing note only if it is still the version `put` read. It then
+  announces the note with a comment on the round's pull request, a link to the
+  note at its commit, which is how the chat learns there is one. `put` is Code's
+  only route to that repository: Code does not edit it any other way. The
+  repository's own `AGENTS.md` (written by `ci-docs init`) tells the chat the same
+  steps for its side: commit to the branch with `close-out: <slug> rN to-code`,
+  then announce with a pull request comment.
 - The rules for each section are in the template's bracketed notes. They are the
   ones the drafting side needs at the moment of writing, so they live there and
   not here.
@@ -181,10 +208,11 @@ states, and a note can override it.
 The drafting project does not read this repo, so it works from a copy of
 `close_out.md` and of the rules for naming the note. **`ci-docs init` now renders
 that copy.** It commits `close_out.md` into the document repository's `templates/`
-folder, and the file-name pattern and the `close-out: <slug> rN to-code` commit
-message into the repository's `AGENTS.md`, from sources kept here
+folder, and the two fixed file names, the `close-out: <slug> rN to-code` commit
+message and the announce-by-comment step into the repository's `AGENTS.md`, from
+sources kept here
 ([docs/GITHUB-DOCUMENTS.md](GITHUB-DOCUMENTS.md#bootstrapping-the-repository-ci-docs-init)).
-A change to a header, a label or the name pattern in `close_out.md` therefore
+A change to a header or a label in `close_out.md` therefore
 reaches the drafting side by merging it here and re-running `ci-docs init`; a copy
 someone edited in the document repository is left alone and listed, and
 `--overwrite-edited` replaces it. The template's header comment says so.
@@ -206,8 +234,8 @@ list under "File and artifact storage":
   List the folder before writing one. Never overwrite one.
 ```
 
-After that, a change to a header, a label or the name pattern in `close_out.md`
-means the same change to that copy.
+After that, a change to a header, a label or the Drive name pattern in
+`close_out.md` means the same change to that copy.
 
 ## Not built
 

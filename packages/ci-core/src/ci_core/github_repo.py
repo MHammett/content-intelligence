@@ -203,6 +203,51 @@ class ReviewInfo:
     html_url: str
 
 
+@dataclass(frozen=True)
+class UserInfo:
+    """The user a token belongs to, from ``GET /user``."""
+
+    login: str
+    id: int
+    #: The profile name; empty when the user has not set one.
+    name: str
+
+
+@dataclass(frozen=True)
+class TagInfo:
+    """A tag as ``get_tag`` reads it back, peeled to the commit it marks."""
+
+    name: str
+    #: The commit the tag marks, or ``None`` when it points at something else.
+    commit_sha: str | None
+    #: The tag object's SHA; ``None`` for a lightweight tag (a bare ref).
+    tag_sha: str | None
+    #: The tagger's date as GitHub gave it; ``None`` for a lightweight tag.
+    tagged_at: str | None
+    message: str
+
+
+@dataclass(frozen=True)
+class CompareInfo:
+    """``GET /compare/{base}...{head}``: how ``head`` stands against ``base``."""
+
+    #: "ahead", "behind", "identical", "diverged", or "unrelated" (no common ancestor).
+    status: str
+    ahead_by: int
+    behind_by: int
+
+
+@dataclass(frozen=True)
+class CommitSummary:
+    """One commit of a path's history."""
+
+    sha: str
+    #: The first line of the message.
+    subject: str
+    #: The committer date as GitHub gave it.
+    date: str | None
+
+
 def _pull_info(body):
     head, base = body.get("head") or {}, body.get("base") or {}
     merged_at = body.get("merged_at")
@@ -470,6 +515,19 @@ class GitHubRepo:
         """The repository's default branch, privacy, push access and merge settings."""
         return _repo_info(self._request("GET", f"/repos/{self.repo}").json())
 
+    def current_user(self):
+        """The user this token belongs to (``GET /user``).
+
+        An installation token of a GitHub App has no user and GitHub answers it
+        403 or 404; that raises as usual and the caller decides what to do.
+        """
+        body = self._request("GET", "/user").json()
+        return UserInfo(
+            login=str(body["login"]),
+            id=int(body["id"]),
+            name=str(body.get("name") or ""),
+        )
+
     def resolve(self, ref):
         """A branch, tag or SHA as the commit SHA it names right now."""
         if _FULL_SHA.match(ref):
@@ -588,6 +646,90 @@ class GitHubRepo:
             Entry(name=e["name"], path=e["path"], type=e["type"], sha=e["sha"])
             for e in body
         ]
+
+    def get_tag(self, name):
+        """The tag ``name`` read back, or ``None`` if there is no such tag.
+
+        An annotated tag is peeled through its tag object (and through a tag of
+        a tag, to a small depth) to the commit it marks; a lightweight tag is
+        its ref's commit. ``commit_sha`` is ``None`` when the tag points at
+        something that is not a commit.
+        """
+        _check_path(name)
+        resp = self._send("GET", f"/repos/{self.repo}/git/ref/tags/{_quote(name)}")
+        if resp.status_code == 404:
+            return None
+        if not 200 <= resp.status_code < 300:
+            raise self._http_error(resp, f"look up tag {name}")
+        obj = resp.json().get("object") or {}
+        sha, kind = obj.get("sha"), obj.get("type")
+        tag_sha = tagged_at = None
+        message = ""
+        for depth in range(5):
+            if kind != "tag":
+                break
+            body = self._request("GET", f"/repos/{self.repo}/git/tags/{sha}").json()
+            if depth == 0:
+                tag_sha = sha
+                tagged_at = (body.get("tagger") or {}).get("date")
+                message = body.get("message") or ""
+            obj = body.get("object") or {}
+            sha, kind = obj.get("sha"), obj.get("type")
+        return TagInfo(
+            name=name,
+            commit_sha=sha if kind == "commit" else None,
+            tag_sha=tag_sha,
+            tagged_at=tagged_at,
+            message=message,
+        )
+
+    def compare(self, base, head):
+        """How ``head`` stands against ``base``: its status and the commits each side has alone."""
+        resp = self._send(
+            "GET",
+            f"/repos/{self.repo}/compare/{_quote(base)}...{_quote(head)}",
+            params={"per_page": 1},
+        )
+        if (
+            resp.status_code == 404
+            and "no common ancestor" in self._message(resp).lower()
+        ):
+            return CompareInfo("unrelated", 0, 0)
+        if not 200 <= resp.status_code < 300:
+            raise self._http_error(resp, f"compare {base[:12]}...{head[:12]}")
+        body = resp.json() or {}
+        return CompareInfo(
+            status=str(body.get("status", "unknown")),
+            ahead_by=int(body.get("ahead_by") or 0),
+            behind_by=int(body.get("behind_by") or 0),
+        )
+
+    def last_commit(self, path, ref):
+        """The newest commit at ``ref`` that changed ``path``, or ``None``.
+
+        ``GET /commits?path=&sha=&per_page=1``. For a file on a merged round that
+        is the commit on the round's branch that last changed it, not the merge
+        commit, because GitHub follows the side of a merge the path matches.
+        """
+        _check_path(path)
+        resp = self._send(
+            "GET",
+            f"/repos/{self.repo}/commits",
+            params={"path": path, "sha": ref, "per_page": 1},
+        )
+        if resp.status_code == 404:
+            return None
+        if not 200 <= resp.status_code < 300:
+            raise self._http_error(resp, f"history of {path}")
+        items = resp.json()
+        if not isinstance(items, list) or not items:
+            return None
+        commit = items[0].get("commit") or {}
+        return CommitSummary(
+            sha=items[0]["sha"],
+            subject=(commit.get("message") or "").split("\n", 1)[0],
+            date=(commit.get("committer") or {}).get("date"),
+        )
 
     # -- writes --------------------------------------------------------------
 

@@ -13,15 +13,24 @@ docs/GITHUB-DOCUMENTS.md; what each file is for is in ``documents_init``.
 article folder, which is the retry for a ``ci-review --github SLUG --write-back``
 whose commit failed (``github_writeback``).
 
-``ci-docs ls SLUG`` lists an article's folder, and ``ci-docs put SLUG FILE`` adds a
-close-out note or a drafting file to it, never overwriting (``github_put``).
+``ci-docs ls SLUG`` shows an article's rounds and the files of its folder (reads
+only), and ``ci-docs put SLUG FILE`` commits one file to the open round's branch
+(``github_put``).
+
+A round is accepted by merging its pull request, and the merge is tagged
+``<slug>/rN`` automatically: ``push-run``, ``put`` and ``accept --yes`` tag any
+merged, untagged round of the article before their own work, and ``ls`` never
+does. ``ci-docs tag SLUG`` runs that step alone, and ``ci-docs accept SLUG``
+merges the open round when the author has said to (``github_rounds``).
 
     ci-docs init --dry-run                  # the plan; writes nothing
     ci-docs init --create                   # make the repository too, if missing
     ci-docs init --seed-instructions PATH   # first run: instructions/publication.md
     ci-docs push-run pipeline_history/example-article/run_4_<ts>_report.json
     ci-docs ls example-article
-    ci-docs put example-article example-article-close-out-r4-to-chat.md
+    ci-docs put example-article close-out-to-chat.md
+    ci-docs tag example-article --dry-run
+    ci-docs accept example-article          # shows the open round; --yes merges it
 
 ``ci-docs import scan SLUG ... --out PLAN.json`` is step 1 of importing an
 article's history from local files (``history_import``): it merges the sources
@@ -158,33 +167,48 @@ def build_parser():
 
     ls = sub.add_parser(
         "ls",
-        help="list an article's folder, with each file's round and kind",
+        help="show an article's rounds and the files of its folder",
         description=(
-            "List the article folder SLUG in the document repository, the top "
-            "level and then pipeline/, with the round and kind each file name "
-            "says. Reads only."
+            "Show the article SLUG: its rounds (tags with their dates, merged and "
+            "open pull requests with branch, head and the last review's run), then "
+            "the files of articles/SLUG/ at REF with each one's last commit. REF "
+            "defaults to the open round's branch, else the base branch. Reads "
+            "only: it tags nothing."
         ),
     )
     ls.add_argument("slug", metavar="SLUG", help="the article's folder name")
+    ls.add_argument(
+        "--ref",
+        metavar="REF",
+        default=None,
+        help="list the files at this branch, tag or commit (default: the open round's branch, else the base branch)",
+    )
     _repo_options(ls)
 
     put = sub.add_parser(
         "put",
-        help="commit a close-out note or a drafting file into an article's folder",
+        help="commit one file to the open round's branch",
         description=(
-            "Commit one local file into the article folder SLUG, in one commit, "
-            "adding it and nothing else. The file name must be "
-            "<slug>-(draft|metadata|handoff|publication)-rN.md or "
-            "<slug>-close-out-rN-to-(code|chat)[-vM].md, with the same slug. A "
-            "file already there with the same bytes is left alone; one with "
-            "different bytes is refused. A close-out note for a round and "
-            "direction that already has one is refused with the next free -vM "
-            "suggested, and a -vM whose predecessor is missing is refused. The "
-            "file must not contain a configured API key or the token."
+            "Commit one local file to the open round's branch of the article "
+            "SLUG, never to the base branch. The file's own name is the name it "
+            "gets and must be close-out-to-chat.md, close-out-to-code.md, "
+            "draft.md, metadata.md or publication.md; review.md and anything "
+            "under pipeline/ belong to the pipeline and are refused. An existing "
+            "file is replaced only if it is still what put read; the same bytes "
+            "make no commit. A close-out note is announced with a comment on the "
+            "pull request. The file must not contain a configured API key or the "
+            "token. A merged, untagged round of the article is tagged first."
         ),
     )
     put.add_argument("slug", metavar="SLUG", help="the article's folder name")
-    put.add_argument("file", metavar="FILE", help="the local file to add")
+    put.add_argument("file", metavar="FILE", help="the local file to commit")
+    put.add_argument(
+        "--pr",
+        type=int,
+        metavar="N",
+        default=None,
+        help="the round's pull request, when the article has more than one open",
+    )
     _repo_options(put)
     put.add_argument(
         "--publication",
@@ -308,6 +332,53 @@ def build_parser():
         ),
     )
     check.add_argument("plan", metavar="PLAN.json", help="the plan to check")
+
+    tag = sub.add_parser(
+        "tag",
+        help="tag the article's merged rounds that have no tag yet",
+        description=(
+            "Create the annotated tag SLUG/rN on the merge commit of every merged "
+            "round pull request of the article that has none, tagger dated at "
+            "the merge. Commands that write to the article do this on their own "
+            "first; this runs it alone. Safe to run twice, or at once with "
+            "another command: a tag that exists is never moved."
+        ),
+    )
+    tag.add_argument("slug", metavar="SLUG", help="the article's folder name")
+    tag.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="say which tags would be made and write nothing",
+    )
+    _repo_options(tag)
+
+    accept = sub.add_parser(
+        "accept",
+        help="merge the open round's pull request, then tag it (when the author has said to)",
+        description=(
+            "Show the article's open round pull request, its head, the last "
+            "review's run and whether a commit has landed since that review. "
+            "With --yes, merge it with a merge commit, only if its head is still "
+            "the one shown, and tag the round. A merge is the author's "
+            "acceptance: a Code session passes --yes only when the author has "
+            "said to accept the round. The normal path is the drafting chat "
+            "merging the pull request on the author's word."
+        ),
+    )
+    accept.add_argument("slug", metavar="SLUG", help="the article's folder name")
+    accept.add_argument(
+        "--pr",
+        type=int,
+        metavar="N",
+        default=None,
+        help="the round's pull request, when the article has more than one open",
+    )
+    accept.add_argument(
+        "--yes",
+        action="store_true",
+        help="merge the pull request (without it, only show it)",
+    )
+    _repo_options(accept)
     return parser
 
 
@@ -319,11 +390,6 @@ def _repo_options(parser):
             "the document repository (default: github_documents.repo in "
             f"user.yaml, else {di.DEFAULT_REPO})"
         ),
-    )
-    parser.add_argument(
-        "--branch",
-        default=None,
-        help="branch to read or commit (default: github_documents.branch, else the repository's default)",
     )
     parser.add_argument(
         "--config-dir",
@@ -481,6 +547,10 @@ def main(
             return _ls(args, environ, run, session, out)
         if args.command == "put":
             return _put(args, environ, run, session, out)
+        if args.command == "tag":
+            return _tag(args, environ, run, session, out)
+        if args.command == "accept":
+            return _accept(args, environ, run, session, out)
         return _init(args, environ, run, session, out, sleep)
     except GitHubDocumentsError as exc:
         return _fail(str(exc))
@@ -566,6 +636,7 @@ def _push_run(args, environ, run, session, out):
         merge_configs,
         normalize_github_documents,
     )
+    from .github_rounds import tag_for_saved_run
     from .github_writeback import push_saved_run
 
     # The commit must not contain a configured API key, so the keys have to be
@@ -586,9 +657,20 @@ def _push_run(args, environ, run, session, out):
     except (OSError, ValueError):
         pub = {}
     config = merge_configs(user, pub)
+    settings = normalize_github_documents(config.get("github_documents"))
+    # Tag a merged round first, as every command that writes does. It is
+    # silent about anything push_saved_run is about to refuse for itself.
+    tag_for_saved_run(
+        args.report,
+        settings=settings,
+        repo=args.github_repo,
+        token_lookup=lambda: resolve_token(environ, run),
+        session=session,
+        out=out,
+    )
     push_saved_run(
         args.report,
-        settings=normalize_github_documents(config.get("github_documents")),
+        settings=settings,
         api_keys=config["api_keys"],
         repo=args.github_repo,
         token_lookup=lambda: resolve_token(environ, run),
@@ -602,15 +684,15 @@ def _ls(args, environ, run, session, out):
     from .config_loader import normalize_github_documents
     from .github_put import format_listing, list_article
 
-    header, rows = list_article(
+    header, rounds, files = list_article(
         args.slug,
         settings=normalize_github_documents(_configured(args.config_dir)),
         repo=args.github_repo,
-        branch=args.branch,
+        ref=args.ref,
         token_lookup=lambda: resolve_token(environ, run),
         session=session,
     )
-    for line in format_listing(header, rows):
+    for line in format_listing(header, rounds, files):
         out(line)
     return 0
 
@@ -646,7 +728,42 @@ def _put(args, environ, run, session, out):
         settings=normalize_github_documents(config.get("github_documents")),
         api_keys=config["api_keys"],
         repo=args.github_repo,
-        branch=args.branch,
+        pr=args.pr,
+        token_lookup=lambda: resolve_token(environ, run),
+        session=session,
+        out=out,
+    )
+    return 0
+
+
+def _tag(args, environ, run, session, out):
+    from .config_loader import normalize_github_documents
+    from .github_rounds import tag_command
+
+    results = tag_command(
+        args.slug,
+        settings=normalize_github_documents(_configured(args.config_dir)),
+        repo=args.github_repo,
+        dry_run=args.dry_run,
+        token_lookup=lambda: resolve_token(environ, run),
+        session=session,
+        out=out,
+    )
+    # A conflict or a failure is a warning in the output; the exit status says
+    # the command did not finish its job.
+    return 1 if any(r.problem for r in results) else 0
+
+
+def _accept(args, environ, run, session, out):
+    from .config_loader import normalize_github_documents
+    from .github_rounds import accept_round
+
+    accept_round(
+        args.slug,
+        settings=normalize_github_documents(_configured(args.config_dir)),
+        repo=args.github_repo,
+        pr=args.pr,
+        yes=args.yes,
         token_lookup=lambda: resolve_token(environ, run),
         session=session,
         out=out,
