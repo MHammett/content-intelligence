@@ -41,6 +41,16 @@ PLAN.json`` validates the plan after it is edited. Both read local files only.
         --out ~/private/example-article-plan.json
     ci-docs import check ~/private/example-article-plan.json
 
+``ci-docs import apply PLAN.json --repo OWNER/NAME`` is step 2
+(``history_apply``): it writes the plan as merged pull requests, one per round,
+in order, with the original dates on every commit, and resumes after a failure
+from the plan's ``applied`` block. ``--repo`` is required, so the real repository
+is never written by accident, and ``--dry-run`` prints every write it would make
+and makes none.
+
+    ci-docs import apply ~/private/example-article-plan.json --repo OWNER/NAME --dry-run
+    ci-docs import apply ~/private/example-article-plan.json --repo OWNER/NAME
+
 The token is ``GITHUB_TOKEN``, else ``gh auth token``. It is never printed.
 """
 
@@ -355,6 +365,43 @@ def build_parser():
         ),
     )
     check.add_argument("plan", metavar="PLAN.json", help="the plan to check")
+    apply_ = imp_sub.add_parser(
+        "apply",
+        help="write an edited plan into the document repository as merged pull requests",
+        description=(
+            "Step 2 of the history import. For each round of the plan, in order: "
+            "a branch round/SLUG/rN, one commit per event dated at the event's "
+            "time, a pull request with a review per run, a merge commit dated at "
+            "accepted_at, and the annotated tag SLUG/rN. Each step is recorded in "
+            "the plan's applied block and the plan file is rewritten, so running "
+            "the same command again resumes after a failure and repeats nothing. "
+            "Refuses a public repository, a repository that is not merge-commit-"
+            "only, one that already has the article, or one that has rounds or "
+            "tags of it the plan does not account for. Nothing is deleted, moved "
+            "or force-pushed."
+        ),
+    )
+    apply_.add_argument("plan", metavar="PLAN.json", help="the checked plan to apply")
+    apply_.add_argument(
+        "--repo",
+        required=True,
+        metavar="OWNER/NAME",
+        help="the document repository to write (required: there is no default)",
+    )
+    apply_.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print every write it would make and make none (it still reads GitHub)",
+    )
+    apply_.add_argument(
+        "--config-dir",
+        default="configs",
+        metavar="DIR",
+        help=(
+            "where user.yaml is read from, for path_prefix and the API keys no "
+            "file may contain (default: configs)"
+        ),
+    )
 
     tag = sub.add_parser(
         "tag",
@@ -560,10 +607,12 @@ def main(
 ):
     """Entry point. ``environ``, ``run``, ``session`` and ``sleep`` are for tests."""
     args = build_parser().parse_args(argv)
-    if args.command == "import":
+    if args.command == "import" and args.import_command != "apply":
         # Local files only: no token, no network, nothing to catch from GitHub.
         return _import(args, environ, out)
     try:
+        if args.command == "import":
+            return _import_apply(args, environ, run, session, out)
         if args.command == "push-run":
             return _push_run(args, environ, run, session, out)
         if args.command == "ls":
@@ -630,6 +679,42 @@ def _import_scan(args, environ, hi, out):
         "Edit it (include: false, move an event, set accepted_at), then: "
         f"ci-docs import check {args.out}"
     )
+    return 0
+
+
+def _import_apply(args, environ, run, session, out):
+    from .config_loader import (
+        load_user_config,
+        merge_configs,
+        normalize_github_documents,
+    )
+    from .github_rounds import open_client, require_token
+    from .history_apply import apply_plan
+
+    # The files must not contain a configured API key, so the keys have to be
+    # known: a configuration that cannot be loaded stops the command.
+    try:
+        config = merge_configs(load_user_config(args.config_dir), {})
+    except (OSError, ValueError) as exc:
+        return _fail(
+            f"cannot read the configuration in {args.config_dir} ({exc}); apply "
+            "needs it to check the files for API keys. Pass --config-dir."
+        )
+    client = open_client(
+        args.repo.strip(), require_token(lambda: resolve_token(environ, run)), session
+    )
+    try:
+        apply_plan(
+            args.plan,
+            repo=args.repo,
+            client=client,
+            settings=normalize_github_documents(config.get("github_documents")),
+            api_keys=config["api_keys"],
+            dry_run=args.dry_run,
+            out=out,
+        )
+    finally:
+        client.close()
     return 0
 
 

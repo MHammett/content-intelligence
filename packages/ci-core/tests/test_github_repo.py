@@ -106,6 +106,14 @@ class FakeGitHub:
             "delete_branch_on_merge": False,
         }
         self.page_size = None  # cap on items per page, whatever per_page asks for
+        # Moving a branch to a commit that contains an open pull request's head
+        # marks that pull request merged, as GitHub does (checked live on
+        # 2026-10-27, see docs/GITHUB-DOCUMENTS.md "Importing an article's
+        # history"). A test sets this False to model a GitHub that does not.
+        self.marks_merged_on_ref_move = True
+        # GitHub shows the merged flag a few seconds after the push: this many
+        # reads of the pull request still say "open" before it appears.
+        self.merge_flag_lag = 0
         # GitHub refuses APPROVE from the pull request's own author, and the
         # token here is always that author.
         self.author_is_reviewer = True
@@ -339,11 +347,18 @@ class FakeGitHub:
             return self._compare(path[len("/compare/") :])
         if method == "GET" and path.startswith("/git/commits/"):
             sha = path[len("/git/commits/") :]
+            if sha not in self.commits:
+                return Resp(404, {"message": "Not Found"})
+            commit = self.commits[sha]
             return Resp(
                 200,
                 {
                     "sha": sha,
-                    "tree": {"sha": self.commits[sha]["tree"]},
+                    "message": commit["message"],
+                    "parents": [{"sha": p} for p in commit["parents"]],
+                    "author": commit.get("author"),
+                    "committer": commit.get("committer"),
+                    "tree": {"sha": commit["tree"]},
                     "html_url": f"https://github.com/{REPO}/commit/{sha}",
                 },
             )
@@ -527,6 +542,7 @@ class FakeGitHub:
                 return Resp(404, {"message": "Not Found"})
             rest = "/".join(parts[3:])
             if (method, rest) == ("GET", ""):
+                self._settle_pending_merge(pull)
                 return Resp(200, self._pull_json(pull))
             if (method, rest) == ("PUT", "merge"):
                 return self._merge(pull, body)
@@ -570,6 +586,22 @@ class FakeGitHub:
                     "html_url": f"https://github.com/{REPO}/issues/{number}",
                 },
             )
+        if (
+            method == "POST"
+            and path.startswith("/issues/")
+            and path.endswith("/labels")
+        ):
+            number = int(path.split("/")[2])
+            item = self.issues.get(number) or self.pulls.get(number)
+            if item is None:
+                return Resp(404, {"message": "Not Found"})
+            have = item.setdefault("labels", [])
+            for name in body["labels"]:
+                # GitHub makes a label that does not exist; one that does is not doubled.
+                self.labels.setdefault(name.lower(), {"name": name, "color": "ededed"})
+                if name not in have:
+                    have.append(name)
+            return Resp(200, [{"name": name} for name in have])
         if (
             method == "POST"
             and path.startswith("/issues/")
@@ -646,6 +678,17 @@ class FakeGitHub:
 
     def _review(self, pull, body):
         assert set(body) <= {"commit_id", "body", "event", "comments"}, body
+        if body["commit_id"] not in self._ancestors(self.branches[pull["head"]]):
+            # GitHub: a review is of a commit that is part of the pull request.
+            return Resp(
+                422,
+                {
+                    "message": "Unprocessable Entity",
+                    "errors": [
+                        "Pull request review commit_id is not part of the pull request"
+                    ],
+                },
+            )
         if body["event"] == "APPROVE" and self.author_is_reviewer:
             return Resp(
                 422,
@@ -689,9 +732,47 @@ class FakeGitHub:
             # The words the real API uses for a non-fast-forward update.
             return Resp(422, {"message": "Update is not a fast forward"})
         self.branches[branch] = body["sha"]
+        if self.marks_merged_on_ref_move:
+            self._mark_merged_by_push(branch, body["sha"])
         return Resp(
             200, {"ref": f"refs/heads/{branch}", "object": {"sha": body["sha"]}}
         )
+
+    def _mark_merged_by_push(self, branch, new_head):
+        """An open pull request whose head is now in ``branch``'s history is merged."""
+        for pull in self.pulls.values():
+            if pull["state"] != "open" or pull["base"] != branch:
+                continue
+            head = self.branches.get(pull["head"])
+            if (
+                head is None
+                or head == new_head
+                or not self._is_ancestor(head, new_head)
+            ):
+                continue
+            merged = {
+                "state": "closed",
+                "merged": True,
+                "merged_at": "2026-10-27T12:00:00Z",
+                "merge_commit_sha": new_head,
+                "head_sha": head,
+                "merge_method": "push",
+            }
+            if self.merge_flag_lag:
+                pull["_merged_state"] = merged
+                pull["merge_pending"] = self.merge_flag_lag
+            else:
+                pull.update(merged)
+
+    def _settle_pending_merge(self, pull):
+        """One read of a pull request whose merged flag has not appeared yet."""
+        if "_merged_state" not in pull:
+            return
+        if pull["merge_pending"] > 0:
+            pull["merge_pending"] -= 1
+        else:
+            pull.update(pull.pop("_merged_state"))
+            del pull["merge_pending"]
 
     def _contents(self, method, path, accept, params, body):
         if method == "PUT":
@@ -1609,6 +1690,73 @@ def test_a_signature_must_be_timezone_aware_and_keeps_its_offset():
 
 
 # -- labels, issues, settings --------------------------------------------------
+
+
+def test_add_labels_adds_without_doubling_and_returns_the_names(gh, fake):
+    pull = _open_pull(gh, fake)
+    assert gh.add_labels(pull.number, ["round", "article:example-article"]) == [
+        "round",
+        "article:example-article",
+    ]
+    assert gh.add_labels(pull.number, ["round"]) == [
+        "round",
+        "article:example-article",
+    ]
+    with pytest.raises(ValueError):
+        gh.add_labels(pull.number, [])
+    with pytest.raises(ValueError):
+        gh.add_labels(0, ["round"])
+
+
+def test_get_commit_reads_message_parents_tree_and_both_dates(gh, fake):
+    sig = _sig(day=20, hour=9)
+    tip = gh.commit_files(
+        "main", {"a.md": b"a\n"}, "subject\n\nbody line", author=sig, committer=sig
+    ).commit_sha
+    got = gh.get_commit(tip)
+    assert got.sha == tip
+    assert got.message == "subject\n\nbody line"
+    assert got.parents == (fake.commits[tip]["parents"][0],)
+    assert got.tree == fake.commits[tip]["tree"]
+    assert got.author_date == got.committer_date == "2026-06-20T09:02:11+00:00"
+    raises("not_found", gh.get_commit, "0" * 40)
+    with pytest.raises(ValueError):
+        gh.get_commit("main")
+
+
+def test_moving_a_branch_to_a_commit_that_holds_a_pull_requests_head_merges_it(
+    gh, fake
+):
+    pull = _open_pull(gh, fake)
+    head = fake.branches[pull.head_ref]
+    gh.merge_commit("main", head, "merge by push")
+    got = gh.get_pull(pull.number)
+    assert got.merged and got.state == "closed"
+    assert got.merge_commit_sha == fake.branches["main"]
+
+
+def test_the_merged_flag_can_lag_and_a_fake_can_decline_to_set_it(gh, fake):
+    fake.merge_flag_lag = 2
+    pull = _open_pull(gh, fake)
+    gh.merge_commit("main", fake.branches[pull.head_ref], "merge by push")
+    assert [gh.get_pull(pull.number).merged for _ in range(3)] == [False, False, True]
+
+    fake.marks_merged_on_ref_move = False
+    other = _open_pull(gh, fake, name="round/example-article/r2", title="r2")
+    gh.merge_commit("main", fake.branches[other.head_ref], "merge by push")
+    assert not gh.get_pull(other.number).merged
+
+
+def test_a_review_of_a_commit_outside_the_pull_request_is_refused(gh, fake):
+    pull = _open_pull(gh, fake)
+    elsewhere = fake.external_commit("main", {"later.md": b"later\n"})
+    raises(
+        "other",
+        gh.create_review,
+        pull.number,
+        commit_id=elsewhere,
+        body="not part of it",
+    )
 
 
 def test_ensure_label_creates_once_then_sends_no_write(gh, fake):

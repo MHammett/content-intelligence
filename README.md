@@ -786,6 +786,28 @@ A draft that is the same text in two places is one version (CRLF and trailing wh
 | `--min-chat-words N` | the fewest words such a chat-only document may have (default 300) |
 | `--out PLAN.json` | where the plan goes; must be outside the checkout |
 
+### `ci-docs import apply`
+
+Step 2: write the checked plan into the document repository as **merged pull requests, one per round, in order, with the original dates on every commit** (issue #421; [Decision 7](docs/GITHUB-DOCUMENTS.md#importing-an-articles-history)).
+
+```powershell
+uv run ci-docs import apply D:\private\my-article-plan.json --repo OWNER/NAME --dry-run
+uv run ci-docs import apply D:\private\my-article-plan.json --repo OWNER/NAME
+```
+
+`--repo` is required and there is no default, so the real repository is never written by accident. `--dry-run` reads GitHub (to run every refusal below) and prints each write it would make, and makes none, not even to the plan file. For each round with an included event it writes, in order: the branch `round/<slug>/rN` from `main`; one commit per event, `author` and `committer` the token's user with the event's time as the date (`draft:` and `revise:` write `draft.md` and `metadata.md`, or `handoff.md` for a Template A round, and a commit that moves between the two forms deletes the other; `review:` writes `review.md` and `pipeline/run.json`, `report.json` and `worklist.md` as `--write-back` does; `close-out:` and `publication:` write their fixed names); the pull request, labelled `round` and `article:<slug>`; one pull request review per run (the `--write-back` body and marker, no line comments); the merge, which moves `main` to a merge commit dated `accepted_at` and reads the merged flag back; and the annotated tag `<slug>/rN` dated `accepted_at`. Every commit message ends in trailers naming where each text came from (`Imported-from: file <name>`, `drive <id>`, `chat <conversation>/<message>`, `run <name>`), never what it says, plus `Imported-at:` and `Plan-event:`; a reproduction adds `Recovered: reproduced by a chat from its context; not the original bytes`. A pull request's own timestamps are the import's (GitHub does not let anyone set them); only the commits carry the original dates. A file that holds a configured API key stops the import before anything is sent.
+
+**Refused before any write:** a plan `ci-docs import check` rejects; a public repository (no override); a token that cannot push; a repository that is not merge-commit-only (run `ci-docs init`); `main` already having `articles/<slug>/`; and any `round/<slug>/...` branch or `<slug>/...` tag that the plan's `applied` block does not account for. Nothing is ever deleted, moved or force-pushed.
+
+**Resuming.** After every step the plan file is rewritten with that step's result in its `applied` block (`branch`, `commits`, `pull_request`, `reviews`, `merge`, `tag` per round). After a failure, run the same command again: a step that is recorded and still true is skipped, one that is recorded and gone is an error and is never redone, and one GitHub has but the plan does not record (the process died between the two) is adopted when its commit carries this import's `Plan-event` trailer. Running it on a finished plan makes no write.
+
+| Flag | Meaning |
+|---|---|
+| `PLAN.json` | the plan, outside the checkout (it is rewritten as the import proceeds) |
+| `--repo OWNER/NAME` | the document repository to write; required |
+| `--dry-run` | print every write and make none |
+| `--config-dir DIR` | where `user.yaml` is read from, for `path_prefix` and the API keys no file may contain (default `configs`) |
+
 ---
 
 ## Running the tests
@@ -1074,6 +1096,7 @@ content-intelligence/
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── chat_export.py         reads a claude.ai data export for ci-docs import scan (--chat-export)
 │   │   │   ├── history_import.py      ci-docs import scan/check: merge an article's local sources into an editable plan
+│   │   │   ├── history_apply.py       ci-docs import apply: write a checked plan as merged, dated pull requests; resumes from the plan
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
 │   │   │   ├── passage_match.py       decides when two quoted passages are the same passage
 │   │   │   ├── voice_pattern_report.py  recurring voice patterns across articles (ci-voice-patterns)
