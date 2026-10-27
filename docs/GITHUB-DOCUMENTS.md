@@ -908,10 +908,21 @@ interleaves with live rounds):
    parents `main`'s tip and the branch tip, dated `accepted_at`), and `main`'s ref
    moved to it as a fast-forward. GitHub marks a pull request merged when its
    commits reach the base branch by a direct push
-   ([changelog, 2023-09-26](https://github.blog/changelog/2023-09-26-more-details-provided-when-a-pull-request-is-merged-indirectly-or-is-still-processing-updates/));
-   that this holds for a ref moved through the API is the phase's first live check
-   on the scratch repository, and the fallback is `PUT .../merge` (dated at import
-   time, with the original date in its message);
+   ([changelog, 2023-09-26](https://github.blog/changelog/2023-09-26-more-details-provided-when-a-pull-request-is-merged-indirectly-or-is-still-processing-updates/)).
+   **Checked live (2026-10-27, `MHammett/ci-docs-scratch`, `ci_core.github_repo`'s
+   `merge_commit`): it holds for a ref moved through the API.** A pull request
+   opened on a round branch with four commits, then `main` moved to a merge
+   commit built with the Git Data API (parents `main`'s old tip and the branch
+   tip, `force: false`), read `state: closed`, `merged: true`, `merged_by` the
+   token's user, `merged_at` the moment of the push and `merge_commit_sha` the
+   hand-built commit, within five seconds (the first read, a second after the
+   push, still said `open`, with GitHub's own test-merge SHA in
+   `merge_commit_sha`: poll for `merged`, do not read it once). The web page shows
+   the purple "Merged" badge, "merged commit 4f320ec into main" and "Pull request
+   successfully merged and closed", and the timeline has a `merged` event with that
+   commit. So the pull request's `merged_at` and merger are the import's, not
+   `accepted_at` (the commit's own dates are), as step 3 already says. The
+   `PUT .../merge` fallback was not needed;
 5. the annotated tag `<slug>/rN`, `tagger.date` = `accepted_at`.
 
 `apply` records each step's result (branch, commit SHAs, pull request number, tag)

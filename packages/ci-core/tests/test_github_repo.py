@@ -10,6 +10,10 @@ back from the Contents API only when asked for raw.
 
 Where the fake is deliberately strict, it is because the real API is. Each such
 choice names its source in a comment.
+
+It also holds pull requests (a merge makes a two-parent commit and moves the
+base), reviews, annotated tag objects, labels, issues, repository settings, the
+compare endpoint, and ``Link`` pagination with a configurable page size.
 """
 
 import base64
@@ -17,12 +21,21 @@ import hashlib
 import json
 import logging
 import subprocess
+from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote, urlencode
 
 import pytest
 import requests
 
 from ci_core import github_repo, http
-from ci_core.github_repo import GitHubRepo, GitHubRepoError, git_blob_sha, resolve_token
+from ci_core.github_repo import (
+    GitHubRepo,
+    GitHubRepoError,
+    RepoInfo,
+    Signature,
+    git_blob_sha,
+    resolve_token,
+)
 
 REPO = "owner/name"
 TOKEN = "ghp_exampleSECRETtoken0123456789"
@@ -75,7 +88,24 @@ class FakeGitHub:
         self.before_ref_update = None  # called with the fake, on every ref update
         self.injected = []  # [(method, path part, Resp, times left)]
         self.closed = False
+        self.tags = {}  # tag name -> sha it points at (a tag object, or a commit)
+        self.tag_objects = {}  # sha -> {"tag", "message", "object", "type", "tagger"}
+        self.pulls = {}  # number -> dict, see _create_pull
+        self.reviews = {}  # pull number -> [dict]
+        self.labels = {}  # lower-case name -> dict
+        self.issues = {}  # number -> {"title", "body", "labels", "comments": [..]}
+        self.settings = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
+        }
+        self.page_size = None  # cap on items per page, whatever per_page asks for
+        # GitHub refuses APPROVE from the pull request's own author, and the
+        # token here is always that author.
+        self.author_is_reviewer = True
         self._n = 0
+        self._numbers = 0  # pull requests and issues share one number space
         if not empty:
             self.external_commit("main", {"README.md": b"# readme\n"}, "initial")
 
@@ -114,16 +144,48 @@ class FakeGitHub:
         self.trees[sha] = dict(flat)
         return sha
 
-    def _new_commit(self, tree, parents, message):
+    def _new_commit(self, tree, parents, message, author=None, committer=None):
         self._n += 1
         sha = _sha("commit", tree, parents, message, self._n)
-        self.commits[sha] = {"tree": tree, "parents": list(parents), "message": message}
+        self.commits[sha] = {
+            "tree": tree,
+            "parents": list(parents),
+            "message": message,
+            "author": author,
+            "committer": committer,
+        }
         return sha
 
     def _resolve(self, ref):
         if ref in self.commits:
             return ref
         return self.branches.get(ref)
+
+    def _next_number(self):
+        self._numbers += 1
+        return self._numbers
+
+    def pull_by_head(self, head_ref):
+        return next(p for p in self.pulls.values() if p["head"] == head_ref)
+
+    def _page(self, path, items, params):
+        """One page of ``items`` and, while there is more, GitHub's ``Link`` header."""
+        per = int(params.get("per_page", 30))
+        if self.page_size:
+            per = min(per, self.page_size)
+        page = int(params.get("page", 1))
+        chunk = items[(page - 1) * per : page * per]
+        headers = {}
+        if page * per < len(items):
+            base = f"https://api.github.com/repos/{REPO}{path}"
+            query = lambda n: urlencode({**params, "per_page": per, "page": n})  # noqa: E731
+            last = -(-len(items) // per)
+            parts = [f'<{base}?{query(page + 1)}>; rel="next"']
+            parts.append(f'<{base}?{query(last)}>; rel="last"')
+            if page > 1:
+                parts.append(f'<{base}?{query(page - 1)}>; rel="prev"')
+            headers["Link"] = ", ".join(parts)
+        return Resp(200, chunk, headers=headers)
 
     def _is_ancestor(self, old, new):
         seen, todo = set(), [new]
@@ -168,15 +230,12 @@ class FakeGitHub:
     def _route(self, method, path, headers, params, body):
         accept = headers.get("Accept", "")
         if (method, path) == ("GET", ""):
-            return Resp(
-                200,
-                {
-                    "default_branch": "main",
-                    "private": True,
-                    "permissions": {"push": True},
-                },
-            )
-        git_routes = path.startswith(("/git/", "/commits"))
+            return Resp(200, self._repo_json())
+        if (method, path) == ("PATCH", ""):
+            assert set(body) <= set(self.settings), body
+            self.settings.update(body)
+            return Resp(200, self._repo_json())
+        git_routes = path.startswith(("/git/", "/commits", "/compare/"))
         if self.empty and git_routes:
             # https://docs.github.com/en/rest/guides/using-the-rest-api-to-interact-with-your-git-database
             return Resp(409, {"message": "Git Repository is empty."})
@@ -194,6 +253,39 @@ class FakeGitHub:
             if sha is None:
                 return Resp(404, {"message": "Not Found"})
             return Resp(200, {"object": {"sha": sha, "type": "commit"}})
+        if method == "GET" and path.startswith("/git/ref/tags/"):
+            sha = self.tags.get(path[len("/git/ref/tags/") :])
+            if sha is None:
+                return Resp(404, {"message": "Not Found"})
+            kind = "tag" if sha in self.tag_objects else "commit"
+            return Resp(200, {"object": {"sha": sha, "type": kind}})
+        if method == "GET" and path.startswith("/git/matching-refs/"):
+            prefix = "refs/" + unquote(path[len("/git/matching-refs/") :])
+            refs = [(f"refs/heads/{b}", s) for b, s in self.branches.items()]
+            refs += [(f"refs/tags/{t}", s) for t, s in self.tags.items()]
+            found = [
+                {
+                    "ref": r,
+                    "object": {
+                        "sha": s,
+                        "type": "tag" if s in self.tag_objects else "commit",
+                    },
+                }
+                for r, s in sorted(refs)
+                if r.startswith(prefix)
+            ]
+            return self._page(path, found, params)
+        if (method, path) == ("POST", "/git/refs"):
+            return self._create_ref(body)
+        if (method, path) == ("POST", "/git/tags"):
+            assert body["type"] == "commit" and body["object"] in self.commits
+            assert set(body["tagger"]) == {"name", "email", "date"}
+            sha = _sha("tag", body["tag"], body["object"], body["message"], self._n)
+            self._n += 1
+            self.tag_objects[sha] = dict(body)
+            return Resp(201, {"sha": sha, "tag": body["tag"]})
+        if method == "GET" and path.startswith("/compare/"):
+            return self._compare(path[len("/compare/") :])
         if method == "GET" and path.startswith("/git/commits/"):
             sha = path[len("/git/commits/") :]
             return Resp(
@@ -213,11 +305,27 @@ class FakeGitHub:
             flat = dict(self.trees[body["base_tree"]]) if body.get("base_tree") else {}
             for e in body["tree"]:
                 assert e["mode"] == "100644" and e["type"] == "blob"
+                if e["sha"] is None:
+                    # https://docs.github.com/en/rest/git/trees: a null sha
+                    # deletes the path from the base tree; one the base does
+                    # not hold is an error.
+                    if e["path"] not in flat:
+                        return Resp(422, {"message": "GitRPC::BadObjectState"})
+                    del flat[e["path"]]
+                    continue
                 assert e["sha"] in self.blobs
                 flat[e["path"]] = e["sha"]
             return Resp(201, {"sha": self._new_tree(flat)})
         if (method, path) == ("POST", "/git/commits"):
-            sha = self._new_commit(body["tree"], body["parents"], body["message"])
+            for parent in body["parents"]:
+                assert parent in self.commits, parent
+            sha = self._new_commit(
+                body["tree"],
+                body["parents"],
+                body["message"],
+                body.get("author"),
+                body.get("committer"),
+            )
             return Resp(
                 201, {"sha": sha, "html_url": f"https://github.com/{REPO}/commit/{sha}"}
             )
@@ -227,7 +335,245 @@ class FakeGitHub:
             return self._contents(
                 method, path[len("/contents") :].lstrip("/"), accept, params, body
             )
+        if path.startswith(("/pulls", "/labels", "/issues")):
+            return self._collab(method, path, params, body)
         return Resp(404, {"message": "Not Found"})
+
+    def _create_ref(self, body):
+        ref, sha = body["ref"], body["sha"]
+        assert ref.startswith(("refs/heads/", "refs/tags/")), ref
+        kind, _, name = ref.split("/", 2)
+        table = self.branches if ref.startswith("refs/heads/") else self.tags
+        if name in table:
+            return Resp(422, {"message": "Reference already exists"})
+        if sha not in self.commits and sha not in self.tag_objects:
+            return Resp(422, {"message": "Object does not exist"})
+        table[name] = sha
+        return Resp(201, {"ref": ref, "object": {"sha": sha}})
+
+    def _compare(self, basehead):
+        base, _, head = basehead.partition("...")
+        for sha in (base, head):
+            if sha not in self.commits:
+                return Resp(404, {"message": f"No commit found for SHA: {sha}"})
+        if base == head:
+            status = "identical"
+        elif self._is_ancestor(base, head):
+            status = "ahead"
+        elif self._is_ancestor(head, base):
+            status = "behind"
+        else:
+            status = "diverged"
+        return Resp(200, {"status": status})
+
+    def _collab(self, method, path, params, body):
+        """Pull requests, reviews, labels and issues."""
+        if (method, path) == ("GET", "/pulls"):
+            state = params.get("state", "open")
+            found = [
+                self._pull_json(p, full=False)
+                for _, p in sorted(self.pulls.items())
+                if state == "all" or p["state"] == state
+            ]
+            return self._page(path, found, params)
+        if (method, path) == ("POST", "/pulls"):
+            if body["head"] not in self.branches or body["base"] not in self.branches:
+                return Resp(
+                    422,
+                    {
+                        "message": "Validation Failed",
+                        "errors": [{"resource": "PullRequest", "code": "invalid"}],
+                    },
+                )
+            if any(
+                p["state"] == "open" and p["head"] == body["head"]
+                for p in self.pulls.values()
+            ):
+                return Resp(
+                    422,
+                    {
+                        "message": "Validation Failed",
+                        "errors": [
+                            {
+                                "resource": "PullRequest",
+                                "code": "custom",
+                                "message": f"A pull request already exists for {body['head']}.",
+                            }
+                        ],
+                    },
+                )
+            number = self._next_number()
+            self.pulls[number] = {
+                "number": number,
+                "state": "open",
+                "merged": False,
+                "merged_at": None,
+                "merge_commit_sha": None,
+                "head": body["head"],
+                "base": body["base"],
+                "head_sha": None,
+                "title": body["title"],
+                "body": body["body"],
+            }
+            return Resp(201, self._pull_json(self.pulls[number]))
+        parts = path.split("/")  # ["", "pulls", "7", "merge"]
+        if parts[1] == "pulls" and len(parts) >= 3:
+            pull = self.pulls.get(int(parts[2]))
+            if pull is None:
+                return Resp(404, {"message": "Not Found"})
+            rest = "/".join(parts[3:])
+            if (method, rest) == ("GET", ""):
+                return Resp(200, self._pull_json(pull))
+            if (method, rest) == ("PUT", "merge"):
+                return self._merge(pull, body)
+            if (method, rest) == ("GET", "reviews"):
+                return self._page(path, self.reviews.get(pull["number"], []), params)
+            if (method, rest) == ("POST", "reviews"):
+                return self._review(pull, body)
+        if method == "GET" and path.startswith("/labels/"):
+            label = self.labels.get(unquote(path[len("/labels/") :]).lower())
+            return Resp(200, label) if label else Resp(404, {"message": "Not Found"})
+        if (method, path) == ("POST", "/labels"):
+            if body["name"].lower() in self.labels:
+                return Resp(
+                    422,
+                    {
+                        "message": "Validation Failed",
+                        "errors": [
+                            {
+                                "resource": "Label",
+                                "code": "already_exists",
+                                "field": "name",
+                            }
+                        ],
+                    },
+                )
+            assert not body["color"].startswith("#")
+            self.labels[body["name"].lower()] = dict(body)
+            return Resp(201, dict(body))
+        if (method, path) == ("POST", "/issues"):
+            number = self._next_number()
+            self.issues[number] = {
+                "title": body["title"],
+                "body": body["body"],
+                "labels": body.get("labels", []),
+                "comments": [],
+            }
+            return Resp(
+                201,
+                {
+                    "number": number,
+                    "html_url": f"https://github.com/{REPO}/issues/{number}",
+                },
+            )
+        if (
+            method == "POST"
+            and path.startswith("/issues/")
+            and path.endswith("/comments")
+        ):
+            number = int(path.split("/")[2])
+            item = self.issues.get(number) or self.pulls.get(number)
+            if item is None:
+                return Resp(404, {"message": "Not Found"})
+            comments = item.setdefault("comments", [])
+            comments.append(body["body"])
+            return Resp(
+                201,
+                {
+                    "html_url": f"https://github.com/{REPO}/issues/{number}#c{len(comments)}"
+                },
+            )
+        return Resp(404, {"message": "Not Found"})
+
+    def _pull_json(self, pull, *, full=True):
+        # The list endpoint has no ``merged`` flag; a single pull request does.
+        merged_head = pull["head_sha"] or self.branches[pull["head"]]
+        out = {
+            "number": pull["number"],
+            "state": pull["state"],
+            "merged_at": pull["merged_at"],
+            "merge_commit_sha": pull["merge_commit_sha"],
+            "head": {
+                "ref": pull["head"],
+                "sha": merged_head,
+                "repo": {"full_name": REPO},
+            },
+            "base": {"ref": pull["base"], "sha": self.branches[pull["base"]]},
+            "title": pull["title"],
+            "html_url": f"https://github.com/{REPO}/pull/{pull['number']}",
+        }
+        if full:
+            out["merged"] = pull["merged"]
+        return out
+
+    def _merge(self, pull, body):
+        if pull["state"] != "open":
+            return Resp(405, {"message": "Pull Request is not mergeable"})
+        head = self.branches[pull["head"]]
+        if body.get("sha") and body["sha"] != head:
+            # https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request
+            return Resp(
+                409,
+                {
+                    "message": "Head branch was modified. Review and try the merge again."
+                },
+            )
+        base = self.branches[pull["base"]]
+        flat = dict(self.trees[self.commits[head]["tree"]])
+        if not self._is_ancestor(base, head):
+            flat = {**self.trees[self.commits[base]["tree"]], **flat}
+        message = body.get("commit_title") or f"Merge pull request #{pull['number']}"
+        if body.get("commit_message"):
+            message += "\n\n" + body["commit_message"]
+        sha = self._new_commit(self._new_tree(flat), [base, head], message)
+        self.branches[pull["base"]] = sha
+        pull.update(
+            state="closed",
+            merged=True,
+            merged_at="2026-10-27T12:00:00Z",
+            merge_commit_sha=sha,
+            head_sha=head,
+            merge_method=body["merge_method"],
+        )
+        return Resp(
+            200,
+            {"sha": sha, "merged": True, "message": "Pull Request successfully merged"},
+        )
+
+    def _review(self, pull, body):
+        assert set(body) <= {"commit_id", "body", "event", "comments"}, body
+        if body["event"] == "APPROVE" and self.author_is_reviewer:
+            return Resp(
+                422,
+                {
+                    "message": "Unprocessable Entity",
+                    "errors": ["Can not approve your own pull request"],
+                },
+            )
+        reviews = self.reviews.setdefault(pull["number"], [])
+        state = {
+            "COMMENT": "COMMENTED",
+            "APPROVE": "APPROVED",
+            "REQUEST_CHANGES": "CHANGES_REQUESTED",
+        }[body["event"]]
+        review = {
+            "id": 1000 + len(reviews),
+            "body": body["body"],
+            "commit_id": body["commit_id"],
+            "state": state,
+            "submitted_at": "2026-10-27T12:00:00Z",
+            "html_url": f"https://github.com/{REPO}/pull/{pull['number']}#pullrequestreview-{1000 + len(reviews)}",
+        }
+        reviews.append(review)
+        return Resp(200, review)
+
+    def _repo_json(self):
+        return {
+            "default_branch": "main",
+            "private": True,
+            "permissions": {"push": True},
+            **self.settings,
+        }
 
     def _update_ref(self, branch, body):
         if self.before_ref_update:
@@ -660,6 +1006,723 @@ def test_seed_empty_refuses_the_token():
     gh = GitHubRepo(REPO, TOKEN, session=fake)
     raises("secret", gh.seed_empty, "a.md", TOKEN.encode(), "m")
     assert fake.requests == []
+
+
+# -- the round surface: helpers ----------------------------------------------
+
+
+def _when(day=14, hour=18, tz=timezone.utc):
+    return datetime(2026, 6, day, hour, 2, 11, tzinfo=tz)
+
+
+def _sig(day=14, hour=18, tz=timezone.utc):
+    return Signature("Example Author", "author@example.invalid", _when(day, hour, tz))
+
+
+def _round_branch(fake, name="round/example-article/r1", files=None):
+    """A branch cut from ``main`` with one commit of its own; returns its tip."""
+    fake.branches[name] = fake.branches["main"]
+    return fake.external_commit(
+        name, files or {"articles/example-article/draft.md": b"draft\n"}, "draft"
+    )
+
+
+def _open_pull(gh, fake, name="round/example-article/r1", title="example-article r1"):
+    _round_branch(fake, name)
+    return gh.create_pull(name, "main", title, "body")
+
+
+def _posts(fake, part):
+    return [r for r in fake.requests if r[0] == "POST" and part in r[1]]
+
+
+# -- pagination ----------------------------------------------------------------
+
+
+def test_a_list_is_followed_across_three_pages(gh, fake):
+    for n in range(1, 6):
+        _open_pull(gh, fake, f"round/example-article/r{n}")
+    fake.page_size = 2
+    before = len(fake.requests)
+    pulls = gh.list_pulls()
+    assert [p.number for p in pulls] == [1, 2, 3, 4, 5]
+    gets = [
+        r for r in fake.requests[before:] if r[0] == "GET" and r[1].endswith("/pulls")
+    ]
+    assert len(gets) == 3
+    assert gets[0][2]["per_page"] == 100 and gets[0][2]["state"] == "open"
+    assert [r[2]["page"] for r in gets[1:]] == ["2", "3"]
+
+
+def test_a_list_that_never_ends_stops_at_the_page_cap(gh, fake, monkeypatch):
+    for n in range(1, 5):
+        _open_pull(gh, fake, f"round/example-article/r{n}")
+    fake.page_size = 1
+    monkeypatch.setattr(github_repo, "_MAX_PAGES", 3)
+    before = len(fake.requests)
+    err = raises("other", gh.list_pulls)
+    assert "more than 3 pages" in str(err)
+    assert len(fake.requests) - before == 3
+
+
+def test_a_list_exactly_at_the_page_cap_is_complete(gh, fake, monkeypatch):
+    for n in range(1, 4):
+        _open_pull(gh, fake, f"round/example-article/r{n}")
+    fake.page_size = 1
+    monkeypatch.setattr(github_repo, "_MAX_PAGES", 3)
+    assert len(gh.list_pulls()) == 3
+
+
+def test_a_next_link_that_leaves_the_api_host_is_not_followed(gh, fake):
+    fake.inject(
+        "GET",
+        "/pulls",
+        Resp(200, [], headers={"Link": '<https://evil.example/x?page=2>; rel="next"'}),
+    )
+    err = raises("other", gh.list_pulls)
+    assert "leaves the API host" in str(err)
+    assert fake.count("GET", "/pulls") == 1
+
+
+def test_list_pulls_filters_by_state_and_rejects_a_bad_one(gh, fake):
+    _open_pull(gh, fake, "round/example-article/r1")
+    _open_pull(gh, fake, "round/example-article/r2")
+    gh.merge_pull(1, sha=fake.branches["round/example-article/r1"])
+    assert [p.number for p in gh.list_pulls()] == [2]
+    assert [p.number for p in gh.list_pulls("closed")] == [1]
+    assert [p.number for p in gh.list_pulls("all")] == [1, 2]
+    with pytest.raises(ValueError):
+        gh.list_pulls("merged")
+
+
+# -- pull requests -------------------------------------------------------------
+
+
+def test_create_pull_then_get_pull_report_every_field(gh, fake):
+    tip = _round_branch(fake)
+    made = gh.create_pull("round/example-article/r1", "main", "example-article r1", "b")
+    got = gh.get_pull(made.number)
+    assert got == made
+    assert (got.number, got.state, got.merged, got.merged_at) == (
+        1,
+        "open",
+        False,
+        None,
+    )
+    assert got.head_ref == "round/example-article/r1" and got.head_sha == tip
+    assert got.head_repo == REPO
+    assert got.base_ref == "main" and got.base_sha == fake.branches["main"]
+    assert got.title == "example-article r1"
+    assert got.html_url == f"https://github.com/{REPO}/pull/1"
+    sent = _posts(fake, "/pulls")[0][3]
+    assert sent == {
+        "head": "round/example-article/r1",
+        "base": "main",
+        "title": "example-article r1",
+        "body": "b",
+    }
+
+
+def test_a_second_pull_request_for_one_branch_says_why(gh, fake):
+    _open_pull(gh, fake)
+    err = raises("other", gh.create_pull, "round/example-article/r1", "main", "t", "b")
+    assert err.status == 422 and "already exists" in str(err)
+
+
+def test_a_pull_request_that_does_not_exist_is_not_found(gh):
+    raises("not_found", gh.get_pull, 99)
+
+
+def test_a_pull_number_must_be_a_positive_int(gh):
+    for bad in (0, -1, "1", 1.5, True, None):
+        with pytest.raises(ValueError):
+            gh.get_pull(bad)
+
+
+def test_merge_pull_with_the_right_sha_merges(gh, fake):
+    tip = _round_branch(fake)
+    old_main = fake.branches["main"]
+    gh.create_pull("round/example-article/r1", "main", "example-article r1", "b")
+    sha = gh.merge_pull(1, sha=tip, commit_title="Merge example-article r1")
+    assert fake.branches["main"] == sha
+    assert fake.commits[sha]["parents"] == [old_main, tip]
+    assert fake.commits[sha]["message"] == "Merge example-article r1"
+    assert "articles/example-article/draft.md" in fake.tree_at("main")
+    assert fake.requests[-1][3] == {
+        "sha": tip,
+        "merge_method": "merge",
+        "commit_title": "Merge example-article r1",
+    }
+    pull = gh.get_pull(1)
+    assert pull.state == "closed" and pull.merged is True
+    assert pull.merged_at and pull.merge_commit_sha == sha
+    # The list entry has no ``merged`` flag; it is derived from ``merged_at``.
+    assert gh.list_pulls("closed")[0].merged is True
+
+
+def test_merge_pull_with_a_stale_sha_is_a_conflict_and_merges_nothing(gh, fake):
+    tip = _round_branch(fake)
+    gh.create_pull("round/example-article/r1", "main", "t", "b")
+    fake.external_commit("round/example-article/r1", {"late.md": b"late"})
+    main = fake.branches["main"]
+    err = raises("conflict", gh.merge_pull, 1, sha=tip)
+    assert err.status == 409 and "Head branch was modified" in str(err)
+    assert fake.branches["main"] == main
+    assert gh.get_pull(1).state == "open" and not gh.get_pull(1).merged
+
+
+def test_merge_pull_of_a_closed_pull_request_is_a_conflict(gh, fake):
+    tip = _round_branch(fake)
+    gh.create_pull("round/example-article/r1", "main", "t", "b")
+    gh.merge_pull(1, sha=tip)
+    err = raises("conflict", gh.merge_pull, 1, sha=tip)
+    assert err.status == 405 and "not mergeable" in str(err)
+
+
+def test_merge_pull_passes_the_method_and_message_and_rejects_a_bad_method(gh, fake):
+    tip = _round_branch(fake)
+    gh.create_pull("round/example-article/r1", "main", "t", "b")
+    with pytest.raises(ValueError):
+        gh.merge_pull(1, sha=tip, merge_method="fast-forward")
+    gh.merge_pull(1, sha=tip, merge_method="squash", commit_message="why")
+    assert fake.requests[-1][3]["merge_method"] == "squash"
+    assert fake.requests[-1][3]["commit_message"] == "why"
+
+
+def test_merge_pull_that_gets_no_merge_back_is_an_error(gh, fake):
+    tip = _round_branch(fake)
+    gh.create_pull("round/example-article/r1", "main", "t", "b")
+    fake.inject("PUT", "/merge", Resp(200, {"merged": False, "message": "later"}))
+    raises("other", gh.merge_pull, 1, sha=tip)
+
+
+# -- reviews -------------------------------------------------------------------
+
+
+def test_create_review_sends_exactly_the_given_fields_and_no_comments(gh, fake):
+    _open_pull(gh, fake)
+    tip = fake.branches["round/example-article/r1"]
+    review = gh.create_review(1, commit_id=tip, body="Summary\n- [ ] one")
+    sent = _posts(fake, "/reviews")[0][3]
+    assert sent == {"commit_id": tip, "body": "Summary\n- [ ] one", "event": "COMMENT"}
+    assert "comments" not in sent
+    assert review.state == "COMMENTED" and review.commit_id == tip
+    assert review.body == "Summary\n- [ ] one" and review.submitted_at
+    assert review.html_url.endswith(f"pullrequestreview-{review.id}")
+
+
+def test_create_review_passes_event_through_as_given(gh, fake):
+    _open_pull(gh, fake)
+    tip = fake.branches["round/example-article/r1"]
+    fake.author_is_reviewer = False
+    review = gh.create_review(1, commit_id=tip, body="ok", event="REQUEST_CHANGES")
+    assert review.state == "CHANGES_REQUESTED"
+    assert _posts(fake, "/reviews")[0][3]["event"] == "REQUEST_CHANGES"
+
+
+def test_approving_ones_own_pull_request_is_refused_with_githubs_words(gh, fake):
+    _open_pull(gh, fake)
+    tip = fake.branches["round/example-article/r1"]
+    err = raises("other", gh.create_review, 1, commit_id=tip, body="x", event="APPROVE")
+    assert err.status == 422
+    assert "Can not approve your own pull request" in str(err)
+    assert gh.list_reviews(1) == []
+
+
+def test_a_422_that_echoes_the_token_is_redacted(gh, fake):
+    _open_pull(gh, fake)
+    fake.inject(
+        "POST",
+        "/reviews",
+        Resp(422, {"message": f"Unprocessable, token={TOKEN}", "errors": [TOKEN]}),
+    )
+    err = raises("other", gh.create_review, 1, commit_id="a" * 40, body="x")
+    assert "[REDACTED]" in str(err)
+
+
+def test_list_reviews_is_paginated_and_in_order(gh, fake):
+    _open_pull(gh, fake)
+    tip = fake.branches["round/example-article/r1"]
+    for n in range(3):
+        gh.create_review(1, commit_id=tip, body=f"run {n}")
+    fake.page_size = 1
+    reviews = gh.list_reviews(1)
+    assert [r.body for r in reviews] == ["run 0", "run 1", "run 2"]
+    assert fake.count("GET", "/reviews") == 3
+
+
+def test_a_review_body_holding_the_token_is_refused_before_sending(gh, fake):
+    _open_pull(gh, fake)
+    before = len(fake.requests)
+    raises("secret", gh.create_review, 1, commit_id="a" * 40, body=f"see {TOKEN}")
+    assert len(fake.requests) == before
+
+
+# -- refs and tags -------------------------------------------------------------
+
+
+def test_matching_refs_lists_a_prefix_with_shas_across_pages(gh, fake):
+    a = _round_branch(fake, "round/example-article/r1")
+    b = _round_branch(fake, "round/example-article/r2")
+    _round_branch(fake, "round/other-article/r1")
+    fake.page_size = 1
+    assert gh.matching_refs("heads/round/example-article/") == [
+        ("refs/heads/round/example-article/r1", a),
+        ("refs/heads/round/example-article/r2", b),
+    ]
+    assert gh.matching_refs("tags/example-article/") == []
+    assert fake.requests[-1][1].endswith("/git/matching-refs/tags/example-article/")
+
+
+@pytest.mark.parametrize("prefix", ["", "/tags/x", "tags//x", "../x", "tags\\x"])
+def test_matching_refs_rejects_a_malformed_prefix(gh, prefix):
+    with pytest.raises(ValueError):
+        gh.matching_refs(prefix)
+
+
+def test_create_ref_makes_a_branch_and_never_moves_an_existing_one(gh, fake):
+    main = fake.branches["main"]
+    gh.create_ref("refs/heads/round/example-article/r1", main)
+    assert fake.branches["round/example-article/r1"] == main
+    other = fake.external_commit("main", {"x.md": b"x"})
+    err = raises("exists", gh.create_ref, "refs/heads/round/example-article/r1", other)
+    assert err.status == 422 and "was not moved" in str(err)
+    assert fake.branches["round/example-article/r1"] == main
+
+
+@pytest.mark.parametrize("ref", ["heads/x", "main", "refs/heads/", "refs/heads/../x"])
+def test_create_ref_wants_a_fully_qualified_name(gh, ref):
+    with pytest.raises(ValueError):
+        gh.create_ref(ref, "a" * 40)
+
+
+def test_create_ref_on_a_missing_object_is_an_error(gh):
+    err = raises("other", gh.create_ref, "refs/heads/x", "f" * 40)
+    assert "Object does not exist" in str(err)
+
+
+def test_create_tag_makes_an_annotated_tag_with_the_given_date(gh, fake):
+    tip = fake.branches["main"]
+    tagger = _sig(day=16, hour=10)
+    tag_sha = gh.create_tag("example-article/r1", "accepted r1", tip, tagger=tagger)
+    obj = fake.tag_objects[tag_sha]
+    assert obj["tag"] == "example-article/r1" and obj["object"] == tip
+    assert obj["type"] == "commit" and obj["message"] == "accepted r1"
+    assert obj["tagger"] == {
+        "name": "Example Author",
+        "email": "author@example.invalid",
+        "date": "2026-06-16T10:02:11+00:00",
+    }
+    assert (
+        fake.tags["example-article/r1"] == tag_sha
+    )  # the ref points at the tag object
+    assert gh.matching_refs("tags/example-article/") == [
+        ("refs/tags/example-article/r1", tag_sha)
+    ]
+
+
+def test_create_tag_on_an_existing_tag_raises_exists_and_does_not_move_it(gh, fake):
+    tip = fake.branches["main"]
+    first = gh.create_tag("example-article/r1", "one", tip, tagger=_sig())
+    later = fake.external_commit("main", {"x.md": b"x"})
+    objects, posts = len(fake.tag_objects), len(_posts(fake, "/git/tags"))
+    err = raises(
+        "exists", gh.create_tag, "example-article/r1", "two", later, tagger=_sig()
+    )
+    assert "not moved" in str(err)
+    assert fake.tags["example-article/r1"] == first
+    assert len(fake.tag_objects) == objects  # no orphan tag object either
+    assert len(_posts(fake, "/git/tags")) == posts
+
+
+def test_create_tag_that_loses_a_race_on_the_ref_is_still_exists(gh, fake):
+    fake.inject("POST", "/git/refs", Resp(422, {"message": "Reference already exists"}))
+    raises(
+        "exists",
+        gh.create_tag,
+        "example-article/r1",
+        "m",
+        fake.branches["main"],
+        tagger=_sig(),
+    )
+
+
+def test_create_tag_checks_its_name_and_hides_the_token(gh, fake):
+    with pytest.raises(ValueError):
+        gh.create_tag("../x", "m", fake.branches["main"], tagger=_sig())
+    raises(
+        "secret",
+        gh.create_tag,
+        "t/r1",
+        f"m {TOKEN}",
+        fake.branches["main"],
+        tagger=_sig(),
+    )
+
+
+def test_a_signature_must_be_timezone_aware_and_keeps_its_offset():
+    with pytest.raises(ValueError):
+        Signature("n", "e@example.invalid", datetime(2026, 6, 14, 18, 0, 0))
+    plus5 = Signature(
+        "n",
+        "e@example.invalid",
+        datetime(
+            2026, 6, 14, 18, 0, 0, 999, tzinfo=timezone(timedelta(hours=5, minutes=30))
+        ),
+    )
+    assert plus5.to_api()["date"] == "2026-06-14T18:00:00+05:30"
+
+
+# -- labels, issues, settings --------------------------------------------------
+
+
+def test_ensure_label_creates_once_then_sends_no_write(gh, fake):
+    assert gh.ensure_label("github-documents", "#0e8a16", "Document store") is True
+    assert fake.labels["github-documents"]["color"] == "0e8a16"
+    writes = len(_posts(fake, "/labels"))
+    assert gh.ensure_label("github-documents", "ff0000", "different") is False
+    assert len(_posts(fake, "/labels")) == writes == 1
+    assert not [r for r in fake.requests if r[0] in ("PATCH", "PUT", "DELETE")]
+    assert fake.labels["github-documents"]["color"] == "0e8a16"  # never edited
+
+
+def test_ensure_label_that_loses_a_race_returns_false(gh, fake):
+    fake.inject(
+        "POST",
+        "/labels",
+        Resp(
+            422,
+            {
+                "message": "Validation Failed",
+                "errors": [{"resource": "Label", "code": "already_exists"}],
+            },
+        ),
+    )
+    assert gh.ensure_label("round: open", "ededed") is False
+
+
+def test_ensure_label_quotes_a_name_with_spaces_and_colons(gh, fake):
+    assert gh.ensure_label("from-review: deferred", "ededed") is True
+    assert any(
+        r[1].endswith("/labels/from-review%3A%20deferred") for r in fake.requests
+    )
+    assert gh.ensure_label("from-review: deferred", "ededed") is False
+
+
+def test_a_label_needs_a_name(gh):
+    with pytest.raises(ValueError):
+        gh.ensure_label(" ", "ededed")
+
+
+def test_create_issue_and_comment_on_an_issue_and_a_pull_request(gh, fake):
+    number, url = gh.create_issue("Open work", "body", labels=("from-review",))
+    assert (number, url) == (1, f"https://github.com/{REPO}/issues/1")
+    assert fake.issues[1]["labels"] == ["from-review"]
+    assert gh.comment_on_issue(1, "later").startswith(
+        f"https://github.com/{REPO}/issues/1"
+    )
+    pull = _open_pull(gh, fake)
+    assert pull.number == 2
+    assert gh.comment_on_issue(2, "note on the pull request").endswith("#c1")
+    assert fake.pulls[2]["comments"] == ["note on the pull request"]
+    raises("not_found", gh.comment_on_issue, 99, "x")
+
+
+def test_create_issue_without_labels_sends_none(gh, fake):
+    gh.create_issue("t", "b")
+    assert "labels" not in _posts(fake, "/issues")[0][3]
+
+
+def test_info_reports_the_merge_settings(gh, fake):
+    info = gh.info()
+    assert (info.allow_merge_commit, info.allow_squash_merge) == (True, True)
+    assert (info.allow_rebase_merge, info.delete_branch_on_merge) == (True, False)
+
+
+def test_info_says_none_when_github_leaves_the_settings_out(gh, fake):
+    fake.settings.clear()
+    info = gh.info()
+    assert info.allow_merge_commit is None and info.delete_branch_on_merge is None
+    assert RepoInfo("main", True, False).allow_squash_merge is None
+
+
+def test_update_repo_patches_and_returns_the_new_settings(gh, fake):
+    info = gh.update_repo(allow_squash_merge=False, delete_branch_on_merge=True)
+    assert fake.requests[-1][:2] == ("PATCH", f"/repos/{REPO}")
+    assert fake.requests[-1][3] == {
+        "allow_squash_merge": False,
+        "delete_branch_on_merge": True,
+    }
+    assert info.allow_squash_merge is False and info.delete_branch_on_merge is True
+    assert gh.info() == info
+    with pytest.raises(ValueError):
+        gh.update_repo()
+
+
+# -- commit_files: signatures and deletes --------------------------------------
+
+
+def test_commit_files_without_signatures_sends_none(gh, fake):
+    gh.commit_files("main", {"a.md": b"a"}, "m")
+    assert set(_posts(fake, "/git/commits")[0][3]) == {"message", "tree", "parents"}
+    sha = fake.branches["main"]
+    assert (
+        fake.commits[sha]["author"] is None and fake.commits[sha]["committer"] is None
+    )
+
+
+def test_commit_files_records_the_author_and_committer_dates(gh, fake):
+    when = _sig(day=14, hour=18, tz=timezone(timedelta(hours=-5)))
+    result = gh.commit_files(
+        "main", {"a.md": b"a"}, "m", author=when, committer=_sig(day=15)
+    )
+    commit = fake.commits[result.commit_sha]
+    assert commit["author"] == {
+        "name": "Example Author",
+        "email": "author@example.invalid",
+        "date": "2026-06-14T18:02:11-05:00",
+    }
+    assert commit["committer"]["date"] == "2026-06-15T18:02:11+00:00"
+
+
+def test_a_lone_author_sends_no_committer(gh, fake):
+    gh.commit_files("main", {"a.md": b"a"}, "m", author=_sig())
+    body = _posts(fake, "/git/commits")[0][3]
+    assert "author" in body and "committer" not in body
+
+
+def test_deletes_with_the_right_blob_remove_the_path_in_one_commit(gh, fake):
+    gh.commit_files("main", {"old.md": b"old", "keep.md": b"keep"}, "setup")
+    before = fake.branches["main"]
+    result = gh.commit_files(
+        "main",
+        {"new.md": b"new"},
+        "swap",
+        deletes={"old.md": git_blob_sha(b"old")},
+    )
+    tree = fake.tree_at("main")
+    assert "old.md" not in tree and "keep.md" in tree and "new.md" in tree
+    assert result.deleted == ("old.md",) and result.written == ("new.md",)
+    assert fake.commits[result.commit_sha]["parents"] == [before]
+    entry = [
+        e for e in _posts(fake, "/git/trees")[-1][3]["tree"] if e["path"] == "old.md"
+    ]
+    assert entry == [{"path": "old.md", "mode": "100644", "type": "blob", "sha": None}]
+
+
+def test_deletes_alone_make_a_commit(gh, fake):
+    gh.commit_files("main", {"old.md": b"old"}, "setup")
+    result = gh.commit_files(
+        "main", {}, "drop", deletes={"old.md": git_blob_sha(b"old")}
+    )
+    assert result.deleted == ("old.md",) and result.written == ()
+    assert "old.md" not in fake.tree_at("main")
+
+
+def test_deletes_with_a_wrong_blob_raise_exists_and_commit_nothing(gh, fake):
+    gh.commit_files("main", {"old.md": b"old"}, "setup")
+    head, blobs, commits = fake.branches["main"], len(fake.blobs), len(fake.commits)
+    posts = len(_posts(fake, ""))
+    err = raises(
+        "exists",
+        gh.commit_files,
+        "main",
+        {"new.md": b"new"},
+        "swap",
+        deletes={"old.md": git_blob_sha(b"someone else's")},
+    )
+    assert "old.md" in str(err) and "not deleted" in str(err)
+    assert fake.branches["main"] == head and len(fake.commits) == commits
+    assert len(fake.blobs) == blobs and len(_posts(fake, "")) == posts
+    assert "old.md" in fake.tree_at("main") and "new.md" not in fake.tree_at("main")
+
+
+def test_deleting_a_path_that_is_already_absent_is_a_no_op(gh, fake):
+    head, commits = fake.branches["main"], len(fake.commits)
+    result = gh.commit_files("main", {}, "m", deletes={"gone.md": "0" * 40})
+    assert result.commit_sha == head and result.deleted == () and result.written == ()
+    assert len(fake.commits) == commits and fake.branches["main"] == head
+    assert not [r for r in fake.requests if r[0] != "GET"]
+
+
+def test_deletes_are_validated_before_anything_is_sent(gh, fake):
+    with pytest.raises(ValueError):
+        gh.commit_files("main", {"a.md": b"a"}, "m", deletes={"a.md": "0" * 40})
+    with pytest.raises(ValueError):
+        gh.commit_files("main", {}, "m", deletes={"a.md": "not-a-sha"})
+    with pytest.raises(ValueError):
+        gh.commit_files("main", {}, "m", deletes={"../a.md": "0" * 40})
+    with pytest.raises(ValueError):
+        gh.commit_files("main", {}, "m")
+    assert fake.requests == []
+
+
+def test_a_directory_cannot_be_deleted_as_a_file(gh, fake):
+    fake.external_commit("main", {"docs/a.md": b"a"})
+    raises("exists", gh.commit_files, "main", {}, "m", deletes={"docs": "0" * 40})
+
+
+def test_replace_of_a_path_absent_at_the_head_is_written_not_refused(gh, fake):
+    # What the docstring says, pinned: ``replace`` guards a file that exists.
+    result = gh.commit_files(
+        "main", {"gone.md": b"back"}, "m", replace={"gone.md": git_blob_sha(b"was")}
+    )
+    assert result.written == ("gone.md",)
+
+
+# -- merge_commit --------------------------------------------------------------
+
+
+def test_merge_commit_onto_a_branch_that_is_behind(gh, fake):
+    main = fake.branches["main"]
+    _round_branch(fake)
+    fake.external_commit("round/example-article/r1", {"b.md": b"b"}, "second")
+    tip = fake.branches["round/example-article/r1"]
+    result = gh.merge_commit(
+        "main",
+        tip,
+        "Merge example-article r1",
+        author=_sig(day=16),
+        committer=_sig(day=16),
+    )
+    commit = fake.commits[result.commit_sha]
+    assert commit["parents"] == [main, tip]
+    assert commit["tree"] == fake.commits[tip]["tree"]
+    assert fake.branches["main"] == result.commit_sha
+    assert commit["message"] == "Merge example-article r1"
+    assert commit["author"]["date"] == "2026-06-16T18:02:11+00:00"
+    assert commit["committer"]["date"] == "2026-06-16T18:02:11+00:00"
+    assert fake.requests[-1][3]["force"] is False
+    assert gh.resolve("main") == result.commit_sha
+
+
+def test_merge_commit_when_identical_makes_no_commit(gh, fake):
+    tip = _round_branch(fake)
+    fake.branches["main"] = tip
+    commits = len(fake.commits)
+    result = gh.merge_commit("main", tip, "m")
+    assert result.commit_sha == tip and len(fake.commits) == commits
+    assert not [r for r in fake.requests if r[0] in ("POST", "PATCH")]
+
+
+def test_merge_commit_when_diverged_is_a_conflict_and_writes_nothing(gh, fake):
+    tip = _round_branch(fake)
+    fake.external_commit("main", {"theirs.md": b"theirs"})
+    main, commits = fake.branches["main"], len(fake.commits)
+    err = raises("conflict", gh.merge_commit, "main", tip, "m")
+    assert "diverged" in str(err) and "Nothing was written" in str(err)
+    assert fake.branches["main"] == main and len(fake.commits) == commits
+    assert not _posts(fake, "/git/commits")
+
+
+def test_merge_commit_of_something_the_branch_already_contains_is_a_conflict(gh, fake):
+    old = fake.branches["main"]
+    fake.external_commit("main", {"x.md": b"x"})
+    err = raises("conflict", gh.merge_commit, "main", old, "m")
+    assert "behind" in str(err)
+
+
+def test_merge_commit_retries_from_the_new_head_and_then_sees_the_divergence(gh, fake):
+    tip = _round_branch(fake)
+    moves = []
+
+    def once(f):
+        if not moves:
+            moves.append(f.external_commit("main", {"theirs.md": b"theirs"}))
+
+    fake.before_ref_update = once
+    err = raises("conflict", gh.merge_commit, "main", tip, "m")
+    assert "diverged" in str(err)
+    assert fake.branches["main"] == moves[0]  # their commit is still the head
+    assert fake.count("PATCH", "/git/refs/") == 1
+
+
+def test_merge_commit_gives_up_after_the_retries(gh, fake):
+    tip = _round_branch(fake)
+    main = fake.branches["main"]
+    # The compare stays "ahead" every time and only the update is refused.
+    fake.inject(
+        "PATCH",
+        "/git/refs/",
+        Resp(422, {"message": "Update is not a fast forward"}),
+        times=10,
+    )
+    err = raises("conflict", gh.merge_commit, "main", tip, "m", retries=2)
+    assert "kept moving" in str(err) and "Nothing was lost" in str(err)
+    assert fake.count("PATCH", "/git/refs/") == 3
+    assert fake.branches["main"] == main
+
+
+def test_merge_commit_resolves_a_branch_name_and_hides_the_token(gh, fake):
+    _round_branch(fake)
+    result = gh.merge_commit("main", "round/example-article/r1", "m")
+    assert (
+        fake.commits[result.commit_sha]["parents"][1]
+        == fake.branches["round/example-article/r1"]
+    )
+    raises("secret", gh.merge_commit, "main", fake.branches["main"], f"m {TOKEN}")
+
+
+def test_merge_commit_on_a_missing_branch_is_not_found(gh, fake):
+    raises("not_found", gh.merge_commit, "nope", fake.branches["main"], "m")
+
+
+# -- the token never leaks from the new calls ----------------------------------
+
+
+def test_no_new_error_log_or_repr_holds_the_token(gh, fake, caplog):
+    caplog.set_level(logging.DEBUG)
+    _open_pull(gh, fake)
+    tip = fake.branches["round/example-article/r1"]
+    echo = Resp(500, {"message": f"upstream said token={TOKEN}", "errors": [TOKEN]})
+    errors = []
+    calls = [
+        ("GET", "/pulls", lambda: gh.list_pulls()),
+        ("GET", "/pulls/1", lambda: gh.get_pull(1)),
+        ("POST", "/pulls", lambda: gh.create_pull("a", "b", "t", "b")),
+        ("PUT", "/merge", lambda: gh.merge_pull(1, sha=tip)),
+        ("GET", "/reviews", lambda: gh.list_reviews(1)),
+        ("POST", "/reviews", lambda: gh.create_review(1, commit_id=tip, body="x")),
+        ("GET", "/matching-refs/", lambda: gh.matching_refs("tags/x/")),
+        ("POST", "/git/refs", lambda: gh.create_ref("refs/heads/x", tip)),
+        ("POST", "/git/tags", lambda: gh.create_tag("t/r1", "m", tip, tagger=_sig())),
+        ("GET", "/labels/", lambda: gh.ensure_label("l", "ededed")),
+        ("POST", "/issues", lambda: gh.create_issue("t", "b")),
+        ("POST", "/comments", lambda: gh.comment_on_issue(1, "b")),
+        ("PATCH", f"/repos/{REPO}", lambda: gh.update_repo(allow_merge_commit=True)),
+        ("GET", "/compare/", lambda: gh.merge_commit("main", tip, "m")),
+    ]
+    for method, part, call in calls:
+        fake.inject(method, part, echo)
+        with pytest.raises(GitHubRepoError) as info:
+            call()
+        errors.append(info.value)
+    assert len(errors) == len(calls)
+    for err in errors:
+        assert "[REDACTED]" in str(err), (err.kind, str(err))
+        assert_no_token(str(err), repr(err), err.args, err.__dict__)
+    assert_no_token(caplog.text, repr(gh), str(gh))
+    # And the token is only ever in the Authorization header.
+    assert_no_token(
+        *fake.urls, *[r[2] for r in fake.requests], *[r[3] for r in fake.requests]
+    )
+
+
+def test_the_token_is_refused_in_every_text_the_new_calls_send(gh, fake):
+    tip = _round_branch(fake)
+    gh.create_pull("round/example-article/r1", "main", "t", "b")
+    before = len(fake.requests)
+    leak = f"x {TOKEN} y"
+    for call in (
+        lambda: gh.create_pull("a", "b", leak, "b"),
+        lambda: gh.create_pull("a", "b", "t", leak),
+        lambda: gh.merge_pull(1, sha=tip, commit_message=leak),
+        lambda: gh.create_issue(leak, "b"),
+        lambda: gh.create_issue("t", leak),
+        lambda: gh.comment_on_issue(1, leak),
+    ):
+        raises("secret", call)
+    assert len(fake.requests) == before
 
 
 # -- errors ------------------------------------------------------------------
