@@ -192,7 +192,7 @@ retires.
 
 ## Bootstrapping the repository: `ci-docs init`
 
-This code repository owns the scaffolding. `uv run ci-docs init` creates the
+This code repository owns the scaffolding. `ci-docs init` (a console script #406 adds) creates the
 document repository when it is missing and keeps its onboarding files current:
 
 1. If the repository does not exist, create it with `gh repo create
