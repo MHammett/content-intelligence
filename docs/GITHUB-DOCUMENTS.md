@@ -1180,7 +1180,7 @@ Each is an issue labelled `github-documents`, buildable from the issue alone.
 | [#419](https://github.com/MHammett/content-intelligence/issues/419) | G. claude.ai end to end on the scratch repository (the maintainer's checks) | #415, #417, #418 | not yet |
 | [#420](https://github.com/MHammett/content-intelligence/issues/420) | H. import, step 1: `ci-docs import scan` over local files, saved runs and a Drive download | nothing (#416's names) | [PR #423](https://github.com/MHammett/content-intelligence/pull/423) (merged) |
 | [#421](https://github.com/MHammett/content-intelligence/issues/421) | I. import, step 2: `ci-docs import apply` | #413, #415, #417, #418, #420 | not yet |
-| [#422](https://github.com/MHammett/content-intelligence/issues/422) | J. import: the claude.ai export as a source | #420; the maintainer's export | not yet |
+| [#422](https://github.com/MHammett/content-intelligence/issues/422) | J. import: the claude.ai export as a source | #420; the maintainer's export | [PR #426](https://github.com/MHammett/content-intelligence/pull/426) (merged) |
 | [#405](https://github.com/MHammett/content-intelligence/issues/405) | `ci-docs pull-history`, rewritten (optional) | #413, #417 | not yet |
 
 #413 and #420 can start at once. #404 (the first design's phase 5) is
