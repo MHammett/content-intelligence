@@ -61,7 +61,9 @@ pjm-capacity-auction-close-out-r3-to-code-v2.md
 - `close-out` is the kind, the only new word beside that project's `draft`,
   `metadata`, `handoff`, `review` and `publication`.
 - `r<N>` is the last pipeline run the note takes into account, the N of
-  `<slug>-review-rN.md`.
+  `<slug>-review-rN.md` (the review's Drive name; in the document repository the
+  review is `review.md` on the round's branch, and its run number is the
+  `run_number` of `pipeline/run.json` and the marker of the pull request review).
 - `to-code` or `to-chat` says who has to act, so a listing of the folder shows
   which notes are waiting on whom.
 - `-v<M>` marks a rewrite of the same round and direction. Its `Supersedes:` line
@@ -229,7 +231,8 @@ list under "File and artifact storage":
 ```
 - `<slug>-close-out-rN-to-code.md` and `<slug>-close-out-rN-to-chat.md`: a
   close-out note, written from the close-out template. N is the last pipeline
-  run it takes into account, the N of `<slug>-review-rN.md`. A rewrite of the
+  run it takes into account, the N of `<slug>-review-rN.md` (the Drive name of
+  the review). A rewrite of the
   same round and direction is `-v2`, `-v3`, and says which note it supersedes.
   List the folder before writing one. Never overwrite one.
 ```
