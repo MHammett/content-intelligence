@@ -47,9 +47,11 @@ pipeline lowercases that value and cuts it to 60 characters, so the line and the
 directory can differ. Run history hangs on this name and it never changes; a
 note that guesses it is how one article ends up with two histories.]
 Drive folder: [the article's folder in the shared Drive, named exactly as Drive
-shows it]
+shows it. For an article kept in the document repository, the folder's
+`<owner>/<repo>:<path>` instead, e.g. `example-owner/example-articles:articles/<slug>`]
 Drive folder id: [the folder's id, so a session can list it without searching
-by name]
+by name. For an article kept in the document repository, the commit SHA this note
+was written against, so a session can read the folder as the sender saw it]
 Names match: [yes | no, left as it is on purpose: why, decided by whom, on what
 date. Compare Drive folder with History key on the first note of every article,
 in whichever direction it goes, before filling in anything else. A mismatch is

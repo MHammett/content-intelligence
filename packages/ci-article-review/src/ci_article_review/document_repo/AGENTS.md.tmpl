@@ -45,6 +45,16 @@ A close-out note is named `<slug>-close-out-rN-to-(code|chat)[-vM].md` and eithe
 
 `N` is a round number, counted from 1. On a draft, a metadata file, a handoff and a publication handoff it is the round of drafting. On a review and on a close-out note `N` is the pipeline run number: `<slug>-review-r4.md` is run 4's review. `-vM` on a close-out note is a rewrite of the same round and direction, `-v2`, `-v3`, and the note says which one it supersedes.
 
+### Close-out notes
+
+A close-out note is written from `templates/close_out.md` and saved in the article's folder. Before writing one:
+
+1. **List the folder first** (the GitHub MCP `get_file_contents` on `articles/<slug>/`, or `ci-docs ls <slug>`). If a note for this round and direction is already there, you are writing its `-vM` successor, and its `Supersedes:` line names the note it replaces.
+2. **Name it** `<slug>-close-out-rN-to-(code|chat)[-vM].md`. `N` is the last pipeline run the note takes into account, the `N` of `<slug>-review-rN.md`. The first note for a round and direction has no `-v`; the next is `-v2`, then `-v3`. A `-vM` needs `-v(M-1)` to be there already (`-v2` needs the plain note).
+3. **Never overwrite one.** A note that is there stays there, whatever is wrong with it.
+
+A Code session adds a note with `ci-docs put <slug> <file>`, which applies these same rules: it refuses a name that does not fit the pattern, a `-vM` with no predecessor, and a round and direction that already has a note written without `-v` (it suggests the next free one). A person using github.com or a claude.ai connector has to apply them by hand.
+
 ## Where to commit
 
 - Commit to `main` only. Do not create branches, and never force-push.
@@ -53,15 +63,18 @@ A close-out note is named `<slug>-close-out-rN-to-(code|chat)[-vM].md` and eithe
 | Commit | Message |
 |---|---|
 | a draft and its metadata, together in one commit | `draft: <slug> rN` |
-| a close-out note | `close-out: <slug> rN to-code` or `close-out: <slug> rN to-chat` |
+| a handoff | `handoff: <slug> rN` |
+| a close-out note | `close-out: <slug> rN to-code` or `close-out: <slug> rN to-chat`, with ` v2`, ` v3` added for a rewrite |
 | a publication handoff | `publication: <slug> rN` |
 | a review | `review: <slug> rN`, which is the pipeline's |
 
 ## Submitting a round for review
 
 1. Write `<slug>-draft-rN.md` and `<slug>-metadata-rN.md` (or one `<slug>-handoff-rN.md`) from the shapes in `templates/`.
-2. Commit them together in one commit: `draft: <slug> rN`.
+2. Commit them together in one commit: `draft: <slug> rN`. With GitHub's MCP connector that is the `push_files` tool, which writes several files in one commit; `create_or_update_file` makes one commit per file, so using it for the pair leaves a commit that holds a draft with no metadata. On github.com, upload both files in one commit.
 3. Ask the author to run `ci-review --github <slug>`. You cannot run the review yourself.
+
+`History key:` is optional here. When a handoff or metadata file has none, the run uses the article's folder name, `<slug>`, as its history key: the line in the templates that says the title becomes the key does not apply to a round read from this repository. If you do write a `History key:`, make it the slug, because the pipeline lowercases a key and cuts it to 60 characters, and a key that differs from the folder name splits the article's history in two.
 
 ## Where the review comes back
 

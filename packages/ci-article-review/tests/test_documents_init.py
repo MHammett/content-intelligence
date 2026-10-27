@@ -361,6 +361,19 @@ def test_agents_md_states_every_name_and_commit_message_the_pipeline_depends_on(
         "templates/revise_after_review_prompt.md",
         "main",
         "force",
+        # Committing the pair in one commit needs the connector's push_files.
+        "`push_files`",
+        "`create_or_update_file` makes one commit per file",
+        # Under --github a missing History key is the folder's slug, not the title.
+        "uses the article's folder name, `<slug>`, as its history key",
+        "does not apply to a round read from this repository",
+        # Close-out notes: list first, the naming rules, never overwrite, ci-docs put.
+        "List the folder first",
+        "`ci-docs ls <slug>`",
+        "`-v2` needs the plain note",
+        "Never overwrite one",
+        "`ci-docs put <slug> <file>`",
+        "`handoff: <slug> rN`",
     ):
         assert needle in text, needle
     # The "never" list.

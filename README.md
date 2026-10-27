@@ -379,7 +379,7 @@ Two things it does deliberately:
 
 6. Repeat until the findings are ones you're content to ship, then publish with `--publish`.
 
-**Drafting in a separate chat project?** When the article changes hands between that project and a Code session, write the hand-off from `handoff_templates/close_out.md` (Template D) instead of free-hand: settled edits as exact find-and-replace text, decisions kept apart from edits, and a check that the Drive folder and the pipeline's `History key` name the same article. See [docs/CLOSE-OUT.md](docs/CLOSE-OUT.md).
+**Drafting in a separate chat project?** When the article changes hands between that project and a Code session, write the hand-off from `handoff_templates/close_out.md` (Template D) instead of free-hand: settled edits as exact find-and-replace text, decisions kept apart from edits, and a check that the Drive folder and the pipeline's `History key` name the same article. See [docs/CLOSE-OUT.md](docs/CLOSE-OUT.md). The files can also go through a private GitHub repository instead of Drive and paste: the chat project commits a draft there, `ci-review --github SLUG` reads it and commits the review back, and a Code session adds a close-out note with `ci-docs put`. See [The document repository](#the-document-repository-ci-docs) and [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md).
 
 `--raw-draft` on its own works too — it just uses the whole file as the article body and skips the metadata context, which means the review models lose the author-supplied framing. Pair it with `--metadata` whenever you have that context to give.
 
@@ -661,7 +661,7 @@ It reads every URL out of the draft's own citation block (`## Sources` / `## Cit
 
 ## The document repository (`ci-docs`)
 
-An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design. `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here.
+An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design, and has the steps for connecting a claude.ai project to it. `ci-docs` has four subcommands: `init` (below), `push-run`, `ls` and `put`. `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here.
 
 ```powershell
 uv run ci-docs init --dry-run                            # print the plan; write nothing
@@ -696,6 +696,26 @@ It reads `document_source` from the report to find the repository, the branch an
 | `REPORT_JSON` | the run's `pipeline_history/<key>/run_N_<timestamp>_report.json` |
 | `--github-repo OWNER/NAME` | commit to this repository instead of the one the report names |
 | `--config-dir DIR` | where `user.yaml` is read from, for `github_documents` and the API keys the commit must not contain (default `configs`) |
+
+### `ci-docs ls` and `ci-docs put`
+
+`ls` lists an article's folder, the top level and then `pipeline/`, with the round and kind each file name says. `put` adds one local file to that folder, in one commit: it is how a Code session hands a close-out note (Template D) to the drafting side through the repository, and it takes the drafting side's own files too.
+
+```powershell
+uv run ci-docs ls my-article
+uv run ci-docs put my-article my-article-close-out-r4-to-chat.md
+uv run ci-docs put my-article my-article-close-out-r4-to-chat-v2.md      # a rewrite; -v2 needs the plain note
+```
+
+The file's own name is the name in the repository, and it must be `<slug>-(draft|metadata|handoff|publication)-rN.md` or `<slug>-close-out-rN-to-(code|chat)[-vM].md` with the same slug; anything else is refused before a request is sent. `put` only adds: the same bytes again is a no-op, other bytes under an existing name are refused, a `-vM` without its predecessor is refused, and a second plain note for a round and direction is refused with the next free `-vM` named. The commit message is `close-out: my-article r4 to-chat` (`<kind>: <slug> rN[ to-<dir>][ vM]`). The file is checked for the token and every configured API key, and a public repository is refused unless `allow_public_repo` is set.
+
+| Flag | Meaning |
+|---|---|
+| `SLUG`, `FILE` | the article's folder name; the local file to add (`put` only) |
+| `--github-repo OWNER/NAME` | the document repository; default `github_documents.repo` in `user.yaml`, else `MHammett/mikehammett.net-articles` |
+| `--branch NAME` | the branch to read or commit to; default `github_documents.branch`, else the repository's default branch |
+| `--config-dir DIR` | where `user.yaml` is read from (default `configs`); `put` also needs it for the API keys the file must not contain |
+| `--publication NAME` | `put` only: also scan for the keys in `configs/NAME.yaml` |
 
 ---
 
@@ -979,6 +999,7 @@ content-intelligence/
 │   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
 │   │   │   ├── github_documents.py    reads one round of an article from a GitHub repository (--github)
 │   │   │   ├── github_writeback.py    commits a run's review back to that folder (--write-back, ci-docs push-run)
+│   │   │   ├── github_put.py          ci-docs ls and put: list an article folder, add a close-out note or drafting file
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
 │   │   │   ├── passage_match.py       decides when two quoted passages are the same passage
