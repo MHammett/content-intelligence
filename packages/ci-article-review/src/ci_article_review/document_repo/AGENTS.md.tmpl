@@ -2,14 +2,16 @@
 
 Rules for any AI client or person working in this repository: Codex, Claude Code, a claude.ai project, or someone using github.com. Read this file first and follow it.
 
-This repository holds articles for one publication, from first draft to published post. Drafts are written here, `ci-review` (from the content-intelligence project) reviews them, and the review comes back into the same folder. Every round is a commit, so the history shows who did what and when.
+This repository holds articles for one publication, from first draft to published post. Each round of an article is a branch and a pull request: the drafting side writes the draft on the branch, `ci-review` (from the content-intelligence project) reviews it and writes the review back to the same branch, the drafting side revises, and the author says when to merge. `main` holds only accepted text.
+
+**The point of all this is a history an AI client can read.** The author rarely opens GitHub. What the repository is for is that any AI client, starting cold, can read an article's history and learn what changed in each round, why, and in answer to which review, so that nobody has to carry files between tools. Pull request descriptions, revision commit messages and issues are that history. Write them for a reader who was not in this chat. The rules for each are below, and they are not optional.
 
 ## Layout
 
 ```
 AGENTS.md              these rules (managed)
 CLAUDE.md              one line, "@AGENTS.md", for Claude Code (managed)
-README.md              the same layout and review loop, for people (managed)
+README.md              the same layout and round loop, for people (managed)
 .gitattributes         "* text=auto eol=lf" (managed)
 templates/             the file shapes: draft_submission.template.md, metadata_only.md,
                        publication.md, close_out.md, revise_after_review_prompt.md (managed)
@@ -17,83 +19,130 @@ instructions/
   claude-project.md    the stanza pasted at the top of the claude.ai project's instructions (managed)
   publication.md       the publication's own drafting rules: voice and editorial (the author's)
 .ci-docs/manifest.json what the bootstrap wrote, and from which source commit
+articles/README.md     what articles/ holds (managed)
 articles/<slug>/       one folder per article
-  <slug>-draft-rN.md
-  <slug>-metadata-rN.md
-  <slug>-handoff-rN.md
-  <slug>-publication-rN.md
-  <slug>-close-out-rN-to-code.md, <slug>-close-out-rN-to-chat.md
-  <slug>-review-rN.md
-  pipeline/            the worklist and the run reports
+  draft.md               the draft                                         drafting side
+  metadata.md            its metadata (the two-file form)                  drafting side
+  publication.md         the publication handoff                           drafting side
+  close-out-to-code.md   the latest close-out note to a Code session       either side
+  close-out-to-chat.md   the latest close-out note to the drafting chat    either side
+  review.md              the latest ci-review review on this branch        ci-review only
+  pipeline/              run.json, report.json, worklist.md                ci-review only
 ```
 
-"Managed" means the file is written by `ci-docs init` from the content-intelligence repository. Do not edit a managed file here: the edit is lost or refused the next time the bootstrap runs. Change its source in content-intelligence and re-run `ci-docs init`. Everything else in this repository is yours to edit as these rules allow. `instructions/publication.md` is the exception to "managed": it was seeded once and belongs to the author.
+"Managed" means the file is written by `ci-docs init` from the content-intelligence repository. Do not edit a managed file here: the edit is lost or refused the next time the bootstrap runs. Change its source in content-intelligence and re-run `ci-docs init`. `instructions/publication.md` is not managed: it was seeded once and belongs to the author.
 
 ## Names
 
-`<slug>` is the article's folder name and the stem of every file in it. It is lowercase words joined by hyphens, and it never changes.
+`<slug>` is the article's folder name. It is lowercase words joined by hyphens, never contains `/`, and never changes. File names inside the folder are fixed (above): the round, the run and the version are not in the file name, they are in git.
 
-| File | Name | Written by |
-|---|---|---|
-| draft | `<slug>-draft-rN.md` | the drafting side |
-| metadata | `<slug>-metadata-rN.md` | the drafting side |
-| draft and metadata in one file | `<slug>-handoff-rN.md` | the drafting side |
-| publication handoff | `<slug>-publication-rN.md` | the drafting side |
-| review | `<slug>-review-rN.md` | `ci-review` |
+| What | Name |
+|---|---|
+| a round's branch | `round/<slug>/rN` |
+| a round's pull request | titled `<slug> rN`, from that branch into `main` |
+| an accepted round's tag | `<slug>/rN` |
 
-A close-out note is named `<slug>-close-out-rN-to-(code|chat)[-vM].md` and either side may write it: `to-code` is addressed to a Code session, `to-chat` to the drafting chat.
+`N` is the round number, counted from 1. The branch and the tag are deliberately different strings (`round/<slug>/rN` and `<slug>/rN`): one name for both would make every `ref` ambiguous. The pipeline makes the tag after the merge. You never make one.
 
-`N` is a round number, counted from 1. On a draft, a metadata file, a handoff and a publication handoff it is the round of drafting. On a review and on a close-out note `N` is the pipeline run number: `<slug>-review-r4.md` is run 4's review. `-vM` on a close-out note is a rewrite of the same round and direction, `-v2`, `-v3`, and the note says which one it supersedes.
-
-### Close-out notes
-
-A close-out note is written from `templates/close_out.md` and saved in the article's folder. Before writing one:
-
-1. **List the folder first** (the GitHub MCP `get_file_contents` on `articles/<slug>/`, or `ci-docs ls <slug>`). If a note for this round and direction is already there, you are writing its `-vM` successor, and its `Supersedes:` line names the note it replaces.
-2. **Name it** `<slug>-close-out-rN-to-(code|chat)[-vM].md`. `N` is the last pipeline run the note takes into account, the `N` of `<slug>-review-rN.md`. The first note for a round and direction has no `-v`; the next is `-v2`, then `-v3`. A `-vM` needs `-v(M-1)` to be there already (`-v2` needs the plain note).
-3. **Never overwrite one.** A note that is there stays there, whatever is wrong with it.
-
-A Code session adds a note with `ci-docs put <slug> <file>`, which applies these same rules: it refuses a name that does not fit the pattern, a `-vM` with no predecessor, and a round and direction that already has a note written without `-v` (it suggests the next free one). A person using github.com or a claude.ai connector has to apply them by hand.
-
-## Where to commit
-
-- Commit to `main` only. Do not create branches, and never force-push.
-- One commit per step, with these messages:
+## Commit messages
 
 | Commit | Message |
 |---|---|
-| a draft and its metadata, together in one commit | `draft: <slug> rN` |
-| a handoff | `handoff: <slug> rN` |
-| a close-out note | `close-out: <slug> rN to-code` or `close-out: <slug> rN to-chat`, with ` v2`, ` v3` added for a rewrite |
-| a publication handoff | `publication: <slug> rN` |
-| a review | `review: <slug> rN`, which is the pipeline's |
+| the draft and its metadata, together, to open a round | `draft: <slug> rN` |
+| a revision after a review | `revise: <slug> rN after run M` (the full shape is below) |
+| a close-out note | `close-out: <slug> rN to-code` or `close-out: <slug> rN to-chat` |
+| the publication handoff | `publication: <slug> rN` |
+| a review | `review: <slug> rN run M`, which is the pipeline's, not yours |
 
-## Submitting a round for review
+## The tools
 
-1. Write `<slug>-draft-rN.md` and `<slug>-metadata-rN.md` (or one `<slug>-handoff-rN.md`) from the shapes in `templates/`.
-2. Commit them together in one commit: `draft: <slug> rN`. With GitHub's MCP connector that is the `push_files` tool, which writes several files in one commit; `create_or_update_file` makes one commit per file, so using it for the pair leaves a commit that holds a draft with no metadata. On github.com, upload both files in one commit.
-3. Ask the author to run `ci-review --github <slug>`. You cannot run the review yourself.
+The steps below name the tools of GitHub's MCP server (its default toolsets) as they were on 2026-10-27. Every call takes the repository's `owner` and `repo`. A listing with more than one page is read to the last page. **If a tool name fails, list the connector's tools and use the one with the same purpose.**
 
-`History key:` is optional here. When a handoff or metadata file has none, the run uses the article's folder name, `<slug>`, as its history key: the line in the templates that says the title becomes the key does not apply to a round read from this repository. If you do write a `History key:`, make it the slug, because the pipeline lowercases a key and cuts it to 60 characters, and a key that differs from the folder name splits the article's history in two.
+## Starting round N
 
-## Where the review comes back
+1. **Find N.** Call `list_tags` and `list_branches`. N is one more than the highest `rK` among the tags `<slug>/rK` and the branches `round/<slug>/rK`, or 1 if there are none. Then call `list_pull_requests` with `state: open`: if a pull request is open for the article (its branch starts `round/<slug>/`), that round is still open, so continue it instead of starting another.
+2. **Branch.** `create_branch` with `branch: round/<slug>/rN` and `from_branch: main`.
+3. **Read the accepted text** you are revising: `get_file_contents` with `path: articles/<slug>/draft.md` (then `metadata.md`) and `ref: refs/heads/main`. Round 1 has none.
+4. **Commit both files in one call.** `push_files` with `branch: round/<slug>/rN`, `files: [{path: articles/<slug>/draft.md, content}, {path: articles/<slug>/metadata.md, content}]` and `message: draft: <slug> rN`. Both files, whole, in the one call. Never use `create_or_update_file` for the pair: it makes one commit per file, which leaves a commit holding a draft with no metadata.
+5. **Open the pull request.** `create_pull_request` with `head: round/<slug>/rN`, `base: main`, `title: <slug> rN` and a `body` that:
+   - **states what changed since the last accepted round (`<slug>/r(N-1)`, or "first draft") and why**, section by section of the article, so that a reader who sees only this description can tell what the round did and for what reason; and
+   - has `Closes #n` on its own line for each issue the round finishes.
+6. **Label it.** `issue_write` with `method: update`, `issue_number` the pull request's number and `labels: [round, article:<slug>]`. If `get_label` does not find `article:<slug>`, create it first with `label_write` (`method: create`).
+7. **Ask the author to run** `ci-review --github <slug> --write-back`. You cannot run the review yourself.
 
-The review is `<slug>-review-rN.md` at the top level of the article's folder, in a commit the pipeline makes. In the claude.ai project it appears after "Sync now". Revise the draft with `templates/revise_after_review_prompt.md`: paste the review under that prompt, and write the result as the next round's files, `rN+1`.
+`History key:` is optional here. When metadata has none, the run uses the article's folder name, `<slug>`, as its history key: the line in the templates that says the title becomes the key does not apply to a round read from this repository. If you do write a `History key:`, make it the slug, because the pipeline lowercases a key and cuts it to 60 characters, and a key that differs from the folder name splits the article's history in two.
 
-The pipeline also writes `pipeline/<slug>-worklist-rN.md` and the run's `report.json` under `pipeline/`. Those are the author's. Do not read them into a revision.
+## After a review
 
-## Reading a pipeline commit
+The pipeline commits `review.md` and `pipeline/` to the round's branch and posts one pull request review. Read them:
 
-A commit whose message starts `review: <slug> rN` was made by the pipeline. Its `Reviewed:` line names the draft files it reviewed and the commit they were at, so you can tell which version of the draft a review is about even after the draft has changed. If the draft at that commit is not the draft in front of you, the review may not apply to it.
+1. `pull_request_read` with `method: get_reviews` (and the pull request's number). The review's body is the run's summary and a checklist of the Section 1 findings, numbered F1, F2, and so on: the same numbers as Section 1 of `review.md`. There are no line comments to read or resolve.
+2. `get_file_contents` for `articles/<slug>/review.md` with `ref: refs/pull/<n>/head`. **Skip the WORKLIST block at the top of the file, above SECTION 1.** The worklist is the author's list of documents nobody has read yet, and `templates/revise_after_review_prompt.md` explains why it must stay out of a revision. Start at SECTION 1. If the file comes back cut off, say so and ask the author to paste the rest.
+3. Revise with `templates/revise_after_review_prompt.md`, then commit the revised files to the same branch with `push_files`, using the commit message below.
+4. Tell the author the round is ready for another review, or ready to accept.
+
+A review is of the commit it names. If the branch has moved since, the review may not apply to the text in front of you.
+
+### The revision commit message is the changelog
+
+Every revision commit has exactly this shape:
+
+```
+revise: <slug> rN after run M
+
+Responds to: run M review (<link to the review>)
+Addressed:
+- F2: <what the finding asked> -> <what changed, and where in the draft>
+- Section 3, "<first words of the finding>": <what changed>
+Deferred:
+- F1: <why it cannot be done in this round> -> #<issue>
+- F4: needs the author (<what exactly>)
+Not acted on:
+- F5: <why not, in one line>
+```
+
+Every F-numbered finding appears under Addressed, Deferred or Not acted on. Findings of other sections are listed when the revision acted on them or decided not to. Leave out a heading that has no lines. Each line says what the finding asked and what changed, so that someone reading the history a year from now can follow it without opening the review.
+
+### Deferred work becomes issues
+
+A finding the round cannot fix, and that the author will not settle in this chat, is opened as an issue before the commit that defers it: `issue_write` with `method: create`, labels `article:<slug>` and `from-review` (or `research`, or `decision`, where one fits), the finding quoted, and the run named. The commit then links the issue (`-> #<issue>`). This is what keeps deferred work alive after the pull request is merged and no longer read.
+
+## Accepting a round
+
+Only when the author says in this chat to merge the round: `merge_pull_request` with `merge_method: merge` and `expectedHeadSha` set to the head commit you last read, so that nothing pushed after it is merged unseen. Do not tag: the pipeline tags merged rounds itself. If the author has not said to merge, do not call the tool: say the round is ready and wait.
+
+## Close-out notes
+
+A close-out note is written from `templates/close_out.md`. There is one file per direction, `articles/<slug>/close-out-to-code.md` (for a Code session) and `articles/<slug>/close-out-to-chat.md` (for the drafting chat). A newer note replaces the older one in place; the older versions are in git. Either side may write either file.
+
+1. Read the current note at that path first, on the round's branch and on `main`.
+2. Commit the new note to the open round's branch with `push_files`: `close-out: <slug> rN to-code` (or `to-chat`).
+3. Announce it with `add_issue_comment` on the pull request: one line, with a link. That comment is how the other side finds out.
+4. The note's `Supersedes:` line names the commit of the note it replaces; `list_commits` with `path` gives it. A Code session writes its notes with `ci-docs put`.
+
+## Issues
+
+Labels: `article:<slug>`, `round`, `known-gap`, `research`, `decision`, `correction`, `from-review`.
+
+- The chat opens `known-gap`, `research` and `decision` issues as it needs them, and **must** open `from-review` (or `research` or `decision`) for each deferred finding, as above.
+- The pipeline opens no issues. `metadata.md`'s KNOWN GAPS and UNCERTAIN SECTIONS stay what the pipeline reads each round; an issue is for work that outlives a round.
+- The author opens a `correction` issue for an error found after publication. A new round fixes it, and that round's pull request says `Closes #n`.
 
 ## Never
 
-- Rename or move an article folder.
-- Modify or delete a numbered file. A new round is a new file. A close-out note that needs rewriting gets a `-vM` successor; the old one stays.
-- Rewrite history or force-push.
+- Commit to `main`.
+- Call `merge_pull_request` unless the author said in this chat to merge that pull request, or with any `merge_method` but `merge`.
+- Force-push.
+- Delete a branch or a tag, or call `delete_file` or `delete_repository`.
+- Edit `review.md` or anything under `pipeline/`. They belong to the pipeline.
+- Read anything under `pipeline/` (the worklist, the report) into a revision.
+- Rename an article folder or change a slug. A slug is lowercase words and hyphens, and never contains `/`.
 - Commit a secret, a token or a credential. This repository is private, and a secret committed once stays in its history.
-- Read `pipeline/` (the worklist and the reports) into a revision.
 - Edit a managed file here. Its source is in content-intelligence.
+
+## If the connector is not available
+
+Do a round by hand on github.com: create the branch `round/<slug>/rN` from `main`, upload `draft.md` and `metadata.md` in one commit (`draft: <slug> rN`), and open the pull request into `main`. Nothing on the pipeline side changes.
 
 ## Publication-specific rules
 

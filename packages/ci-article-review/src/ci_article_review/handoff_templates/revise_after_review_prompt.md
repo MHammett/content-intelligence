@@ -20,6 +20,15 @@ to the JSON report in `pipeline_history/<article-slug>/`) and paste its
 SECTION 1 through SECTION 10 content below it, plus the SEO SUGGESTIONS and
 SEO STRUCTURE REVIEW blocks at the end of that file if the run produced them.
 
+For an article kept in the document repository, the review is not in
+`pipeline_history/`: it is `articles/<slug>/review.md` on the round's branch,
+which a connector reads with `get_file_contents` and `ref: refs/pull/<n>/head`
+(<n> is the pull request's number). The pull request's review holds the run's
+summary and a checklist of the Section 1 findings numbered F1, F2, and so on,
+the same numbers as in Section 1 of `review.md`; cite a finding by its number
+when you say what you did with it. Everything below about what to paste, and
+what not to, applies to that file as it does to the local one.
+
 Paste the "Reading this report" block at the top of the file as well. It
 carries how many comparable prior runs this draft was measured against, and the
 per-finding notes below it ("also in 3 of 4 comparable prior runs") only make
@@ -35,7 +44,8 @@ among the most actionable findings a run produces, and they are invisible in
 SECTIONS 1-8.
 
 Do NOT paste the WORKLIST block. It sits above SECTION 1 in the same file (and
-in `run_N_<timestamp>_worklist.md` on its own), so it is the first thing you
+in `run_N_<timestamp>_worklist.md` on its own, or `pipeline/worklist.md` in the
+document repository, which you do not read at all), so it is the first thing you
 meet when you open the review — but it is your list, not the model's. It is a
 set of documents nobody has read yet, named down to bulletin numbers and URLs,
 and handing that to a model asks it to fill in what those documents say. That
