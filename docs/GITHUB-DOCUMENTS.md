@@ -786,7 +786,7 @@ uv run ci-docs import scan example-article \
     --history-key example-article --history-key an-older-title-derived-key \
     --files ~/private/handoff_templates --files ~/Downloads/example-article-v27 \
     --drive-dir ~/ci-import/example-article/drive \
-    --chat-export ~/ci-import/claude-export \
+    --chat-export ~/ci-import/claude-export --chat-map ~/ci-import/chat-map.tsv \
     --recovered ~/ci-import/example-article/recovered \
     --out ~/ci-import/example-article/plan.json
 # read the timeline it prints; edit plan.json (exclude, regroup, relabel), then:
@@ -1003,6 +1003,70 @@ A chat source in the plan reads `{"type": "chat", "path":
 rebuilds a chat-only version from the export and compares its hash, reading the
 export only when no file or run holds the version. The summary prints the linked
 conversations' ids, dates and message counts to the console.
+
+**A map from conversations to articles, and versions only a chat holds
+(`--chat-map`, issue #430).** Matching by what a conversation says is noisy on
+a real export (one conversation named seven articles, and conversations from
+outside the drafting project named research folders), and it finds nothing for
+an article that has only ever lived in chats: no run, file or Drive copy exists
+for a chat text to resemble. claude.ai does know which project a conversation
+belongs to (`GET /api/organizations/{org}/chat_conversations` returns
+`project_uuid` for each, and `GET /api/organizations/{org}/projects/{project}/conversations`
+lists a project's conversations), but the export does not carry it, so the
+author, or a Code session with the signed-in browser, writes the map:
+
+```text
+conversation<TAB>slug<TAB>name<TAB>confidence
+<conversation uuid><TAB>example-article<TAB>anything<TAB>sure
+```
+
+* The header names the columns. `conversation` and `slug` are read; any others
+  (a name, a confidence) are ignored and never reach the plan or the console.
+  A row with no slug is a conversation not yet placed; one conversation on two
+  rows with different slugs is an error. Slugs are compared in lowercase.
+* With `--chat-map FILE` the conversations linked to `SLUG` are exactly the rows
+  whose slug equals it, plus any `--conversation`; **no conversation is linked
+  by what it says, and the title is not used**. A conversation mapped to another
+  slug is never linked to this one (unless `--conversation` names it, which is
+  the author overriding the map). The plan's `chat.linked[].linked_by` says
+  `chat-map` (or `listed`). A row for this slug whose conversation is not in
+  the export is a warning, not an error. A project's knowledge file whose own
+  file name carries the slug is still read, because it is linked by its file
+  name and the map only covers conversations. Without `--chat-map` nothing
+  about linking changes.
+* **A chat-only version.** From a conversation linked by the map or by
+  `--conversation`, a text is kept even when no other source holds a version it
+  resembles, if it is a whole document:
+  the full content of a file-writing tool call (`create_file`, an artifact
+  `create` or `rewrite`, Google Drive's `create_file` or `update_file`,
+  Dropbox's `create_file`, `Write`), an attachment's `extracted_content`, or a
+  project knowledge file; with at least `--min-chat-words N` words (default
+  300; a word is a whitespace-separated piece of text with a letter in it, so a
+  table's rules and bare numbers do not count); not a file whose name ends in a
+  code, data or PDF suffix (`.py`, `.json`, `.csv`, `.pdf`, ...); and not a
+  document the name or content says is something else (a metadata, handoff
+  without a draft in it, close-out, review or changes note). A tool-written file
+  that is a near-duplicate (`passage_match.same_passage`) of a version kept
+  earlier from a chat is not a new version and is counted, so an assistant that
+  writes its file out again each turn does not bury the others. An
+  `str_replace`, `Edit` or artifact `update` rebuild is kept when the text it
+  edited was kept. Fenced blocks and long messages are **not** whole documents:
+  a chat discusses many texts, so they stay under the resemblance rule above
+  (and now also resemble the chat-only versions kept earlier).
+* Each such version has `"corroborated": false` in the plan and `chat-only` in
+  the timeline: no run, file or Drive copy holds a version like it, so only the
+  export vouches for it. A version that does resemble another source's keeps
+  today's behaviour and has no such key. The summary prints the count per tool
+  kind, how many resembled another source, and how many candidates were not
+  kept and why (`not_a_whole_file`, `not_prose`, `not_a_draft`, `short`,
+  `near_duplicate`, `edit_base_not_kept`).
+* **Rounds for a chat-only article.** A round normally starts at a submitted
+  version (a run's draft, or a file named with a `vNN` or `rN`). An article with
+  no runs and no labelled files has none, so its versions are placed in one
+  round per silence of more than 48 hours between consecutive events, or one
+  round when there is no such gap. `accepted_at` defaults as before (just before
+  the next round's first event), and `plan.json` stays editable. The rule is off
+  as soon as the article has a run or a submitted (labelled) version.
 
 Everything the scan is not sure of goes into the plan for the author, not into the
 repository.
