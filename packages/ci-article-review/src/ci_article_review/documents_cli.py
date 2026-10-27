@@ -317,6 +317,29 @@ def build_parser():
         ),
     )
     scan.add_argument(
+        "--chat-map",
+        metavar="FILE",
+        help=(
+            "a TSV with a header 'conversation<TAB>slug' (other columns ignored) "
+            "that says which export conversation belongs to which article. The "
+            "conversations linked to SLUG are exactly its rows plus any "
+            "--conversation; none is linked by what it says. Their whole documents "
+            "are kept even when no other source holds a similar version. Needs "
+            "--chat-export"
+        ),
+    )
+    scan.add_argument(
+        "--min-chat-words",
+        type=int,
+        default=300,
+        metavar="N",
+        help=(
+            "the fewest words a whole document from a linked conversation "
+            "(--chat-map or --conversation) may have to be kept on its own "
+            "(default 300)"
+        ),
+    )
+    scan.add_argument(
         "--out",
         required=True,
         metavar="PLAN.json",
@@ -585,6 +608,8 @@ def _import_scan(args, environ, hi, out):
         recovered=args.recovered,
         chat_export=args.chat_export,
         conversations=args.conversations,
+        chat_map=args.chat_map,
+        min_chat_words=args.min_chat_words,
         environ=environ,
     )
     hi.write_plan(plan, args.out)

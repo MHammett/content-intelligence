@@ -35,8 +35,14 @@ spellings: ``Google Drive:create_file``, ``mcp__Google_Drive__create_file``).
 Replaying a conversation's tool calls in order therefore rebuilds every version
 of every file it wrote. Attachments come next (a pasted draft), and a fenced
 block or a long human message last.
+
+``load_chat_map`` reads the explicit conversation-to-article map that
+``--chat-map`` takes (issue #430): with a map, ``link_conversations`` links by the
+map alone, and ``Candidate.base`` lets the scan ask whether the text an edit was
+applied to was kept.
 """
 
+import csv
 import io
 import json
 import re
@@ -52,7 +58,9 @@ __all__ = [
     "Candidate",
     "MIN_TEXT_CHARS",
     "load_export",
+    "load_chat_map",
     "link_conversations",
+    "unlisted_mapped",
     "extract",
     "project_candidates",
     "recompute",
@@ -273,6 +281,11 @@ class Link:
         return bool(set(self.reasons) - {"title"})
 
     @property
+    def explicit(self):
+        """Linked by the author (the map or ``--conversation``), not by what it says."""
+        return bool(set(self.reasons) & {"chat-map", "listed"})
+
+    @property
     def messages(self):
         return len(self.conversation.get("chat_messages") or [])
 
@@ -293,7 +306,66 @@ def _squash(text):
     return " ".join(text.lower().split())
 
 
-def link_conversations(export, pattern, title=None, listed=()):
+def load_chat_map(path):
+    """``{conversation uuid: slug}`` from a ``--chat-map`` TSV (issue #430).
+
+    The header names the columns (``conversation`` and ``slug``; any others, such
+    as a name or a confidence, are ignored and never read into the plan). A row
+    with no slug is a conversation the author has not placed. Slugs are compared
+    in lowercase. One conversation on two rows with different slugs is an error:
+    the map is the only thing that links a conversation, so it must not be
+    ambiguous.
+    """
+    source = Path(path)
+    if not source.is_file():
+        raise ChatExportError(f"--chat-map {path} does not exist")
+    try:
+        text = source.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ChatExportError(
+            f"cannot read --chat-map {path} ({exc.__class__.__name__})"
+        ) from exc
+    # No quoting: a conversation's name may contain a quote mark, and the name
+    # column is not read.
+    rows = csv.reader(
+        io.StringIO(text, newline=""), delimiter="\t", quoting=csv.QUOTE_NONE
+    )
+    header = next(rows, None)
+    names = [cell.strip().lower() for cell in header or []]
+    for needed in ("conversation", "slug"):
+        if needed not in names:
+            raise ChatExportError(
+                f"--chat-map {path}: the header row must name a '{needed}' column "
+                "(tab-separated, with a header like conversation<TAB>slug)"
+            )
+    at_conversation, at_slug = names.index("conversation"), names.index("slug")
+    mapping = {}
+    for row in rows:
+        if len(row) <= max(at_conversation, at_slug):
+            continue
+        uuid, slug = row[at_conversation].strip(), row[at_slug].strip().lower()
+        if not uuid or not slug:
+            continue
+        if mapping.setdefault(uuid, slug) != slug:
+            raise ChatExportError(
+                f"--chat-map {path}: conversation {uuid} is mapped to two slugs"
+            )
+    return mapping
+
+
+def unlisted_mapped(export, chat_map, slug):
+    """The conversations the map gives to ``slug`` that the export does not hold."""
+    present = {conv["uuid"] for conv in export.conversations}
+    return sorted(
+        uuid
+        for uuid, mapped in chat_map.items()
+        if mapped == slug.lower() and uuid not in present
+    )
+
+
+def link_conversations(
+    export, pattern, title=None, listed=(), chat_map=None, slug=None
+):
     """The conversations that belong to the article, with why.
 
     ``pattern`` finds the slug (or a history key) in lowercase text. A
@@ -302,8 +374,26 @@ def link_conversations(export, pattern, title=None, listed=()):
     author lists its uuid (``listed``), or, weakly, when it quotes the article's
     ``title``. Only a title match is weak: its candidates are kept in the plan
     but left out (``include: false``) for the author to decide.
+
+    With a ``chat_map`` (``{uuid: slug}``, from ``load_chat_map``) nothing is
+    linked by what it says: the conversations are those the map gives to ``slug``
+    plus the ``listed`` ones, and a conversation the map gives to another slug is
+    never linked (unless the author lists it).
     """
     listed = set(listed)
+    if chat_map is not None:
+        wanted = (slug or "").lower()
+        links = []
+        for conv in export.conversations:
+            reasons = set()
+            if chat_map.get(conv["uuid"]) == wanted:
+                reasons.add("chat-map")
+            if conv["uuid"] in listed:
+                reasons.add("listed")
+            if reasons:
+                links.append(Link(conversation=conv, reasons=tuple(sorted(reasons))))
+        _require_listed(listed, links)
+        return links
     title = _squash(title) if title and len(title.strip()) >= 15 else None
     links = []
     for conv in export.conversations:
@@ -346,12 +436,16 @@ def link_conversations(export, pattern, title=None, listed=()):
             reasons.add("title")
         if reasons:
             links.append(Link(conversation=conv, reasons=tuple(sorted(reasons))))
+    _require_listed(listed, links)
+    return links
+
+
+def _require_listed(listed, links):
     missing = listed - {link.uuid for link in links}
     if missing:
         raise ChatExportError(
             f"--conversation {', '.join(sorted(missing))}: not in the export"
         )
-    return links
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +465,9 @@ class Candidate:
     edit: bool  # produced by applying an edit to an earlier text
     created: object  # aware UTC datetime
     text: str
+    #: for an edit: the text it was applied to (so a scan can ask whether that
+    #: text was kept); ``None`` for a whole file
+    base: object = None
 
     @property
     def source(self):
@@ -456,7 +553,7 @@ def extract(conversation):
     stamps = {}  # (space, key) -> order of the last write
     counter = 0
 
-    def emit(message, locator, via, name, edit, created, text):
+    def emit(message, locator, via, name, edit, created, text, base=None):
         if created is None:
             stats["no_time"] += 1
             return
@@ -470,6 +567,7 @@ def extract(conversation):
                 edit=edit,
                 created=created,
                 text=text,
+                base=base,
             )
         )
 
@@ -561,8 +659,8 @@ def extract(conversation):
                         inputs.get("old_str"),
                         inputs.get("new_str"),
                         False,
-                        lambda text, t=title: emit(
-                            message, locator, via, t, True, at, text
+                        lambda text, base, t=title: emit(
+                            message, locator, via, t, True, at, text, base
                         ),
                     )
                 else:
@@ -584,8 +682,8 @@ def extract(conversation):
                     old,
                     new,
                     inputs.get("replace_all") is True,
-                    lambda text, p=path: emit(
-                        message, locator, via, _basename(p), True, at, text
+                    lambda text, base, p=path: emit(
+                        message, locator, via, _basename(p), True, at, text, base
                     ),
                 )
         _message_candidates(message, created, uuid, candidates)
@@ -609,7 +707,7 @@ def _apply_edit(stats, states, store, base_for, key, name, old, new, replace_all
     stats["edits_applied"] += 1
     store(key, name, text)
     if text != base:
-        emit(text)
+        emit(text, base)
 
 
 def _message_candidates(message, created, uuid, candidates):

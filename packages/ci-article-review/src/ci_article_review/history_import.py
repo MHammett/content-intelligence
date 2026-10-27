@@ -61,6 +61,7 @@ __all__ = [
     "format_timeline",
     "default_history_root",
     "checkout_roots",
+    "DEFAULT_MIN_CHAT_WORDS",
 ]
 
 PLAN_VERSION = 1
@@ -105,6 +106,46 @@ _REPRODUCTION_WINDOW = timedelta(days=3)
 
 #: Where a chat text came from when the author, not the chat, named the file.
 _AUTHORS_FILES = ("attachment", "project_doc")
+
+#: A conversation the author linked (``--chat-map`` or ``--conversation``) keeps a
+#: whole document even when no other source holds a similar version (issue #430),
+#: if it has at least this many words. A shorter text is a note, not a draft.
+DEFAULT_MIN_CHAT_WORDS = 300
+
+#: Where a text that is a whole file comes from: a file-writing tool call's full
+#: content, an attachment's text, a project knowledge file. A fenced block or a
+#: long message is not on the list: a chat discusses many texts.
+_WHOLE_FILE_VIAS = frozenset(
+    {
+        "create_file",
+        "write",
+        "artifacts",
+        "drive_create_file",
+        "drive_update_file",
+        "dropbox_create_file",
+        "attachment",
+        "project_doc",
+    }
+)
+
+#: Of those, the ones a chat's own tool call writes. A chat that writes a file again
+#: with a few words changed has not made a new version, and one that does it in
+#: every turn would bury the others; an attachment or a project file is the
+#: author's own and is never a repeat.
+_TOOL_WRITTEN_VIAS = _WHOLE_FILE_VIAS - {"attachment", "project_doc"}
+
+#: File names with these endings are code, data or sources, not the article.
+_NOT_PROSE_SUFFIXES = frozenset(
+    {
+        ".py", ".js", ".ts", ".json", ".csv", ".tsv", ".html", ".htm", ".css",
+        ".sh", ".yaml", ".yml", ".xml", ".sql", ".toml", ".ini", ".log",
+        ".ipynb", ".svg", ".pdf",
+    }
+)  # fmt: skip
+
+#: With no run and no labelled file to say where a round ends, a chat-only
+#: article starts a new round after a silence longer than this.
+_ROUND_GAP = timedelta(hours=48)
 
 _DOCUMENT_SUFFIXES = (".md", ".markdown")
 
@@ -386,6 +427,8 @@ class Event:
     at: object = None
     id: object = None
     attached_to: object = None
+    #: kept from a linked conversation although no other source holds a similar version
+    uncorroborated: bool = False
 
     @property
     def label(self):
@@ -744,13 +787,38 @@ def _article_title(collector):
     return None
 
 
-def _prepare_chat(collector, path, listed, terms):
-    """Read the export, link its conversations to the article and list their candidates."""
+def _prepare_chat(
+    collector,
+    path,
+    listed,
+    terms,
+    chat_map_path=None,
+    slug=None,
+    min_words=DEFAULT_MIN_CHAT_WORDS,
+):
+    """Read the export, link its conversations to the article and list their candidates.
+
+    With a ``chat_map_path`` the map alone links conversations (plus ``listed``);
+    otherwise they are linked by what they say.
+    """
     try:
         export = chat_export_module.load_export(path)
+        chat_map = (
+            chat_export_module.load_chat_map(chat_map_path) if chat_map_path else None
+        )
         pattern = _term_pattern(terms)
         links = chat_export_module.link_conversations(
-            export, pattern, _article_title(collector), listed
+            export,
+            pattern,
+            None if chat_map is not None else _article_title(collector),
+            listed,
+            chat_map,
+            slug,
+        )
+        absent = (
+            chat_export_module.unlisted_mapped(export, chat_map, slug)
+            if chat_map is not None
+            else []
         )
     except chat_export_module.ChatExportError as exc:
         raise ImportScanError(str(exc)) from exc
@@ -765,17 +833,31 @@ def _prepare_chat(collector, path, listed, terms):
         (c, True) for c in chat_export_module.project_candidates(export, pattern)
     )
     links.sort(key=lambda link: (link.conversation.get("created_at") or "", link.uuid))
-    if not links:
+    if absent:
         collector.warnings.append(
-            "--chat-export: no conversation in the export names the article "
-            "(its slug, a file name, or its title); pass --conversation UUID"
+            f"--chat-map: {len(absent)} conversation(s) mapped to {slug} are not in "
+            f"the export: {', '.join(absent)}"
         )
+    if not links:
+        if chat_map is not None:
+            collector.warnings.append(
+                f"--chat-map: no conversation in the map is mapped to {slug} "
+                "(and none was passed with --conversation)"
+            )
+        else:
+            collector.warnings.append(
+                "--chat-export: no conversation in the export names the article "
+                "(its slug, a file name, or its title); pass --conversation UUID"
+            )
     return {
         "export": export,
         "links": links,
         "candidates": candidates,
         "read": read,
         "report": {},
+        "chat_map": (Path(chat_map_path).resolve().as_posix() if chat_map else None),
+        "explicit": {link.uuid for link in links if link.explicit},
+        "min_words": min_words,
     }
 
 
@@ -813,6 +895,46 @@ def _only_chat(version):
     return bool(real) and all(h.source == "chat" for h in real)
 
 
+def _draft_text(text):
+    """The normalised text a chat text is hashed from: a handoff's embedded draft, else all."""
+    embedded = _embedded_draft(text)
+    return normalise(embedded) if embedded else normalise(text)
+
+
+def _prose_words(text):
+    """Words in a text: whitespace-separated, with at least one letter in them."""
+    return sum(1 for token in text.split() if any(c.isalpha() for c in token))
+
+
+def _chat_only_problem(candidate, text, part, kept_shas, terms, min_words):
+    """Why a linked conversation's text is not kept on its own, or ``None`` if it is.
+
+    Issue #430. A whole document (a file-writing tool call's full content, an
+    attachment, a project knowledge file) with at least ``min_words`` words is a
+    version of the article even when no other source holds one (a tool-written
+    file that is a near-duplicate of a version kept earlier is dropped before it
+    gets here, in ``_ingest_chat``). An edit is kept when the text it edited
+    was kept. A fenced block or a long message is neither, so it stays under the
+    resemblance rule.
+    """
+    if candidate.edit:
+        base = candidate.base
+        if isinstance(base, str) and _sha(_draft_text(base)) in kept_shas:
+            return None
+        return "edit_base_not_kept"
+    if candidate.via not in _WHOLE_FILE_VIAS:
+        return "not_a_whole_file"
+    if Path(candidate.name or "").suffix.lower() in _NOT_PROSE_SUFFIXES:
+        return "not_prose"
+    if part is None:
+        kind, _ = _file_kind_and_label(candidate.name or "", terms, candidate.text)
+        if kind not in ("draft", "unknown"):
+            return "not_a_draft"
+    if _prose_words(text) < min_words:
+        return "short"
+    return None
+
+
 def _ingest_chat(chat, versions, version_for, ref_texts, terms):
     """Turn the export's candidates into draft versions (or sources of existing ones).
 
@@ -820,12 +942,22 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
     kept ones are added to the references as they come, oldest first, so a draft
     that grew over a conversation is followed one step at a time. The references
     grow only from conversations linked by more than the title.
+
+    A conversation the author linked (``--chat-map`` or ``--conversation``) also
+    keeps a whole document that resembles nothing (``_chat_only_problem``); such a
+    version is marked uncorroborated unless a version another source holds is
+    like it.
     """
     before = set(versions)
     refs = [tokenise(t) for t in ref_texts]
+    outside = list(refs)  # what the other sources hold; the chat's own texts excluded
     had_references = bool(refs)
+    explicit = chat["explicit"]
+    mapped = chat["chat_map"] is not None
+    min_words = chat["min_words"]
     verdict, grown, weak_only, first_edit = {}, set(), set(), {}
     kept_shas, kept_by_via, dropped_by_via = set(), {}, {}
+    kept_tokens, explicit_kept, skipped = {}, set(), {}
     kept = dropped = 0
     ordered = sorted(
         chat["candidates"],
@@ -843,10 +975,37 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
             dropped += 1
             dropped_by_via[candidate.via] = dropped_by_via.get(candidate.via, 0) + 1
             continue
+        linked = candidate.conversation in explicit or (
+            mapped and candidate.via == "project_doc"
+        )
         tokens = None
-        if sha not in verdict:
+        if (
+            linked
+            and not candidate.edit
+            and candidate.via in _TOOL_WRITTEN_VIAS
+            and sha not in kept_shas
+        ):
             tokens = tokenise(text)
+            if any(same_passage(tokens, other) for other in kept_tokens.values()):
+                skipped["near_duplicate"] = skipped.get("near_duplicate", 0) + 1
+                dropped += 1
+                dropped_by_via[candidate.via] = dropped_by_via.get(candidate.via, 0) + 1
+                continue
+        if sha not in verdict:
+            if tokens is None:
+                tokens = tokenise(text)
             verdict[sha] = _resembles(tokens, refs)
+        if not verdict[sha] and linked:
+            if sha in kept_shas:
+                verdict[sha] = True  # the same bytes, kept from another message
+            else:
+                problem = _chat_only_problem(
+                    candidate, text, part, kept_shas, terms, min_words
+                )
+                if problem is None:
+                    verdict[sha] = True
+                else:
+                    skipped[problem] = skipped.get(problem, 0) + 1
         if verdict[sha] and strong and sha not in grown:
             grown.add(sha)
             refs.append(tokens if tokens is not None else tokenise(text))
@@ -856,7 +1015,10 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
             continue
         kept += 1
         kept_shas.add(sha)
+        kept_tokens.setdefault(sha, tokens if tokens is not None else tokenise(text))
         kept_by_via.setdefault(candidate.via, set()).add(sha)
+        if linked:
+            explicit_kept.add(sha)
         first_edit.setdefault(sha, candidate.edit)
         existed = sha in versions
         version = version_for(sha, text)
@@ -897,6 +1059,27 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
             "replaced": 0,
         }
     )
+    if explicit or mapped:
+        # A version is corroborated when a version another source holds is like it.
+        alone = {
+            sha for sha in explicit_kept if not _resembles(kept_tokens[sha], outside)
+        }
+        for sha in alone:
+            versions[sha].uncorroborated = True
+        chat["report"].update(
+            {
+                "chat_only": len(alone),
+                "chat_only_by_via": {
+                    k: n
+                    for k, n in sorted(
+                        (k, len(v & alone)) for k, v in kept_by_via.items()
+                    )
+                    if n
+                },
+                "corroborated": len(kept_shas) - len(alone),
+                "chat_only_skipped": dict(sorted(skipped.items())),
+            }
+        )
 
 
 def _in_reproduction_window(holder, version, versions):
@@ -1180,8 +1363,12 @@ def _mark_suspect_runs(run_events):
         event.run_data["suspect_why"] = "; ".join(reasons) if reasons else None
 
 
-def _group_rounds(events):
-    """Rounds: a new one at each included, submitted draft version."""
+def _group_rounds(events, gap=None):
+    """Rounds: a new one at each included, submitted draft version.
+
+    With a ``gap`` (an article that exists only in chats, issue #430) a new round
+    also starts after a silence longer than that between two events.
+    """
 
     def tiebreak(e):
         path = e.run_data["path"] if e.kind == "run" else e.holders[0].path
@@ -1192,10 +1379,13 @@ def _group_rounds(events):
     )
     unplaced = sorted((e for e in events if e.at is None), key=tiebreak)
     rounds = []
+    previous = None
     for event in placed:
         starts = event.kind == "draft" and event.submitted and event.include
-        if not rounds or (starts and rounds[-1]["started"]):
+        silent = gap is not None and previous is not None and event.at - previous > gap
+        if not rounds or (starts and rounds[-1]["started"]) or silent:
             rounds.append({"events": [], "started": False})
+        previous = event.at
         rounds[-1]["events"].append(event)
         if starts:
             rounds[-1]["started"] = True
@@ -1252,6 +1442,8 @@ def scan(
     recovered=None,
     chat_export=None,
     conversations=(),
+    chat_map=None,
+    min_chat_words=DEFAULT_MIN_CHAT_WORDS,
     environ=None,
 ):
     """Read the sources and return ``(plan, stats)``. Writes nothing.
@@ -1260,6 +1452,10 @@ def scan(
     """
     if conversations and not chat_export:
         raise ImportScanError("--conversation needs --chat-export")
+    if chat_map and not chat_export:
+        raise ImportScanError("--chat-map needs --chat-export")
+    if not isinstance(min_chat_words, int) or min_chat_words < 0:
+        raise ImportScanError("--min-chat-words must be a whole number, 0 or more")
     if not isinstance(slug, str) or not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]*", slug
     ):
@@ -1286,7 +1482,15 @@ def scan(
     if recovered:
         _scan_recovered(collector, recovered, terms)
     if chat_export:
-        collector.chat = _prepare_chat(collector, chat_export, conversations, terms)
+        collector.chat = _prepare_chat(
+            collector,
+            chat_export,
+            conversations,
+            terms,
+            chat_map,
+            slug,
+            min_chat_words,
+        )
 
     drafts, others, run_events = _build_events(collector)
     if not (drafts or others or run_events):
@@ -1310,7 +1514,14 @@ def scan(
     _mark_suspect_runs(run_events)
     all_events = [*drafts, *others, *run_events]
 
-    rounds = _group_rounds(all_events)
+    # An article that exists only in chats has no run or labelled file to say where
+    # a round ends: a silence of more than 48 hours does.
+    chat_only_article = (
+        not run_events
+        and any(d.uncorroborated for d in drafts)
+        and not any(d.submitted and d.include for d in drafts)
+    )
+    rounds = _group_rounds(all_events, _ROUND_GAP if chat_only_article else None)
 
     # Attach each non-draft document to the nearest included draft in its round.
     for group in rounds:
@@ -1392,7 +1603,7 @@ def _chat_record(chat):
     Conversation ids, dates, message counts and why each was linked; never a name
     or any text.
     """
-    return {
+    record = {
         "export": chat["export"].path,
         "linked": [
             {
@@ -1408,6 +1619,11 @@ def _chat_record(chat):
         "kept": chat["report"],
         "skipped": dict(sorted(chat["export"].skipped.items())),
     }
+    if chat["chat_map"] is not None:
+        record["chat_map"] = chat["chat_map"]
+    if chat["chat_map"] is not None or chat["explicit"]:
+        record["min_chat_words"] = chat["min_words"]
+    return record
 
 
 def _event_record(event):
@@ -1442,6 +1658,8 @@ def _event_record(event):
     }
     if event.kind == "draft":
         record["submitted"] = event.submitted and event.superseded_by is None
+    if event.uncorroborated:
+        record["corroborated"] = False
     other = event.other_labels()
     if other:
         record["other_labels"] = other
@@ -1518,6 +1736,8 @@ def _stats(collector, drafts, others, run_events, rounds, root, root_why, keys, 
             "skipped": dict(chat["export"].skipped),
             "read": dict(chat["read"]),
             "rounds": len(rounds),
+            "chat_map": chat["chat_map"] is not None,
+            "min_chat_words": chat["min_words"],
             **chat["report"],
         }
     return stats
@@ -1571,6 +1791,8 @@ def format_timeline(plan):
                 marks.append(f"superseded by {event['superseded_by']}")
             if event.get("suspect"):
                 marks.append("suspect")
+            if event.get("corroborated") is False:
+                marks.append("chat-only")
             sources = event.get("sources")
             if event.get("kind") == "run":
                 sources = [{"type": "run", "path": event.get("report", "")}]
@@ -1623,11 +1845,20 @@ def format_summary(stats):
 def _format_chat(chat):
     """The export's part of the summary: counts and conversation ids, never names or text."""
     strong = sum(1 for link in chat["linked"] if link["strong"])
-    lines = [
-        f"Chat export: {chat['conversations']} conversations searched by content (they "
-        f"carry no project id); {len(chat['linked'])} linked ({strong} by the slug or a "
-        f"file name, {len(chat['linked']) - strong} by the title only)",
-    ]
+    if chat.get("chat_map"):
+        by_map = sum(1 for link in chat["linked"] if "chat-map" in link["linked_by"])
+        by_hand = sum(1 for link in chat["linked"] if "listed" in link["linked_by"])
+        lines = [
+            f"Chat export: {chat['conversations']} conversations, none searched by "
+            f"content; {by_map} linked by --chat-map"
+            + (f", {by_hand} by --conversation" if by_hand else ""),
+        ]
+    else:
+        lines = [
+            f"Chat export: {chat['conversations']} conversations searched by content "
+            f"(they carry no project id); {len(chat['linked'])} linked ({strong} by "
+            f"the slug or a file name, {len(chat['linked']) - strong} by the title only)",
+        ]
     for link in chat["linked"]:
         lines.append(
             f"  {link['uuid']}  created {(link['created_at'] or '?')[:10]}  "
@@ -1648,6 +1879,18 @@ def _format_chat(chat):
         f"{chat.get('in_round_edits', 0)}; left out for the author (title only): "
         f"{chat.get('left_out', 0)}"
     )
+    if "chat_only" in chat:
+        alone_by = ", ".join(f"{k} {n}" for k, n in chat["chat_only_by_via"].items())
+        lines.append(
+            f"  Chat-only versions (no other source holds them): {chat['chat_only']}"
+            + (f" ({alone_by})" if alone_by else "")
+            + f"; like a version another source holds: {chat['corroborated']}"
+        )
+        left = ", ".join(f"{k} {n}" for k, n in chat["chat_only_skipped"].items())
+        lines.append(
+            f"  Not kept from linked conversations (at least {chat['min_chat_words']} "
+            f"words, whole documents only): {left or 'none'}"
+        )
     lines.append(
         f"  Reproductions: {chat.get('confirmed', 0)} confirmed by the export, "
         f"{chat.get('replaced', 0)} replaced by it"
@@ -1665,7 +1908,7 @@ def _format_chat(chat):
             "  Skipped in the export: "
             + ", ".join(f"{n} {what}" for what, n in sorted(chat["skipped"].items()))
         )
-    if chat.get("no_references"):
+    if chat.get("no_references") and not chat.get("chat_only"):
         lines.append(
             "  warning: no other source holds a draft, so no chat text could be "
             "compared with one"
