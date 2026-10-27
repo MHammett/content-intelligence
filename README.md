@@ -533,7 +533,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is 
 | `--round N` | With `--github`: read round `N`: the open pull request from `round/SLUG/rN` if there is one, else the tag `SLUG/rN`. Only the open pull request can be written back to. |
 | `--github-ref REF` | With `--github`: read a branch, tag or commit SHA as it is. Never written back: a usage error with `--write-back`. |
 | `--github-repo OWNER/NAME` | With `--github`: read from this repository instead of `github_documents.repo`, for this run only |
-| `--write-back` / `--no-write-back` | With `--github`: commit the review back to the article's folder, or don't, overriding `github_documents.write_back`. A usage error without `--github`, and `--write-back` is one with `--replay`, `--offline`, `--only-model`, `--only-domain`, `--no-timeout` or `--github-ref`. See [Writing the review back](#writing-the-review-back-to-github) |
+| `--write-back` / `--no-write-back` | With `--github`: deliver the review to the round's pull request (a commit to its branch and one pull request review), or don't, overriding `github_documents.write_back`. A usage error without `--github`, and `--write-back` is one with `--replay`, `--offline`, `--only-model`, `--only-domain`, `--no-timeout` or `--github-ref`. See [Writing the review back](#writing-the-review-back-to-github) |
 | `--publish PATH` | Publish an approved publication handoff (saves as draft unless `--publish-live`) |
 | `--metadata PATH` | Metadata-only file (PRIMARY CLAIM, TARGET AUDIENCE, etc., no DRAFT section) to pair with `--raw-draft`. Requires `--raw-draft`. |
 | `--publication NAME` | Publication config to use (`configs/NAME.yaml`) — **required** |
@@ -594,8 +594,8 @@ Configuration is an optional `github_documents` block in `configs/user.yaml` (co
 | `repo` | `MHammett/mikehammett.net-articles` | `OWNER/NAME` of the document repository. `--github-repo` overrides it. An empty string is an error. |
 | `branch` | the repository's default branch | The base branch rounds merge into; its head is where `pipeline/run.json` is read for run numbers already taken |
 | `path_prefix` | `articles` | The folder that holds the article folders (empty: the repository root) |
-| `write_back` | `false` | Commit the review back after every `--github` run, as if `--write-back` were given. `--no-write-back` overrides it; it is set aside, with one INFO line, on a replay, an offline run or a calibration run |
-| `include_capture` | `false` | Also commit `run_N_<ts>_results.json` (the raw ensemble) under `pipeline/` |
+| `write_back` | `false` | Deliver the review to the round's pull request after every `--github` run, as if `--write-back` were given. `--no-write-back` overrides it; it is set aside, with one INFO line, on a replay, an offline run or a calibration run |
+| `include_capture` | `false` | Also commit the run's raw ensemble as `pipeline/results.json` |
 | `allow_public_repo` | `false` | Let write-back commit to a public repository, where the review and the worklist would be published |
 
 There is no token key. The token is `GITHUB_TOKEN` if set, else the output of `gh auth token`; a fine-grained personal access token limited to the one repository, with Contents read, is the narrowest choice. A public repository needs no token, but the run warns because drafts committed there are published.
@@ -604,30 +604,34 @@ Every failure stops the run before a model is called, with one message and exit 
 
 ### Writing the review back to GitHub
 
-`--write-back` commits the run's review to the folder the draft was read from, so the drafting side reads it without anybody pasting a file. It is off unless the flag or `write_back: true` turns it on, and it needs `--github`.
+`--write-back` delivers the run's review to the round's pull request, so the drafting side reads it without anybody pasting a file. It is off unless the flag or `write_back: true` turns it on, and it needs `--github` and a round's open pull request.
 
 ```powershell
 uv run ci-review --github my-article --write-back --publication your_publication_name
 ```
 
-One commit on the branch the draft was read from, holding new files only, from run N (the run number the run actually used):
+It does two things, in this order. The first is one commit to the pull request's head branch, from run N (the run number the run actually used), under fixed names:
 
 | Local file in `pipeline_history/<key>/` | Path in the document repository |
 |---|---|
-| `run_N_<ts>_review.md` | `<slug>/<slug>-review-rN.md` |
-| `run_N_<ts>_worklist.md` | `<slug>/pipeline/<slug>-worklist-rN.md` |
-| `run_N_<ts>_report.json` | `<slug>/pipeline/run_N_<ts>_report.json` |
-| `run_N_<ts>_results.json` (only with `include_capture: true`) | `<slug>/pipeline/run_N_<ts>_results.json` |
+| `run_N_<ts>_review.md` | `<slug>/review.md` |
+| (built from the report) | `<slug>/pipeline/run.json` |
+| `run_N_<ts>_report.json` | `<slug>/pipeline/report.json` |
+| `run_N_<ts>_worklist.md` | `<slug>/pipeline/worklist.md` |
+| `run_N_<ts>_results.json` (only with `include_capture: true`) | `<slug>/pipeline/results.json` |
 
-The paths are relative to `path_prefix`. The review is at the top level, where the chat project reads; `pipeline/` is not, because the worklist lists documents nobody has read yet. Line endings are converted to LF. The commit message names the draft files and the commit they were read at, the run, its preset and reported cost, and the files, and says so when the reviewed draft has since been edited at its own path.
+The paths are relative to `path_prefix`. `run.json` holds `run_number`, `history_key`, `history_name`, `reviewed_commit`, `round`, `pull_request`, `preset` and `cost_reported_usd`, which is how a later run, on any machine, numbers itself past this one. Line endings are converted to LF. The commit message names the draft files and the commit they were read at, the pull request, the run, its preset and reported cost, and the files, and says so when a reviewed draft has since been edited at its own path.
 
-- **Checked before any model call.** A token, push permission on the repository, an open pull request to commit to (a tag, a merged or closed round, a fork, or `--github-ref` is refused), and a private repository unless `allow_public_repo: true`. Each refusal is one message and exit status 1 and costs nothing. The run number also moves past every number in `pipeline/run.json` at the round's head and at the base branch, so the names are free.
-- **Never over anything.** A file already there with the same bytes is left alone; one with different bytes stops the write-back and nothing is overwritten. There is no force. If the drafting side commits while the review is being written, the commit is rebuilt on top of theirs, up to three more times.
-- **No secrets.** Every outgoing file and the message are scanned for the token and for every configured API key value; a hit refuses the whole commit.
+The second is one pull request review (event `COMMENT`, no line comments) of the commit that was read. Its first line is a marker, `<!-- ci-review run=N commit=SHA -->`. The body is the run, preset and cost; the commit reviewed and any edits since; a line saying one run is not a measurement; one line per section with its count of findings; every Section 1 finding as a task, `- [ ] **F3** "the passage": the finding`, where `F3` is the number the finding has in Section 1 of `review.md`; and where the whole review is, with the connector call to read it. **The worklist is never in the body.** It lists documents nobody has read yet, so it is only in `pipeline/worklist.md` and the WORKLIST block that opens `review.md`. A body is cut to 60,000 characters (GitHub's limit is about 65,000): the per-section lines go first, then whole checklist items from the end, and the body says what was cut.
+
+- **Checked before any model call.** A token, push permission on the repository, an open pull request to commit to (a tag, a merged or closed round, a fork, or `--github-ref` is refused), and a private repository unless `allow_public_repo: true`. Each refusal is one message and exit status 1 and costs nothing. The run number also moves past every number in `pipeline/run.json` at the round's head and at the base branch.
+- **Only the pipeline's own files are replaced.** A file that was there at the commit the run reviewed is replaced only if it is still what it was; one that was absent must still be absent. If anyone changed one since, the write-back is refused and nothing is overwritten. There is no force. Edits to other files, such as the drafting side's revisions, are kept: the commit is built on top of them, up to three more times if the branch keeps moving, and the review still says it is of the commit that was read.
+- **If the pull request was merged or closed during the run,** nothing is written (a commit to its branch would never reach the base branch), the run exits 1, and the review stays in local history.
+- **No secrets.** Every outgoing file, the commit message and the review body are scanned for the token and for every configured API key value; a hit refuses the write before anything is sent.
 - **If it fails after the review,** the local files are already saved. The run prints the reason, says so, gives the retry command, and exits 1.
 - **Never from a replay.** A replay's report goes to `_replay/` and is a code test, not a review of the article. `--write-back` with `--replay`, `--offline`, `--only-model`, `--only-domain` or `--no-timeout` is a usage error; with `write_back: true` in config those runs ignore it and log one INFO line. `--retry-failed` may write back.
 
-The retry, and the way to hand over a run whose commit failed, is `ci-docs push-run`: see [`ci-docs`](#the-document-repository-ci-docs).
+The retry, and the way to hand over a run whose commit or review failed, is `ci-docs push-run`: see [`ci-docs`](#the-document-repository-ci-docs).
 
 ### Iterating on the code without paying for the ensemble
 
@@ -689,13 +693,13 @@ It also sets the repository's merge settings, once, and only when they differ: m
 
 ### `ci-docs push-run`
 
-`push-run` writes back a run that is already saved on disk, without running it again. It is the retry for a `ci-review --github ... --write-back` whose commit failed (the error prints the exact command), and the way to hand over a run you decided about later.
+`push-run` writes back a run that is already saved on disk, without running it again. It is the retry for a `ci-review --github ... --write-back` whose commit or review failed (the error prints the exact command), and the way to hand over a run you decided about later.
 
 ```powershell
 uv run ci-docs push-run pipeline_history/my-article/run_4_20261026_143022_report.json
 ```
 
-It reads `document_source` from the report to find the repository, the branch and the article folder, maps the files beside the report as in [Writing the review back](#writing-the-review-back-to-github), and applies the same refusals and the same commit. Running it twice is a no-op. A report under `_replay/`, one not named `run_N_<timestamp>_report.json`, and one without a `document_source` are refused.
+It reads `document_source` from the report to find the repository, the pull request and the article folder, maps the files beside the report as in [Writing the review back](#writing-the-review-back-to-github), and does the same two steps with the same refusals. Both are safe to repeat: when every file is already identical it makes no commit, and when the pull request already has a review with this run's marker it posts none. So after a failed review post it posts only the review, and run twice it does nothing. A report under `_replay/`, one not named `run_N_<timestamp>_report.json`, one without a `document_source` or whose `document_source` names no pull request, and one whose pull request is merged or closed are refused. It prints the commit URL and then the review URL.
 
 | Flag | Meaning |
 |---|---|
@@ -1030,7 +1034,8 @@ content-intelligence/
 │   │   │   ├── handoff_parser.py      parses Template A and Template C documents
 │   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
 │   │   │   ├── github_documents.py    reads one round of an article from a GitHub repository (--github)
-│   │   │   ├── github_writeback.py    commits a run's review back to that folder (--write-back, ci-docs push-run)
+│   │   │   ├── github_writeback.py    commits a run's review to the round's branch and posts the pull request review (--write-back, ci-docs push-run)
+│   │   │   ├── review_body.py         the body of that review: summary and a checklist of the Section 1 findings
 │   │   │   ├── github_put.py          ci-docs ls and put: list an article folder, add a close-out note or drafting file
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
 │   │   │   ├── chat_export.py         reads a claude.ai data export for ci-docs import scan (--chat-export)
