@@ -340,6 +340,17 @@ class GitHubRepo:
             )
         return sha
 
+    def has_branch(self, branch):
+        """True if ``branch`` is a branch of the repository (a tag or SHA is not)."""
+        resp = self._send("GET", f"/repos/{self.repo}/git/ref/heads/{_quote(branch)}")
+        if resp.status_code == 404 or (
+            resp.status_code == 409 and self._is_empty(resp)
+        ):
+            return False
+        if not 200 <= resp.status_code < 300:
+            raise self._http_error(resp, f"look up branch {branch}")
+        return True
+
     def read(self, path, ref):
         """The bytes of ``path`` as of ``ref``, pinned to the commit ``ref`` names."""
         _check_path(path)
