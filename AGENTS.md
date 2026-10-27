@@ -11,6 +11,7 @@ Guidance for any coding agent or human contributor working in this repository. A
 | landing or merging a pull request, or a PR has gone behind `master` | [docs/LANDING-A-PR.md](docs/LANDING-A-PR.md) |
 | changing a provider, a preset, a price or a timeout | [docs/PROVIDERS.md](docs/PROVIDERS.md), [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | debugging a run or a report | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
+| working on `ci-docs`, `--github`, `--write-back`, or the private document repository (or connecting a claude.ai project to it) | [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) |
 | touching citations, archive lookups or link checks | [docs/CITATIONS.md](docs/CITATIONS.md) |
 | learning how the pipeline fits together | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | naming a package, module or concept | [docs/NAMING.md](docs/NAMING.md), [docs/TERMINOLOGY.md](docs/TERMINOLOGY.md) |

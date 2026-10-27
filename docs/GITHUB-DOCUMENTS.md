@@ -1,9 +1,21 @@
 # GitHub as a document store (design)
 
-Status: **design, partly built.** The client (#401) and `ci-docs init` (#406)
-are built; the rest is not. The build is split into phases, each a GitHub
-issue labelled `github-documents`; the issues are the specification a builder
-works from, and this page is the reasoning behind them.
+Status: **built**, except the optional last phase. The design is
+[#400](https://github.com/MHammett/content-intelligence/pull/400); it was built
+in phases, each a GitHub issue labelled `github-documents`:
+
+| Phase | What | PR |
+|---|---|---|
+| client | `ci_core.github_repo`, the REST client with the never-clobber commit | [#407](https://github.com/MHammett/content-intelligence/pull/407) |
+| `ci-docs init` | creates the document repository and keeps its onboarding files current | [#408](https://github.com/MHammett/content-intelligence/pull/408) |
+| `--github SLUG` | reads a round from the repository | [#409](https://github.com/MHammett/content-intelligence/pull/409) |
+| `--write-back`, `ci-docs push-run` | commits the review back | [#410](https://github.com/MHammett/content-intelligence/pull/410) |
+| `ci-docs ls` and `put`, the docs, the claude.ai check | close-out notes from a Code session | [#411](https://github.com/MHammett/content-intelligence/pull/411) (issue #404) |
+
+Copying runs from the document repository into a history root (#405) is not
+built. The issues are the specification a builder worked from, and where this
+page and an issue differed the issue won; this page is the reasoning behind
+them and says below where the build changed it.
 
 An article is drafted in a chat project and reviewed by `ci-review`. Today the two
 sides exchange files through a shared Drive folder and by pasting (see
@@ -60,13 +72,14 @@ branch or open a pull request ([Anthropic's page](https://claude.com/docs/connec
 Writing needs a connector. GitHub's own remote MCP server
 (`https://api.githubcopilot.com/mcp/`) has the tools (`get_file_contents` with a
 `ref`; `create_or_update_file`, which needs the existing blob's `sha` to replace a
-file; `push_files`, several files in one commit; `create_branch`;
-`create_pull_request`), and users report it working as a claude.ai custom
-connector since June 2026 with its default toolsets, though not for repositories
-owned by an organization ([github/github-mcp-server#549](https://github.com/github/github-mcp-server/issues/549)).
-That is **not yet verified on this deployment's account**; it is the first
-acceptance check of the docs phase. If it fails, the author commits the drafting
-side's files by hand (github.com's upload page), and nothing below changes.
+file and makes one commit per file; `push_files`, several files in one commit;
+`create_branch`; `create_pull_request`), and users report it working as a
+claude.ai custom connector since June 2026, though not for repositories owned by
+an organization ([github/github-mcp-server#549](https://github.com/github/github-mcp-server/issues/549)).
+It does work on this deployment's account, but only with the setup in
+[Setting up claude.ai](#setting-up-claudeai), which differs from what the
+connector's defaults suggest. If it fails, the author commits the drafting side's
+files by hand on github.com, and nothing below changes.
 
 **Clone or API.** Considered: driving a local clone with `git` or `gh`, and the
 REST API. Chosen: **the REST API, with no local clone.** Reasons:
@@ -180,7 +193,20 @@ and its metadata together in one commit, then ask the author to run
 `templates/revise_after_review_prompt.md`); **never** rename an article folder,
 modify or delete a numbered file, rewrite history, force-push, commit a secret or
 read `pipeline/` into a revision; and how to read the pipeline's commits
-(message, `Reviewed:` line, `document_source` in the report).
+(message, `Reviewed:` line, `document_source` in the report). Phase 5 (#404)
+added three things the drafting side must do, in the packaged `AGENTS.md.tmpl`
+and nowhere else:
+
+- **Close-out notes:** list the folder before writing one, name it
+  `<slug>-close-out-rN-to-(code|chat)[-vM].md` (a `-vM` needs `-v(M-1)`), and
+  never overwrite one.
+- **One commit for a draft and its metadata** needs the connector's `push_files`
+  tool; `create_or_update_file` makes one commit per file.
+- **The history key:** a handoff or metadata file with no `History key:` gets the
+  article's folder name under `--github`, not the title that the templates'
+  bracketed note describes (see [The history key](#the-history-key)). The notes in
+  `draft_submission.template.md` and `metadata_only.md` now say so; no label or
+  header was renamed.
 
 **Publication-specific instructions stay the author's.** The drafting project's
 instructions in Drive (`mikehammett-project-instructions.md`) carry voice and
@@ -190,6 +216,77 @@ and never touches it again; it is edited in the document repository like an
 article. The workflow half of those instructions (file storage, naming, the
 close-out list CLOSE-OUT.md asks for) moves into `AGENTS.md`, and the Drive copy
 retires.
+
+## Setting up claude.ai
+
+Checked live on 2026-10-27 against a claude.ai project and a scratch repository.
+**Reading and writing are two separate setups**, and the first is enough for a
+project that only needs to see the pipeline's reviews.
+
+**Reading: the built-in GitHub integration.** It is read-only: it syncs the files
+you pick into the project's knowledge. A test project with the
+`instructions/claude-project.md` stanza at the top of its instructions, and
+`AGENTS.md` and `templates/` attached as knowledge, answered "how do I submit a
+draft?" correctly from `AGENTS.md`. Use "Sync now" after a review has been
+committed.
+
+**Writing: a custom connector.** claude.ai can only commit through GitHub's remote
+MCP server, added as a custom connector at `https://api.githubcopilot.com/mcp/`.
+The authentication has to be set up like this:
+
+1. On github.com, register an OAuth App (Settings, Developer settings, OAuth
+   Apps, New OAuth App). Give it any name. GitHub's form requires a homepage URL;
+   any URL will do. Set **Authorization callback URL** to
+   `https://claude.ai/api/mcp/auth_callback`. Create it, then generate a client
+   secret. Keep the **client ID** and the **client secret**.
+2. In claude.ai, add the custom connector with the URL above. For its OAuth
+   setting choose **Use your own OAuth client** and enter that client ID and
+   secret.
+3. Connect, and approve the sign-in at GitHub.
+
+Why the other options do not work, so nobody spends time on them:
+
+- **"Register automatically"** needs the server to accept dynamic client
+  registration, and **"Use Claude's published identity"** needs it to accept a
+  client-ID metadata document. GitHub's OAuth server metadata
+  (`https://github.com/.well-known/oauth-authorization-server/login/oauth`)
+  advertises neither: it has no registration endpoint and no client-ID-metadata
+  support. Neither option can work against GitHub.
+- **A fine-grained token in an `Authorization: Bearer` header, with "No
+  sign-in"**, fails with "Couldn't connect", although the same request works from
+  curl. That is a claude.ai bug
+  ([anthropics/claude-ai-mcp#1109](https://github.com/anthropics/claude-ai-mcp/issues/1109)).
+  It would have been the better choice, because a fine-grained token can be
+  limited to the one document repository.
+
+**The cost of the OAuth App route.** The connector asks GitHub for the broad
+`repo` scope, and an OAuth App token cannot be narrowed to one repository, so
+what the connector can reach is **every repository the account can**, private
+ones included. `AGENTS.md` tells the drafting side to commit to `main` and never
+to modify a numbered file, but that is an instruction to the model, not a
+permission GitHub enforces. This is the price of writing from claude.ai; if it is
+too high, use the fallback below. The App's grant can be revoked at any time on
+github.com (Settings, Applications). Use a personal-account repository: the
+connector has been reported not to reach organization-owned ones
+([github/github-mcp-server#549](https://github.com/github/github-mcp-server/issues/549)).
+
+**Verified through the connector:** a project chat read `AGENTS.md` from the
+articles repository, and committed a file to a scratch repository with
+`create_or_update_file` (commit `acd7f54`).
+
+**Not yet verified**, to do once by the maintainer:
+
+- [ ] `push_files` commits a draft and its metadata together in **one** commit.
+  `AGENTS.md` tells the drafting side to use it for that pair, because
+  `create_or_update_file` makes one commit per file.
+- [ ] "Sync now" in the project's built-in integration shows the pipeline's
+  `<slug>-review-rN.md` after a `ci-review --github SLUG --write-back` run.
+
+**Fallback.** If the connector is not worth its scope, or stops working, the
+author commits the drafting side's files on github.com by hand: Add file, then
+Upload files (or Create new file), putting a draft and its metadata in one commit
+with the message `draft: <slug> rN`. Nothing else in this design changes, and the
+review still comes back by `ci-review --github SLUG --write-back`.
 
 ## Bootstrapping the repository: `ci-docs init`
 
@@ -513,9 +610,45 @@ follows the repository and not a copy of these rules kept somewhere else.
 
 **Close-out notes from a Code session.** CLOSE-OUT.md says Code has no standing
 permission to write to the author's Drive. Here the configured repository is that
-permission, limited to adding new files. `ci-docs put <slug> <file>` commits one
-note with the same never-overwrite rule and checks its name against the pattern;
-`ci-docs ls <slug>` lists a folder.
+permission, limited to adding new files, through `ci-docs put`. Built in #404
+(`github_put.py`), where the issue's list is the specification and this page's
+earlier one-line sketch (a close-out note only) was widened to match it:
+
+```bash
+uv run ci-docs ls example-article
+uv run ci-docs put example-article example-article-close-out-r4-to-chat.md
+uv run ci-docs put example-article example-article-close-out-r4-to-chat-v2.md
+```
+
+- **`ls SLUG`** lists the article folder, top level and then `pipeline/`, with each
+  file's round and kind read from its name (`close-out to-chat v2`, `review`,
+  `worklist`, `report`; anything else is `other`). It reads only, and a missing
+  folder is reported with the article folders that do exist.
+- **`put SLUG FILE`** commits the one file, by its own name, into the article
+  folder, in one commit, with `GitHubRepo.commit_files`. The name has to be
+  `<slug>-(draft|metadata|handoff|publication)-rN.md` or
+  `<slug>-close-out-rN-to-(code|chat)[-vM].md` with `<slug>` equal to `SLUG`, `N`
+  from 1 and `M` from 2; the pipeline's own `review` and `worklist` names and
+  anything else are refused, before a request is sent.
+- **Close-out `-vM` rules.** A `-vM` whose `-v(M-1)` (for `-v2`, the plain note) is
+  not in the folder is refused. A note for a round and direction that already has
+  one, written without `-v`, is refused and the next free `-vM` is suggested; the
+  same for a `-vM` that exists with other bytes. A note for an article whose folder
+  does not exist is refused (a typo in the slug would otherwise start a new
+  folder). A draft, metadata, handoff or publication file may start the folder.
+- **Never overwrite.** A path that exists with the same bytes is a no-op and makes
+  no commit; with other bytes it is refused. Line endings are normalised to LF, so
+  a CRLF file saved on Windows matches its LF copy.
+- **Commit message** `<kind>: <slug> r<N>[ to-<dir>][ v<M>]`, for example
+  `close-out: example-article r4 to-chat`; the kind is the file's own, so a lone
+  metadata file is `metadata: ...` and `draft: <slug> rN` is the message for the
+  pair the drafting side commits together.
+- **Safety.** The file is scanned for the token and for every configured API key
+  value, as write-back is (`secret_values`; the keys come from `--config-dir`,
+  plus the publication's with `--publication`, and an unreadable configuration
+  stops the command). A public repository is refused unless `allow_public_repo`
+  is set, and so is a token that cannot push. `--github-repo` and `--branch` stand
+  in for `github_documents.repo` and `branch`; the branch must be a branch.
 
 ## What does not change
 
@@ -539,7 +672,8 @@ alone, in this order:
 3. #402: reading a draft with `--github`.
 4. #403: write-back and `ci-docs push-run`.
 5. #404: `ci-docs put` and `ls`, the README, CLOSE-OUT.md, and the check that a
-   claude.ai project follows the repository's `AGENTS.md`.
+   claude.ai project follows the repository's `AGENTS.md` (built; two of the
+   checks are left to the maintainer, under [Setting up claude.ai](#setting-up-claudeai)).
 6. #405 (optional): copying runs from the document repository into a history
    root for `ci-history-report`.
 

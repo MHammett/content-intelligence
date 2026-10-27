@@ -24,6 +24,14 @@ summary of it is not the note. On 2026-09-27 a paraphrase given in chat had to b
 replaced by the Drive file before anything could safely be edited, because an
 all-or-nothing edit needs the literal text.
 
+**Or in the document repository.** An article kept in the private GitHub document
+repository ([GITHUB-DOCUMENTS.md](GITHUB-DOCUMENTS.md)) has its article folder,
+`articles/<slug>/`, instead of the Drive folder, and the notes live there with the
+same names, beside the draft and the pipeline's review. The committed file is the
+record, just as the Drive file is, and `Drive folder:` and `Drive folder id:` in
+the note hold `<owner>/<repo>:<path>` and the commit SHA the note was written
+against. `ci-docs ls <slug>` lists the folder.
+
 Name each note:
 
 ```
@@ -98,7 +106,13 @@ makes the rename dearer. That is why this is a step at the first run.
   have changed.
 - Code has no standing permission to write to the author's Drive. It saves a
   note to the article's folder when the author has said it may; otherwise it
-  hands the file to the author, who saves it there.
+  hands the file to the author, who saves it there. **The Drive rule is
+  unchanged.** For an article in the document repository the configured
+  repository (`github_documents.repo`) is that standing permission, limited to
+  *adding* files: Code runs `ci-docs put <slug> <file>`, which commits the one
+  file and refuses a name that does not fit, a `-vM` with no predecessor and an
+  existing note (naming the next free `-vM`), and never overwrites or deletes
+  anything. Code does not edit that repository by any other route.
 - The rules for each section are in the template's bracketed notes. They are the
   ones the drafting side needs at the moment of writing, so they live there and
   not here.

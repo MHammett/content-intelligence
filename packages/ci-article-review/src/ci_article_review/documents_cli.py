@@ -11,10 +11,15 @@ what each file is for is in ``documents_init``.
 article folder, which is the retry for a ``ci-review --github SLUG --write-back``
 whose commit failed (``github_writeback``).
 
+``ci-docs ls SLUG`` lists an article's folder, and ``ci-docs put SLUG FILE`` adds a
+close-out note or a drafting file to it, never overwriting (``github_put``).
+
     ci-docs init --dry-run                  # the plan; writes nothing
     ci-docs init --create                   # make the repository too, if missing
     ci-docs init --seed-instructions PATH   # first run: instructions/publication.md
     ci-docs push-run pipeline_history/example-article/run_4_<ts>_report.json
+    ci-docs ls example-article
+    ci-docs put example-article example-article-close-out-r4-to-chat.md
 
 The token is ``GITHUB_TOKEN``, else ``gh auth token``. It is never printed.
 """
@@ -137,7 +142,68 @@ def build_parser():
             "keys the commit must not contain (default: configs)"
         ),
     )
+
+    ls = sub.add_parser(
+        "ls",
+        help="list an article's folder, with each file's round and kind",
+        description=(
+            "List the article folder SLUG in the document repository, the top "
+            "level and then pipeline/, with the round and kind each file name "
+            "says. Reads only."
+        ),
+    )
+    ls.add_argument("slug", metavar="SLUG", help="the article's folder name")
+    _repo_options(ls)
+
+    put = sub.add_parser(
+        "put",
+        help="commit a close-out note or a drafting file into an article's folder",
+        description=(
+            "Commit one local file into the article folder SLUG, in one commit, "
+            "adding it and nothing else. The file name must be "
+            "<slug>-(draft|metadata|handoff|publication)-rN.md or "
+            "<slug>-close-out-rN-to-(code|chat)[-vM].md, with the same slug. A "
+            "file already there with the same bytes is left alone; one with "
+            "different bytes is refused. A close-out note for a round and "
+            "direction that already has one is refused with the next free -vM "
+            "suggested, and a -vM whose predecessor is missing is refused. The "
+            "file must not contain a configured API key or the token."
+        ),
+    )
+    put.add_argument("slug", metavar="SLUG", help="the article's folder name")
+    put.add_argument("file", metavar="FILE", help="the local file to add")
+    _repo_options(put)
+    put.add_argument(
+        "--publication",
+        metavar="NAME",
+        help=(
+            "also load configs/NAME.yaml, for API keys it sets that the file "
+            "must not contain (default: user.yaml's keys)"
+        ),
+    )
     return parser
+
+
+def _repo_options(parser):
+    parser.add_argument(
+        "--github-repo",
+        metavar="OWNER/NAME",
+        help=(
+            "the document repository (default: github_documents.repo in "
+            f"user.yaml, else {di.DEFAULT_REPO})"
+        ),
+    )
+    parser.add_argument(
+        "--branch",
+        default=None,
+        help="branch to read or commit (default: github_documents.branch, else the repository's default)",
+    )
+    parser.add_argument(
+        "--config-dir",
+        default="configs",
+        metavar="DIR",
+        help="where user.yaml is read from (default: configs)",
+    )
 
 
 def _configured(config_dir):
@@ -270,6 +336,10 @@ def main(
     try:
         if args.command == "push-run":
             return _push_run(args, environ, run, session, out)
+        if args.command == "ls":
+            return _ls(args, environ, run, session, out)
+        if args.command == "put":
+            return _put(args, environ, run, session, out)
         return _init(args, environ, run, session, out, sleep)
     except GitHubDocumentsError as exc:
         return _fail(str(exc))
@@ -313,6 +383,62 @@ def _push_run(args, environ, run, session, out):
         settings=normalize_github_documents(config.get("github_documents")),
         api_keys=config["api_keys"],
         repo=args.github_repo,
+        token_lookup=lambda: resolve_token(environ, run),
+        session=session,
+        out=out,
+    )
+    return 0
+
+
+def _ls(args, environ, run, session, out):
+    from .config_loader import normalize_github_documents
+    from .github_put import format_listing, list_article
+
+    header, rows = list_article(
+        args.slug,
+        settings=normalize_github_documents(_configured(args.config_dir)),
+        repo=args.github_repo,
+        branch=args.branch,
+        token_lookup=lambda: resolve_token(environ, run),
+        session=session,
+    )
+    for line in format_listing(header, rows):
+        out(line)
+    return 0
+
+
+def _put(args, environ, run, session, out):
+    from .config_loader import (
+        load_publication_config,
+        load_user_config,
+        merge_configs,
+        normalize_github_documents,
+    )
+    from .github_put import put_file
+
+    # The file must not contain a configured API key, so the keys have to be
+    # known: a configuration that cannot be loaded stops the command rather than
+    # quietly skipping the scan (as push-run does).
+    try:
+        user = load_user_config(args.config_dir)
+        pub = (
+            load_publication_config(args.publication, args.config_dir)
+            if args.publication
+            else {}
+        )
+    except (OSError, ValueError) as exc:
+        return _fail(
+            f"cannot read the configuration in {args.config_dir} ({exc}); put "
+            "needs it to check the file for API keys. Pass --config-dir."
+        )
+    config = merge_configs(user, pub)
+    put_file(
+        args.slug,
+        args.file,
+        settings=normalize_github_documents(config.get("github_documents")),
+        api_keys=config["api_keys"],
+        repo=args.github_repo,
+        branch=args.branch,
         token_lookup=lambda: resolve_token(environ, run),
         session=session,
         out=out,
