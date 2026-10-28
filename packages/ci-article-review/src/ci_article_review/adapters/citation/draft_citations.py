@@ -333,6 +333,20 @@ class DraftCitations:
                     urls.append(candidate[depth])
         return urls
 
+    def descriptions_for(self, url):
+        """The text of every citation entry that lists ``url``, URLs removed.
+
+        An entry's description is the author naming what the source says and
+        often where ("Google, 2025 Environmental Report, p. 110 (Council
+        Bluffs, IA: 1,410.3 million gallons withdrawn)"). The resolver uses it
+        to find that place in a long document (issue #440).
+        """
+        return [
+            " ".join(_URL.sub(" ", entry["text"]).split())
+            for entry in self.entries.values()
+            if url in entry.get("urls", ())
+        ]
+
     def candidates_for(self, claim, source_text=""):
         """URLs the draft cites for ``claim``, best first (empty when none).
 
