@@ -1099,7 +1099,7 @@ Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article
 **When `cost_preset` is set:**
 - It overrides model names and reasoning flags for all configured providers, except the model name on Azure, where the deployment decides it
 - Provider infrastructure settings (vertex_ai, azure, credentials_file) are preserved
-- So is the per-model tuning you set under `models:`: `prompts`, `web_search` and the Perplexity search controls, `timeout_seconds`, `max_tokens`, `stream_read_timeout`, `stream_gap_timeout` and a gemini `temperature`. Where the preset sets one of these too, yours wins (a lower stream budget is warned about at load)
+- So is the per-model tuning you set under `models:`: `prompts`, `web_search`, the Perplexity search controls and Claude's `search_max_uses`, `timeout_seconds`, `max_tokens`, `stream_read_timeout`, `stream_gap_timeout` and a gemini `temperature`. Where the preset sets one of these too, yours wins (a lower stream budget is warned about at load)
 - Providers you haven't configured (no API key) are skipped
 - Setting `enabled: false` on a provider still takes precedence
 - Set `thoroughness:` separately to override just that part of the preset
@@ -1206,7 +1206,7 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted. `stream_read_timeout: 200` |
 | perplexity | `perplexity/sonar` | — | — | Same model as every other tier; see `thorough` |
 | grok | `grok-4.6` | `reasoning_effort` | `"high"` | Full CoT depth. `xhigh` exists, unmeasured. `stream_read_timeout: 500`, same measurement as at `thorough` |
-| claude | `claude-opus-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Also sets `web_search: [fact_check]`, so it searches on that domain only |
+| claude | `claude-opus-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Also sets `web_search: [fact_check]`, so it searches on that domain only, and `search_max_uses: 40`, the most searches one call may run (without it litellm caps a call at 5; see [Claude in PROVIDERS.md](PROVIDERS.md#anthropic-claude-optional)) |
 
 **Notes on the preset tables:**
 - "Not set" means the preset leaves the parameter out and the provider's own default applies. For the gpt-5.6 models that default is `medium`. It is not off.

@@ -159,6 +159,9 @@ models:
 #    model: claude-opus-5
 #    effort: high               # "low" | "medium" | "high" — adaptive thinking depth
 #    timeout_seconds: 360
+#    web_search: [fact_check]   # live search on fact_check only (bills per search)
+#    search_max_uses: 40        # searches one call may run; without it litellm caps
+#                               # a call at 5 (search_context_size medium)
 #
 #  claude:
 #    model: claude-sonnet-5
@@ -360,7 +363,8 @@ pipeline:
   # providers.  Provider infrastructure settings (vertex_ai, azure, credentials) are
   # preserved, and so is the model name on Azure, where the deployment decides it.
   # Per-model tuning set under models: is preserved too — prompts, web_search and
-  # the search controls, temperature, timeout_seconds, max_tokens, stream_read_timeout and
+  # the search controls (claude's search_max_uses included), temperature,
+  # timeout_seconds, max_tokens, stream_read_timeout and
   # stream_gap_timeout — and wins where a preset sets the same key.
   # Use thoroughness: below to override just that part of the preset.
   #
