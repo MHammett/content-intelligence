@@ -39,6 +39,7 @@ the one thing this pass must not be able to assert.
 """
 
 import logging
+import re
 
 from ci_core import llm
 from ci_core.config_helpers import has_credentials
@@ -260,7 +261,75 @@ def reask_one(
         return None
 
     recorded["asked_model"] = provider
-    return recorded
+    return _keep_the_claims_date(result, recorded)
+
+
+#: A date a figure is pinned to: "October 4", "Oct. 4, 2026", "2026-10-04".
+_DATE = re.compile(
+    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b",
+    re.IGNORECASE,
+)
+
+
+def _dates(text):
+    """The dates in ``text``, normalised so "October 4" and "Oct. 4" agree."""
+    found = set()
+    for m in _DATE.finditer(text or ""):
+        parts = m.group(0).lower().replace(".", "").split()
+        if len(parts) == 2 and parts[0][:1].isalpha():
+            found.add(f"{parts[0][:3]} {int(parts[1])}")
+        else:
+            found.add(m.group(0))
+    return found
+
+
+def _keep_the_claims_date(result, recorded):
+    """Refuse a "correction" that moves a dated figure to another date.
+
+    "9,683 reports as of October 4" checked against a live page that now reads
+    9,733 as of October 22 was re-asked into "9,733 reports as of October 22,
+    2026" (brockovich-fact-check run 2, issue #442). The page changed; the
+    claim, which says which day it describes, did not become wrong. A
+    correction that drops a date the claim states is recorded as "stand", with
+    what was proposed kept beside it so nothing is hidden.
+    """
+    if recorded.get("action") != "correct_claim":
+        return recorded
+    stated = _dates(result.get("claim", ""))
+    if not stated or stated <= _dates(recorded.get("corrected_claim", "")):
+        return recorded
+    declined = dict(recorded)
+    declined["action"] = "stand"
+    declined["declined_correction"] = recorded.get("corrected_claim", "")
+    declined["corrected_claim"] = ""
+    declined["reason"] = (
+        f"{recorded.get('reason', '').rstrip()} Not applied: the claim states "
+        f"its own date ({', '.join(sorted(stated))}) and the proposed wording "
+        "replaces it, so it describes the page on another day, not an error in "
+        "the claim."
+    ).strip()
+    return declined
+
+
+#: What a wrong refutation costs, lowest first. A "contradicts" tells the
+#: author their sentence is false, so it is re-asked first; a "not_addressed"
+#: on a page read in full is next; anything read only in part is last, since
+#: its verdict is about the part read.
+def _reask_priority(result):
+    verdict = result.get("relevance_verdict")
+    if verdict == "contradicts":
+        return 0
+    coverage = result.get("read_coverage") or {}
+    if verdict == "not_addressed" and not coverage.get("partial"):
+        return 1
+    return 2
+
+
+#: However many "contradicts" a run produces, re-ask at most this many. Five
+#: is a busy run (brockovich-fact-check run 2); a verifier gone wrong could
+#: produce hundreds, and this pass bills a model call each.
+_CONTRADICTS_CEILING = 30
 
 
 def reask_refuted(
@@ -272,7 +341,13 @@ def reask_refuted(
     fallback_provider=None,
     author=None,
 ):
-    """Re-ask every refuted citation, in report order, up to ``limit``.
+    """Re-ask refuted citations, most costly first, up to ``limit``.
+
+    Order is ``_reask_priority``, stable within a priority. On
+    brockovich-fact-check run 2 the pass re-asked twelve in report order and
+    left 31, among them a "contradicts" that misread an Aurora street address
+    as Chicago (issue #448). Every "contradicts" is re-asked whatever the
+    limit: the limit rises to their count when there are more of them.
 
     Attaches a ``reask`` key to the results it acted on and returns the number
     of re-asks made. ``results`` is modified in place, because the caller holds
@@ -287,9 +362,11 @@ def reask_refuted(
     api_keys = api_keys or {}
     model_configs = model_configs or {}
 
-    refuted = [r for r in results if is_refuted(r)]
+    refuted = sorted((r for r in results if is_refuted(r)), key=_reask_priority)
     if not refuted:
         return 0
+    contradicted = sum(1 for r in refuted if _reask_priority(r) == 0)
+    limit = max(limit, min(contradicted, _CONTRADICTS_CEILING))
 
     asked = 0
     for result in refuted:

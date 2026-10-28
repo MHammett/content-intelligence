@@ -1422,6 +1422,22 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
             verify_claim = _claim_for_verifier(claim, source_field, draft)
             if verify_claim != claim:
                 entry["verify_claim"] = verify_claim
+            hints = _locate_hints(cited, known_urls, own, item)
+            if hints:
+                entry["locate_hints"] = hints
+            # URLs that reached this claim only as the preceding span's markers.
+            # They may support it; they are not reported as its failed source
+            # when its own was tried (issue #441). A URL the model named itself
+            # is its own source even if a neighbouring marker also carries it.
+            neighbours = [
+                u
+                for u in (
+                    cited.neighbour_urls_for(claim, source_field) if cited else []
+                )
+                if u in known_urls and u != own
+            ]
+            if neighbours:
+                entry["neighbour_urls"] = neighbours
             claims.append(entry)
     log.info(
         "Citations: %d of %d claim(s) traced to a citation in the draft",
@@ -1429,6 +1445,28 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
         len(claims),
     )
     return claims
+
+
+def _locate_hints(cited, known_urls, own_url, item) -> dict:
+    """``{url: [text, ...]}``: where in each candidate the evidence probably is.
+
+    Two sources, both already in hand. The draft's citation entry for the URL,
+    which often names the place ("p. 110 (Council Bluffs, IA: 1,410.3 million
+    gallons withdrawn ...)"), and the fact-check model's quote from the URL it
+    named itself. The resolver uses them only to choose which part of a long
+    document the verifier is shown (``extract.select_excerpt_with_window``,
+    issue #440); the verdict is still the verifier's, on the claim alone. A
+    paraphrased quote still helps here: its figures are the page's.
+    """
+    hints: dict = {}
+    quote = consolidation._evidence_quote(item) if isinstance(item, dict) else ""
+    for url in known_urls:
+        texts = list(cited.descriptions_for(url)) if cited else []
+        if quote and own_url and url == own_url:
+            texts.append(quote)
+        if texts:
+            hints[url] = texts
+    return hints
 
 
 def _read_handoff_file(path: str) -> str:
@@ -3165,6 +3203,66 @@ def _grammar_skipped(reason):
     }
 
 
+def _warn_if_draft_already_reviewed(draft_text, handoff, handoff_path, publication):
+    """Say so before the ensemble runs on a draft history already has a run of.
+
+    A warning, never a block: re-running an unchanged draft is how
+    reproducibility is measured, and some of the zero-change runs in history
+    were exactly that. But most were not. Full-cost runs at
+    ``word_change_pct`` 0.0 cost $4.50, $5.66, $7.37 and $11.59 (issue #454),
+    and ``--replay`` re-runs everything downstream of the ensemble from the
+    earlier run's capture for nothing.
+
+    Returns the matches, newest first, for tests.
+    """
+    try:
+        matches = reproducibility.prior_runs_of_this_draft(
+            draft_text, _history_root(), _history_key(handoff)
+        )
+    except Exception as exc:  # an advisory must never stop a run
+        log.debug("Unchanged-draft check failed: %s", exc)
+        return []
+    if not matches:
+        return []
+    latest = matches[0]
+    with_capture = next((m for m in matches if m["results"]), None)
+    cost = latest["total_usd"]
+    preset = latest["cost_preset"]
+    detail = ", ".join(
+        part
+        for part in (
+            f"{preset}" if preset else "",
+            f"${cost:.2f}" if isinstance(cost, (int, float)) else "",
+        )
+        if part
+    )
+    lines = [
+        f"This draft is unchanged since run {latest['run_number']}"
+        f"{f' ({detail})' if detail else ''}"
+        + (f" and {len(matches) - 1} earlier run(s)" if len(matches) > 1 else "")
+        + ". This run will pay for the ensemble again."
+    ]
+    if with_capture:
+        source = f"--draft {handoff_path}" if handoff_path else "<same draft flags>"
+        lines.append(
+            "To re-run consolidation, citations and the report from that run's "
+            "ensemble for nothing, stop now and use:"
+        )
+        lines.append(
+            f"  uv run ci-review {source} --publication {publication} "
+            f"--replay {with_capture['results']} --offline"
+        )
+    else:
+        lines.append(
+            "No ensemble capture of it survives, so --replay is not available; "
+            "carry on if a fresh review is what you want."
+        )
+    # The console handler shows WARNING, so this reaches the terminal as well as
+    # the day's log file, before the first model call goes out.
+    log.warning("\n".join(lines))
+    return matches
+
+
 def run_draft_pipeline(
     handoff_path,
     publication_name,
@@ -3630,6 +3728,11 @@ def run_draft_pipeline(
     # Pre-load all prompt files before spawning threads (warms the cache)
     for prompt_name in _DOMAIN_PROMPTS.values():
         _load_prompt(prompt_name)
+
+    if not (replay_results or retry_failed_results):
+        _warn_if_draft_already_reviewed(
+            corrected_draft, handoff, handoff_path, publication_name
+        )
 
     # Pass 2: Ensemble model review — built-in domains
     drafting_model = _drafting_model(handoff, pipeline_cfg)

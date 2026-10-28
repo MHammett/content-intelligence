@@ -622,3 +622,42 @@ class TestFindingIndexAndKeysAgree:
         index = repro.finding_index(report)
         assert repro.finding_keys(report) == {s: set(v) for s, v in index.items()}
         assert index["section_3_voice"] == {"v": "v"}
+
+
+class TestPriorRunsOfThisDraft:
+    """The lookup behind the unchanged-draft warning (issue #454)."""
+
+    def test_finds_an_earlier_run_of_the_same_draft_newest_first(self, tmp_path):
+        older = {**make_report(), "run_number": 1}
+        newer = {
+            **make_report(),
+            "run_number": 2,
+            "ensemble": {**make_report()["ensemble"], "cost_preset": "maximum"},
+            "cost_summary": {"total_usd": 10.3},
+        }
+        paths = write_history(tmp_path, KEY, [older, newer])
+        paths[1].with_name(
+            paths[1].name.replace("_report.json", "_results.json")
+        ).write_text("{}", encoding="utf-8")
+
+        matches = repro.prior_runs_of_this_draft(DRAFT, str(tmp_path), KEY)
+
+        assert [m["run_number"] for m in matches] == [2, 1]
+        assert matches[0]["cost_preset"] == "maximum"
+        assert matches[0]["total_usd"] == 10.3
+        assert matches[0]["results"].name.endswith("_results.json")
+        assert matches[1]["results"] is None
+
+    def test_whitespace_only_differences_still_match(self, tmp_path):
+        write_history(tmp_path, KEY, [make_report()])
+        rewrapped = DRAFT.replace(" ", "\n  ", 3)
+        assert len(repro.prior_runs_of_this_draft(rewrapped, str(tmp_path), KEY)) == 1
+
+    def test_a_changed_draft_matches_nothing(self, tmp_path):
+        write_history(tmp_path, KEY, [make_report()])
+        assert repro.prior_runs_of_this_draft(OTHER_DRAFT, str(tmp_path), KEY) == []
+
+    def test_no_history_and_no_draft_match_nothing(self, tmp_path):
+        assert repro.prior_runs_of_this_draft(DRAFT, str(tmp_path), KEY) == []
+        write_history(tmp_path, KEY, [make_report()])
+        assert repro.prior_runs_of_this_draft("", str(tmp_path), KEY) == []

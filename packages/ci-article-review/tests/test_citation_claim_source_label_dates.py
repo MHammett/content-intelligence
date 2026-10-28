@@ -193,7 +193,7 @@ def seen_by_verifier(monkeypatch):
     """Fetch a fixed page and record the claim text the relevance check is given."""
     seen = []
 
-    def fake_verify(claim, content, api_keys, author=None):
+    def fake_verify(claim, content, api_keys, author=None, hints=()):
         seen.append(claim)
         return {"checked": True, "verdict": "not_addressed", "reason": "r"}, None
 
