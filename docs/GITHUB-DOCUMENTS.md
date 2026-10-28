@@ -1173,13 +1173,29 @@ does not say, or says differently:
   wrote the version the run reviewed (else the round's latest commit before it). No
   line comments.
 - **The merge** is `merge_commit("main", branch tip, "<slug> rN (#n)")` dated
-  `accepted_at`, then `get_pull` polled (about a minute at most) until `merged`;
-  this is the path #413's live check found works, and the live check of this
-  phase took it for all seven rounds (`merged_at` is the import's, the merge
-  commit's dates are `accepted_at`). If the flag never appears, the fallback
-  `PUT .../merge` (`merge_method: merge`, dated now) is tried once, and its refusal
-  is an error that leaves `main` where it is; a rerun never tries it, because by
-  then `main` already holds the round.
+  `accepted_at`, then `get_pull` polled until `merged`; this is the path #413's
+  live check found works, and the live check of this phase took it for all seven
+  rounds (`merged_at` is the import's, the merge commit's dates are `accepted_at`).
+  GitHub marks the pull request merged by itself once `main` holds its head, but
+  not at once: a later run measured about 90 seconds. So the poll backs off from 1
+  to 10 seconds and runs to about five minutes, printing a progress line every 30
+  seconds. The API's `PUT .../merge` is **never** tried: with the head already in
+  `main` GitHub refuses it ("not mergeable", the pull request still reads
+  `CONFLICTING` while the flag lags), so the only correct action is to wait. If the
+  bound runs out the run stops with "GitHub has not marked pull request #n merged
+  yet"; `main` already holds the round, and a rerun finds the pull request open with
+  its head in `main` and waits the same way.
+- **Read-after-write lag.** github.com has answered `GET git/ref` with the head from
+  before a ref update the same client made seconds earlier (undocumented; three
+  times in one 68-commit import), so a commit built on a fresh ref read could not
+  see the previous commit's file and the `replace` check refused it as "changed by
+  someone else". The import therefore tells `commit_files(parent=...)` and
+  `merge_commit(parent=...)` the commit it knows the branch is at (the last commit
+  it wrote; for a merge, the base the round branch was cut from), and the commit is
+  built on that without reading the ref. The ref update is still `force: false`, so
+  if someone else really moved the branch the update is refused as not a fast
+  forward and the call falls back to the ordinary read, where `replace` refuses a
+  file they changed.
 - **The tag** is made by `tag_merged_rounds(client, slug, imported={n:
   accepted_at})`: only the rounds being imported, dated `accepted_at`, message
   `<slug> rN (imported): PR #n, runs ...`. Without `imported` the function is
@@ -1201,7 +1217,8 @@ does not say, or says differently:
 - **Test support** (not product): ci-core gained `GitHubRepo.add_labels` and
   `get_commit`, and the in-process `FakeGitHub` now marks a pull request merged
   when its base branch is moved to a commit that holds its head (switch
-  `marks_merged_on_ref_move`, delay `merge_flag_lag`), refuses a review whose
+  `marks_merged_on_ref_move`, delay `merge_flag_lag`), can answer ref reads with the
+  head from before the last update (`ref_read_lag`), refuses a review whose
   `commit_id` is not in the pull request, and adds labels.
 
 **Privacy.** The sources are private: unpublished drafts, chats, and slugs. They

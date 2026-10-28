@@ -114,6 +114,11 @@ class FakeGitHub:
         # GitHub shows the merged flag a few seconds after the push: this many
         # reads of the pull request still say "open" before it appears.
         self.merge_flag_lag = 0
+        # Read-after-write lag seen on github.com: after a ref update, this many
+        # reads of that branch's ref (GET git/ref/heads/..) still answer the head it
+        # had *before* the update. Writes, and reads of commits by SHA, are never stale.
+        self.ref_read_lag = 0
+        self._stale_refs = {}  # branch -> [previous head, stale reads left]
         # GitHub refuses APPROVE from the pull request's own author, and the
         # token here is always that author.
         self.author_is_reviewer = True
@@ -292,9 +297,14 @@ class FakeGitHub:
             assert accept == "application/vnd.github.sha"
             return Resp(200, content=sha.encode(), ctype="text/plain")
         if method == "GET" and path.startswith("/git/ref/heads/"):
-            sha = self.branches.get(path[len("/git/ref/heads/") :])
+            name = path[len("/git/ref/heads/") :]
+            sha = self.branches.get(name)
             if sha is None:
                 return Resp(404, {"message": "Not Found"})
+            stale = self._stale_refs.get(name)
+            if stale and stale[1] > 0:
+                stale[1] -= 1
+                sha = stale[0]
             return Resp(200, {"object": {"sha": sha, "type": "commit"}})
         if method == "GET" and path.startswith("/git/ref/tags/"):
             sha = self.tags.get(path[len("/git/ref/tags/") :])
@@ -731,6 +741,8 @@ class FakeGitHub:
         if not body.get("force") and not self._is_ancestor(current, body["sha"]):
             # The words the real API uses for a non-fast-forward update.
             return Resp(422, {"message": "Update is not a fast forward"})
+        if self.ref_read_lag:
+            self._stale_refs[branch] = [current, self.ref_read_lag]
         self.branches[branch] = body["sha"]
         if self.marks_merged_on_ref_move:
             self._mark_merged_by_push(branch, body["sha"])
@@ -1961,6 +1973,93 @@ def test_replace_of_a_path_absent_at_the_head_is_written_not_refused(gh, fake):
     assert result.written == ("gone.md",)
 
 
+# -- parent: building on a commit the caller made, not on a fresh ref read -----
+
+
+def test_a_branch_read_that_lags_our_own_update_refuses_without_a_parent(gh, fake):
+    # The failure this guards: github.com answered GET git/ref with the head from
+    # before the update this client had just made, so the replace check saw the
+    # file as it was one commit ago and refused (undocumented lag, seen live).
+    fake.ref_read_lag = 1
+    v1, v2 = b"one\n", b"two\n"
+    first = gh.commit_files("main", {"a.md": v1}, "one")
+    second = gh.commit_files(
+        "main",
+        {"a.md": v2},
+        "two",
+        replace={"a.md": git_blob_sha(v1)},
+        parent=first.commit_sha,
+    )
+    assert fake.commits[second.commit_sha]["parents"] == [first.commit_sha]
+    assert fake.branches["main"] == second.commit_sha
+
+    # and without parent, the same call over a still-lagging read is refused
+    v3 = b"three\n"
+    err = raises(
+        "exists",
+        gh.commit_files,
+        "main",
+        {"a.md": v3},
+        "three",
+        replace={"a.md": git_blob_sha(v2)},
+    )
+    assert "changed by someone else" in str(err)
+    assert fake.branches["main"] == second.commit_sha
+
+
+def test_a_parent_commit_is_built_on_without_reading_the_branch(gh, fake):
+    first = gh.commit_files("main", {"a.md": b"one"}, "one")
+    reads = fake.count("GET", "/git/ref/heads/")
+    second = gh.commit_files("main", {"b.md": b"two"}, "two", parent=first.commit_sha)
+    assert fake.count("GET", "/git/ref/heads/") == reads
+    assert fake.commits[second.commit_sha]["parents"] == [first.commit_sha]
+    assert fake.tree_at("main").keys() >= {"README.md", "a.md", "b.md"}
+
+
+def test_the_ref_is_still_updated_without_force_when_a_parent_is_given(gh, fake):
+    first = gh.commit_files("main", {"a.md": b"one"}, "one")
+    gh.commit_files("main", {"b.md": b"two"}, "two", parent=first.commit_sha)
+    patches = [r for r in fake.requests if r[0] == "PATCH"]
+    assert patches and all(r[3]["force"] is False for r in patches)
+
+
+def test_a_parent_that_is_no_longer_the_head_falls_back_to_the_ordinary_read(gh, fake):
+    first = gh.commit_files("main", {"a.md": b"one"}, "one")
+    theirs = fake.external_commit("main", {"theirs.md": b"theirs"})
+    result = gh.commit_files(
+        "main", {"mine.md": b"mine"}, "mine", parent=first.commit_sha
+    )
+    tree = fake.tree_at("main")
+    assert fake.blobs[tree["theirs.md"]] == b"theirs"  # their commit survived
+    assert fake.commits[result.commit_sha]["parents"] == [theirs]
+    assert fake.count("PATCH", "/git/refs/") == 3  # ours, the refused one, the retry
+
+
+def test_a_parent_does_not_let_a_real_change_to_the_file_be_overwritten(gh, fake):
+    v1 = b"one\n"
+    first = gh.commit_files("main", {"a.md": v1}, "one")
+    fake.external_commit("main", {"a.md": b"edited by hand\n"})
+    moved = fake.branches["main"]
+    err = raises(
+        "exists",
+        gh.commit_files,
+        "main",
+        {"a.md": b"two\n"},
+        "two",
+        replace={"a.md": git_blob_sha(v1)},
+        parent=first.commit_sha,
+    )
+    assert "a.md" in str(err) and "changed by someone else" in str(err)
+    assert fake.branches["main"] == moved
+    assert all(r[3]["force"] is False for r in fake.requests if r[0] == "PATCH")
+
+
+def test_a_parent_must_be_a_full_commit_sha(gh, fake):
+    with pytest.raises(ValueError, match="parent"):
+        gh.commit_files("main", {"a.md": b"x"}, "m", parent="main")
+    assert fake.count("POST", "") == 0
+
+
 # -- merge_commit --------------------------------------------------------------
 
 
@@ -1985,6 +2084,52 @@ def test_merge_commit_onto_a_branch_that_is_behind(gh, fake):
     assert commit["committer"]["date"] == "2026-06-16T18:02:11+00:00"
     assert fake.requests[-1][3]["force"] is False
     assert gh.resolve("main") == result.commit_sha
+
+
+def test_merge_commit_over_a_lagging_branch_read_needs_the_parent_to_keep_the_chain(
+    gh, fake
+):
+    # main moves, and the next read of its ref still answers the previous head: a
+    # merge built on that read would take the stale head as its first parent and
+    # drop the commit that moved main from the first-parent chain.
+    fake.ref_read_lag = 1
+    moved = gh.commit_files("main", {"a.md": b"a"}, "main moves").commit_sha
+    before = fake.branches["main"]
+    _round_branch(fake)  # cut from the new main
+    tip = fake.branches["round/example-article/r1"]
+
+    result = gh.merge_commit("main", tip, "merge", parent=moved)
+
+    assert before == moved
+    assert fake.commits[result.commit_sha]["parents"] == [moved, tip]
+    assert fake.count("GET", "/git/ref/heads/main") == 1  # only commit_files read it
+
+
+def test_merge_commit_without_a_parent_is_built_on_the_ref_read(gh, fake):
+    fake.ref_read_lag = 1
+    moved = gh.commit_files("main", {"a.md": b"a"}, "main moves").commit_sha
+    _round_branch(fake)
+    tip = fake.branches["round/example-article/r1"]
+    result = gh.merge_commit("main", tip, "merge")
+    # the documented hazard: the lagging read becomes the first parent
+    assert fake.commits[result.commit_sha]["parents"][0] != moved
+
+
+def test_merge_commit_with_a_parent_that_is_not_the_head_falls_back_to_the_read(
+    gh, fake
+):
+    stale = fake.branches["main"]
+    tip = _round_branch(fake)
+    theirs = fake.external_commit("main", {"theirs.md": b"theirs"})
+    # the round was cut before theirs landed: diverged, so refused, nothing forced
+    raises("conflict", gh.merge_commit, "main", tip, "m", parent=stale)
+    assert fake.branches["main"] == theirs
+
+
+def test_merge_commit_parent_must_be_a_full_sha(gh, fake):
+    tip = _round_branch(fake)
+    with pytest.raises(ValueError, match="parent"):
+        gh.merge_commit("main", tip, "m", parent="main")
 
 
 def test_merge_commit_when_identical_makes_no_commit(gh, fake):

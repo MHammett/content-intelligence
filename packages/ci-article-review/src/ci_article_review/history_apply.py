@@ -93,9 +93,13 @@ RECOVERED_TRAILER = (
 )
 
 #: Seconds to wait between reads of a pull request whose merged flag has not yet
-#: appeared. GitHub showed it within five seconds in the live check (#413); the
-#: schedule runs to about a minute before the fallback.
-_MERGE_WAITS = (1, 1, 2, 2, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5)
+#: appeared. GitHub showed it within five seconds in the live check (#413) but took
+#: about 90 seconds in a later one, so the schedule runs to about five minutes
+#: (302 seconds) before it gives up, backing off from 1 to 10 seconds a read.
+_MERGE_WAITS = (1, 1, 2, 2, 3, 3, 5, 5, 5, 5) + (10,) * 27
+
+#: A progress line while waiting for the merged flag, every this many seconds.
+_MERGE_PROGRESS_EVERY = 30
 
 
 class ImportApplyError(GitHubDocumentsError):
@@ -915,6 +919,13 @@ class _Applier:
                 continue
             replace = {p: state[p] for p in files if p in state}
             signature = self.signature(unit.at)
+            # Build on the commit this import made last rather than on a fresh read of
+            # the branch: github.com has answered that read with the head from before
+            # the import's own previous commit (read-after-write lag, undocumented),
+            # which the replace check then rightly refuses as "changed by someone else".
+            # If someone really did move the branch, the update is refused as not a
+            # fast forward and commit_files re-reads, so a real change still refuses.
+            parent = rec["commits"][-1]["sha"] if rec["commits"] else rec["base"]
             result = client.commit_files(
                 branch,
                 files,
@@ -924,6 +935,7 @@ class _Applier:
                 author=signature,
                 committer=signature,
                 refuse_if_contains=self.secrets,
+                parent=parent,
             )
             entry = {"events": unit.ids, "sha": result.commit_sha, "at": _iso(unit.at)}
             if unit.kind == "review":
@@ -1183,46 +1195,40 @@ class _Applier:
             )
             signature = self.signature(rnd.accepted)
             if not contained:
+                # The branch was cut from the base branch's head and this import is
+                # its only writer, so that head is rec["base"]; building on it avoids
+                # a ref read that may lag the previous round's merge (see commit_units).
                 result = client.merge_commit(
                     self.base_branch,
                     tip,
                     message,
                     author=signature,
                     committer=signature,
+                    parent=self._merge_parent(rec),
                 )
                 merge_sha = result.commit_sha
                 self.say(
                     f"  moved {self.base_branch} to merge commit {_short(merge_sha)} "
                     f"dated {_iso(rnd.accepted)}"
                 )
+            # Here the base branch holds the round's head (it did already, or the
+            # move just above put it there), and GitHub marks a pull request merged
+            # on its own once that is so, but only after a lag that was measured at
+            # about 90 seconds. Asking the API to merge it meanwhile is wrong: it
+            # refuses ("not mergeable", the pull request still reads CONFLICTING)
+            # and the only correct action is to wait.
             pull = self._wait_for_merged(number)
             if not pull.merged:
-                if contained:
-                    raise ImportApplyError(
-                        f"round {rnd.number}: {self.base_branch} already holds the "
-                        f"round, but GitHub still shows pull request #{number} as open. "
-                        "Wait a minute and run the same command again."
-                    )
-                # GitHub did not mark the pull request merged when the branch moved:
-                # ask it to merge. This is dated now, not at accepted_at.
-                path = "merge-pull"
-                try:
-                    merge_sha = client.merge_pull(
-                        number,
-                        sha=tip,
-                        merge_method="merge",
-                        commit_message=f"Accepted {_iso(rnd.accepted)} (imported)",
-                    )
-                except GitHubRepoError as exc:
-                    raise ImportApplyError(
-                        f"round {rnd.number}: {self.base_branch} was moved to "
-                        f"{_short(merge_sha)} but GitHub still shows pull request "
-                        f"#{number} as open, and merging it was refused ({exc}). Nothing "
-                        "was undone; resolve the pull request by hand."
-                    ) from exc
-                pull = self._wait_for_merged(number)
-                self.say(
-                    "  GitHub did not mark the pull request merged; merged it through the API"
+                held = (
+                    "already holds the round"
+                    if contained
+                    else f"was moved to {_short(merge_sha)}, which holds the round"
+                )
+                raise ImportApplyError(
+                    f"round {rnd.number}: {self.base_branch} {held}, but GitHub has "
+                    f"not marked pull request #{number} merged yet (waited "
+                    f"{sum(self.merge_waits)} seconds). GitHub catches up on its "
+                    "own; run the same command again later and it resumes from here."
                 )
         rec["merge"] = {
             "sha": pull.merge_commit_sha or merge_sha,
@@ -1235,12 +1241,33 @@ class _Applier:
             f"  pull request #{number} merged (merge commit {_short(rec['merge']['sha'])})"
         )
 
+    def _merge_parent(self, rec):
+        """The base branch's head as this import last left it, or None if unknown.
+
+        Round N's branch is cut from the base branch right after round N-1's
+        merge, so for a branch cut by this run that is ``rec["base"]``. A branch
+        adopted from an earlier run may have been cut from an older head; then
+        the ordinary read decides, and a merge onto the wrong parent cannot slip
+        through (the update is refused as not a fast forward).
+        """
+        base = rec.get("base")
+        return base if isinstance(base, str) and len(base) == 40 else None
+
     def _wait_for_merged(self, number):
         pull = self.client.get_pull(number)
+        waited = 0
+        next_report = 0
         for delay in self.merge_waits:
             if pull.merged:
                 break
+            if waited >= next_report:
+                self.say(
+                    f"  waiting for GitHub to mark pull request #{number} merged "
+                    f"({waited}s so far; it can take a couple of minutes)"
+                )
+                next_report = waited + _MERGE_PROGRESS_EVERY
             self.sleep(delay)
+            waited += delay
             pull = self.client.get_pull(number)
         return pull
 
