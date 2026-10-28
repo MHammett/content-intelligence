@@ -11,6 +11,7 @@ archive copy, and how to summarize a wayback result for a human reader.
 
 import logging
 import ssl
+from pathlib import Path
 
 import requests
 
@@ -32,7 +33,6 @@ from spn_client import (
     SystemStatusResult,
     capture_capacity,
     categorize_job_error,
-    check,
     check_job_status,
     rate_limited_out,
     reset_rate_limit_state,
@@ -41,6 +41,9 @@ from spn_client import (
     submit,
     system_status,
 )
+from spn_client import check as _spn_check
+
+from .wayback_lookup_cache import STORE_FILENAME, LookupCache
 
 __all__ = [
     "ARCHIVE_ARCHIVED",
@@ -66,11 +69,16 @@ __all__ = [
     "certificate_failure_summary",
     "check",
     "check_job_status",
+    "close_lookup_cache",
     "fallback_reason_for_exception",
     "fallback_reason_for_status",
+    "forget_lookup",
     "format_summary",
+    "lookup_cache_summary",
     "lookup_was_rate_limited",
+    "open_lookup_cache",
     "rate_limited_out",
+    "remember_lookup",
     "reset_rate_limit_state",
     "service_health_note",
     "snapshot_raw_url",
@@ -80,6 +88,118 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+#: The lookup memo every ``check()`` in this process reads first. Module-level
+#: for the same reason spn-client's pacing state is: the link pass and the
+#: citation resolver are separate modules that must share one answer per URL,
+#: and threading a cache object through both call chains would touch every
+#: signature between the pipeline and the lookup. Memory-only until the
+#: pipeline opens a store; ``open_lookup_cache`` replaces it at run start,
+#: which also empties the memo so one run's answers do not leak into the next
+#: run in the same process (tests, mostly).
+_lookup_cache = LookupCache()
+
+
+def open_lookup_cache(history_root=None):
+    """Start a run's lookup memo, backed by the store under ``history_root``.
+
+    ``None`` keeps the memo in memory only, which is how ``--offline`` and the
+    tests run: one answer per URL per run, nothing on disk. Returns the cache so
+    a caller that wants to inspect it can.
+    """
+    global _lookup_cache
+    _lookup_cache.close()
+    path = Path(history_root) / STORE_FILENAME if history_root else None
+    _lookup_cache = LookupCache(path)
+    if path is not None and not _lookup_cache.summary()["persistent"]:
+        log.warning(
+            "Wayback lookup store %s could not be opened; lookups are not "
+            "remembered across runs this time",
+            path,
+        )
+    return _lookup_cache
+
+
+def close_lookup_cache():
+    """Close the store. The memo stays readable for the rest of the process."""
+    _lookup_cache.close()
+
+
+def lookup_cache_summary():
+    """Counts for the log and report: see ``LookupCache.summary``."""
+    return _lookup_cache.summary()
+
+
+def forget_lookup(url):
+    """Drop the remembered answer for ``url``; the next ``check()`` goes live."""
+    _lookup_cache.forget(url)
+
+
+def remember_lookup(url, answer):
+    """Remember ``answer`` (a ``wayback`` dict naming a snapshot) as what a
+    lookup of ``url`` would return.
+
+    For a capture this run completed. archive.org's availability index lags a
+    fresh capture by hours (spn-client's ``check`` docstring, point 3; seen
+    here 2026-10-28: a PDF captured at 21:15 UTC read "not archived" two
+    minutes later and was captured again). The capture's own answer is the
+    truth for the next run, where a live lookup would be a second capture.
+    """
+    _lookup_cache.put(url, answer)
+
+
+def check(
+    url,
+    timeout=10,
+    stale_days=None,
+    cdx_fallback=False,
+    cdx_timeout=60,
+):
+    """``spn_client.check`` behind the run's lookup memo.
+
+    Same signature and the same result shape, plus ``lookup_cached: True`` and
+    ``lookup_checked_at`` on an answer that came from the memo rather than from
+    archive.org, so a report can tell the two apart. See
+    :mod:`.wayback_lookup_cache` for what is remembered and for how long.
+
+    Concurrent misses for one URL take turns on a per-URL lock, so the second
+    asks the memo again and finds the first's answer instead of paying a paced
+    live call for it. A lookup that did not complete is not remembered, so a
+    waiter whose leader got ``archived: None`` asks archive.org itself, which
+    is exactly what it would have done without the memo.
+    """
+    cache = _lookup_cache
+    if not isinstance(url, str):
+        # Let spn-client raise its own ValueError for a non-URL.
+        return _spn_check(
+            url,
+            timeout=timeout,
+            stale_days=stale_days,
+            cdx_fallback=cdx_fallback,
+            cdx_timeout=cdx_timeout,
+        )
+    cache.note("lookups")
+    hit, source = cache.lookup(url, stale_days=stale_days, cdx_fallback=cdx_fallback)
+    if hit is not None:
+        cache.note(f"{source}_hits")
+        return hit
+    with cache.lock_for(url):
+        hit, _ = cache.lookup(url, stale_days=stale_days, cdx_fallback=cdx_fallback)
+        if hit is not None:
+            # The leader's answer, written while this thread waited for the lock.
+            cache.note("run_hits")
+            return hit
+        cache.note("live")
+        result = _spn_check(
+            url,
+            timeout=timeout,
+            stale_days=stale_days,
+            cdx_fallback=cdx_fallback,
+            cdx_timeout=cdx_timeout,
+        )
+        cache.put(url, result, cdx_fallback=cdx_fallback)
+        return result
 
 
 #: The SPN2 capture options spn-client exposes on ``submit()`` that carry no

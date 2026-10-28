@@ -17,9 +17,17 @@ right inputs and reads the right outputs, not that archive.org answers them.
 
 from unittest.mock import patch
 
+import pytest
+
 import ci_article_review.pipeline as pipeline
 
 _MINIMAL_CONFIG = {"api_keys": {}, "pipeline": {}}
+
+
+@pytest.fixture(autouse=True)
+def _history_in_tmp(tmp_history_root):
+    """``run_archive_only`` opens the Wayback lookup store under the history
+    root, which must not be the working directory's ``pipeline_history/``."""
 
 
 def _write(tmp_path, name, text):

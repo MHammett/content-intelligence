@@ -1746,6 +1746,12 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
     """
     wb = entry.setdefault("wayback", {})
     wb["submitted"] = bool(sub.get("submitted"))
+    if wb["submitted"] and entry.get("url"):
+        # Whatever archive.org said about this URL before the submission is no
+        # longer what it would say after it. Drop the remembered answer so the
+        # next run's lookup asks, rather than repeating "not archived" for a
+        # page this run just had captured.
+        wayback.forget_lookup(entry["url"])
     if sub.get("job_id"):
         wb["submission_job_id"] = sub["job_id"]
     if sub.get("error"):
@@ -1780,6 +1786,9 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
                 wb["submission_retry_category"] = category
     elif sub.get("archived") and sub.get("snapshot_url"):
         _record_archived(wb, sub)
+        if entry.get("url"):
+            # The capture is the answer; the availability index will lag it.
+            wayback.remember_lookup(entry["url"], wb)
     elif sub.get("job_id"):
         wb["archive_outcome"] = wayback.ARCHIVE_PENDING
         wb["archive_outcome_detail"] = (
@@ -1815,6 +1824,8 @@ def _record_job_status(entry, status: wayback.JobStatusResult) -> str | None:
     state = status.get("state")
     if state == "success":
         _record_archived(wb, status)
+        if entry.get("url"):
+            wayback.remember_lookup(entry["url"], wb)
     elif state == "failed":
         wb["archive_outcome"] = wayback.ARCHIVE_CAPTURE_FAILED
         wb["archive_outcome_detail"] = status.get("reason")

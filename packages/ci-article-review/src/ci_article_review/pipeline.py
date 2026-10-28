@@ -3290,6 +3290,15 @@ def run_draft_pipeline(
     # every archive lookup here, reporting each citation as "rate limit tripped
     # earlier this run" for a limit that expired before this run began.
     wayback.reset_rate_limit_state()
+    # One archive.org answer per URL per run, shared by link validation and
+    # Section 9, and kept under the history root for the next run. Memory-only
+    # when the store is switched off; --offline makes no lookups at all, and
+    # opening the store would create history for a run that writes none.
+    wayback.open_lookup_cache(
+        _history_root()
+        if pipeline_cfg.get("wayback_lookup_cache", True) and not offline
+        else None
+    )
     # The handoff declares the run number, so re-running without editing it
     # writes a second report with the same number — pipeline_history ended up
     # with two run_16_* files for one article, and the later one is not
@@ -4613,6 +4622,21 @@ def run_draft_pipeline(
 
     # Attach pre-analysis
     report["pre_analysis"] = pre_analysis
+    # How many archive.org lookups the run asked for and how many it answered
+    # itself. The number that matters is `live`: it is what archive.org saw,
+    # and what the circuit breaker counts against.
+    report["wayback_lookups"] = wayback.lookup_cache_summary()
+    wayback.close_lookup_cache()
+    if report["wayback_lookups"]["lookups"]:
+        wl = report["wayback_lookups"]
+        log.info(
+            "Wayback lookups: %d asked, %d sent to archive.org, %d answered from "
+            "this run, %d from earlier runs",
+            wl["lookups"],
+            wl["live"],
+            wl["run_hits"],
+            wl["store_hits"],
+        )
 
     # Fallback warnings
     fallback_warnings = [
@@ -6156,6 +6180,17 @@ def run_archive_only(
     # 2026-09-28 on one NHTSA PDF). The fallback is slow, up to cdx_timeout per
     # stale or unarchived URL, which is why the full review's own lookups do not
     # use it; see content-intelligence#289 for measuring that before widening it.
+    #
+    # The lookup memo is opened too: a URL this mode asked about yesterday, or
+    # a full review did, is answered from the store. A cached negative or stale
+    # answer is taken only if CDX was consulted when it was stored, a fresh
+    # positive from anyone (see wayback_lookup_cache).
+    wayback.reset_rate_limit_state()
+    wayback.open_lookup_cache(
+        _history_root()
+        if config["pipeline"].get("wayback_lookup_cache", True)
+        else None
+    )
     checked = {url: wayback.check(url, cdx_fallback=True) for url in unique_urls}
     results = [
         {"resolved": True, "url": url, "marker": marker, "wayback": dict(checked[url])}
@@ -6167,6 +6202,8 @@ def run_archive_only(
     _submit_missing_archives(
         results, api_keys.get("archive_org"), _history_root(), capture_settings
     )
+    lookups = wayback.lookup_cache_summary()
+    wayback.close_lookup_cache()
 
     from .report_markdown import _render_archive_pair
 
@@ -6217,6 +6254,12 @@ def run_archive_only(
         f"\n{len(results)} citation URL(s): {fresh} with a fresh Wayback snapshot, "
         f"{stale} with only a stale one, {missing} with none{not_checked}."
     )
+    remembered = lookups["store_hits"]
+    if remembered:
+        print(
+            f"{lookups['live']} lookup(s) sent to archive.org; {remembered} answered "
+            f"from earlier runs."
+        )
     print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
 
 
