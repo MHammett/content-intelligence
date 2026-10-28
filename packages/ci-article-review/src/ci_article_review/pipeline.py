@@ -1425,6 +1425,19 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
             hints = _locate_hints(cited, known_urls, own, item)
             if hints:
                 entry["locate_hints"] = hints
+            # URLs that reached this claim only as the preceding span's markers.
+            # They may support it; they are not reported as its failed source
+            # when its own was tried (issue #441). A URL the model named itself
+            # is its own source even if a neighbouring marker also carries it.
+            neighbours = [
+                u
+                for u in (
+                    cited.neighbour_urls_for(claim, source_field) if cited else []
+                )
+                if u in known_urls and u != own
+            ]
+            if neighbours:
+                entry["neighbour_urls"] = neighbours
             claims.append(entry)
     log.info(
         "Citations: %d of %d claim(s) traced to a citation in the draft",
