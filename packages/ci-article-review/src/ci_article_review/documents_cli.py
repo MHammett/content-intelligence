@@ -152,7 +152,9 @@ def build_parser():
             "files only: a file already there with the same bytes is left alone "
             "(running it twice is a no-op) and one with different bytes stops "
             "it. A report under _replay/ or one that was not read from --github "
-            "is refused."
+            "is refused. A run read from a tag or a ref (--round of an accepted "
+            "round) names no pull request: --pr N attaches it to open round pull "
+            "request N, if the commit it reviewed is an ancestor of N's head."
         ),
     )
     push.add_argument(
@@ -164,6 +166,15 @@ def build_parser():
         "--github-repo",
         metavar="OWNER/NAME",
         help="commit to this repository instead of the one the report names",
+    )
+    push.add_argument(
+        "--pr",
+        type=int,
+        metavar="N",
+        help=(
+            "write a run read from a tag or a ref to open round pull request N; "
+            "refused unless the commit it reviewed is an ancestor of N's head"
+        ),
     )
     push.add_argument(
         "--config-dir",
@@ -783,6 +794,7 @@ def _push_run(args, environ, run, session, out):
         settings=settings,
         api_keys=config["api_keys"],
         repo=args.github_repo,
+        pr=args.pr,
         token_lookup=lambda: resolve_token(environ, run),
         session=session,
         out=out,
