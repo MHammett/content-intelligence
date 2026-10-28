@@ -3215,7 +3215,10 @@ class TestClaudeThinkingIsAudible:
         assert result["raw"] == '{"flags": []}'
         (record,) = result["stream_timing"]
         assert record["first_byte_s"] < 0.3
-        assert record["first_output_s"] >= 0.6
+        # Six 0.1 s sleeps, measured on a clock Windows ticks at ~15.6 ms: 0.59 s
+        # is the same 0.6 s of thinking. What matters is that the answer came
+        # after the thinking, well past the 0.3 s first-byte allowance.
+        assert record["first_output_s"] >= 0.5
 
         silent = _slow_stream(_completion_stream(), first_delay=0.6)
         with patch.object(client.litellm, "completion", return_value=silent):
