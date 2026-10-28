@@ -612,6 +612,36 @@ def _fetch_following_page(url, timeout=15):
     return resp
 
 
+#: A Google Drive file link that opens the viewer: ``/file/d/<id>/view`` (or
+#: ``/edit``, ``/preview``, nothing) and the older ``/open?id=<id>``.
+_DRIVE_VIEWER = re.compile(
+    r"^https?://drive\.google\.com/(?:file/d/([A-Za-z0-9_-]{10,})(?:/[a-z]*)?/?(?:[?#].*)?"
+    r"|open\?(?:[^#]*&)?id=([A-Za-z0-9_-]{10,})(?:[&#].*)?)$"
+)
+
+
+def direct_document_url(url):
+    """The URL that returns a cited document's bytes, when the cited one does not.
+
+    A Google Drive viewer link returns a JavaScript shell (90 KB of script, no
+    document text), so a claim cited to one could never be checked: two claims
+    on brockovich-fact-check run 2 (issue #447). For a publicly shared file
+    ``uc?export=download&id=<id>`` returns the file itself, redirecting to
+    drive.usercontent.google.com; checked live on that run's file, a 12.6 MB
+    PDF. Over 25 MB, Drive serves a virus-scan page needing a confirm token
+    first. ``gdown`` handles that, but a downloader dependency for one URL
+    shape is not worth it here: the scan page is HTML and is reported as
+    unreadable, which is true. A private file fails exactly as it did.
+
+    Anything else comes back unchanged.
+    """
+    match = _DRIVE_VIEWER.match(url or "")
+    if not match:
+        return url
+    file_id = match.group(1) or match.group(2)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+
 def _get_page(url, timeout=15, page_cache=None):
     """The direct fetch of a source page, taken from ``page_cache`` when it holds one.
 
@@ -1005,10 +1035,11 @@ def _resolve_known_url(
     coverage = None
     try:
         _step("fetch")
-        resp = _get_page(known_url, timeout, page_cache)
+        fetch_url = direct_document_url(known_url)
+        resp = _get_page(fetch_url, timeout, page_cache)
         _step("extract")
         content, content_kind, coverage = _extract_fetched_with_coverage(
-            resp, known_url
+            resp, fetch_url
         )
         # Where the fetch actually landed. `safe_get` follows redirects one
         # validated hop at a time and returns the last hop's response, so this
@@ -1022,7 +1053,10 @@ def _resolve_known_url(
         # redirect URLs were 817 of the 2,682 characters in one Section 9 entry,
         # while the page behind them was a Jalopnik article the pipeline had
         # already fetched, read and checksummed.
-        final_url = getattr(resp, "url", "") or ""
+        #
+        # Not for a rewritten Drive link: the download host it lands on is
+        # not a page a reader opens, and the viewer link the draft cites is.
+        final_url = "" if fetch_url != known_url else getattr(resp, "url", "") or ""
     except UnsafeURLError as e:
         # Distinct from a fetch failure, and never eligible for the Wayback
         # fallback: archive.org has no snapshot of an internal host, and asking
@@ -1200,11 +1234,19 @@ def _resolve_known_url(
         result["note"] = _UNVERIFIABLE_NOTES["access_wall"]
         return _check_drift(result, checksum_index)
 
-    if len(content.strip()) < _MIN_VERIFIABLE_CHARS:
+    if len(content.strip()) < _MIN_VERIFIABLE_CHARS or (
+        content_kind == "pdf"
+        # A partial read is never reported as a mismatch anyway (see below),
+        # so only a PDF read whole needs telling apart from a scan.
+        and not (coverage or {}).get("partial")
+        and extract.looks_like_scanned_pdf(content, (coverage or {}).get("pages_read"))
+    ):
         # We fetched a real document but could not read it: a PDF with no text
         # layer (or no pypdf installed), a JS-only render, a bot wall. Say that
         # — do NOT run verification and report "does not support the claim",
-        # which asserts something false about a source we never read.
+        # which asserts something false about a source we never read. A scan
+        # with a stamp on every page clears the character floor and is the
+        # same case (issue #447).
         result["verification"] = "unverifiable"
         result["note"] = _UNVERIFIABLE_NOTES.get(
             content_kind, _UNVERIFIABLE_NOTES["default"]

@@ -275,6 +275,26 @@ PDF_MAX_SECONDS = 180
 #: file that is fast per page but endless.
 PDF_MAX_PAGES = 5000
 
+#: Below this many extracted characters per page on average, a PDF is a scan
+#: whose text layer is only a stamp or a header. A page of real text carries
+#: well over a thousand.
+SCANNED_PDF_CHARS_PER_PAGE = 80
+
+
+def looks_like_scanned_pdf(text, pages_read):
+    """True when a PDF's text is too thin per page to be its content.
+
+    A court order filed as page images, downloaded on brockovich-fact-check run
+    2 (issue #447), gave 251 characters over 11 pages: "Copy from re:SearchTX",
+    the e-filing system's stamp, once a page. That is above the 200-character
+    floor callers use for "could not read", so the verifier was asked about it
+    and reported that the document does not support the claim, a false
+    statement about a source nobody read.
+    """
+    if not pages_read:
+        return False
+    return len((text or "").strip()) / pages_read < SCANNED_PDF_CHARS_PER_PAGE
+
 
 def read_coverage(kind, pages_total=None, pages_read=None, stopped_by=None):
     """What was read of a document, as the record every reader hands on.

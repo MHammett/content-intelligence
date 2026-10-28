@@ -205,6 +205,11 @@ def _pdf_text(raw):
     text, coverage = extract.extract_pdf_text_with_coverage(
         raw, max_pages=_PDF_MAX_PAGES
     )
+    if not coverage.get("partial") and extract.looks_like_scanned_pdf(
+        text, coverage.get("pages_read")
+    ):
+        # A scan's stamp is not its text; "" makes it "too short", not a miss.
+        return "", False
     return text, bool(coverage.get("partial"))
 
 
