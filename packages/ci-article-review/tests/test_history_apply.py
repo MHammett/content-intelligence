@@ -28,8 +28,9 @@ from ci_article_review import (
 )
 
 from .github_fake import REPO, SETTINGS, TOKEN, FakeGitHub, Resp, client, non_get
+from .test_chat_export import message, tool_result, tool_use
 from .test_chat_map import Mapped
-from .test_history_import import handoff_text, make_draft
+from .test_history_import import handoff_text, make_draft, when
 
 SLUG = "example-import"
 FOLDER = f"articles/{SLUG}"
@@ -1039,6 +1040,91 @@ def test_a_chat_only_version_from_the_real_scan_is_written_with_its_chat_trailer
     tree = fake.trees[fake.commits[fake.branches[f"round/{slug}/r1"]]["tree"]]
     assert fake.blobs[tree[f"articles/{slug}/draft.md"]].endswith(b"\n")
     assert f"{slug}/r1" in fake.tags
+
+
+def test_one_messages_edits_are_written_in_the_order_they_were_made(tmp_path, fake):
+    """A message has one timestamp, so its edits tie; item numbers say the order.
+
+    The items are 9, 11, 111 and 142: as strings ``item:11`` < ``item:111`` <
+    ``item:142`` < ``item:9``, and the versions' hashes sort another way again, so
+    only the number puts them in the order the edits were made.
+    """
+    base = tmp_path / "chat"
+    base.mkdir()
+    mapped = Mapped(base)
+    items = [9, 11, 111, 142]
+    expected, current = [], hi.normalise(mapped.v1)
+    content = [{"type": "text", "text": ""} for _ in range(max(items))]
+    for number, index in enumerate(items):
+        old = f"Sentence {number + 3} of part a"
+        new = f"{old}, revised alpha{number},"
+        current = current.replace(old, new)
+        expected.append(hi._sha(current))
+        # the message's own text block is item 0, so item N sits at N - 1 here
+        content[index - 1] = tool_use(
+            "str_replace",
+            {"path": mapped.path, "old_str": old, "new_str": new},
+            when(1, 11),
+            f"edit{number}",
+            stamped=False,
+        )
+    content += [tool_result(f"edit{n}") for n in range(len(items))]
+    edits = message("m1c", "assistant", when(1, 11), content=content)
+    mapped.conversations[0]["chat_messages"][2:] = [edits]  # after the creation
+    mapped.write()
+
+    plan, _ = mapped.scan()
+
+    locators = [f"item:{i}" for i in items]
+    made = [
+        e
+        for r in plan["rounds"]
+        for e in r["events"]
+        if e["kind"] == "draft"
+        and any(s.get("locator") in locators for s in e["sources"])
+    ]
+    assert [e["sha256"] for e in made] == expected
+    assert [
+        s["locator"] for e in made for s in e["sources"] if s.get("via")
+    ] == locators
+    # the tie this test is about, and that no other order would have passed
+    assert len({e["at"] for e in made}) == 1
+    assert sorted(expected) != expected
+    assert sorted(locators) != locators
+
+    plan_path = tmp_path / "edits-plan.json"
+    plan_path.write_text(hi.plan_text(plan), encoding="utf-8")
+    ids = [e["id"] for e in made]
+    units = [u.ids for r in ha._plan_rounds(plan) for u in r.units]
+    assert [i for unit in units for i in unit if i in ids] == ids
+
+    def run(**kw):
+        lines = []
+        ha.apply_plan(
+            plan_path,
+            repo=REPO,
+            client=client(fake),
+            settings=SETTINGS,
+            api_keys=API_KEYS,
+            out=lines.append,
+            now=lambda: NOW,
+            sleep=lambda s: None,
+            **kw,
+        )
+        return "\n".join(lines)
+
+    assert run(dry_run=True).count("would commit") == len(units)
+    assert nothing_written(fake)
+
+    run()
+    branch, written = fake.branches[f"round/{plan['slug']}/r1"], []
+    while "Plan-event:" in fake.commits[branch]["message"]:
+        tree = fake.trees[fake.commits[branch]["tree"]]
+        data = fake.blobs[tree[f"articles/{plan['slug']}/draft.md"]]
+        written.append(hi._sha(hi.normalise(data.decode("utf-8"))))
+        branch = fake.commits[branch]["parents"][0]
+    written.reverse()
+    assert [w for w in written if w in expected] == expected
 
 
 def test_the_tag_step_dates_an_import_at_accepted_at_and_leaves_other_callers_alone(

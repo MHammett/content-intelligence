@@ -965,7 +965,7 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
             cs[0].created,
             cs[0].conversation,
             cs[0].message,
-            cs[0].locator,
+            _locator_key(cs[0].locator),
         ),
     )
     for candidate, strong in ordered:
@@ -1122,10 +1122,11 @@ def _in_reproduction_window(holder, version, versions):
 # ---------------------------------------------------------------------------
 
 
-def _best_time(holders):
-    """The time of a version or file: the earliest, unless a more trusted source is within 5 minutes of it.
+def _best_holder(holders):
+    """The holder that defines the time of a version or file, or ``None``.
 
-    A reproduction's claimed time counts only when nothing else has a time.
+    The earliest, unless a more trusted source is within 5 minutes of it. A
+    reproduction's claimed time counts only when nothing else has a time.
     """
     timed = [h for h in holders if h.time and h.source != "recovered"]
     if not timed:
@@ -1134,7 +1135,38 @@ def _best_time(holders):
         return None
     earliest = min(h.time for h in timed)
     near = [h for h in timed if h.time - earliest <= _CLOSE]
-    return min(near, key=lambda h: (_TRUST[h.source], h.time)).time
+    return min(near, key=lambda h: (_TRUST[h.source], h.time))
+
+
+def _best_time(holders):
+    """The time of a version or file (see ``_best_holder``)."""
+    holder = _best_holder(holders)
+    return holder.time if holder is not None else None
+
+
+def _locator_key(locator):
+    """Sort key for a chat locator (``item:N``, ``fence:N``, ``text``...).
+
+    The number compares as a number: ``item:9`` precedes ``item:11``, which a
+    string comparison reverses.
+    """
+    kind, _, number = str(locator or "").partition(":")
+    return (kind, int(number) if number.isdigit() else -1)
+
+
+def _edit_order(event):
+    """Where an event sits among others made at the same instant by one chat message.
+
+    A claude.ai export has one timestamp per message, but a message can edit a
+    file many times, and those edits share that timestamp. They were made in item
+    order, so the order is the message, then the locator's number. Events with no
+    chat holder return an empty key and keep the order the rest of the tie-break
+    gives them.
+    """
+    holder = _best_holder(event.holders)
+    if holder is None or holder.source != "chat" or not holder.via:
+        return ("", ("", -1))
+    return (holder.path, _locator_key(holder.locator))
 
 
 def _closeness(a, b):
@@ -1372,7 +1404,13 @@ def _group_rounds(events, gap=None):
 
     def tiebreak(e):
         path = e.run_data["path"] if e.kind == "run" else e.holders[0].path
-        return (_KIND_ORDER[e.kind], e.superseded_by is not None, e.sha or "", path)
+        return (
+            _KIND_ORDER[e.kind],
+            e.superseded_by is not None,
+            _edit_order(e) if e.kind != "run" else ("", ("", -1)),
+            e.sha or "",
+            path,
+        )
 
     placed = sorted(
         (e for e in events if e.at is not None), key=lambda e: (e.at, *tiebreak(e))
