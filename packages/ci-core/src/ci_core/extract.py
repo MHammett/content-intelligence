@@ -19,8 +19,10 @@ raising: callers must be able to tell "read it, and here is the text" from
 would collapse that distinction into a generic failure.
 """
 
+import bisect
 import codecs
 import logging
+import math
 import re
 import time
 from html.parser import HTMLParser
@@ -672,7 +674,7 @@ def claim_terms(claim):
 _TERM_COUNT_CAP = 5
 
 
-def select_excerpt(text, claim, head=4000, tail=1000):
+def select_excerpt(text, claim, head=4000, tail=1000, hints=()):
     """Return the region of ``text`` most likely to contain support for ``claim``.
 
     Blind head+tail truncation reliably misses the supporting passage in long
@@ -701,10 +703,10 @@ def select_excerpt(text, claim, head=4000, tail=1000):
     matches several distinct terms; the score still rewards both breadth and
     density.
     """
-    return select_excerpt_with_window(text, claim, head=head, tail=tail)[0]
+    return select_excerpt_with_window(text, claim, head=head, tail=tail, hints=hints)[0]
 
 
-def select_excerpt_with_window(text, claim, head=4000, tail=1000):
+def select_excerpt_with_window(text, claim, head=4000, tail=1000, hints=()):
     """:func:`select_excerpt`, plus a record of how much of ``text`` it kept.
 
     Returns ``(excerpt, window)`` where ``window`` is::
@@ -718,6 +720,14 @@ def select_excerpt_with_window(text, claim, head=4000, tail=1000):
     window is chosen by the claim's own terms, which is a real search and not a
     blind cut, but it is still a 20,000-character sample of what may be a
     600,000-character council packet.
+
+    ``hints`` are other texts that say where the evidence probably is: the
+    draft's own citation entry for the URL (an author who wrote "p. 110 (Council
+    Bluffs, IA: 1,410.3 million gallons withdrawn)" has named the row) and the
+    fact-check model's quote from the page. Their terms help choose the window
+    at a lower weight than the claim's own; they never reach the verifier.
+    The window may come back as several stretches of the document
+    (``how: "best_windows"``) when the claim's terms sit far apart.
     """
     from ci_core import redact
 
@@ -740,39 +750,196 @@ def select_excerpt_with_window(text, claim, head=4000, tail=1000):
             "how": "head_tail",
         }
 
-    numbers, words = claim_terms(claim)
-    if not numbers and not words:
-        return _head_tail()
-
     lowered = text.lower()
-    step = max(budget // 8, 1)
-    best_score, best_start = 0, None
-    for start in range(0, max(total - budget, 0) + step, step):
-        end = start + budget
-        if start >= len(lowered):
-            break
-        # Numbers weigh more than words: a matching figure is far stronger
-        # evidence of the right passage than a matching common-ish term.
-        score = sum(
-            3 * min(lowered.count(n.lower(), start, end), _TERM_COUNT_CAP)
-            for n in numbers
-        )
-        score += sum(min(lowered.count(w, start, end), _TERM_COUNT_CAP) for w in words)
-        if score > best_score:
-            best_score, best_start = score, start
-
-    if best_start is None:
+    numbers, words = claim_terms(claim)
+    hint_numbers, hint_words = set(), set()
+    for hint in hints or ():
+        n, w = claim_terms(hint)
+        hint_numbers |= n
+        hint_words |= w
+    claim_weighted = _weighted_terms(numbers, words, lowered, total, budget)
+    hint_weighted = _weighted_terms(
+        hint_numbers - numbers, hint_words - words, lowered, total, budget
+    )
+    if not claim_weighted and not hint_weighted:
         return _head_tail()
 
-    excerpt = text[best_start : best_start + budget]
-    if best_start > 0:
-        excerpt = f"...[{best_start} chars omitted]...\n{excerpt}"
-    remaining = total - (best_start + budget)
-    if remaining > 0:
-        excerpt = f"{excerpt}\n...[{remaining} chars omitted]..."
-    return excerpt, {
+    # The claim chooses first and the hints only add to what it found. Mixed
+    # into one pool, a long citation entry ("[9] ... p. 110 (Council Bluffs ...)
+    # and endnote 66, p. 117 (golf ...)") outvoted the claim it was cited for
+    # and pulled the window off the passage the claim's own terms had found.
+    reserve = _HINT_PASSAGES if hint_weighted else 0
+    chosen = _pick_passages(
+        claim_weighted, [], total, budget, _PASSAGES_PER_BUDGET - reserve
+    )
+    chosen = _pick_passages(
+        hint_weighted, chosen, total, budget, _PASSAGES_PER_BUDGET - len(chosen)
+    )
+    if not chosen:
+        return _head_tail()
+    spans = _grow_spans(sorted(chosen), total, budget)
+
+    parts = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            parts.append(f"...[{start - cursor} chars omitted]...")
+        parts.append(text[start:end])
+        cursor = end
+    if cursor < total:
+        parts.append(f"...[{total - cursor} chars omitted]...")
+    return "\n".join(parts), {
         "chars_total": total,
-        "chars_read": min(budget, total - best_start),
+        "chars_read": sum(end - start for start, end in spans),
         "windowed": True,
-        "how": "best_window",
+        # One stretch keeps the name it always had, so a report or test that
+        # reads it is unchanged; several stretches say so.
+        "how": "best_window" if len(spans) == 1 else "best_windows",
     }
+
+
+#: Passages held back for the hints when there are any. A hint says where the
+#: evidence probably is (the draft's citation entry for this URL, a fact-check
+#: model's quote from the page); the claim is what is being checked, so it gets
+#: the rest, and the hints steer the window, never the verdict.
+_HINT_PASSAGES = 2
+
+#: A later passage is kept only if what it adds is at least this share of the
+#: first passage's score; below it, the budget is better spent as context
+#: around what was already found than on a distant, weak match.
+_LATER_PASSAGE_SHARE = 0.35
+
+#: Base weight of a figure against a word. A matching figure is far stronger
+#: evidence of the right passage than a matching common-ish term.
+_NUMBER_WEIGHT = 3.0
+
+#: The passages a long document is cut into while choosing what to show, as a
+#: fraction of the budget. Four 5,000-character passages fit the verifier's
+#: 20,000; a claim whose figures sit in two places gets both.
+_PASSAGES_PER_BUDGET = 4
+
+#: How much a term still counts in a later passage once an earlier chosen one
+#: already holds it. Low, so the second pick goes to whatever the first did not
+#: cover rather than to another copy of the same match.
+_COVERED_DISCOUNT = 0.25
+
+
+def _weighted_terms(numbers, words, lowered, total, budget):
+    """``[(positions, weight), ...]`` for the terms that occur in ``lowered``.
+
+    Weighted by rarity in this document, which is what the old scorer lacked.
+    It counted every claim word alike, so in a 644,000-character EPA technical
+    document the claim's generic vocabulary ("cooling", "energy", "plants")
+    pulled the window to wherever those were densest, 58,000 characters from
+    the one sentence that answers it ("The disadvantages of dry cooling include
+    an increase in noise generation", issue #440). A term that occurs twice in
+    a long document is a pointer to the passage; one that occurs on every page
+    says nothing about where to look. The weight is an inverse document
+    frequency over passage-sized pieces: ``log(1 + pieces / min(count,
+    pieces))``.
+    """
+    piece = max(budget // _PASSAGES_PER_BUDGET, 1)
+    pieces = max(total // piece, 1)
+    weighted = []
+    for group, base in ((numbers, _NUMBER_WEIGHT), (words, 1.0)):
+        for term in sorted(group):
+            needle = term.lower()
+            positions = [m.start() for m in re.finditer(re.escape(needle), lowered)]
+            if not positions:
+                continue
+            rarity = math.log(1 + pieces / min(len(positions), pieces))
+            weighted.append((positions, base * rarity))
+    return weighted
+
+
+def _window_score(terms, start, end, covered=None):
+    """Score of ``[start, end)``: each term present adds its weight, once, plus
+    a little for repeats (``log``), so breadth beats one word said many times.
+    ``covered`` holds the indexes of terms an already chosen passage holds."""
+    score = 0.0
+    for index, (positions, weight) in enumerate(terms):
+        count = bisect.bisect_left(positions, end) - bisect.bisect_left(
+            positions, start
+        )
+        if not count:
+            continue
+        repeats = 1 + math.log(min(count, _TERM_COUNT_CAP))
+        if covered and index in covered:
+            weight *= _COVERED_DISCOUNT
+        score += weight * repeats
+    return score
+
+
+def _pick_passages(terms, chosen, total, budget, limit):
+    """``chosen`` plus up to ``limit`` more passage-sized spans scored by ``terms``.
+
+    Greedy: each pick is the best window that does not overlap one already
+    chosen, scored with the terms an earlier pick of this call covered
+    discounted, so the second pick goes to what the first did not hold (a 2023
+    share on one page and a 2028 projection on another). A pick that adds less
+    than ``_LATER_PASSAGE_SHARE`` of this call's first pick ends it. The caller
+    shares the rest of the budget out around the picks (``_grow_spans``), so a
+    claim answered in one place still gets one long stretch of context.
+    """
+    chosen = list(chosen)
+    if not terms or limit <= 0:
+        return chosen
+    piece = max(budget // _PASSAGES_PER_BUDGET, 1)
+    step = max(piece // 4, 1)
+    starts = range(0, max(total - piece, 0) + 1, step)
+    covered = set()
+    first = None
+    for _ in range(limit):
+        best, best_start = 0.0, None
+        for start in starts:
+            end = start + piece
+            if any(start < c_end and end > c_start for c_start, c_end in chosen):
+                continue
+            score = _window_score(terms, start, end, covered)
+            if score > best:
+                best, best_start = score, start
+        if best_start is None:
+            break
+        if first is not None and best < _LATER_PASSAGE_SHARE * first:
+            break
+        first = best if first is None else first
+        span = (best_start, min(best_start + piece, total))
+        chosen.append(span)
+        for index, (positions, _weight) in enumerate(terms):
+            if bisect.bisect_left(positions, span[1]) > bisect.bisect_left(
+                positions, span[0]
+            ):
+                covered.add(index)
+    return chosen
+
+
+def _grow_spans(spans, total, budget):
+    """Widen ``spans`` evenly, merging any that meet, until ``budget`` is used."""
+    spans = [list(s) for s in spans]
+    while True:
+        used = sum(e - s for s, e in spans)
+        spare = budget - used
+        if spare <= 0:
+            break
+        share = max(spare // (2 * len(spans)), 1)
+        grew = False
+        for span in spans:
+            new_start = max(0, span[0] - share)
+            new_end = min(total, span[1] + share)
+            if (new_start, new_end) != (span[0], span[1]):
+                grew = True
+            span[0], span[1] = new_start, new_end
+        merged = [spans[0]]
+        for span in spans[1:]:
+            if span[0] <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], span[1])
+            else:
+                merged.append(span)
+        spans = merged
+        if not grew:
+            break
+    # Growth in whole shares can overshoot by a few characters; trim the last.
+    over = sum(e - s for s, e in spans) - budget
+    if over > 0:
+        spans[-1][1] -= over
+    return [(s, e) for s, e in spans]
