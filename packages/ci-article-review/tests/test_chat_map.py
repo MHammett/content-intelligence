@@ -18,6 +18,7 @@ from .test_chat_export import (
     chat_sources,
     conversation,
     message,
+    stamp,
     tool_result,
     tool_use,
 )
@@ -1038,3 +1039,162 @@ def test_a_section_cut_from_an_existing_draft_is_left_out_even_under_its_name(ma
     left = by_sha(plan)[sha_of(cut)]
     assert left["include"] is False
     assert left["why"].startswith("a fragment")
+
+
+# ---------------------------------------------------------------------------
+# A project document does not date a version; research/ is never the article
+# ---------------------------------------------------------------------------
+
+
+def add_project_docs(mapped, docs):
+    """Knowledge files of one invented project: ``[(filename, content, moment)]``."""
+    folder = mapped.dir / "projects" / "projects"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "project-1.json").write_text(
+        json.dumps(
+            {
+                "uuid": "proj-1",
+                "name": "Invented project",
+                "description": "",
+                "prompt_template": "",
+                "docs": [
+                    {"filename": name, "content": text, "created_at": stamp(moment)}
+                    for name, text, moment in docs
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_a_project_document_does_not_date_a_version_a_file_also_holds(mapped):
+    submitted = prose("a", ARTICLE_LINES).replace(
+        "Sentence 5 of part a", "Sentence 5 of part a, submitted,"
+    )
+    article_chat(mapped)  # chat edits on day 1, 10:00 to 12:00
+    # The project doc says "existed by day 1, 09:00"; the file is the same bytes,
+    # saved on day 3 after the edits.
+    add_project_docs(
+        mapped, [(f"claude/{SLUG}/{SLUG}-draft-r2.md", submitted, when(1, 9))]
+    )
+    put(mapped.base / "files", f"{SLUG}-draft-r2.md", submitted, when(3, 11))
+    plan, _ = mapped.scan(files=[mapped.base / "files"])
+    found = by_sha(plan)
+    version = found[sha_of(submitted)]
+    assert version["at"] == hi._iso(when(3, 11))
+    assert "hint" not in version
+    assert {s["type"] for s in version["sources"]} == {"file", "chat"}
+    # (the chat's first write is a near-duplicate of the file, so only its edits stay)
+    edits = [found[sha_of(mapped.texts[key])] for key in ("first", "second")]
+    assert all(version["at"] > e["at"] for e in edits)
+    order = [e["id"] for r in plan["rounds"] for e in r["events"]]
+    assert all(order.index(version["id"]) > order.index(e["id"]) for e in edits)
+
+
+def test_a_project_document_dates_a_version_only_when_nothing_else_does(mapped):
+    submitted = prose("a", ARTICLE_LINES).replace(
+        "Sentence 5 of part a", "Sentence 5 of part a, submitted,"
+    )
+    article_chat(mapped)
+    add_project_docs(
+        mapped, [(f"claude/{SLUG}/{SLUG}-draft-r2.md", submitted, when(1, 9))]
+    )
+    plan, _ = mapped.scan()
+    version = by_sha(plan)[sha_of(submitted)]
+    assert version["at"] == hi._iso(when(1, 9))
+    assert "project document" in version["hint"]
+
+
+def test_a_research_file_that_is_also_a_project_document_is_left_out(mapped):
+    base = prose("a", ARTICLE_LINES)
+    # Quotes 60 lines of the article among 200 of its own: related, not a fragment.
+    analysis = "\n".join(base.split("\n")[:60]) + "\n" + prose("m", 200)
+    article_chat(mapped)
+    add_project_docs(
+        mapped,
+        [
+            (f"claude/{SLUG}/research/map-data-analysis.md", analysis, when(1, 9)),
+            (
+                f"claude/{SLUG}/{SLUG}-draft-r3.md",
+                base + "\nA closing line.",
+                when(1, 9),
+            ),
+        ],
+    )
+    put(mapped.base / "files" / "research", f"{SLUG}-map-data-analysis.md", analysis)
+    put(
+        mapped.base / "files",
+        f"{SLUG}-draft-r3.md",
+        base + "\nA closing line.",
+        when(3, 9),
+    )
+    plan, stats = mapped.scan(files=[mapped.base / "files"])
+    assert sha_of(analysis) not in by_sha(plan)
+    assert sha_of(base + "\nA closing line.") in by_sha(plan)
+    why = {item["path"]: item["why"] for item in plan["excluded"]}
+    assert any(
+        path.endswith("research/map-data-analysis.md") and "research/" in text
+        for path, text in why.items()
+    )
+    assert any(
+        path.endswith("/research") and "1 file(s) not read" in text
+        for path, text in why.items()
+    )
+    printed = "\n".join(hi.format_excluded(plan))
+    assert "research/" in printed and "Sentence" not in printed
+
+
+def test_a_document_named_like_a_draft_in_the_folder_root_is_kept(mapped):
+    article_chat(mapped)
+    put(
+        mapped.base / "files",
+        f"{SLUG}-draft-r4.md",
+        prose("a", ARTICLE_LINES),
+        when(3, 9),
+    )
+    put(mapped.base / "files" / "research", f"{SLUG}-notes-draft.md", prose("n", 80))
+    plan, _ = mapped.scan(files=[mapped.base / "files"])
+    kept = by_sha(plan)[sha_of(prose("a", ARTICLE_LINES))]
+    assert kept["include"] is True
+    assert "file" in {s["type"] for s in kept["sources"]}
+    assert sha_of(prose("n", 80)) not in by_sha(plan)
+
+
+def test_the_drive_manifest_and_a_research_directory_given_on_its_own(mapped):
+    assert hi._under_research("research/x.md")
+    assert hi._under_research("claude/slug/Research/x.md")
+    assert hi._under_research("a\\research\\x.md")
+    assert not hi._under_research("research.md")
+    assert not hi._under_research("slug/research-notes.md")
+    put(mapped.base / "alone" / "research", f"{SLUG}-draft.md", prose("n", 80))
+    article_chat(mapped)
+    plan, _ = mapped.scan(files=[mapped.base / "alone" / "research"])
+    assert any(
+        item["path"].endswith("/alone/research") and "whole directory" in item["why"]
+        for item in plan["excluded"]
+    )
+    assert sha_of(prose("n", 80)) not in by_sha(plan)
+
+
+def test_a_drive_file_under_research_is_left_out(mapped):
+    article_chat(mapped)
+    drive = mapped.base / "drive"
+    put(drive / "research", f"{SLUG}-notes.md", prose("n", 80))
+    put(drive, f"{SLUG}-draft-r5.md", prose("a", ARTICLE_LINES))
+    (drive / "drive-manifest.json").write_text(
+        json.dumps(
+            [
+                {"name": f"research/{SLUG}-notes.md", "createdTime": stamp(when(2, 9))},
+                {"name": f"{SLUG}-draft-r5.md", "createdTime": stamp(when(3, 9))},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    plan, _ = mapped.scan(drive_dir=drive)
+    assert sha_of(prose("n", 80)) not in by_sha(plan)
+    assert sha_of(prose("a", ARTICLE_LINES)) in by_sha(plan)
+    assert any(
+        item["path"].endswith(f"research/{SLUG}-notes.md")
+        and "research/" in item["why"]
+        for item in plan["excluded"]
+    )

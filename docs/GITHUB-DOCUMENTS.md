@@ -1114,6 +1114,22 @@ conversation<TAB>slug<TAB>name<TAB>confidence
   anything, nothing says which is the article, so all stay and a warning says
   so. A genuine early draft that was written after a larger text it sits inside
   reads as a fragment: set its `include` back to `true`.
+* **`research/` is never the article.** A file under a `research/` directory
+  (a `--files` or `--drive-dir` entry, or a project knowledge file whose name
+  has `research/` in its path, as a project mirroring a Drive folder does) is
+  never a version of the article, whatever text it shares with it: notes,
+  checks and data the article was written from often quote it. A `--files`
+  directory named `research`, or one found inside a `--files` directory, is not
+  read; each such directory, Drive entry or project file is listed under
+  `excluded` with the reason. A document named as a draft in the folder itself
+  (`<slug>-draft-rN.md`) is unaffected.
+* **A project document does not date a version.** A project's knowledge file
+  carries only a `created_at`, which says the document existed by then in some
+  earlier state; the project syncs from Drive, so its text can be a later file's
+  byte for byte. A version is dated by any other source that holds it (a run,
+  Drive, a file, a reproduction's claimed time); the project document's
+  `created_at` is used only when nothing else has a time, and the event then
+  carries a `hint` saying so.
 * **Rounds for a chat-only article.** A round normally starts at a submitted
   version (a run's draft, or a file named with a `vNN` or `rN`). An article with
   no runs and no labelled files has none, so its versions are placed in one

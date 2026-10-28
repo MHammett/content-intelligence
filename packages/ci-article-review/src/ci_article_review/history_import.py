@@ -173,6 +173,22 @@ _ROUND_GAP = timedelta(hours=48)
 
 _DOCUMENT_SUFFIXES = (".md", ".markdown")
 
+#: Notes, data and checks the article was written from live in a ``research/``
+#: directory next to it (on disk, in Drive, mirrored in a project). They are never
+#: versions of the article, whatever text they share with it.
+_RESEARCH_DIR = "research"
+_RESEARCH_WHY = (
+    "under a research/ directory: research notes and data are not versions of "
+    "the article"
+)
+
+
+def _under_research(name):
+    """Whether a relative file name or path has a ``research`` directory in it."""
+    parts = str(name).replace("\\", "/").lower().split("/")
+    return _RESEARCH_DIR in parts[:-1]
+
+
 _REPORT_RE = re.compile(r"^run_(?P<run>\d+)_((?P<ts>\d{8}_\d{6})_)?report\.json$")
 _LABEL_RE = re.compile(r"(?<![a-z0-9])([vr])(\d+)(?![a-z0-9])")
 
@@ -590,9 +606,25 @@ def _scan_files(collector, directories, terms, include_names):
         directory = Path(directory)
         if not directory.is_dir():
             raise ImportScanError(f"--files {directory} is not a directory")
+        if directory.name.lower() == _RESEARCH_DIR:
+            collector.excluded.append(
+                {
+                    "path": _posix(directory),
+                    "why": f"{_RESEARCH_WHY} (the whole directory)",
+                }
+            )
+            continue
         for entry in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
             if entry.is_file():
                 consider(entry, None, False)
+            elif entry.is_dir() and entry.name.lower() == _RESEARCH_DIR:
+                count = sum(1 for p in entry.rglob("*") if p.is_file())
+                collector.excluded.append(
+                    {
+                        "path": _posix(entry),
+                        "why": f"{_RESEARCH_WHY} ({count} file(s) not read)",
+                    }
+                )
             elif entry.is_dir():
                 matched = bool(pattern.search(entry.name.lower()))
                 folder_label = None
@@ -644,6 +676,9 @@ def _scan_drive(collector, drive_dir, terms):
         name = entry["name"]
         listed.add(name)
         path = drive_dir / name
+        if _under_research(name):
+            collector.excluded.append({"path": _posix(path), "why": _RESEARCH_WHY})
+            continue
         if not path.is_file():
             collector.excluded.append(
                 {
@@ -856,9 +891,11 @@ def _prepare_chat(
         for key, value in counts.items():
             read[key] = read.get(key, 0) + value
         candidates.extend((c, link.strong) for c in found)
-    candidates.extend(
-        (c, True) for c in chat_export_module.project_candidates(export, pattern)
-    )
+    for doc in chat_export_module.project_candidates(export, pattern):
+        if _under_research(doc.name):
+            collector.excluded.append({"path": doc.source, "why": _RESEARCH_WHY})
+        else:
+            candidates.append((doc, True))
     links.sort(key=lambda link: (link.conversation.get("created_at") or "", link.uuid))
     if absent:
         collector.warnings.append(
@@ -981,7 +1018,8 @@ def _name_stem(name):
     """
     if not isinstance(name, str):
         return None
-    stem = _EXTENSION_RE.sub("", name.strip().lower())
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = _EXTENSION_RE.sub("", base.strip().lower())
     while True:
         found = _VERSION_MARKER_RE.search(stem)
         if not found:
@@ -1353,15 +1391,31 @@ def _in_reproduction_window(holder, version, versions):
 # ---------------------------------------------------------------------------
 
 
+def _time_tier(holder):
+    """0 for a source that dates its text, 1 for a reproduction, 2 for a project document.
+
+    A project document's ``created_at`` only says that the document existed by
+    then, in some earlier state: the project syncs from Drive, so its text can be
+    a later file's, byte for byte. It dates a version only when nothing else does.
+    """
+    if holder.source == "recovered":
+        return 1
+    return 2 if holder.via == "project_doc" else 0
+
+
 def _best_holder(holders):
     """The holder that defines the time of a version or file, or ``None``.
 
     The earliest, unless a more trusted source is within 5 minutes of it. A
-    reproduction's claimed time counts only when nothing else has a time.
+    reproduction's claimed time counts only when nothing else has a time, and a
+    project document's creation time only when not even that exists
+    (``_time_tier``).
     """
-    timed = [h for h in holders if h.time and h.source != "recovered"]
-    if not timed:
-        timed = [h for h in holders if h.time]
+    timed = []
+    for tier in (0, 1, 2):
+        timed = [h for h in holders if h.time and _time_tier(h) == tier]
+        if timed:
+            break
     if not timed:
         return None
     earliest = min(h.time for h in timed)
@@ -1806,6 +1860,12 @@ def scan(
         event.at = _best_time(event.holders)
         if event.at is None and event.recovered and event.superseded_by is None:
             event.at = None
+        dated_by = _best_holder(event.holders)
+        if dated_by is not None and dated_by.via == "project_doc":
+            event.hint = (
+                "time is when a project document holding it was created: it may "
+                "have held an earlier state, and no other source dates it"
+            )
     for event in others:
         if event.superseded_by is not None:
             event.at = event.superseded_by.at
