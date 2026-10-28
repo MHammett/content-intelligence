@@ -272,7 +272,7 @@ def _offline_resolution(monkeypatch):
     monkeypatch.setattr(
         resolver,
         "_verify_relevance",
-        lambda claim, content, keys, author=None: (
+        lambda claim, content, keys, author=None, hints=(): (
             {"checked": True, "verdict": "supports", "reason": "ok", "quote": _QUOTE},
             None,
         ),

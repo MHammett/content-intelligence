@@ -1429,6 +1429,22 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
             verify_claim = _claim_for_verifier(claim, source_field, draft)
             if verify_claim != claim:
                 entry["verify_claim"] = verify_claim
+            hints = _locate_hints(cited, known_urls, own, item)
+            if hints:
+                entry["locate_hints"] = hints
+            # URLs that reached this claim only as the preceding span's markers.
+            # They may support it; they are not reported as its failed source
+            # when its own was tried (issue #441). A URL the model named itself
+            # is its own source even if a neighbouring marker also carries it.
+            neighbours = [
+                u
+                for u in (
+                    cited.neighbour_urls_for(claim, source_field) if cited else []
+                )
+                if u in known_urls and u != own
+            ]
+            if neighbours:
+                entry["neighbour_urls"] = neighbours
             claims.append(entry)
     log.info(
         "Citations: %d of %d claim(s) traced to a citation in the draft",
@@ -1436,6 +1452,28 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
         len(claims),
     )
     return claims
+
+
+def _locate_hints(cited, known_urls, own_url, item) -> dict:
+    """``{url: [text, ...]}``: where in each candidate the evidence probably is.
+
+    Two sources, both already in hand. The draft's citation entry for the URL,
+    which often names the place ("p. 110 (Council Bluffs, IA: 1,410.3 million
+    gallons withdrawn ...)"), and the fact-check model's quote from the URL it
+    named itself. The resolver uses them only to choose which part of a long
+    document the verifier is shown (``extract.select_excerpt_with_window``,
+    issue #440); the verdict is still the verifier's, on the claim alone. A
+    paraphrased quote still helps here: its figures are the page's.
+    """
+    hints: dict = {}
+    quote = consolidation._evidence_quote(item) if isinstance(item, dict) else ""
+    for url in known_urls:
+        texts = list(cited.descriptions_for(url)) if cited else []
+        if quote and own_url and url == own_url:
+            texts.append(quote)
+        if texts:
+            hints[url] = texts
+    return hints
 
 
 def _read_handoff_file(path: str) -> str:
@@ -3510,6 +3548,15 @@ def run_draft_pipeline(
             len(broken),
             len(not_archived),
         )
+        # When archive.org's breaker opened, if it did, so Section 9 can tell
+        # whether it has been shut long enough to try again (issue #445).
+        if wayback.note_breaker_state():
+            log.warning(
+                "archive.org rate-limited link validation; its lookups were "
+                "skipped after the breaker opened. Section 9 tries again if "
+                "it starts at least %d min from now.",
+                wayback.BREAKER_COOLDOWN_SECONDS // 60,
+            )
     else:
         # Not checked, rather than checked and empty. An empty list here was
         # indistinguishable from a draft with no links, so every reader took it
@@ -4455,6 +4502,9 @@ def run_draft_pipeline(
         or None
     )
     if claims:
+        # A breaker the link pass tripped half an hour ago is not a reason for
+        # every citation to go without its archive lookup (issue #445).
+        wayback.reopen_breaker_if_cooled()
         citation_results = resolve_citations(
             claims,
             citation_sources,
@@ -4705,6 +4755,11 @@ def run_draft_pipeline(
     # and what the circuit breaker counts against.
     report["wayback_lookups"] = wayback.lookup_cache_summary()
     wayback.close_lookup_cache()
+    # Only when the breaker opened, so a run archive.org never refused carries
+    # no new field (and the golden report stays as it was).
+    breaker = wayback.breaker_summary()
+    if breaker:
+        report["wayback_breaker"] = breaker
     if report["wayback_lookups"]["lookups"]:
         wl = report["wayback_lookups"]
         log.info(
@@ -5755,29 +5810,14 @@ def _print_draft_summary(
             print(
                 f"  {len(stale)} resolved URL(s) have a stale Wayback snapshot (>180 days)"
             )
+        # A note, not a warning: every source here was read again this run and
+        # still supports its claim (issue #446; see the report's drift note).
         changed = [c for c in verified if c.get("content_changed_since")]
         if changed:
-            print(f"\n{'!' * 60}")
             print(
-                f"WARNING: {len(changed)} verified source(s) have changed content "
-                "since a prior run checksummed them:"
+                f"  {len(changed)} verified source(s) have changed text since an "
+                "earlier run checksummed them; each still supports its claim."
             )
-            for c in changed:
-                drift = c["content_changed_since"]
-                print(f"  {c.get('url')}")
-                print(
-                    f"    Last matched in run {drift.get('prior_run')} of "
-                    f"'{drift.get('prior_article')}'"
-                    + (
-                        f" on {drift.get('prior_date')}"
-                        if drift.get("prior_date")
-                        else ""
-                    )
-                )
-            print(
-                "Claims previously verified against these sources may need re-checking."
-            )
-            print("!" * 60)
 
     # Section 10 — only on an --expand run. Silence otherwise: a line reading
     # "0 candidates" for a pass nobody asked for is worse than no line.

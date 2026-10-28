@@ -549,7 +549,9 @@ def _check_drift(result, checksum_index):
         "note": (
             "This source's content differs from the last time it was "
             f"checksummed (run {prior_run} of '{prior_article}'{when}). "
-            "A claim previously verified against it may need re-checking."
+            "This run read the current text and it still supports this "
+            "claim; other articles verified against the older text may want "
+            "a look."
         ),
     }
     return result
@@ -610,6 +612,36 @@ def _fetch_following_page(url, timeout=15):
     resp = safe_get(url, timeout=timeout)
     resp.raise_for_status()
     return resp
+
+
+#: A Google Drive file link that opens the viewer: ``/file/d/<id>/view`` (or
+#: ``/edit``, ``/preview``, nothing) and the older ``/open?id=<id>``.
+_DRIVE_VIEWER = re.compile(
+    r"^https?://drive\.google\.com/(?:file/d/([A-Za-z0-9_-]{10,})(?:/[a-z]*)?/?(?:[?#].*)?"
+    r"|open\?(?:[^#]*&)?id=([A-Za-z0-9_-]{10,})(?:[&#].*)?)$"
+)
+
+
+def direct_document_url(url):
+    """The URL that returns a cited document's bytes, when the cited one does not.
+
+    A Google Drive viewer link returns a JavaScript shell (90 KB of script, no
+    document text), so a claim cited to one could never be checked: two claims
+    on brockovich-fact-check run 2 (issue #447). For a publicly shared file
+    ``uc?export=download&id=<id>`` returns the file itself, redirecting to
+    drive.usercontent.google.com; checked live on that run's file, a 12.6 MB
+    PDF. Over 25 MB, Drive serves a virus-scan page needing a confirm token
+    first. ``gdown`` handles that, but a downloader dependency for one URL
+    shape is not worth it here: the scan page is HTML and is reported as
+    unreadable, which is true. A private file fails exactly as it did.
+
+    Anything else comes back unchanged.
+    """
+    match = _DRIVE_VIEWER.match(url or "")
+    if not match:
+        return url
+    file_id = match.group(1) or match.group(2)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 def _get_page(url, timeout=15, page_cache=None):
@@ -789,7 +821,7 @@ def _normalise_for_match(text):
     return " ".join((text or "").split()).casefold()
 
 
-def _quote_is_grounded(quote, content):
+def _quote_is_grounded(quote, content, claim=None):
     """True if ``quote`` actually occurs in the page text.
 
     The verifier's verdict is the one thing an injected page most wants to
@@ -805,12 +837,41 @@ def _quote_is_grounded(quote, content):
     """
     normalised_quote = _normalise_for_match(quote)
     if len(normalised_quote) < _MIN_QUOTE_CHARS:
-        return False
+        return _short_figure_is_grounded(normalised_quote, content, claim)
     return normalised_quote in _normalise_for_match(content)
 
 
-def _verify_relevance(claim, content, api_keys, author=None):
+#: A short quote that is nothing but a figure: "9,683", "4.4%", "$40". A quote
+#: with a word in it ("$40 billion") is not one.
+_BARE_FIGURE = re.compile(r"[$]?\d[\d,.]*%?")
+
+
+def _short_figure_is_grounded(normalised_quote, content, claim):
+    """A quote shorter than ``_MIN_QUOTE_CHARS`` that is exactly the claim's figure.
+
+    A stats page lays its headline number out as a block of its own ("9,683 /
+    Total Reports"), and the verifier, asked for the sentence it relied on,
+    quotes the number. The 12-character floor then threw away a correct
+    "supports" against the archived copy the draft cited (issue #442). The floor
+    exists because a few characters match almost any page by chance; a figure of
+    three or more digits that the claim itself states, found on the page, does
+    not match by chance and carries no instruction a page could inject.
+    """
+    if not claim or not _BARE_FIGURE.fullmatch(normalised_quote):
+        return False
+    if sum(ch.isdigit() for ch in normalised_quote) < 3:
+        return False
+    return normalised_quote in _normalise_for_match(
+        claim
+    ) and normalised_quote in _normalise_for_match(content)
+
+
+def _verify_relevance(claim, content, api_keys, author=None, hints=()):
     """Ask a cheap/fast model whether ``content`` actually supports ``claim``.
+
+    ``hints`` (the draft's citation entry for this URL, a fact-check model's
+    quote from it) only steer which part of a long document is shown; the
+    model is asked about ``claim`` alone (issue #440).
 
     ``known_url`` citations often come from an ungrounded model recalling a
     URL from training data rather than a live search — the URL loading is not
@@ -848,7 +909,7 @@ def _verify_relevance(claim, content, api_keys, author=None):
     # genuinely long documents, and mistral-small at $0.15/M input prices even
     # the worst case (every call maxed) at under $0.09 for the pass.
     excerpt, window = extract.select_excerpt_with_window(
-        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL
+        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL, hints=hints
     )
     user_prompt = _build_verification_prompt(claim, excerpt, author)
 
@@ -889,7 +950,9 @@ def _verify_relevance(claim, content, api_keys, author=None):
         }, call_log_entry
 
     quote = str(data.get("quote", ""))
-    if verdict in _SUPPORTING_VERDICTS and not _quote_is_grounded(quote, content):
+    if verdict in _SUPPORTING_VERDICTS and not _quote_is_grounded(
+        quote, content, claim
+    ):
         # A "supports" verdict promotes the citation to the strongest tier, so
         # it is the answer an injected page most wants to produce. Requiring the
         # model to hand back text that is actually in the document turns the
@@ -920,7 +983,7 @@ def _verify_relevance(claim, content, api_keys, author=None):
         # What the model was shown: the whole text, or a window of it. A
         # negative verdict on a window is a verdict about the window.
         "window": window,
-        "quote_grounded": bool(quote) and _quote_is_grounded(quote, content),
+        "quote_grounded": bool(quote) and _quote_is_grounded(quote, content, claim),
     }, call_log_entry
 
 
@@ -934,6 +997,7 @@ def _resolve_known_url(
     author=None,
     verify_claim=None,
     page_cache=None,
+    locate_hints=(),
 ):
     """Resolve a claim whose source URL is already known (e.g. supplied by the
     fact-check model itself), bypassing the narrow adapter matching entirely.
@@ -1005,10 +1069,11 @@ def _resolve_known_url(
     coverage = None
     try:
         _step("fetch")
-        resp = _get_page(known_url, timeout, page_cache)
+        fetch_url = direct_document_url(known_url)
+        resp = _get_page(fetch_url, timeout, page_cache)
         _step("extract")
         content, content_kind, coverage = _extract_fetched_with_coverage(
-            resp, known_url
+            resp, fetch_url
         )
         # Where the fetch actually landed. `safe_get` follows redirects one
         # validated hop at a time and returns the last hop's response, so this
@@ -1022,7 +1087,10 @@ def _resolve_known_url(
         # redirect URLs were 817 of the 2,682 characters in one Section 9 entry,
         # while the page behind them was a Jalopnik article the pipeline had
         # already fetched, read and checksummed.
-        final_url = getattr(resp, "url", "") or ""
+        #
+        # Not for a rewritten Drive link: the download host it lands on is
+        # not a page a reader opens, and the viewer link the draft cites is.
+        final_url = "" if fetch_url != known_url else getattr(resp, "url", "") or ""
     except UnsafeURLError as e:
         # Distinct from a fetch failure, and never eligible for the Wayback
         # fallback: archive.org has no snapshot of an internal host, and asking
@@ -1200,11 +1268,19 @@ def _resolve_known_url(
         result["note"] = _UNVERIFIABLE_NOTES["access_wall"]
         return _check_drift(result, checksum_index)
 
-    if len(content.strip()) < _MIN_VERIFIABLE_CHARS:
+    if len(content.strip()) < _MIN_VERIFIABLE_CHARS or (
+        content_kind == "pdf"
+        # A partial read is never reported as a mismatch anyway (see below),
+        # so only a PDF read whole needs telling apart from a scan.
+        and not (coverage or {}).get("partial")
+        and extract.looks_like_scanned_pdf(content, (coverage or {}).get("pages_read"))
+    ):
         # We fetched a real document but could not read it: a PDF with no text
         # layer (or no pypdf installed), a JS-only render, a bot wall. Say that
         # — do NOT run verification and report "does not support the claim",
-        # which asserts something false about a source we never read.
+        # which asserts something false about a source we never read. A scan
+        # with a stamp on every page clears the character floor and is the
+        # same case (issue #447).
         result["verification"] = "unverifiable"
         result["note"] = _UNVERIFIABLE_NOTES.get(
             content_kind, _UNVERIFIABLE_NOTES["default"]
@@ -1252,7 +1328,7 @@ def _resolve_known_url(
     # the cleaned text, and ``verified_as`` records what that was.
     _step("relevance")
     verdict_info, verification_call_log = _verify_relevance(
-        verify_claim or claim, verify_content, api_keys, author
+        verify_claim or claim, verify_content, api_keys, author, hints=locate_hints
     )
     if call_log is not None and verification_call_log is not None:
         call_log.append(verification_call_log)
@@ -1475,6 +1551,8 @@ def _resolve_candidates(
     author=None,
     verify_claim=None,
     page_cache=None,
+    locate_hints=None,
+    secondary_urls=None,
 ):
     """Check a claim against the sources cited for it, best candidate first.
 
@@ -1488,7 +1566,17 @@ def _resolve_candidates(
     That ordering matters for honesty as much as cost. Reporting "the source
     does not support this" after checking one of three cited sources says
     something false about a draft that cited the right source second.
+
+    ``secondary_urls`` are candidates that reached the claim only through a
+    neighbouring span's marker or a weak span match. They are tried, and may
+    support the claim, but when none supports it the reported failure is drawn
+    from the claim's own sources whenever one of those was tried (issue #441).
+    On brockovich-fact-check run 2 a TV guest listing one span earlier won the
+    headline for three facility-count claims because the draft's own source, a
+    759,000-character JSON file, could only be read in part and a partial read
+    ranks below a clean "not addressed".
     """
+    secondary = set(secondary_urls or ())
     attempts = []
     for url in known_urls:
         result = _resolve_known_url(
@@ -1500,6 +1588,7 @@ def _resolve_candidates(
             author=author,
             verify_claim=verify_claim,
             page_cache=page_cache,
+            locate_hints=tuple((locate_hints or {}).get(url, ())),
         )
         if verify_claim:
             result["verified_as"] = verify_claim
@@ -1508,11 +1597,26 @@ def _resolve_candidates(
             # citation list where only the third entry carries the claim is
             # worth knowing about, and it is invisible otherwise.
             if attempts:
-                result["alternates_checked"] = [a.get("url") for a in attempts]
+                result["alternates_checked"] = [a.get("url") for _u, a in attempts]
+                if draft_citations.is_archive_url(url) and any(
+                    a.get("relevance_verdict") == "contradicts" for _u, a in attempts
+                ):
+                    # A dated figure checked against the live page first: the
+                    # live page now says something else, and the archived copy
+                    # the draft cites says what the draft says (issue #442).
+                    result["note"] = (
+                        f"{result.get('note', '').rstrip()} The archived copy "
+                        "the draft cites supports this; a live page checked "
+                        "first now reads differently, which is a change in the "
+                        "page, not an error in the claim."
+                    ).lstrip()
             return result
-        attempts.append(result)
+        attempts.append((url, result))
 
-    best = max(attempts, key=_informativeness)
+    pairs = attempts
+    own = [result for url, result in pairs if url not in secondary]
+    attempts = [result for _url, result in pairs]
+    best = max(own or attempts, key=_informativeness)
     others = [a.get("url") for a in attempts if a is not best]
     if others:
         best["alternates_checked"] = others
@@ -1555,6 +1659,8 @@ def _resolve_one(
     verify_claim=None,
     page_cache=None,
     clock=None,
+    locate_hints=None,
+    secondary_urls=None,
 ):
     """Resolve a single claim against the configured sources, in order.
 
@@ -1584,6 +1690,8 @@ def _resolve_one(
             author,
             verify_claim,
             page_cache,
+            locate_hints=locate_hints,
+            secondary_urls=secondary_urls,
         )
     finally:
         _clock.current = None
@@ -1604,6 +1712,8 @@ def _resolve_one_steps(
     author,
     verify_claim,
     page_cache,
+    locate_hints=None,
+    secondary_urls=None,
 ):
     checksum_index = checksum_index if checksum_index is not None else {}
 
@@ -1617,6 +1727,8 @@ def _resolve_one_steps(
             author=author,
             verify_claim=verify_claim,
             page_cache=page_cache,
+            locate_hints=locate_hints,
+            secondary_urls=secondary_urls,
         )
 
     for source_config in citation_sources:
@@ -2000,12 +2112,17 @@ def _note_breaker_state():
     exists to explain is precisely the run with zero targets, which returns
     early and never reaches the end of that function. It has to sit outside.
     """
-    if wayback.rate_limited_out():
+    if wayback.note_breaker_state():
+        summary = wayback.breaker_summary()
+        when = summary.get("first_seen_open_utc")
+        reopened = summary.get("reopened", 0)
         log.warning(
             "archive.org's rate-limit breaker was open at the end of the "
-            "archiving pass — lookups and submissions after it tripped were "
+            "archiving pass%s%s — lookups and submissions after it tripped were "
             "skipped, so an unknown archive status this run is this, not a "
-            "statement about the pages"
+            "statement about the pages",
+            f" (first seen open at {when})" if when else "",
+            f", after {reopened} retry(ies) this run" if reopened else "",
         )
 
 
@@ -2817,6 +2934,17 @@ def resolve_citations(
         entry.get("verify_claim") if isinstance(entry, dict) else None
         for entry in claims
     ]
+    hints_per_claim = [
+        entry.get("locate_hints") if isinstance(entry, dict) else None
+        for entry in claims
+    ]
+    secondary_per_claim = [
+        set(entry.get("neighbour_urls") or ())
+        | set(entry.get("weak_source_urls") or ())
+        if isinstance(entry, dict)
+        else set()
+        for entry in claims
+    ]
     call_log = verification_call_log if verification_call_log is not None else []
     checksum_index = build_checksum_index(history_root) if history_root else {}
 
@@ -2834,7 +2962,7 @@ def resolve_citations(
     jobs = [
         (
             str(idx),
-            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim, clock=clock: (
+            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim, clock=clock, hints=hints, secondary=secondary: (
                 _resolve_one(
                     claim,
                     citation_sources,
@@ -2846,12 +2974,20 @@ def resolve_citations(
                     verify_claim,
                     page_cache,
                     clock=clock,
+                    locate_hints=hints,
+                    secondary_urls=secondary,
                 )
             ),
             _RESOLVE_TIMEOUT_SECONDS,
         )
-        for idx, ((claim, known_urls, _bucket), verify_claim, clock) in enumerate(
-            zip(normalized, verify_claims, clocks)
+        for idx, (
+            (claim, known_urls, _bucket),
+            verify_claim,
+            clock,
+            hints,
+            secondary,
+        ) in enumerate(
+            zip(normalized, verify_claims, clocks, hints_per_claim, secondary_per_claim)
         )
     ]
 

@@ -11,6 +11,8 @@ archive copy, and how to summarize a wayback result for a human reader.
 
 import logging
 import ssl
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -35,13 +37,13 @@ from spn_client import (
     categorize_job_error,
     check_job_status,
     rate_limited_out,
-    reset_rate_limit_state,
     service_health_note,
     snapshot_raw_url,
     submit,
     system_status,
 )
 from spn_client import check as _spn_check
+from spn_client import reset_rate_limit_state as _spn_reset_rate_limit_state
 
 from .wayback_lookup_cache import STORE_FILENAME, LookupCache
 
@@ -99,6 +101,82 @@ log = logging.getLogger(__name__)
 #: which also empties the memo so one run's answers do not leak into the next
 #: run in the same process (tests, mostly).
 _lookup_cache = LookupCache()
+
+
+#: How long archive.org's circuit breaker stays shut before this run tries
+#: again. spn-client's breaker, once tripped, stays open for the rest of the
+#: process, and archive.org's throttle is episodic: all 429s for a few minutes,
+#: then all 200s (spn-client's own notes, 2026-08-12 and 08-15). On
+#: brockovich-fact-check run 2 it tripped in link validation at 05:47 and
+#: Section 9, 40 minutes later, skipped all 188 of its lookups and the archive
+#: fallback for the pages that refused us (issue #445).
+BREAKER_COOLDOWN_SECONDS = 300
+
+#: Reopenings per run. Each costs at most the five refused lookups it takes to
+#: trip again, so two bound the extra load on archive.org to ten requests.
+_MAX_BREAKER_REOPENS = 2
+
+_breaker = {"seen_open": None, "first_seen_open_utc": None, "reopened": 0}
+
+
+def reset_rate_limit_state():
+    """spn-client's run-start reset, plus this module's record of the breaker."""
+    _spn_reset_rate_limit_state()
+    _breaker.update(seen_open=None, first_seen_open_utc=None, reopened=0)
+
+
+def note_breaker_state():
+    """Record when the breaker was first seen open; return whether it is open.
+
+    spn-client does not say when it tripped, so this records when a caller
+    first saw it open, which is the latest it can have tripped.
+    """
+    if not rate_limited_out():
+        return False
+    if _breaker["seen_open"] is None:
+        _breaker["seen_open"] = time.monotonic()
+        if _breaker["first_seen_open_utc"] is None:
+            _breaker["first_seen_open_utc"] = datetime.now(timezone.utc)
+    return True
+
+
+def reopen_breaker_if_cooled(cooldown=BREAKER_COOLDOWN_SECONDS, now=None):
+    """Close an open breaker that has been open at least ``cooldown`` seconds.
+
+    Called before Section 9 resolves, so a throttle that ended while the
+    ensemble ran does not cost every citation its archive lookup. Returns True
+    when it reopened. If archive.org is still refusing, the breaker trips again
+    after spn-client's usual five refused lookups.
+    """
+    if not note_breaker_state():
+        return False
+    now = time.monotonic() if now is None else now
+    waited = now - _breaker["seen_open"]
+    if waited < cooldown or _breaker["reopened"] >= _MAX_BREAKER_REOPENS:
+        return False
+    _spn_reset_rate_limit_state()
+    _breaker["seen_open"] = None
+    _breaker["reopened"] += 1
+    log.info(
+        "archive.org's rate-limit breaker had been open for %d min; trying "
+        "archive lookups again (reopening %d of %d this run)",
+        waited // 60,
+        _breaker["reopened"],
+        _MAX_BREAKER_REOPENS,
+    )
+    return True
+
+
+def breaker_summary():
+    """``{}`` when the breaker never opened this run, else when and what followed."""
+    first = _breaker["first_seen_open_utc"]
+    if first is None and not rate_limited_out():
+        return {}
+    return {
+        "first_seen_open_utc": first.isoformat(timespec="seconds") if first else None,
+        "reopened": _breaker["reopened"],
+        "open_at_end": rate_limited_out(),
+    }
 
 
 def open_lookup_cache(history_root=None):
