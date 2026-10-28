@@ -1044,5 +1044,13 @@
     }
   ],
   "truncated_result_details": [],
-  "truncated_results": []
+  "truncated_results": [],
+  "wayback_lookups": {
+    "live": 0,
+    "lookups": 0,
+    "persistent": true,
+    "run_hits": 0,
+    "store_hits": 0,
+    "stored": 0
+  }
 }
