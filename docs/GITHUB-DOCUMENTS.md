@@ -601,7 +601,11 @@ this chat, to merge that pull request; merge any way but `merge`; force-push,
 delete a branch or a tag, or call `delete_file` or `delete_repository`; edit
 `review.md` or anything under `pipeline/`; read anything under `pipeline/` (the
 worklist, the report) into a revision; rename an article folder or change a
-slug; commit a secret; edit a managed file. A slug is lowercase words joined by hyphens and never contains `/`.
+slug; commit a secret; edit a managed file; save an article's files outside the
+repository. A slug is lowercase words joined by hyphens and never contains `/`.
+The last rule exists because a claude.ai chat has a built-in tool that writes
+files into its project's knowledge: drafting chats used it unasked, a copy per
+draft version, until one project's knowledge was 82% full.
 
 **Fallback.** If the connector is not worth its scope or stops working, the author
 does a round by hand on github.com: create the branch, upload `draft.md` and
