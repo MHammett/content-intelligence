@@ -100,6 +100,30 @@ _CHAT_SHARE_OF_CANDIDATE = 0.6
 #: fragment and not a version.
 _CHAT_SHARE_OF_VERSION = 0.5
 
+#: A version only a chat holds (issue #430) must also be a version *of this
+#: article* (PR #435). A linked conversation holds the article's drafts and
+#: also its side documents (a verification log, a research batch, a source
+#: excerpt), and a whole document of enough words passes the rule above either
+#: way. The test is 8-word shingle containment: the share of a document's
+#: 8-word windows that appear in the article's other versions. Measured on three
+#: real articles, every side document scored 0.00-0.03 and the genuine drafts
+#: scored 0.14 or more against the others (lowest 0.14, 0.35, 0.47, most far
+#: higher). 0.10 is over three times the highest side document and below the
+#: lowest genuine draft.
+_SHINGLE_WORDS = 8
+_RELATED_SHARE = 0.10
+
+#: A text that sits inside a version it is a small part of is a fragment, not a
+#: version: a section cut from a 51 KB draft (about 6 KB, 0.87 of it inside the
+#: draft) covers 12% of the draft, and the body-only versions of a draft cover
+#: 76% or more. A text is a fragment when at least ``_FRAGMENT_INSIDE`` of it is
+#: inside a version written before it (or at the same time) and it covers less
+#: than ``_COVERS_SHARE`` of every other version. A smaller text that a later
+#: version expanded is an earlier draft, not a fragment. Half is also what ``_CHAT_SHARE_OF_VERSION`` already asks of a text
+#: that resembles a version.
+_FRAGMENT_INSIDE = 0.5
+_COVERS_SHARE = 0.5
+
 #: How far from a reproduction's claimed time an export version may be and still
 #: stand in for it (the label must match too).
 _REPRODUCTION_WINDOW = timedelta(days=3)
@@ -148,6 +172,36 @@ _NOT_PROSE_SUFFIXES = frozenset(
 _ROUND_GAP = timedelta(hours=48)
 
 _DOCUMENT_SUFFIXES = (".md", ".markdown")
+
+#: Notes, data and checks the article was written from live in a ``research/``
+#: directory next to it (on disk, in Drive, mirrored in a project), and so do the
+#: superseded drafts and metadata an author moves out of the way. A file there is
+#: read exactly as it would be in the folder root when its name follows the
+#: handoff naming for a draft or metadata (``-draft-r1-superseded-<date>``,
+#: ``-draft-v4-prerun``, ``-metadata-r1-superseded``: the scan's own kind
+#: detection); any other file there is never a version of the article, whatever
+#: text it shares with it.
+_RESEARCH_DIR = "research"
+_RESEARCH_WHY = (
+    "under a research/ directory and not named as a draft or metadata: research "
+    "notes and data are not versions of the article"
+)
+
+
+def _under_research(name):
+    """Whether a relative file name or path has a ``research`` directory in it."""
+    parts = str(name).replace("\\", "/").lower().split("/")
+    return _RESEARCH_DIR in parts[:-1]
+
+
+def _left_out_of_research(name, terms):
+    """Whether a file under ``research/`` is research, not a draft or metadata by name."""
+    if not _under_research(name):
+        return False
+    base = str(name).replace("\\", "/").rsplit("/", 1)[-1]
+    kind, _ = _file_kind_and_label(base, terms, "")
+    return kind not in ("draft", "metadata")
+
 
 _REPORT_RE = re.compile(r"^run_(?P<run>\d+)_((?P<ts>\d{8}_\d{6})_)?report\.json$")
 _LABEL_RE = re.compile(r"(?<![a-z0-9])([vr])(\d+)(?![a-z0-9])")
@@ -429,6 +483,9 @@ class Event:
     attached_to: object = None
     #: kept from a linked conversation although no other source holds a similar version
     uncorroborated: bool = False
+    #: left out of the plan as not a version of the article: "not_related" or
+    #: "fragment" (``why`` says which, with the numbers); include: true keeps it
+    unrelated: object = None
 
     @property
     def label(self):
@@ -559,13 +616,29 @@ def _scan_files(collector, directories, terms, include_names):
             return False
         return True
 
+    def read_research(directory):
+        # A draft or metadata by name is read as in the folder root; the rest is
+        # research and each such file is listed.
+        for child in sorted(directory.rglob("*"), key=lambda p: p.as_posix().lower()):
+            if not child.is_file():
+                continue
+            if _left_out_of_research(f"{_RESEARCH_DIR}/{child.name}", terms):
+                collector.excluded.append({"path": _posix(child), "why": _RESEARCH_WHY})
+            else:
+                consider(child, None, False)
+
     for directory in directories:
         directory = Path(directory)
         if not directory.is_dir():
             raise ImportScanError(f"--files {directory} is not a directory")
+        if directory.name.lower() == _RESEARCH_DIR:
+            read_research(directory)
+            continue
         for entry in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
             if entry.is_file():
                 consider(entry, None, False)
+            elif entry.is_dir() and entry.name.lower() == _RESEARCH_DIR:
+                read_research(entry)
             elif entry.is_dir():
                 matched = bool(pattern.search(entry.name.lower()))
                 folder_label = None
@@ -617,6 +690,9 @@ def _scan_drive(collector, drive_dir, terms):
         name = entry["name"]
         listed.add(name)
         path = drive_dir / name
+        if _left_out_of_research(name, terms):
+            collector.excluded.append({"path": _posix(path), "why": _RESEARCH_WHY})
+            continue
         if not path.is_file():
             collector.excluded.append(
                 {
@@ -829,9 +905,11 @@ def _prepare_chat(
         for key, value in counts.items():
             read[key] = read.get(key, 0) + value
         candidates.extend((c, link.strong) for c in found)
-    candidates.extend(
-        (c, True) for c in chat_export_module.project_candidates(export, pattern)
-    )
+    for doc in chat_export_module.project_candidates(export, pattern):
+        if _left_out_of_research(doc.name, terms):
+            collector.excluded.append({"path": doc.source, "why": _RESEARCH_WHY})
+        else:
+            candidates.append((doc, True))
     links.sort(key=lambda link: (link.conversation.get("created_at") or "", link.uuid))
     if absent:
         collector.warnings.append(
@@ -935,7 +1013,161 @@ def _chat_only_problem(candidate, text, part, kept_shas, terms, min_words):
     return None
 
 
-def _ingest_chat(chat, versions, version_for, ref_texts, terms):
+_EXTENSION_RE = re.compile(r"\.[a-z]{1,5}$")
+_VERSION_MARKER_RE = re.compile(
+    r"[-_ ](?:v\d+|r\d+|final|draft|\d{4}-\d{2}-\d{2}|\d{8}|superseded.*)$"
+)
+
+
+def _name_stem(name):
+    """A file name's stem: what stays the same as a document is versioned.
+
+    Lowercase the name, drop its extension, then drop trailing version markers
+    one after another: ``-vN``, ``-rN``, ``-final``, ``-draft``, ``-superseded``
+    and whatever follows it, and a date (``-YYYY-MM-DD`` or ``-YYYYMMDD``); the
+    separator before a marker is ``-``, ``_`` or a space. Two names belong to
+    one document only when their whole stems are equal: ``a-draft.md`` and
+    ``a-v2.md`` are both ``a``, and ``a-check-r1.md`` is ``a-check``. Nothing
+    joins on a prefix. A name with nothing left has no stem (``None``).
+    """
+    if not isinstance(name, str):
+        return None
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = _EXTENSION_RE.sub("", base.strip().lower())
+    while True:
+        found = _VERSION_MARKER_RE.search(stem)
+        if not found:
+            break
+        stem = stem[: found.start()]
+    stem = stem.strip(" -_")
+    return stem or None
+
+
+def _shingles(text):
+    """The set of ``_SHINGLE_WORDS``-word windows of a text (hashed)."""
+    words = normalise(text).split()
+    size = _SHINGLE_WORDS
+    if not words:
+        return frozenset()
+    if len(words) <= size:
+        return frozenset([hash(tuple(words))])
+    return frozenset(
+        hash(tuple(words[i : i + size])) for i in range(len(words) - size + 1)
+    )
+
+
+def _share(part, whole):
+    """The share of ``part``'s shingles that ``whole`` holds."""
+    return len(part & whole) / len(part) if part else 0.0
+
+
+def _not_versions(alone, anchors, stems, anchor_stems, bases):
+    """Which texts only a linked chat holds are not versions of the article.
+
+    ``alone`` is ``[(sha, text, time)]`` in time order. ``anchors`` are
+    ``[(text, time)]`` of the versions another source holds (a run, a file,
+    Drive, a reproduction, or a chat text that resembles one). ``stems`` maps a
+    sha to the name stems (``_name_stem``) of the files the chat wrote it as,
+    ``anchor_stems`` is the set of stems of the other sources' files, and
+    ``bases`` maps an edit's sha to the shas of the texts it edited. Returns
+    ``(left_out, undecided, by_name)``: ``{sha: (code, share)}``, how many texts
+    could not be judged, and the shas kept only because of their name.
+
+    A text is kept while ``_RELATED_SHARE`` of its shingles are in the versions
+    kept so far: the anchors first, then the chat's own texts one after another
+    until none more joins, so a draft that grew over a conversation is followed
+    from version to version. A text that does not relate is still kept when its
+    file name has the same stem as a kept version's (a first draft the article
+    was later rewritten from), or when it is an edit of a kept text. With no
+    anchor the biggest group of texts that share text with one another (by
+    words) is the article; if no two share any, nothing says which is the
+    article and none is left out. Of the kept, a fragment is left out (see
+    ``_FRAGMENT_INSIDE``).
+    """
+    order = [sha for sha, _, _ in alone]
+    shingles = {sha: _shingles(text) for sha, text, _ in alone}
+    words = {sha: len(text.split()) for sha, text, _ in alone}
+    when = {sha: time for sha, _, time in alone}
+    held = [(_shingles(text), time) for text, time in anchors]
+    kept = []
+    if not held:
+        group = {sha: {sha} for sha in order}
+        for i, a in enumerate(order):
+            for b in order[i + 1 :]:
+                related = max(
+                    _share(shingles[a], shingles[b]), _share(shingles[b], shingles[a])
+                )
+                if related >= _RELATED_SHARE:
+                    merged = group[a] | group[b]
+                    for member in merged:
+                        group[member] = merged
+        biggest = max(
+            (frozenset(g) for g in group.values()),
+            key=lambda g: (sum(words[s] for s in g), len(g)),
+            default=frozenset(),
+        )
+        if len(biggest) < 2:
+            return {}, len(order), set()
+        kept = [sha for sha in order if sha in biggest]
+    union = set()
+    for part in [*(h for h, _ in held), *(shingles[sha] for sha in kept)]:
+        union |= part
+    left = [sha for sha in order if sha not in kept]
+    by_name = set()
+    grew = True
+    while grew:
+        grew = False
+        known = set(anchor_stems)
+        for sha in kept:
+            known |= stems.get(sha, set())
+        for sha in list(left):
+            related = _share(shingles[sha], union) >= _RELATED_SHARE
+            named = bool(stems.get(sha, set()) & known) or bool(
+                bases.get(sha, set()) & set(kept)
+            )
+            if related or named:
+                left.remove(sha)
+                kept.append(sha)
+                union |= shingles[sha]
+                grew = True
+                if not related:
+                    by_name.add(sha)
+                break  # the names known have grown: look again from the top
+    out = {sha: ("not_related", _share(shingles[sha], union)) for sha in left}
+    everyone = [(h, time) for h, time in held]
+    everyone += [(shingles[sha], when[sha]) for sha in kept]
+    for sha in kept:
+        if sha in by_name:
+            continue
+        mine, moment = shingles[sha], when[sha]
+        others = [(o, t) for o, t in everyone if o is not mine]
+        inside = any(
+            _share(mine, o) >= _FRAGMENT_INSIDE
+            and (t is None or moment is None or t <= moment)
+            for o, t in others
+        )
+        covers = max((_share(o, mine) for o, _ in others), default=0.0)
+        if inside and covers < _COVERS_SHARE:
+            out[sha] = ("fragment", covers)
+    return out, 0, by_name
+
+
+_UNRELATED_WHY = {
+    "not_related": (
+        "only {share:.0%} of its text is in the article's other versions (at "
+        "least {need:.0%} is expected): it looks like a side document of the "
+        "conversation, not a draft"
+    ),
+    "fragment": (
+        "a fragment: most of it is inside another version, which it covers only "
+        "{share:.0%} of (at least {need:.0%} is expected of a version)"
+    ),
+}
+
+
+def _ingest_chat(
+    chat, versions, version_for, ref_texts, terms, ref_times=(), ref_names=()
+):
     """Turn the export's candidates into draft versions (or sources of existing ones).
 
     A candidate is kept when it resembles a known version (see ``_resembles``);
@@ -958,6 +1190,7 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
     verdict, grown, weak_only, first_edit = {}, set(), set(), {}
     kept_shas, kept_by_via, dropped_by_via = set(), {}, {}
     kept_tokens, explicit_kept, skipped = {}, set(), {}
+    stems, bases = {}, {}  # sha -> file name stems; edit sha -> the shas it edited
     kept = dropped = 0
     ordered = sorted(
         chat["candidates"],
@@ -1020,6 +1253,10 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
         if linked:
             explicit_kept.add(sha)
         first_edit.setdefault(sha, candidate.edit)
+        if _name_stem(candidate.name):
+            stems.setdefault(sha, set()).add(_name_stem(candidate.name))
+        if candidate.edit and isinstance(candidate.base, str):
+            bases.setdefault(sha, set()).add(_sha(_draft_text(candidate.base)))
         existed = sha in versions
         version = version_for(sha, text)
         version.holders.append(
@@ -1066,6 +1303,52 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
         }
         for sha in alone:
             versions[sha].uncorroborated = True
+        corroborated = len(kept_shas) - len(alone)
+        times = list(ref_times) + [None] * (len(ref_texts) - len(ref_times))
+        held_texts = [
+            *zip(ref_texts, times),
+            *(
+                (versions[sha].text, min(h.time for h in versions[sha].holders))
+                for sha in explicit_kept - alone
+            ),
+        ]
+        in_order = [
+            (sha, versions[sha].text, min(h.time for h in versions[sha].holders))
+            for sha in sorted(
+                alone,
+                key=lambda sha: (min(h.time for h in versions[sha].holders), sha),
+            )
+        ]
+        anchor_stems = set(ref_names)
+        for sha in explicit_kept - alone:
+            anchor_stems |= stems.get(sha, set())
+        left_out, undecided, by_name = _not_versions(
+            in_order, held_texts, stems, anchor_stems, bases
+        )
+        for sha in by_name:
+            versions[
+                sha
+            ].note = "kept by file name: it has the same name stem as a kept version"
+        for sha, (code, share) in left_out.items():
+            need = _RELATED_SHARE if code == "not_related" else _COVERS_SHARE
+            version = versions[sha]
+            version.include = False
+            version.unrelated = code
+            version.why = _UNRELATED_WHY[code].format(share=share, need=need) + (
+                "; set include to true in the plan to keep it"
+            )
+        alone = alone - set(left_out)
+        chat["report"].update(
+            {
+                "not_versions": {
+                    code: sum(1 for c, _ in left_out.values() if c == code)
+                    for code in _UNRELATED_WHY
+                    if any(c == code for c, _ in left_out.values())
+                },
+                "kept_by_name": len(by_name),
+                "undecided": undecided,
+            }
+        )
         chat["report"].update(
             {
                 "chat_only": len(alone),
@@ -1076,7 +1359,7 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
                     )
                     if n
                 },
-                "corroborated": len(kept_shas) - len(alone),
+                "corroborated": corroborated,
                 "chat_only_skipped": dict(sorted(skipped.items())),
             }
         )
@@ -1122,15 +1405,31 @@ def _in_reproduction_window(holder, version, versions):
 # ---------------------------------------------------------------------------
 
 
+def _time_tier(holder):
+    """0 for a source that dates its text, 1 for a reproduction, 2 for a project document.
+
+    A project document's ``created_at`` only says that the document existed by
+    then, in some earlier state: the project syncs from Drive, so its text can be
+    a later file's, byte for byte. It dates a version only when nothing else does.
+    """
+    if holder.source == "recovered":
+        return 1
+    return 2 if holder.via == "project_doc" else 0
+
+
 def _best_holder(holders):
     """The holder that defines the time of a version or file, or ``None``.
 
     The earliest, unless a more trusted source is within 5 minutes of it. A
-    reproduction's claimed time counts only when nothing else has a time.
+    reproduction's claimed time counts only when nothing else has a time, and a
+    project document's creation time only when not even that exists
+    (``_time_tier``).
     """
-    timed = [h for h in holders if h.time and h.source != "recovered"]
-    if not timed:
-        timed = [h for h in holders if h.time]
+    timed = []
+    for tier in (0, 1, 2):
+        timed = [h for h in holders if h.time and _time_tier(h) == tier]
+        if timed:
+            break
     if not timed:
         return None
     earliest = min(h.time for h in timed)
@@ -1220,7 +1519,13 @@ def _build_events(collector):
                 kind=item.kind,
                 sha=_sha(item.text),
                 recovered=item.recovered,
-                include=item.kind != "unknown",
+                include=item.kind not in ("unknown", "review"),
+                why=(
+                    "a review document has no place in an article's folder (apply "
+                    "refuses it); set include to true only if that changes"
+                    if item.kind == "review"
+                    else None
+                ),
             ),
         )
         event.holders.append(holder)
@@ -1276,6 +1581,31 @@ def _build_events(collector):
                 *(text for _, _, text in recovered_drafts),
             ],
             collector.terms,
+            [
+                min((h.time for h in v.holders if h.time), default=None)
+                for v in versions.values()
+            ]
+            + [holder.time for _, holder, _ in recovered_drafts],
+            {
+                stem
+                for stem in (
+                    _name_stem(Path(h.path).name)
+                    for h in [
+                        *(h for v in versions.values() for h in v.holders),
+                        *(holder for _, holder, _ in recovered_drafts),
+                    ]
+                    if h.source in ("file", "drive", "recovered")
+                )
+                if stem
+            },
+        )
+
+    if chat is not None and chat["report"].get("undecided"):
+        collector.warnings.append(
+            f"--chat-export: {chat['report']['undecided']} documents only a linked "
+            "conversation holds share no text with one another, so none could be "
+            "told from a side document of the conversation; all are kept. Set "
+            "include to false in the plan for any that is not the article"
         )
 
     # Reproductions: any other source holding the version wins.
@@ -1395,12 +1725,40 @@ def _mark_suspect_runs(run_events):
         event.run_data["suspect_why"] = "; ".join(reasons) if reasons else None
 
 
+def _round_number(event):
+    """The ``rN`` number a draft's file names give it (the highest), or ``None``.
+
+    A run's own number is not a label, and neither is a reproduction's.
+    """
+    numbers = [
+        int(h.label[1:])
+        for h in event.holders
+        if h.label and h.label[0] == "r" and h.source != "recovered"
+    ]
+    return max(numbers) if numbers else None
+
+
 def _group_rounds(events, gap=None):
     """Rounds: a new one at each included, submitted draft version.
+
+    When the article's submitted drafts carry ``rN`` labels, the rounds follow the
+    labels instead, because the repository tags a round by its number and an AI
+    reading the history must see the author's numbers: a submitted draft starts a
+    new round only when its ``rN`` is higher than the highest of the round before
+    it. A resubmission under the same ``rN`` (a copy renamed ``-superseded``, an
+    ``a`` copy) is a later version in that round; a ``vN`` or unlabelled draft
+    never starts one; everything before the first ``rN`` draft is round 1,
+    pre-submission drafting. ``check`` refuses a plan whose round K does not carry
+    ``rK`` (``_check_round_labels``), so a skipped label is never renumbered here.
 
     With a ``gap`` (an article that exists only in chats, issue #430) a new round
     also starts after a silence longer than that between two events.
     """
+    labelled = any(
+        e.kind == "draft" and e.include and e.submitted and _round_number(e) is not None
+        for e in events
+    )
+    highest = 0
 
     def tiebreak(e):
         path = e.run_data["path"] if e.kind == "run" else e.holders[0].path
@@ -1419,8 +1777,25 @@ def _group_rounds(events, gap=None):
     rounds = []
     previous = None
     for event in placed:
+        if event.unrelated:
+            # Left out as not a version: it joins the round that is open, and it
+            # neither starts one nor ends a silence.
+            if not rounds:
+                rounds.append({"events": [], "started": False})
+            rounds[-1]["events"].append(event)
+            continue
         starts = event.kind == "draft" and event.submitted and event.include
         silent = gap is not None and previous is not None and event.at - previous > gap
+        if labelled:
+            number = _round_number(event) if starts else None
+            opens = number is not None and highest and number > highest
+            if number is not None:
+                highest = max(highest, number)
+            if not rounds or opens:
+                rounds.append({"events": [], "started": False})
+            previous = event.at
+            rounds[-1]["events"].append(event)
+            continue
         if not rounds or (starts and rounds[-1]["started"]) or silent:
             rounds.append({"events": [], "started": False})
         previous = event.at
@@ -1432,6 +1807,46 @@ def _group_rounds(events, gap=None):
             rounds.append({"events": [], "started": False})
         rounds[-1]["events"].extend(unplaced)
     return rounds
+
+
+def _metadata_with_its_draft(rounds):
+    """Move metadata saved just before its draft into the draft's round.
+
+    An author often saves ``<slug>-metadata-rN.md`` seconds or minutes before
+    ``<slug>-draft-rN.md``, and by time it then ends the round before. A metadata
+    event whose label is the label of the submitted draft that starts a later
+    round moves to the front of that round, but only when no other event of its
+    own round comes after it in time: then the move reorders nothing, and the
+    round it leaves still ends where it did. Any other case stays where time put
+    it and keeps its hint.
+    """
+    starts = {}  # label -> index of the round that a submitted draft with it starts
+    for number, group in enumerate(rounds):
+        first = group["events"][0] if group["events"] else None
+        if number and first is not None and first.kind == "draft":
+            if first.include and first.submitted:
+                for label in first.match_labels():
+                    starts.setdefault(label, number)
+    moves = {}
+    for number, group in enumerate(rounds):
+        for event in list(group["events"]):
+            if event.kind != "metadata" or not event.include or event.at is None:
+                continue
+            target = starts.get(event.label)
+            if target is None or target <= number:
+                continue
+            if any(e.at is not None and e.at > event.at for e in group["events"]):
+                continue
+            group["events"].remove(event)
+            moves.setdefault(target, []).append(event)
+            event.placement = (
+                f"with the draft it labels ({event.label}), which starts round "
+                f"{target + 1}; saved before it"
+            )
+    for target, moved in moves.items():
+        moved.sort(key=lambda e: (e.at, e.sha or ""))
+        rounds[target]["events"][0:0] = moved
+    rounds[:] = [group for group in rounds if group["events"]]
 
 
 def _accepted_at(rounds, index):
@@ -1543,6 +1958,12 @@ def scan(
         event.at = _best_time(event.holders)
         if event.at is None and event.recovered and event.superseded_by is None:
             event.at = None
+        dated_by = _best_holder(event.holders)
+        if dated_by is not None and dated_by.via == "project_doc":
+            event.hint = (
+                "time is when a project document holding it was created: it may "
+                "have held an earlier state, and no other source dates it"
+            )
     for event in others:
         if event.superseded_by is not None:
             event.at = event.superseded_by.at
@@ -1556,10 +1977,11 @@ def scan(
     # a round ends: a silence of more than 48 hours does.
     chat_only_article = (
         not run_events
-        and any(d.uncorroborated for d in drafts)
+        and any(d.uncorroborated and d.include for d in drafts)
         and not any(d.submitted and d.include for d in drafts)
     )
     rounds = _group_rounds(all_events, _ROUND_GAP if chat_only_article else None)
+    _metadata_with_its_draft(rounds)
 
     # Attach each non-draft document to the nearest included draft in its round.
     for group in rounds:
@@ -1777,6 +2199,17 @@ def _stats(collector, drafts, others, run_events, rounds, root, root_why, keys, 
             "chat_map": chat["chat_map"] is not None,
             "min_chat_words": chat["min_words"],
             **chat["report"],
+            "left_out_documents": [
+                {
+                    "id": d.id,
+                    "source": d.holders[0].path,
+                    "via": d.holders[0].via,
+                    "words": len(d.text.split()),
+                    "why": d.why,
+                }
+                for d in drafts
+                if d.unrelated
+            ],
         }
     return stats
 
@@ -1929,6 +2362,24 @@ def _format_chat(chat):
             f"  Not kept from linked conversations (at least {chat['min_chat_words']} "
             f"words, whole documents only): {left or 'none'}"
         )
+    for code, label in (("not_related", "side documents"), ("fragment", "fragments")):
+        count = chat.get("not_versions", {}).get(code)
+        if count:
+            lines.append(
+                f"  Left out of the draft history, not versions of the article "
+                f"({count} {label}); each is in the plan with include: false and "
+                "its reason"
+            )
+    if chat.get("kept_by_name"):
+        lines.append(
+            f"  Kept by file name: {chat['kept_by_name']} chat-only document(s) "
+            "unlike the other versions but named like one (same name stem)"
+        )
+    for item in chat.get("left_out_documents", []):
+        lines.append(
+            f"    {item['id']}  {item['source']}  {item['via']}  {item['words']} "
+            f"words: {item['why']}"
+        )
     lines.append(
         f"  Reproductions: {chat.get('confirmed', 0)} confirmed by the export, "
         f"{chat.get('replaced', 0)} replaced by it"
@@ -2037,6 +2488,51 @@ def _load_source(source, context=None):
     return normalise(raw), None
 
 
+def _plan_round_labels(event):
+    """The ``rN`` numbers a draft record carries: its label and the others it was filed under."""
+    labels = {event.get("label"), *(event.get("other_labels") or [])}
+    return {int(x[1:]) for x in labels if re.fullmatch(r"r\d+", str(x))}
+
+
+def _check_round_labels(rounds):
+    """Round K may not carry ``rN`` labels without carrying ``rK``.
+
+    Applies when the article's submitted drafts carry ``rN`` labels. A round that
+    carries none (drafting before the first submission, a round the author never
+    labelled) is left alone; a round whose labels are all other numbers means a
+    label was skipped or a draft sits in the wrong round, and is refused rather
+    than renumbered.
+    """
+    events = [e for g in rounds for e in g.get("events", []) if e.get("include")]
+    drafts = [e for e in events if e.get("kind") == "draft"]
+    if not any(e.get("submitted") and _plan_round_labels(e) for e in drafts):
+        return []
+    problems = []
+    for group in rounds:
+        number = group.get("round")
+        included = [e for e in group.get("events", []) if e.get("include")]
+        if not included or not isinstance(number, int):
+            continue
+        carried = sorted(
+            {
+                n
+                for e in included
+                if e.get("kind") == "draft"
+                for n in _plan_round_labels(e)
+            }
+        )
+        if carried and number not in carried:
+            found = ", ".join(f"r{n}" for n in carried)
+            problems.append(
+                f"round {number} carries {found}, not r{number}: the rounds must "
+                "follow the author's rN labels, so round K carries the draft "
+                "labelled rK (a label was skipped, or a draft is in the wrong "
+                "round); fix the plan, because the repository tags a round by its "
+                "number"
+            )
+    return problems
+
+
 def check_plan(plan):
     """Problems with an edited plan, as a list of strings (empty means it is fine)."""
     if not isinstance(plan, dict) or plan.get("version") != PLAN_VERSION:
@@ -2108,6 +2604,7 @@ def check_plan(plan):
             )
         if accepted:
             previous_end = accepted
+    problems.extend(_check_round_labels(rounds))
     return problems
 
 

@@ -18,6 +18,7 @@ from .test_chat_export import (
     chat_sources,
     conversation,
     message,
+    stamp,
     tool_result,
     tool_use,
 )
@@ -651,3 +652,586 @@ def test_the_command_refuses_a_map_without_an_export_and_a_bad_floor(mapped, tmp
         mapped, tmp_path, "--chat-map", str(mapped.map), "--min-chat-words", "-3"
     )
     assert code != 0
+
+
+# ---------------------------------------------------------------------------
+# Side documents and fragments (PR #435)
+# ---------------------------------------------------------------------------
+
+ARTICLE_LINES = 400  # about 3,600 words: a section of 50 lines is 12.5% of it
+
+
+def attachment(uuid, moment, name, text):
+    return message(
+        uuid,
+        "human",
+        moment,
+        "Here is a file.",
+        attachments=[
+            {
+                "file_name": name,
+                "file_size": 1,
+                "file_type": "md",
+                "extracted_content": text,
+            }
+        ],
+    )
+
+
+def article_chat(mapped, *, side=(), extra=()):
+    """The mapped conversation: a draft and two edits, then what a test adds."""
+    base = prose("a", ARTICLE_LINES)
+    first = base.replace("Sentence 7 of part a", "Sentence 7 of part a, revised,")
+    second = first.replace(
+        "Sentence 9 of part a", "Sentence 9 of part a, also revised,"
+    )
+    mapped.texts = {"base": base, "first": first, "second": second}
+    mapped.conversations[0]["chat_messages"] = [
+        create("d1", when(1, 10), mapped.path, base, "t1"),
+        replace(
+            "d2",
+            when(1, 11),
+            mapped.path,
+            "Sentence 7 of part a",
+            "Sentence 7 of part a, revised,",
+            "t2",
+        ),
+        replace(
+            "d3",
+            when(1, 12),
+            mapped.path,
+            "Sentence 9 of part a",
+            "Sentence 9 of part a, also revised,",
+            "t3",
+        ),
+        *side,
+        *extra,
+    ]
+    mapped.write()
+
+
+def side_documents():
+    return [
+        create("s1", when(1, 13), "/tmp/verification-log.md", prose("v", 60), "u1"),
+        create("s2", when(1, 14), "/tmp/research-batch.md", prose("w", 90), "u2"),
+    ]
+
+
+def sha_of(text):
+    return hi._sha(hi.normalise(text))
+
+
+def by_sha(plan):
+    return {e["sha256"]: e for e in drafts_of(plan)}
+
+
+def test_a_side_document_of_a_linked_chat_is_left_out_with_its_reason(mapped):
+    article_chat(mapped, side=side_documents())
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    for text in mapped.texts.values():
+        assert found[sha_of(text)]["include"] is True
+    for name, words in (("v", 60), ("w", 90)):
+        left = found[sha_of(prose(name, words))]
+        assert left["include"] is False
+        assert left["corroborated"] is False
+        assert "side document" in left["why"]
+        assert "set include to true" in left["why"]
+    assert [e["include"] for e in drafts_of(plan)].count(True) == 3
+    assert plan["chat"]["kept"]["not_versions"] == {"not_related": 2}
+    assert plan["chat"]["kept"]["chat_only"] == 3
+
+
+def test_a_body_only_version_is_kept_and_a_cut_out_section_is_not(mapped):
+    base = prose("a", ARTICLE_LINES)
+    body = "\n".join(base.split("\n")[40:])  # the draft without its first tenth
+    cut = "\n".join(base.split("\n")[100:150])  # a section: 12.5% of the draft
+    article_chat(
+        mapped,
+        extra=[
+            attachment("b1", when(1, 13), f"{SLUG}-body.md", body),
+            attachment("c1", when(1, 14), f"{SLUG}-cut.md", cut),
+        ],
+    )
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    assert found[sha_of(body)]["include"] is True
+    left = found[sha_of(cut)]
+    assert left["include"] is False
+    assert left["why"].startswith("a fragment")
+    assert plan["chat"]["kept"]["not_versions"] == {"fragment": 1}
+    kept = [e["sha256"] for e in drafts_of(plan) if e["include"]]
+    assert len(kept) == 4  # the draft, its two edits and the body-only version
+
+
+def test_the_edit_chain_of_one_message_is_unaffected(mapped):
+    article_chat(mapped, side=side_documents())
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    chain = [sha_of(t) for t in mapped.texts.values()]
+    assert all(found[sha]["include"] for sha in chain)
+    assert [found[sha]["at"] for sha in chain] == sorted(
+        found[sha]["at"] for sha in chain
+    )
+
+
+def test_a_left_out_document_is_in_the_summary_and_the_timeline(mapped):
+    article_chat(mapped, side=side_documents())
+    plan, stats = mapped.scan()
+    lines = "\n".join(hi.format_summary(stats))
+    assert "2 side documents" in lines
+    assert "chat:m1/s1" in lines and "chat:m1/s2" in lines
+    assert "set include to true" in lines
+    assert "Sentence" not in lines
+    timeline = hi.format_timeline(plan)
+    assert sum("excluded" in line for line in timeline) == 2
+
+
+def test_the_author_can_put_a_left_out_document_back_by_setting_include(mapped):
+    article_chat(mapped, side=side_documents())
+    plan, _ = mapped.scan()
+    by_sha(plan)[sha_of(prose("v", 60))]["include"] = True
+    assert hi.check_plan(plan) == []
+
+
+def test_a_document_another_source_holds_anchors_the_comparison(mapped):
+    base = prose("a", ARTICLE_LINES)
+    put(
+        mapped.base / "files",
+        f"{SLUG}-draft-v1.md",
+        base.replace("Sentence 5 of part a", "Sentence 5 of part a, filed,"),
+        when(1, 8),
+    )
+    article_chat(mapped, side=side_documents())
+    plan, _ = mapped.scan(files=[mapped.base / "files"])
+    found = by_sha(plan)
+    # The chat's draft resembles the file's: kept, and not chat-only.
+    assert found[sha_of(base)]["include"] is True
+    assert "corroborated" not in found[sha_of(base)]
+    assert found[sha_of(prose("v", 60))]["include"] is False
+    assert found[sha_of(prose("w", 90))]["include"] is False
+
+
+def test_a_side_document_does_not_move_a_round_boundary(mapped):
+    article_chat(
+        mapped,
+        side=[create("s1", when(2, 18), "/tmp/log.md", prose("v", 60), "u1")],
+        extra=[
+            replace(
+                "d4",
+                when(4, 10),
+                mapped.path,
+                "Sentence 11 of part a",
+                "Sentence 11 of part a, much later,",
+                "t4",
+            )
+        ],
+    )
+    plan, _ = mapped.scan()
+    # The edit is 70 hours after the one before it; the side document 30 hours
+    # in does not bridge that silence.
+    assert len(plan["rounds"]) == 2
+    assert [e["include"] for e in plan["rounds"][1]["events"]] == [True]
+
+
+def test_when_no_two_documents_share_text_none_can_be_told_apart_and_all_stay(
+    mapped,
+):
+    mapped.conversations[0]["chat_messages"] = [
+        create("a1", when(1, 10), "/tmp/one.md", prose("p", 60), "u1"),
+        create("a2", when(1, 11), "/tmp/two.md", prose("q", 60), "u2"),
+    ]
+    mapped.write()
+    plan, _ = mapped.scan()
+    assert [e["include"] for e in drafts_of(plan)] == [True, True]
+    assert plan["chat"]["kept"]["undecided"] == 2
+    assert any("share no text" in w for w in plan["warnings"])
+
+
+def test_a_single_document_is_kept_as_before(mapped):
+    mapped.conversations[0]["chat_messages"] = [
+        create("a1", when(1, 10), "/tmp/one.md", prose("p", 60), "u1")
+    ]
+    mapped.write()
+    plan, _ = mapped.scan()
+    assert [e["include"] for e in drafts_of(plan)] == [True]
+
+
+def test_the_edits_of_a_side_document_are_left_out_with_it(mapped):
+    article_chat(
+        mapped,
+        side=[
+            create("s1", when(1, 13), "/tmp/log.md", prose("v", 60), "u1"),
+            replace(
+                "s2",
+                when(1, 14),
+                "/tmp/log.md",
+                "Sentence 3 of part v",
+                "Sentence 3 of part v, amended,",
+                "u2",
+            ),
+        ],
+    )
+    plan, _ = mapped.scan()
+    assert [e["include"] for e in drafts_of(plan)].count(False) == 2
+    assert plan["chat"]["kept"]["chat_only"] == 3
+
+
+def test_the_command_prints_each_left_out_document_with_its_reason(mapped, tmp_path):
+    article_chat(mapped, side=side_documents())
+    code, printed = run_cli(mapped, tmp_path, "--chat-map", str(mapped.map))
+    assert code == 0
+    assert "Left out of the draft history, not versions of the article" in printed
+    assert "chat:m1/s1" in printed
+    assert "Sentence" not in printed
+
+
+# ---------------------------------------------------------------------------
+# Lineage by name, and earlier drafts that a later version expanded (PR #435)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "stem"),
+    [
+        ("Piece-Notes.md", "piece-notes"),
+        ("piece-notes-v2.md", "piece-notes"),
+        ("piece-notes-v4-FINAL.md", "piece-notes"),
+        ("piece-notes_draft.md", "piece-notes"),
+        ("piece-notes-final-v3.md", "piece-notes"),
+        ("piece-notes-2026-03-02.md", "piece-notes"),
+        ("piece-notes-20260302.md", "piece-notes"),
+        ("piece-notes-superseded-by-v3.md", "piece-notes"),
+        ("piece-notes-r2.md", "piece-notes"),
+        ("piece-notes-citation-check-r1.md", "piece-notes-citation-check"),
+        ("piece-notes-cut.md", "piece-notes-cut"),
+        ("piece.md", "piece"),
+        ("draft.md", "draft"),
+        ("v2.md", "v2"),
+        ("My Piece v2", "my piece"),
+        (None, None),
+        ("", None),
+    ],
+)
+def test_a_name_stem_drops_the_extension_and_trailing_version_markers(name, stem):
+    assert hi._name_stem(name) == stem
+
+
+def lineage_chat(mapped, *, extra=()):
+    """A first draft written, then rewritten from scratch under one name stem."""
+    rewritten = prose("a", ARTICLE_LINES)
+    # v3 expands v2 about 2.2 times, so v2 covers less than half of it
+    expanded = prose("a", 900).replace(
+        "Sentence 7 of part a", "Sentence 7 of part a, longer,"
+    )
+    mapped.texts = {
+        "first": prose("r", 300),
+        "v2": rewritten,
+        "v3": expanded,
+    }
+    mapped.conversations[0]["chat_messages"] = [
+        create("l1", when(1, 10), "/tmp/piece.md", mapped.texts["first"], "t1"),
+        replace(
+            "l2",
+            when(1, 10, 5),
+            "/tmp/piece.md",
+            "Sentence 7 of part r",
+            "Sentence 7 of part r, edited,",
+            "t2",
+        ),
+        replace(
+            "l3",
+            when(1, 10, 9),
+            "/tmp/piece.md",
+            "Sentence 9 of part r",
+            "Sentence 9 of part r, also edited,",
+            "t3",
+        ),
+        create("l4", when(1, 12), "/tmp/piece-v2.md", mapped.texts["v2"], "t4"),
+        attachment("l5", when(1, 14), "piece-v3-FINAL.md", mapped.texts["v3"]),
+        *extra,
+    ]
+    mapped.write()
+
+
+def test_a_heavily_rewritten_first_draft_is_kept_by_its_name_with_its_edits(mapped):
+    lineage_chat(mapped)
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    first = mapped.texts["first"]
+    edited = first.replace("Sentence 7 of part r", "Sentence 7 of part r, edited,")
+    edited_again = edited.replace(
+        "Sentence 9 of part r", "Sentence 9 of part r, also edited,"
+    )
+    for text in (first, edited, edited_again):
+        assert found[sha_of(text)]["include"] is True
+    # The first text is kept by its name; its edits relate to it.
+    assert found[sha_of(first)]["note"].startswith("kept by file name")
+    for key in ("v2", "v3"):
+        assert found[sha_of(mapped.texts[key])]["include"] is True
+        assert "note" not in found[sha_of(mapped.texts[key])]
+    assert plan["chat"]["kept"]["kept_by_name"] == 1
+    assert plan["chat"]["kept"]["not_versions"] == {}
+    assert "Kept by file name: 1" in "\n".join(hi.format_summary(mapped.scan()[1]))
+
+
+def test_a_name_sharing_only_a_prefix_with_the_stem_does_not_keep_a_document(mapped):
+    lineage_chat(
+        mapped,
+        extra=[
+            create(
+                "p1",
+                when(1, 15),
+                "/tmp/piece-citation-check-r1.md",
+                prose("v", 60),
+                "u1",
+            ),
+            create("p2", when(1, 16), "/tmp/pie.md", prose("w", 60), "u2"),
+            create("p3", when(1, 17), "/tmp/piece-pie.md", prose("x", 60), "u3"),
+        ],
+    )
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    for name in ("v", "w", "x"):
+        assert found[sha_of(prose(name, 60))]["include"] is False
+    assert found[sha_of(mapped.texts["first"])]["include"] is True
+    assert plan["chat"]["kept"]["not_versions"] == {"not_related": 3}
+
+
+def test_a_document_with_the_stem_of_a_file_another_source_holds_is_kept(mapped):
+    put(
+        mapped.base / "files",
+        f"{SLUG}-draft-v1.md",
+        prose("a", ARTICLE_LINES),
+        when(1, 8),
+    )
+    mapped.conversations[0]["chat_messages"] = [
+        create("n1", when(1, 10), f"/tmp/{SLUG}.md", prose("r", ARTICLE_LINES), "t1"),
+        create(
+            "n2", when(1, 11), f"/tmp/{SLUG}-citation-check.md", prose("v", 60), "t2"
+        ),
+    ]
+    mapped.write()
+    plan, _ = mapped.scan(files=[mapped.base / "files"])
+    found = by_sha(plan)
+    assert found[sha_of(prose("r", ARTICLE_LINES))]["include"] is True
+    assert found[sha_of(prose("v", 60))]["include"] is False
+
+
+def test_an_earlier_smaller_draft_that_a_later_version_expanded_is_kept(mapped):
+    base = prose("a", ARTICLE_LINES)
+    small = "\n".join(base.split("\n")[:150])  # 37% of the later draft
+    article_chat(mapped, extra=[attachment("e1", when(1, 9), "outline.md", small)])
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    assert found[sha_of(small)]["include"] is True
+    assert plan["chat"]["kept"]["not_versions"] == {}
+
+
+def test_a_section_cut_from_an_existing_draft_is_left_out_even_under_its_name(mapped):
+    base = prose("a", ARTICLE_LINES)
+    cut = "\n".join(base.split("\n")[100:150])
+    article_chat(
+        mapped,
+        extra=[attachment("c1", when(1, 14), "piece-notes-v9.md", cut)],
+    )
+    plan, _ = mapped.scan()
+    left = by_sha(plan)[sha_of(cut)]
+    assert left["include"] is False
+    assert left["why"].startswith("a fragment")
+
+
+# ---------------------------------------------------------------------------
+# A project document does not date a version; research/ is never the article
+# ---------------------------------------------------------------------------
+
+
+def add_project_docs(mapped, docs):
+    """Knowledge files of one invented project: ``[(filename, content, moment)]``."""
+    folder = mapped.dir / "projects" / "projects"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "project-1.json").write_text(
+        json.dumps(
+            {
+                "uuid": "proj-1",
+                "name": "Invented project",
+                "description": "",
+                "prompt_template": "",
+                "docs": [
+                    {"filename": name, "content": text, "created_at": stamp(moment)}
+                    for name, text, moment in docs
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_a_project_document_does_not_date_a_version_a_file_also_holds(mapped):
+    submitted = prose("a", ARTICLE_LINES).replace(
+        "Sentence 5 of part a", "Sentence 5 of part a, submitted,"
+    )
+    article_chat(mapped)  # chat edits on day 1, 10:00 to 12:00
+    # The project doc says "existed by day 1, 09:00"; the file is the same bytes,
+    # saved on day 3 after the edits.
+    add_project_docs(
+        mapped, [(f"claude/{SLUG}/{SLUG}-draft-r2.md", submitted, when(1, 9))]
+    )
+    put(mapped.base / "files", f"{SLUG}-draft-r2.md", submitted, when(3, 11))
+    plan, _ = mapped.scan(files=[mapped.base / "files"])
+    found = by_sha(plan)
+    version = found[sha_of(submitted)]
+    assert version["at"] == hi._iso(when(3, 11))
+    assert "hint" not in version
+    assert {s["type"] for s in version["sources"]} == {"file", "chat"}
+    # (the chat's first write is a near-duplicate of the file, so only its edits stay)
+    edits = [found[sha_of(mapped.texts[key])] for key in ("first", "second")]
+    assert all(version["at"] > e["at"] for e in edits)
+    order = [e["id"] for r in plan["rounds"] for e in r["events"]]
+    assert all(order.index(version["id"]) > order.index(e["id"]) for e in edits)
+
+
+def test_a_project_document_dates_a_version_only_when_nothing_else_does(mapped):
+    submitted = prose("a", ARTICLE_LINES).replace(
+        "Sentence 5 of part a", "Sentence 5 of part a, submitted,"
+    )
+    article_chat(mapped)
+    add_project_docs(
+        mapped, [(f"claude/{SLUG}/{SLUG}-draft-r2.md", submitted, when(1, 9))]
+    )
+    plan, _ = mapped.scan()
+    version = by_sha(plan)[sha_of(submitted)]
+    assert version["at"] == hi._iso(when(1, 9))
+    assert "project document" in version["hint"]
+
+
+def test_a_research_file_that_is_also_a_project_document_is_left_out(mapped):
+    base = prose("a", ARTICLE_LINES)
+    # Quotes 60 lines of the article among 200 of its own: related, not a fragment.
+    analysis = "\n".join(base.split("\n")[:60]) + "\n" + prose("m", 200)
+    article_chat(mapped)
+    add_project_docs(
+        mapped,
+        [
+            (f"claude/{SLUG}/research/map-data-analysis.md", analysis, when(1, 9)),
+            (
+                f"claude/{SLUG}/{SLUG}-draft-r3.md",
+                base + "\nA closing line.",
+                when(1, 9),
+            ),
+        ],
+    )
+    put(mapped.base / "files" / "research", f"{SLUG}-map-data-analysis.md", analysis)
+    put(
+        mapped.base / "files",
+        f"{SLUG}-draft-r3.md",
+        base + "\nA closing line.",
+        when(3, 9),
+    )
+    plan, stats = mapped.scan(files=[mapped.base / "files"])
+    assert sha_of(analysis) not in by_sha(plan)
+    assert sha_of(base + "\nA closing line.") in by_sha(plan)
+    why = {item["path"]: item["why"] for item in plan["excluded"]}
+    assert any(
+        path.endswith("research/map-data-analysis.md") and "research/" in text
+        for path, text in why.items()
+    )
+    assert any(
+        path.endswith(f"/research/{SLUG}-map-data-analysis.md")
+        and text == hi._RESEARCH_WHY
+        for path, text in why.items()
+    )
+    assert not any("not read" in text for text in why.values())
+    printed = "\n".join(hi.format_excluded(plan))
+    assert "research/" in printed and "Sentence" not in printed
+
+
+def test_a_document_named_like_a_draft_in_the_folder_root_is_kept(mapped):
+    article_chat(mapped)
+    put(
+        mapped.base / "files",
+        f"{SLUG}-draft-r4.md",
+        prose("a", ARTICLE_LINES),
+        when(3, 9),
+    )
+    put(mapped.base / "files" / "research", f"{SLUG}-citation-check.md", prose("n", 80))
+    plan, _ = mapped.scan(files=[mapped.base / "files"])
+    kept = by_sha(plan)[sha_of(prose("a", ARTICLE_LINES))]
+    assert kept["include"] is True
+    assert "file" in {s["type"] for s in kept["sources"]}
+    assert sha_of(prose("n", 80)) not in by_sha(plan)
+
+
+def test_the_drive_manifest_and_a_research_directory_given_on_its_own(mapped):
+    assert hi._under_research("research/x.md")
+    assert hi._under_research("claude/slug/Research/x.md")
+    assert hi._under_research("a\\research\\x.md")
+    assert not hi._under_research("research.md")
+    assert not hi._under_research("slug/research-notes.md")
+    put(mapped.base / "alone" / "research", f"{SLUG}-notes.md", prose("n", 80))
+    article_chat(mapped)
+    plan, _ = mapped.scan(files=[mapped.base / "alone" / "research"])
+    assert any(
+        item["path"].endswith(f"/alone/research/{SLUG}-notes.md")
+        and item["why"] == hi._RESEARCH_WHY
+        for item in plan["excluded"]
+    )
+    assert sha_of(prose("n", 80)) not in by_sha(plan)
+
+
+def test_a_drive_file_under_research_is_left_out(mapped):
+    article_chat(mapped)
+    drive = mapped.base / "drive"
+    put(drive / "research", f"{SLUG}-notes.md", prose("n", 80))
+    put(drive, f"{SLUG}-draft-r5.md", prose("a", ARTICLE_LINES))
+    (drive / "drive-manifest.json").write_text(
+        json.dumps(
+            [
+                {"name": f"research/{SLUG}-notes.md", "createdTime": stamp(when(2, 9))},
+                {"name": f"{SLUG}-draft-r5.md", "createdTime": stamp(when(3, 9))},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    plan, _ = mapped.scan(drive_dir=drive)
+    assert sha_of(prose("n", 80)) not in by_sha(plan)
+    assert sha_of(prose("a", ARTICLE_LINES)) in by_sha(plan)
+    assert any(
+        item["path"].endswith(f"research/{SLUG}-notes.md")
+        and "research/" in item["why"]
+        for item in plan["excluded"]
+    )
+
+
+def test_a_draft_named_project_document_under_research_is_read(mapped):
+    article_chat(mapped)
+    superseded = prose("a", ARTICLE_LINES).replace(
+        "Sentence 5 of part a", "Sentence 5 of part a, superseded,"
+    )
+    notes = prose("m", 80)
+    add_project_docs(
+        mapped,
+        [
+            (
+                f"claude/{SLUG}/research/{SLUG}-draft-r1-superseded-2026-03-02.md",
+                superseded,
+                when(1, 9),
+            ),
+            (
+                f"claude/{SLUG}/research/source-notes-2-2026-03-02.md",
+                notes,
+                when(1, 9),
+            ),
+            (
+                f"claude/{SLUG}/research/{SLUG}-citation-check-r1.md",
+                notes + "x",
+                when(1, 9),
+            ),
+        ],
+    )
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    assert found[sha_of(superseded)]["include"] is True
+    assert sha_of(notes) not in found and sha_of(notes + "x") not in found
+    left = [item["path"] for item in plan["excluded"]]
+    assert sum("/research/" in path for path in left) == 2

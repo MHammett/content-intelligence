@@ -1078,6 +1078,86 @@ conversation<TAB>slug<TAB>name<TAB>confidence
   kind, how many resembled another source, and how many candidates were not
   kept and why (`not_a_whole_file`, `not_prose`, `not_a_draft`, `short`,
   `near_duplicate`, `edit_base_not_kept`).
+* **Side documents and fragments (PR #435).** A linked conversation also
+  holds documents that are not the article: a verification log, a research
+  batch, a source excerpt, a section cut from the draft. A chat-only version is
+  kept as a draft only if it **relates to the article's other versions** and is
+  **not a fragment of one**, judged by 8-word shingles (the share of a text's
+  8-word windows found elsewhere):
+  * *Related.* At least **10%** of its windows are in the versions kept so far
+    (those another source holds, then the chat's own, followed from one to the
+    next). On three real articles every side document scored 0.00-0.03 and the
+    lowest genuine draft 0.14.
+  * *Or named like a kept version.* An article rewritten heavily shares little
+    with its own first draft, so a text whose **file name stem** equals the stem
+    of a kept version's file name (from the chat or from another source) is kept
+    anyway, with a `note` saying so; so are the edits of a text that was kept.
+    The stem is the name lowercased, without its extension, with trailing
+    version markers dropped one after another: `-vN`, `-rN`, `-final`,
+    `-draft`, `-superseded` and whatever follows it, and a date (`-YYYY-MM-DD`
+    or `-YYYYMMDD`), after `-`, `_` or a space. The whole stem must be equal:
+    `x-draft.md` and `x-v2.md` are `x`, `x-citation-check-r1.md` is
+    `x-citation-check`, and nothing joins on a prefix.
+  * *Not a fragment.* A text that is at least half inside a version **written
+    before it (or at the same time)** while covering less than **half** of every
+    version it overlaps is a fragment: a section cut from a draft covered about
+    12% of it, the body-only versions 76% or more. A smaller text that a *later*
+    version expanded is an earlier draft and stays.
+
+  A text that fails is not dropped: it stays in the plan with `"include": false`
+  and a `why` naming the rule and the share, and the summary lists each by
+  event id, conversation and message. To put one back, set its `include` to
+  `true` in `plan.json` (`check` then validates it like any event); `--include`
+  does not apply, as it only names `--files`. Left-out documents do not move a
+  round boundary. With no version from another source, the biggest group of
+  mutually related texts is taken as the article; when no two texts share
+  anything, nothing says which is the article, so all stay and a warning says
+  so. A genuine early draft that was written after a larger text it sits inside
+  reads as a fragment: set its `include` back to `true`.
+* **`research/` holds research, and sometimes superseded drafts.** A file under
+  a `research/` directory (a `--files` or `--drive-dir` entry, or a project
+  knowledge file whose name has `research/` in its path, as a project mirroring
+  a Drive folder does) is read exactly as it would be in the folder root when
+  its **name** follows the handoff naming for a draft or metadata: the scan's own
+  kind detection, so `<slug>-draft-r1-superseded-<date>.md`,
+  `<slug>-draft-v4-prerun.md` and `<slug>-metadata-r1-superseded.md` are read
+  (as in the root, a name must still mention the article). Any other file there
+  is never a version of the article, whatever text it shares with it: notes,
+  checks and data the article was written from often quote it. Each such file
+  is listed under `excluded`, by path, with the reason. A `--files` directory
+  named `research` is treated the same way.
+* **A project document does not date a version.** A project's knowledge file
+  carries only a `created_at`, which says the document existed by then in some
+  earlier state; the project syncs from Drive, so its text can be a later file's
+  byte for byte. A version is dated by any other source that holds it (a run,
+  Drive, a file, a reproduction's claimed time); the project document's
+  `created_at` is used only when nothing else has a time, and the event then
+  carries a `hint` saying so.
+* **Rounds follow the author's `rN` labels.** The repository tags a round by its
+  number, and an AI reading the history must see the author's numbers, so when
+  the article's submitted drafts carry `rN` labels in their file names the scan
+  does not start a round at every submitted draft. A submitted draft starts a new
+  round only when its `rN` is **higher than the highest `rN` of the round before
+  it**. A resubmission under the same `rN` (a copy renamed `-superseded-<date>`,
+  an `a` copy) is a later version inside that round; a `vN` or unlabelled draft
+  (`-v4-prerun`) never starts a round; everything before the first `rN` draft is
+  round 1, pre-submission drafting. A run's own number and a reproduction's label
+  do not count as `rN` labels. `check` refuses a plan in which a round carries
+  `rN` labels but not `rK` for its own number K (`r1` then `r3` gives "round 2
+  carries r3, not r2"); the labels are never renumbered. A round with no `rN`
+  label at all is left alone. An article with no `rN` label keeps the grouping
+  above, including the 48-hour gap rule for a chat-only article.
+* **A review document is left out by default.** `apply` refuses an included
+  review (it has no place in an article's folder), so the scan sets `include:
+  false` on a document of kind `review` and says why in `why`.
+* **Metadata goes with the draft it labels.** An author often saves
+  `<slug>-metadata-rN.md` seconds or minutes before `<slug>-draft-rN.md`, which
+  by time ends the round before. A metadata event whose label is the label of
+  the submitted draft that starts a later round moves to the front of that
+  round, unless some other event of its own round comes after it in time: then
+  the move reorders nothing and the round it leaves ends where it did. A
+  metadata event that does not move keeps its hint ("label rN is on a draft in
+  round M; placed by time"); one that moves carries a `placement`.
 * **Rounds for a chat-only article.** A round normally starts at a submitted
   version (a run's draft, or a file named with a `vNN` or `rN`). An article with
   no runs and no labelled files has none, so its versions are placed in one
