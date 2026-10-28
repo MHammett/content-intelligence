@@ -734,35 +734,174 @@ def test_the_merged_flag_that_appears_late_is_waited_for(article, fake):
     assert article.read()["applied"]["1"]["merge"]["path"] == "ref-move"
 
 
-def test_when_github_does_not_mark_the_pull_request_merged_it_is_merged_through_the_api(
+def merge_puts(fake):
+    return [r for r in fake.requests if r[0] == "PUT" and r[1].endswith("/merge")]
+
+
+def test_a_merged_flag_that_takes_minutes_is_waited_for_and_the_api_is_never_asked(
     article, fake
 ):
-    fake.marks_merged_on_ref_move = False
-
-    lines = apply(article, fake)
+    # Measured on github.com: about 90 seconds between moving main and the pull
+    # request reading merged; far more reads than the old one-minute schedule made.
+    fake.merge_flag_lag = 25
+    waits = []
+    lines = apply(article, fake, sleep=waits.append)
 
     assert all(p["merged"] for p in fake.pulls.values())
-    merge = article.read()["applied"]["1"]["merge"]
-    assert merge["path"] == "merge-pull"
-    assert any("did not mark the pull request merged" in line for line in lines)
-    puts = [r for r in fake.requests if r[0] == "PUT" and r[1].endswith("/merge")]
-    assert len(puts) == 3
-    assert puts[0][3]["commit_message"] == "Accepted 2026-06-01T10:00:00Z (imported)"
-    assert puts[0][3]["merge_method"] == "merge"
+    assert merge_puts(fake) == []
+    assert sum(waits) > 60  # it kept waiting past the old bound
+    assert all(
+        article.read()["applied"][k]["merge"]["path"] == "ref-move" for k in "123"
+    )
+    assert any("waiting for GitHub to mark pull request #1 merged" in x for x in lines)
     assert f"{SLUG}/r3" in fake.tags
 
 
-def test_a_pull_request_that_stays_open_after_the_branch_holds_it_is_an_error(
+def test_the_wait_says_it_is_waiting_and_is_bounded_to_about_five_minutes(
     article, fake
 ):
-    fake.marks_merged_on_ref_move = False
-    fake.inject(
-        "PUT", "/merge", Resp(405, {"message": "Pull Request is not mergeable"}), 99
-    )
+    assert 280 <= sum(ha._MERGE_WAITS) <= 320
+    fake.merge_flag_lag = 5
+    lines = []
+    apply(article, fake, out=lines.append)
+    progress = [x for x in lines if "waiting for GitHub" in x]
+    assert progress and "couple of minutes" in progress[0]
 
-    with pytest.raises(ha.ImportApplyError, match="merging it was refused"):
-        apply(article, fake)
+
+def test_a_pull_request_that_never_reads_merged_is_an_error_and_never_an_api_merge(
+    article, fake
+):
+    fake.merge_flag_lag = 10_000
+    waits = []
+
+    with pytest.raises(ha.ImportApplyError) as info:
+        apply(article, fake, sleep=waits.append)
+
+    message = str(info.value)
+    assert "has not marked pull request #1 merged yet" in message
+    assert "run the same command again later" in message
+    assert "resolve the pull request by hand" not in message
+    assert sum(waits) == sum(ha._MERGE_WAITS)
+    assert merge_puts(fake) == []
+    # main did take the round, and the plan records everything up to the merge
+    assert fake.pulls[1]["state"] == "open"
+    assert len(first_parent_chain(fake)) == 2
     assert "merge" not in article.read()["applied"]["1"]
+
+
+def test_a_rerun_after_github_caught_up_resumes_without_a_second_merge(article, fake):
+    fake.merge_flag_lag = 10_000
+    with pytest.raises(ha.ImportApplyError):
+        apply(article, fake)
+    main_after_move = fake.branches["main"]
+    commits_before = len(fake.commits)
+
+    # GitHub catches up
+    pull = fake.pulls[1]
+    pull["merge_pending"] = 0
+    fake.merge_flag_lag = 0
+    apply(article, fake)
+
+    assert all(p["merged"] for p in fake.pulls.values())
+    assert merge_puts(fake) == []
+    assert fake.commits.keys() >= {main_after_move}
+    assert (
+        first_parent_chain(fake)[1] == main_after_move
+    )  # round 1 was not merged twice
+    assert [subject(fake, m) for m in first_parent_chain(fake)[1:]] == [
+        f"{SLUG} r{n} (#{n})" for n in (1, 2, 3)
+    ]
+    assert len(fake.commits) > commits_before
+    assert all("tag" in article.read()["applied"][k] for k in "123")
+
+
+def test_a_rerun_that_finds_the_pull_request_open_but_in_main_waits_instead_of_failing(
+    article, fake
+):
+    fake.merge_flag_lag = 10_000
+    with pytest.raises(ha.ImportApplyError):
+        apply(article, fake)
+
+    # the second run starts with main already holding the round: it must wait for the
+    # flag the same way, and succeed once GitHub shows it
+    fake.merge_flag_lag = 0
+    fake.pulls[1]["merge_pending"] = 12
+    waits = []
+    apply(article, fake, sleep=waits.append)
+
+    assert waits and merge_puts(fake) == []
+    assert all(p["merged"] for p in fake.pulls.values())
+
+
+# ---------------------------------------------------------------------------
+# A branch read that lags the import's own commit
+# ---------------------------------------------------------------------------
+
+
+def commit_chain_shapes(fake):
+    """Per round branch: the import commits' subjects and the parent links between them."""
+    shapes = {}
+    for n in (1, 2, 3):
+        branch = f"round/{SLUG}/r{n}"
+        commits = import_commits(fake, branch)
+        parents = [fake.commits[c]["parents"] for c in commits]
+        linked = all(parents[i] == [commits[i - 1]] for i in range(1, len(commits)))
+        shapes[n] = ([subject(fake, c) for c in commits], linked, len(parents[0]))
+    return shapes
+
+
+def test_a_branch_read_that_lags_the_imports_own_commit_does_not_stop_the_import(
+    article, fake
+):
+    # github.com answered GET git/ref with the head from before the commit the import
+    # had just written, and the replace check refused it as "changed by someone else".
+    reference = FakeGitHub()
+    reference.settings.update(di.DOCUMENT_REPO_SETTINGS)
+    apply(Article(article.plan_path.parent / "other"), reference)
+
+    fake.ref_read_lag = 2
+    apply(article, fake)
+
+    assert commit_chain_shapes(fake) == commit_chain_shapes(reference)
+    assert all(
+        linked and parents == 1
+        for _, linked, parents in commit_chain_shapes(fake).values()
+    )
+    assert [len(import_commits(fake, f"round/{SLUG}/r{n}")) for n in (1, 2, 3)] == [
+        2,
+        4,
+        2,
+    ]
+    assert len(fake.commits) == len(reference.commits)  # no commit was made twice
+    assert [subject(fake, c) for c in first_parent_chain(fake)] == [
+        subject(reference, c) for c in first_parent_chain(reference)
+    ]
+    assert all(p["merged"] for p in fake.pulls.values())
+
+
+def test_a_real_change_to_the_file_by_someone_else_still_refuses_the_next_commit(
+    article, fake
+):
+    branch = f"round/{SLUG}/r2"
+    seen = {"n": 0}
+
+    def someone_else_edits(f):
+        # on the branch's first import commit, another writer lands a change to the
+        # very file the round's next commit replaces
+        if f.branches.get(branch) and f.branches[branch] != f.branches["main"]:
+            seen["n"] += 1
+            if seen["n"] == 1:
+                f.external_commit(branch, {f"{FOLDER}/draft.md": b"edited by hand\n"})
+
+    fake.before_ref_update = someone_else_edits
+    fake.ref_read_lag = 1
+    with pytest.raises(ha.ImportApplyError, match="changed by someone else"):
+        apply(article, fake)
+
+    patches = [r for r in fake.requests if r[0] == "PATCH"]
+    assert patches and all(r[3]["force"] is False for r in patches)
+    tree = fake.tree_at(branch)
+    assert fake.blobs[tree[f"{FOLDER}/draft.md"]] == b"edited by hand\n"
 
 
 # ---------------------------------------------------------------------------
