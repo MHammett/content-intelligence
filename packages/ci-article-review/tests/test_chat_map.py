@@ -1137,9 +1137,11 @@ def test_a_research_file_that_is_also_a_project_document_is_left_out(mapped):
         for path, text in why.items()
     )
     assert any(
-        path.endswith("/research") and "1 file(s) not read" in text
+        path.endswith(f"/research/{SLUG}-map-data-analysis.md")
+        and text == hi._RESEARCH_WHY
         for path, text in why.items()
     )
+    assert not any("not read" in text for text in why.values())
     printed = "\n".join(hi.format_excluded(plan))
     assert "research/" in printed and "Sentence" not in printed
 
@@ -1152,7 +1154,7 @@ def test_a_document_named_like_a_draft_in_the_folder_root_is_kept(mapped):
         prose("a", ARTICLE_LINES),
         when(3, 9),
     )
-    put(mapped.base / "files" / "research", f"{SLUG}-notes-draft.md", prose("n", 80))
+    put(mapped.base / "files" / "research", f"{SLUG}-citation-check.md", prose("n", 80))
     plan, _ = mapped.scan(files=[mapped.base / "files"])
     kept = by_sha(plan)[sha_of(prose("a", ARTICLE_LINES))]
     assert kept["include"] is True
@@ -1166,11 +1168,12 @@ def test_the_drive_manifest_and_a_research_directory_given_on_its_own(mapped):
     assert hi._under_research("a\\research\\x.md")
     assert not hi._under_research("research.md")
     assert not hi._under_research("slug/research-notes.md")
-    put(mapped.base / "alone" / "research", f"{SLUG}-draft.md", prose("n", 80))
+    put(mapped.base / "alone" / "research", f"{SLUG}-notes.md", prose("n", 80))
     article_chat(mapped)
     plan, _ = mapped.scan(files=[mapped.base / "alone" / "research"])
     assert any(
-        item["path"].endswith("/alone/research") and "whole directory" in item["why"]
+        item["path"].endswith(f"/alone/research/{SLUG}-notes.md")
+        and item["why"] == hi._RESEARCH_WHY
         for item in plan["excluded"]
     )
     assert sha_of(prose("n", 80)) not in by_sha(plan)
@@ -1198,3 +1201,37 @@ def test_a_drive_file_under_research_is_left_out(mapped):
         and "research/" in item["why"]
         for item in plan["excluded"]
     )
+
+
+def test_a_draft_named_project_document_under_research_is_read(mapped):
+    article_chat(mapped)
+    superseded = prose("a", ARTICLE_LINES).replace(
+        "Sentence 5 of part a", "Sentence 5 of part a, superseded,"
+    )
+    notes = prose("m", 80)
+    add_project_docs(
+        mapped,
+        [
+            (
+                f"claude/{SLUG}/research/{SLUG}-draft-r1-superseded-2026-03-02.md",
+                superseded,
+                when(1, 9),
+            ),
+            (
+                f"claude/{SLUG}/research/comparables-batch2-2026-03-02.md",
+                notes,
+                when(1, 9),
+            ),
+            (
+                f"claude/{SLUG}/research/{SLUG}-citation-check-r1.md",
+                notes + "x",
+                when(1, 9),
+            ),
+        ],
+    )
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    assert found[sha_of(superseded)]["include"] is True
+    assert sha_of(notes) not in found and sha_of(notes + "x") not in found
+    left = [item["path"] for item in plan["excluded"]]
+    assert sum("/research/" in path for path in left) == 2

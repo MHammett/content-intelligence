@@ -1136,3 +1136,83 @@ def test_undo_inverts_what_the_real_languagetool_adapter_wrote():
     corrected, change_log = apply_corrections(original, matches, {"TYPOS"}, set())
     assert corrected != original and len(change_log) == len(spans)
     assert hi.undo_lt_corrections(corrected, change_log) == original
+
+
+# ---------------------------------------------------------------------------
+# research/ and the placement of metadata (PR #435)
+# ---------------------------------------------------------------------------
+
+
+def test_a_research_folder_gives_its_drafts_and_metadata_and_loses_its_notes(tmp_path):
+    files = tmp_path / "files"
+    history = tmp_path / "history"
+    history.mkdir()
+    older, newer = make_draft(1), make_draft(2)
+    put(files, f"{SLUG}-draft-r2.md", newer, when(5, 10))
+    put(
+        files / "research",
+        f"{SLUG}-draft-r1-superseded-2026-03-02.md",
+        older,
+        when(2, 10),
+    )
+    put(
+        files / "research",
+        f"{SLUG}-metadata-r1-superseded-2026-03-02.md",
+        "PRIMARY CLAIM\nAn invented claim.\n",
+        when(2, 10, 5),
+    )
+    put(files / "research", f"{SLUG}-notes.md", make_draft(7), when(2, 11))
+    put(files / "research", "comparables-batch2.md", make_draft(8), when(2, 12))
+    put(files / "research", "v4-changes-and-research-log.md", "log\n", when(2, 13))
+    plan, _ = hi.scan(SLUG, history_root=history, files=[files])
+    kinds = [(e["kind"], e["include"]) for e in events(plan)]
+    assert kinds.count(("draft", True)) == 2
+    assert ("metadata", True) in kinds
+    assert draft_with(plan, older)["include"] is True
+    left = {Path(item["path"]).name: item["why"] for item in plan["excluded"]}
+    assert set(left) == {
+        f"{SLUG}-notes.md",
+        "comparables-batch2.md",
+        "v4-changes-and-research-log.md",
+    }
+    assert all(why == hi._RESEARCH_WHY for why in left.values())
+    assert not any("not read" in why for why in left.values())
+
+
+def metadata_before_its_draft(tmp_path, *, with_run=False):
+    files = tmp_path / "files"
+    history = tmp_path / "history"
+    history.mkdir()
+    put(files, f"{SLUG}-draft-r1.md", make_draft(1), when(1, 10))
+    put(
+        files,
+        f"{SLUG}-metadata-r2.md",
+        "PRIMARY CLAIM\nAn invented claim.\n",
+        when(3, 9, 58),
+    )
+    put(files, f"{SLUG}-draft-r2.md", make_draft(2), when(3, 10))
+    if with_run:
+        put_run(history, SLUG, 1, when(3, 9, 59), make_draft(1))
+    return hi.scan(SLUG, history_root=history, files=[files])[0]
+
+
+def test_metadata_saved_shortly_before_its_draft_goes_into_the_drafts_round(tmp_path):
+    plan = metadata_before_its_draft(tmp_path)
+    assert len(plan["rounds"]) == 2
+    first, second = (r["events"] for r in plan["rounds"])
+    assert [e["kind"] for e in first] == ["draft"]
+    assert [e["kind"] for e in second] == ["metadata", "draft"]
+    assert "hint" not in second[0]
+    assert "starts round 2" in second[0]["placement"]
+    assert hi.check_plan(plan) == []
+    # The round it left is accepted just before the metadata, as before.
+    assert plan["rounds"][0]["accepted_at"] <= second[0]["at"]
+
+
+def test_metadata_with_a_run_between_it_and_its_draft_stays_with_its_hint(tmp_path):
+    plan = metadata_before_its_draft(tmp_path, with_run=True)
+    first = plan["rounds"][0]["events"]
+    assert [e["kind"] for e in first] == ["draft", "metadata", "run"]
+    meta = first[1]
+    assert "label r2 is on a draft in round 2" in meta["hint"]
+    assert "placement" not in meta

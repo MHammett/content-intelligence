@@ -174,12 +174,17 @@ _ROUND_GAP = timedelta(hours=48)
 _DOCUMENT_SUFFIXES = (".md", ".markdown")
 
 #: Notes, data and checks the article was written from live in a ``research/``
-#: directory next to it (on disk, in Drive, mirrored in a project). They are never
-#: versions of the article, whatever text they share with it.
+#: directory next to it (on disk, in Drive, mirrored in a project), and so do the
+#: superseded drafts and metadata an author moves out of the way. A file there is
+#: read exactly as it would be in the folder root when its name follows the
+#: handoff naming for a draft or metadata (``-draft-r1-superseded-<date>``,
+#: ``-draft-v4-prerun``, ``-metadata-r1-superseded``: the scan's own kind
+#: detection); any other file there is never a version of the article, whatever
+#: text it shares with it.
 _RESEARCH_DIR = "research"
 _RESEARCH_WHY = (
-    "under a research/ directory: research notes and data are not versions of "
-    "the article"
+    "under a research/ directory and not named as a draft or metadata: research "
+    "notes and data are not versions of the article"
 )
 
 
@@ -187,6 +192,15 @@ def _under_research(name):
     """Whether a relative file name or path has a ``research`` directory in it."""
     parts = str(name).replace("\\", "/").lower().split("/")
     return _RESEARCH_DIR in parts[:-1]
+
+
+def _left_out_of_research(name, terms):
+    """Whether a file under ``research/`` is research, not a draft or metadata by name."""
+    if not _under_research(name):
+        return False
+    base = str(name).replace("\\", "/").rsplit("/", 1)[-1]
+    kind, _ = _file_kind_and_label(base, terms, "")
+    return kind not in ("draft", "metadata")
 
 
 _REPORT_RE = re.compile(r"^run_(?P<run>\d+)_((?P<ts>\d{8}_\d{6})_)?report\.json$")
@@ -602,29 +616,29 @@ def _scan_files(collector, directories, terms, include_names):
             return False
         return True
 
+    def read_research(directory):
+        # A draft or metadata by name is read as in the folder root; the rest is
+        # research and each such file is listed.
+        for child in sorted(directory.rglob("*"), key=lambda p: p.as_posix().lower()):
+            if not child.is_file():
+                continue
+            if _left_out_of_research(f"{_RESEARCH_DIR}/{child.name}", terms):
+                collector.excluded.append({"path": _posix(child), "why": _RESEARCH_WHY})
+            else:
+                consider(child, None, False)
+
     for directory in directories:
         directory = Path(directory)
         if not directory.is_dir():
             raise ImportScanError(f"--files {directory} is not a directory")
         if directory.name.lower() == _RESEARCH_DIR:
-            collector.excluded.append(
-                {
-                    "path": _posix(directory),
-                    "why": f"{_RESEARCH_WHY} (the whole directory)",
-                }
-            )
+            read_research(directory)
             continue
         for entry in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
             if entry.is_file():
                 consider(entry, None, False)
             elif entry.is_dir() and entry.name.lower() == _RESEARCH_DIR:
-                count = sum(1 for p in entry.rglob("*") if p.is_file())
-                collector.excluded.append(
-                    {
-                        "path": _posix(entry),
-                        "why": f"{_RESEARCH_WHY} ({count} file(s) not read)",
-                    }
-                )
+                read_research(entry)
             elif entry.is_dir():
                 matched = bool(pattern.search(entry.name.lower()))
                 folder_label = None
@@ -676,7 +690,7 @@ def _scan_drive(collector, drive_dir, terms):
         name = entry["name"]
         listed.add(name)
         path = drive_dir / name
-        if _under_research(name):
+        if _left_out_of_research(name, terms):
             collector.excluded.append({"path": _posix(path), "why": _RESEARCH_WHY})
             continue
         if not path.is_file():
@@ -892,7 +906,7 @@ def _prepare_chat(
             read[key] = read.get(key, 0) + value
         candidates.extend((c, link.strong) for c in found)
     for doc in chat_export_module.project_candidates(export, pattern):
-        if _under_research(doc.name):
+        if _left_out_of_research(doc.name, terms):
             collector.excluded.append({"path": doc.source, "why": _RESEARCH_WHY})
         else:
             candidates.append((doc, True))
@@ -1751,6 +1765,46 @@ def _group_rounds(events, gap=None):
     return rounds
 
 
+def _metadata_with_its_draft(rounds):
+    """Move metadata saved just before its draft into the draft's round.
+
+    An author often saves ``<slug>-metadata-rN.md`` seconds or minutes before
+    ``<slug>-draft-rN.md``, and by time it then ends the round before. A metadata
+    event whose label is the label of the submitted draft that starts a later
+    round moves to the front of that round, but only when no other event of its
+    own round comes after it in time: then the move reorders nothing, and the
+    round it leaves still ends where it did. Any other case stays where time put
+    it and keeps its hint.
+    """
+    starts = {}  # label -> index of the round that a submitted draft with it starts
+    for number, group in enumerate(rounds):
+        first = group["events"][0] if group["events"] else None
+        if number and first is not None and first.kind == "draft":
+            if first.include and first.submitted:
+                for label in first.match_labels():
+                    starts.setdefault(label, number)
+    moves = {}
+    for number, group in enumerate(rounds):
+        for event in list(group["events"]):
+            if event.kind != "metadata" or not event.include or event.at is None:
+                continue
+            target = starts.get(event.label)
+            if target is None or target <= number:
+                continue
+            if any(e.at is not None and e.at > event.at for e in group["events"]):
+                continue
+            group["events"].remove(event)
+            moves.setdefault(target, []).append(event)
+            event.placement = (
+                f"with the draft it labels ({event.label}), which starts round "
+                f"{target + 1}; saved before it"
+            )
+    for target, moved in moves.items():
+        moved.sort(key=lambda e: (e.at, e.sha or ""))
+        rounds[target]["events"][0:0] = moved
+    rounds[:] = [group for group in rounds if group["events"]]
+
+
 def _accepted_at(rounds, index):
     these = [e for e in rounds[index]["events"] if e.at is not None]
     if not these:
@@ -1883,6 +1937,7 @@ def scan(
         and not any(d.submitted and d.include for d in drafts)
     )
     rounds = _group_rounds(all_events, _ROUND_GAP if chat_only_article else None)
+    _metadata_with_its_draft(rounds)
 
     # Attach each non-draft document to the nearest included draft in its round.
     for group in rounds:
