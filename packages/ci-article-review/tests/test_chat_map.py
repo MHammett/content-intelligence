@@ -1218,7 +1218,7 @@ def test_a_draft_named_project_document_under_research_is_read(mapped):
                 when(1, 9),
             ),
             (
-                f"claude/{SLUG}/research/comparables-batch2-2026-03-02.md",
+                f"claude/{SLUG}/research/source-notes-2-2026-03-02.md",
                 notes,
                 when(1, 9),
             ),

@@ -1162,7 +1162,7 @@ def test_a_research_folder_gives_its_drafts_and_metadata_and_loses_its_notes(tmp
         when(2, 10, 5),
     )
     put(files / "research", f"{SLUG}-notes.md", make_draft(7), when(2, 11))
-    put(files / "research", "comparables-batch2.md", make_draft(8), when(2, 12))
+    put(files / "research", "source-notes-2.md", make_draft(8), when(2, 12))
     put(files / "research", "v4-changes-and-research-log.md", "log\n", when(2, 13))
     plan, _ = hi.scan(SLUG, history_root=history, files=[files])
     kinds = [(e["kind"], e["include"]) for e in events(plan)]
@@ -1172,7 +1172,7 @@ def test_a_research_folder_gives_its_drafts_and_metadata_and_loses_its_notes(tmp
     left = {Path(item["path"]).name: item["why"] for item in plan["excluded"]}
     assert set(left) == {
         f"{SLUG}-notes.md",
-        "comparables-batch2.md",
+        "source-notes-2.md",
         "v4-changes-and-research-log.md",
     }
     assert all(why == hi._RESEARCH_WHY for why in left.values())
