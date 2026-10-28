@@ -552,6 +552,7 @@ pipeline:
   wayback_link_check: true      # also query the Wayback Machine for each URL
   wayback_snapshot_stale_days: 180  # snapshots older than this are flagged [STALE]
   wayback_lookup_cache: true    # remember archive.org answers between runs
+  page_store: true              # keep fetched citation pages; reuse only on a 304
 
   drafting_model: claude        # excluded from voice_style — see below
   prompt_cache_layout: false    # see "Prompt cache layout"
@@ -568,6 +569,8 @@ uv run ci-review --draft handoff.md --publication mypub --retry-failed pipeline_
 ```
 
 **`wayback_snapshot_stale_days`** controls when a Wayback Machine snapshot is considered stale. At 180 days (default), a snapshot from more than six months ago triggers a `[STALE]` flag and a manual re-archive recommendation. Lower this for publications with high source-freshness standards (e.g., 90 days for breaking-news adjacent pieces). It applies to both draft link validation and resolved citation URLs.
+
+**`page_store`** (default `true`) keeps each citation page Section 9 and the quote check fetch in `page_store.sqlite` under the history root, and on the next run asks the origin whether it changed (`If-None-Match` / `If-Modified-Since`). Only a `304 Not Modified` reuses the stored body; a page that changed is downloaded again, and a page that sends no `ETag` or `Last-Modified` is never stored and is fetched in full every run, so the content-drift check always reads what the origin serves today. Only `200` responses up to 32 MB are kept, entries older than 14 days are dropped when a run starts, and every redirect hop still passes the SSRF guard. Link validation's HEAD checks and the TLS-impersonation retry do not use it. Measured live on 40 citation pages of one article, 2026-10-28: the second fetch got 11 answers of 304, did not download 20.9 MB, and took 52 s instead of 69 s, with every page reading the same. The log line `Page store:` and `report.json`'s `page_store` count the 304s and the bytes saved. `false` turns it off; delete the file to start over.
 
 **`wayback_lookup_cache`** (default `true`) keeps archive.org's answers in `wayback_lookups.sqlite` under the history root, so a URL looked up in an earlier run is not asked about again for 7 days if a snapshot exists and 1 day if none does. Within a run the link pass and Section 9 always share one lookup per URL, whatever this is set to; `false` only stops the file. A lookup that did not complete is never remembered, and submitting a URL for capture forgets it. The run's log line `Wayback lookups:` and `report.json`'s `wayback_lookups` say how many lookups went to archive.org. Delete the file to start over. See [CITATIONS.md](CITATIONS.md#wayback-machine-behavior).
 
@@ -923,7 +926,8 @@ ends the citation pass with `Page cache: N page fetch(es) made, M more
 request(s) served`. Only successes are kept, so a refused or rate-limited page is
 asked for again and Section 9's 403 retry and archive.org fallback still decide
 `verified_via`. The cache lives for one run: nothing is saved with a capture or a
-report, and a replay starts empty. Not run with `--offline`, so a replay with
+report, and a replay starts empty. Between runs, `page_store` (above) lets an
+unchanged page cost its host a `304` instead of the whole body. Not run with `--offline`, so a replay with
 `--offline` keeps every verdict where the capture had it.
 
 ---
@@ -1987,7 +1991,7 @@ export CI_HISTORY_ROOT="$HOME/ci-history"
 ```
 
 - **Unset or blank, nothing changes:** history stays in `pipeline_history/` under the working directory.
-- **What it moves:** everything `pipeline_history/` holds, for `ci-review` (saved runs, the daily `pipeline_<date>.log`, the `_replay/` tree that `--replay` writes, the prior-run and archive lookups that a draft run and `--archive-only` make, and the `wayback_lookups.sqlite` store of archive.org answers they share) and for the readers `ci-history-report` and `ci-voice-patterns`. A leading `~` is expanded; a relative path is relative to the working directory, as the default is. When it is set, the run's log starts with a `History root:` line saying where history went.
+- **What it moves:** everything `pipeline_history/` holds, for `ci-review` (saved runs, the daily `pipeline_<date>.log`, the `_replay/` tree that `--replay` writes, the prior-run and archive lookups that a draft run and `--archive-only` make, the `wayback_lookups.sqlite` store of archive.org answers they share, and the `page_store.sqlite` store of fetched citation pages) and for the readers `ci-history-report` and `ci-voice-patterns`. A leading `~` is expanded; a relative path is relative to the working directory, as the default is. When it is set, the run's log starts with a `History root:` line saying where history went.
 - **Readers keep their flag.** `--history-root DIR` on `ci-history-report` and `ci-voice-patterns` still wins over the variable. `ci-review` has no such flag; for a one-off, set the variable for the one command.
 - **`--replay <capture>` and `--retry-failed <capture>` take a path you give them**, so they are not moved: pass the capture's real location, which is now under the shared directory.
 - **Why a variable and not a `user.yaml` key:** `configs/` is git-ignored and per checkout too, so a key there would have to be copied into every new worktree, and `main()` opens the history directory (for its log file) before it loads any config. The variable is shared by every checkout and read first.

@@ -81,7 +81,12 @@ from ci_core.concurrency import (
     exit_without_waiting_for_foreign_threads,
     run_all_with_timeout,
 )
-from ci_core.http import impersonation_available
+from ci_core.http import (
+    close_page_store,
+    impersonation_available,
+    open_page_store,
+    page_store_stats,
+)
 from ci_core.llm.model_registry import check_model_currency
 from ci_core.llm import output_tokens
 from ci_core.llm import timeout_model
@@ -103,6 +108,8 @@ from .adapters.citation.disposition import disposition as citation_disposition
 log = logging.getLogger("pipeline")
 
 HISTORY_ROOT = "pipeline_history"
+#: The page store's file under the history root (see ``ci_core.http``).
+PAGE_STORE_FILENAME = "page_store.sqlite"
 
 
 def _history_root():
@@ -3290,6 +3297,12 @@ def run_draft_pipeline(
     # every archive lookup here, reporting each citation as "rate limit tripped
     # earlier this run" for a limit that expired before this run began.
     wayback.reset_rate_limit_state()
+    # Fetched citation pages kept for the next run and reused only when the
+    # origin answers 304 Not Modified (ci_core.http, "Page store"). Off for
+    # --offline, which fetches nothing.
+    close_page_store()
+    if pipeline_cfg.get("page_store", True) and not offline:
+        open_page_store(Path(_history_root()) / PAGE_STORE_FILENAME)
     # One archive.org answer per URL per run, shared by link validation and
     # Section 9, and kept under the history root for the next run. Memory-only
     # when the store is switched off; --offline makes no lookups at all, and
@@ -4636,6 +4649,18 @@ def run_draft_pipeline(
             wl["live"],
             wl["run_hits"],
             wl["store_hits"],
+        )
+    # Pages an origin answered 304 for, and the body bytes that saved it.
+    report["page_store"] = page_store_stats()
+    close_page_store()
+    ps = report["page_store"]
+    if ps["stored_hits"] or ps["live"]:
+        log.info(
+            "Page store: %d page(s) unchanged since an earlier run (304, %.1f MB "
+            "not downloaded), %d fetched in full",
+            ps["stored_hits"],
+            ps["bytes_not_downloaded"] / 1_000_000,
+            ps["live"],
         )
 
     # Fallback warnings
