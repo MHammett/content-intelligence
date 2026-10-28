@@ -609,3 +609,211 @@ class TestPageCharsetFollowsTheDocument:
         assert page.status == "read"
         assert all("20–50" in t for t in page.texts)
         assert qc.quote_found("employ only 20–50 full-time workers", page.texts) is True
+
+
+# --- issue #443: table rows, who offered a quote, and sibling-aware demotion --
+
+_ROW_PAGE = (
+    "Water use by data center location. "
+    "Berkeley County, SC Million gallons 1,200.0 300.0 900.0 5.1 "
+    "Council Bluffs, IA Million gallons 1,410.3 400.1 1,010.2 6.7 "
+    "The Dalles, OR Million gallons 461.1 120.0 341.1 2.3"
+)
+_ROW_VERBATIM = "Council Bluffs, IA Million gallons 1,410.3 400.1 1,010.2 6.7"
+_ROW_RETYPED = (
+    "Council Bluffs, IA ... Water withdrawal: 1,410.3 million gallons; "
+    "Water consumption: 1,010.2 million gallons"
+)
+
+
+class TestFiguresMatch:
+    """A table row re-typed with its labels counts when its figures are on the page."""
+
+    def test_a_retyped_row_is_found_on_its_figures(self):
+        assert qc.quote_match(_ROW_RETYPED, [_ROW_PAGE]) == (True, "figures")
+        assert qc.quote_found(_ROW_RETYPED, [_ROW_PAGE]) is True
+
+    def test_a_verbatim_row_is_still_reported_as_verbatim(self):
+        assert qc.quote_match(_ROW_VERBATIM, [_ROW_PAGE]) == (True, "verbatim")
+
+    def test_prose_without_figures_has_to_match_as_written(self):
+        paraphrase = (
+            "A large area of southwest Kansas was in moderate to severe drought"
+        )
+        page = "D1-D2 drought still exists across a large area of southwest Kansas."
+        assert qc.quote_match(paraphrase, [page]) == (False, None)
+
+    def test_figures_out_of_order_do_not_match(self):
+        swapped = "Council Bluffs, IA: consumption 1,010.2, withdrawal 1,410.3"
+        assert qc.quote_match(swapped, [_ROW_PAGE]) == (False, None)
+
+    def test_figures_too_far_apart_do_not_match(self):
+        page = "Council Bluffs 1,410.3 " + "filler text " * 60 + "1,010.2 later"
+        quote = "Council Bluffs: 1,410.3 withdrawn and 1,010.2 consumed"
+        assert qc.quote_match(quote, [page]) == (False, None)
+
+    def test_one_long_figure_is_enough_but_one_short_one_is_not(self):
+        page = "The site withdrew 1,410.3 million gallons; 20 staff work there."
+        assert qc.quote_match(
+            "Water withdrawal of 1,410.3 million gallons at the site", [page]
+        ) == (True, "figures")
+        assert qc.quote_match("about 20 full-time employees at the site", [page]) == (
+            False,
+            None,
+        )
+
+    def test_a_figures_match_can_only_turn_a_miss_into_a_hit(self):
+        """A quote on the page as written is never downgraded by the figures path."""
+        assert qc.quote_match(_QUOTE, [_PAGE]) == (True, "verbatim")
+
+    def test_the_first_figure_is_tried_from_every_occurrence(self):
+        page = "Row A: 1,410.3 9,999 " + "x " * 200 + "Row B: 1,410.3 1,010.2"
+        assert qc.quote_match("1,410.3 withdrawn, 1,010.2 consumed", [page]) == (
+            True,
+            "figures",
+        )
+
+
+class TestCheckQuotesRecordsWhoOfferedEachQuote:
+    def test_claims_models_and_how_matched_are_on_the_check(self):
+        results = _results(_verdict(), model="gemini")
+        results[("openai", "fact_check")] = {
+            "failed": False,
+            "data": {
+                "confirmed": [
+                    {
+                        "claim": "Nine units operate at the plant.",
+                        "source": "s",
+                        "source_url": _URL,
+                        "supporting_quote": _QUOTE,
+                    }
+                ]
+            },
+            "model": "openai",
+            "tokens": {},
+        }
+        checks, _ = qc.check_quotes(results, fetch=_fetch_from({_URL: _page(_PAGE)}))
+        check = checks[(_URL, _QUOTE)]
+        assert check["matched"] == "verbatim"
+        assert check["models"] == ["gemini", "openai"]
+        assert check["claims"] == [
+            "The plant has nine units.",
+            "Nine units operate at the plant.",
+        ]
+
+    def test_an_unread_page_still_says_who_asked(self):
+        checks, _ = qc.check_quotes(
+            _results(_verdict()),
+            fetch=_fetch_from({_URL: qc.PageRead(status="failed", detail="boom")}),
+        )
+        assert checks[(_URL, _QUOTE)]["found"] is None
+        assert checks[(_URL, _QUOTE)]["models"] == ["gemini"]
+
+
+class TestSiblingQuoteKeepsTheVerdict:
+    """One model paraphrases, another copies: the verdict rests on the copy (#443)."""
+
+    _CLAIM = "Google's thirstiest site, Council Bluffs, withdrew 1.41 billion gallons in 2024"
+    _OTHER = (
+        "Council Bluffs withdrew 1.41 billion gallons in 2024, Google's thirstiest site"
+    )
+
+    def _run(self, checks, model="gemini"):
+        data = {
+            "confirmed": [
+                {
+                    "claim": self._CLAIM,
+                    "source": "Google report",
+                    "source_url": _URL,
+                    "supporting_quote": _ROW_RETYPED,
+                }
+            ]
+        }
+        results = _results(data, model=model)
+        normalised, _ = consolidation._normalise_fact_check_results(
+            results, None, checks
+        )
+        return normalised[(model, "fact_check")]["data"]
+
+    def _checks(self, other_model="openai", other_claim=None, other_url=_URL):
+        return {
+            (_URL, _ROW_RETYPED): {
+                "found": False,
+                "models": ["gemini"],
+                "claims": [self._CLAIM],
+            },
+            (other_url, _ROW_VERBATIM): {
+                "found": True,
+                "matched": "verbatim",
+                "models": [other_model],
+                "claims": [other_claim or self._OTHER],
+            },
+        }
+
+    def test_another_models_found_quote_for_the_same_point_keeps_it_confirmed(self):
+        data = self._run(self._checks())
+        assert data.get("unverifiable", []) == []
+        (kept,) = data["confirmed"]
+        assert kept["quote_check"] == "sibling_found"
+        assert kept["quote_found_by"] == "openai"
+        assert "openai" in kept["quote_check_note"]
+        assert kept["supporting_quote"] == _ROW_RETYPED, "the model's own item is kept"
+
+    def test_the_same_models_other_quote_is_not_a_second_opinion(self):
+        data = self._run(self._checks(other_model="gemini"))
+        assert data["confirmed"] == []
+        (moved,) = data["unverifiable"]
+        assert moved["quote_check"] == "not_found"
+
+    def test_a_found_quote_for_a_different_point_does_not_count(self):
+        data = self._run(
+            self._checks(other_claim="Golf courses use 150 million gallons a year each")
+        )
+        assert data["confirmed"] == []
+        assert len(data["unverifiable"]) == 1
+
+    def test_a_wrapper_and_the_page_it_forwards_to_are_the_same_page(self):
+        data = self._run(self._checks(other_url=_URL + "?utm_source=x"))
+        (kept,) = data["confirmed"]
+        assert kept["quote_check"] == "sibling_found"
+
+    def test_a_demotion_says_the_page_was_read_in_full(self):
+        data = self._run(
+            {
+                (_URL, _ROW_RETYPED): {
+                    "found": False,
+                    "models": ["gemini"],
+                    "claims": [self._CLAIM],
+                }
+            }
+        )
+        (moved,) = data["unverifiable"]
+        assert "read in full" in moved["reason"]
+        assert "not on the page" in moved["reason"]
+        assert "did not see" not in moved["reason"]
+
+    def test_the_callers_results_are_not_mutated_by_the_annotation(self):
+        results = _results(
+            {
+                "confirmed": [
+                    {
+                        "claim": self._CLAIM,
+                        "source": "s",
+                        "source_url": _URL,
+                        "supporting_quote": _ROW_RETYPED,
+                    }
+                ]
+            }
+        )
+        before = repr(results)
+        consolidation._normalise_fact_check_results(results, None, self._checks())
+        assert repr(results) == before
+
+    def test_section_1_shows_the_sibling_line(self):
+        from ci_article_review import report_markdown
+
+        data = self._run(self._checks())
+        (kept,) = data["confirmed"]
+        lines = "\n".join(report_markdown._kv_lines(kept))
+        assert "Quote check: sibling_found" in lines
+        assert "Quote found by: openai" in lines
