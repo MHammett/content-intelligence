@@ -3190,6 +3190,66 @@ def _grammar_skipped(reason):
     }
 
 
+def _warn_if_draft_already_reviewed(draft_text, handoff, handoff_path, publication):
+    """Say so before the ensemble runs on a draft history already has a run of.
+
+    A warning, never a block: re-running an unchanged draft is how
+    reproducibility is measured, and some of the zero-change runs in history
+    were exactly that. But most were not. Full-cost runs at
+    ``word_change_pct`` 0.0 cost $4.50, $5.66, $7.37 and $11.59 (issue #454),
+    and ``--replay`` re-runs everything downstream of the ensemble from the
+    earlier run's capture for nothing.
+
+    Returns the matches, newest first, for tests.
+    """
+    try:
+        matches = reproducibility.prior_runs_of_this_draft(
+            draft_text, _history_root(), _history_key(handoff)
+        )
+    except Exception as exc:  # an advisory must never stop a run
+        log.debug("Unchanged-draft check failed: %s", exc)
+        return []
+    if not matches:
+        return []
+    latest = matches[0]
+    with_capture = next((m for m in matches if m["results"]), None)
+    cost = latest["total_usd"]
+    preset = latest["cost_preset"]
+    detail = ", ".join(
+        part
+        for part in (
+            f"{preset}" if preset else "",
+            f"${cost:.2f}" if isinstance(cost, (int, float)) else "",
+        )
+        if part
+    )
+    lines = [
+        f"This draft is unchanged since run {latest['run_number']}"
+        f"{f' ({detail})' if detail else ''}"
+        + (f" and {len(matches) - 1} earlier run(s)" if len(matches) > 1 else "")
+        + ". This run will pay for the ensemble again."
+    ]
+    if with_capture:
+        source = f"--draft {handoff_path}" if handoff_path else "<same draft flags>"
+        lines.append(
+            "To re-run consolidation, citations and the report from that run's "
+            "ensemble for nothing, stop now and use:"
+        )
+        lines.append(
+            f"  uv run ci-review {source} --publication {publication} "
+            f"--replay {with_capture['results']} --offline"
+        )
+    else:
+        lines.append(
+            "No ensemble capture of it survives, so --replay is not available; "
+            "carry on if a fresh review is what you want."
+        )
+    # The console handler shows WARNING, so this reaches the terminal as well as
+    # the day's log file, before the first model call goes out.
+    log.warning("\n".join(lines))
+    return matches
+
+
 def run_draft_pipeline(
     handoff_path,
     publication_name,
@@ -3646,6 +3706,11 @@ def run_draft_pipeline(
     # Pre-load all prompt files before spawning threads (warms the cache)
     for prompt_name in _DOMAIN_PROMPTS.values():
         _load_prompt(prompt_name)
+
+    if not (replay_results or retry_failed_results):
+        _warn_if_draft_already_reviewed(
+            corrected_draft, handoff, handoff_path, publication_name
+        )
 
     # Pass 2: Ensemble model review — built-in domains
     drafting_model = _drafting_model(handoff, pipeline_cfg)

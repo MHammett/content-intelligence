@@ -609,11 +609,14 @@ def _verdict_detail(bucket, item):
     return ""
 
 
-def _demote_unevidenced_verdict(bucket, item, own_host, quote_checks=None):
+def _demote_unevidenced_verdict(bucket, item, own_host, quote_checks=None, model=None):
     """Where a verdict belongs under the prompt's evidence rules.
 
-    Returns ``None`` when it stays where it is, or ``(bucket, finding)`` for the
-    bucket it moves to. The rules are the prompt's own (``fact_check.txt``,
+    Returns ``None`` when it stays where it is, ``(bucket, finding)`` for the
+    bucket it moves to, or ``(same bucket, annotated item)`` when it stays but
+    carries a note (rule 4's sibling case). ``model`` is the model whose
+    verdict this is, so another model's quote can be told from its own.
+    The rules are the prompt's own (``fact_check.txt``,
     EVIDENCE REQUIREMENTS), applied to every bucket that asserts a verdict:
 
     1. No openable URL. If the source names no document at all — "Manual
@@ -639,6 +642,10 @@ def _demote_unevidenced_verdict(bucket, item, own_host, quote_checks=None):
        A page that could not be read, or no check at all (``--offline``, a
        disabled check), leaves the verdict where it is. Kept in
        `sources_checked`, so Section 9 reads the same page against the claim.
+       Before demoting, :func:`_sibling_quote_found` looks for another model's
+       quote from the same page, for the same point, that *was* found: then
+       the verdict stays, marked ``quote_check: "sibling_found"`` with the
+       model whose quote carries it (issue #443).
     """
     origin = "confirmed" if bucket == "confirmed" else f"{bucket} (as a verdict)"
     detail = _verdict_detail(bucket, item)
@@ -703,17 +710,31 @@ def _demote_unevidenced_verdict(bucket, item, own_host, quote_checks=None):
 
     check = (quote_checks or {}).get((url, quote))
     if check and check.get("found") is False:
+        sibling = _sibling_quote_found(item.get("claim", ""), url, quote_checks, model)
+        if sibling is not None:
+            sibling_models = ", ".join(sibling.get("models") or []) or "another model"
+            return bucket, {
+                **item,
+                "quote_check": "sibling_found",
+                "quote_found_by": sibling_models,
+                "quote_check_note": (
+                    f"This model's quote is not on the page as written (the page "
+                    f"was read in full), but {sibling_models} quoted the same page "
+                    "for the same point and that quote is on it. The verdict "
+                    "stands on that quote, not on this one."
+                ),
+            }
         return "unverifiable", {
             "claim": item.get("claim", ""),
             "checked": source or url,
             "sources_checked": [url],
             "reason": (
-                f"Reported as {origin} on the strength of a quote that does not "
-                f"appear in the page at {url} as fetched. The page was read; the "
-                "quote may be paraphrased or reconstructed, or sit in a part of "
-                "the page the fetch did not see (a script-rendered table, a later "
-                "page of a paginated listing). Either way the verdict has not "
-                f"been shown against the page.{detail}"
+                f"Reported as {origin} on the strength of a quote that is not on "
+                f"the page at {url} as written. The page was read in full, so "
+                "this is not a part of it the fetch missed: the quote is a "
+                "paraphrase, a table row re-typed with its labels, or the draft's "
+                "own sentence. The verdict has not been shown against the "
+                f"page.{detail}"
             ),
             "demoted_from": bucket,
             "quote_check": "not_found",
@@ -721,14 +742,66 @@ def _demote_unevidenced_verdict(bucket, item, own_host, quote_checks=None):
     return None
 
 
-def _demote_unevidenced_verdicts(data, own_site_url=None, quote_checks=None):
+#: How alike two claims must be, as Jaccard overlap of their content words, for
+#: one model's quote to stand in for another's. The same figure as
+#: ``resolver._SIBLING_OVERLAP``, which pairs Section 9 entries the same way;
+#: duplicated rather than imported because ``consolidation`` sits below the
+#: resolver in the import graph.
+_SIBLING_OVERLAP = 0.45
+
+
+def _sibling_quote_found(claim, url, quote_checks, model=None):
+    """A check on the same page, by another model, for the same point, that was found.
+
+    Returns that check, or ``None``. Same page by ``url_key``, so a wrapper
+    and the page it forwards to count as one; same point by content-word
+    overlap at or above :data:`_SIBLING_OVERLAP`, the resolver's own measure
+    for pairing two phrasings of one draft sentence.
+
+    Why this exists: six models each quote the page for the same sentence, and
+    one of them paraphrases. On the 2026-10-28 brockovich run, Google's Council
+    Bluffs water row was quoted verbatim by openai and found, and re-typed with
+    labels by gemini and mistral and not found; each of the latter was then
+    demoted in Section 1 on its own quote, as if the page had failed the claim.
+    The page carries the quote. The verdict should rest on whichever model
+    copied it.
+    """
+    from .adapters.citation.draft_citations import claim_tokens
+
+    if not claim or not url or not quote_checks:
+        return None
+    own = claim_tokens(claim)
+    if not own:
+        return None
+    page = url_key(url)
+    for (other_url, _other_quote), other in quote_checks.items():
+        if other.get("found") is not True or url_key(other_url) != page:
+            continue
+        others = [m for m in other.get("models") or [] if m != model]
+        if other.get("models") and not others:
+            continue  # the same model's other quote is not a second opinion
+        for other_claim in other.get("claims") or []:
+            theirs = claim_tokens(other_claim)
+            if not theirs:
+                continue
+            overlap = len(own & theirs) / len(own | theirs)
+            if overlap >= _SIBLING_OVERLAP:
+                return {**other, "models": others or other.get("models") or []}
+    return None
+
+
+def _demote_unevidenced_verdicts(
+    data, own_site_url=None, quote_checks=None, model=None
+):
     """Move verdicts that lack the evidence the prompt requires out of their bucket.
 
-    Returns a new data dict, or ``data`` itself when nothing moved; the input is
-    never mutated. A claim is never dropped — it moves to the bucket that says
-    what was actually found, and keeps the model's source and point in
-    ``checked``/``best_candidate_source`` and ``reason``, so a reader can see
-    what was offered instead. ``demoted_from`` records where it came from.
+    Returns a new data dict, or ``data`` itself when nothing moved or was
+    annotated; the input is never mutated. A claim is never dropped — it moves
+    to the bucket that says what was actually found, and keeps the model's
+    source and point in ``checked``/``best_candidate_source`` and ``reason``,
+    so a reader can see what was offered instead. ``demoted_from`` records
+    where it came from. A verdict another model's quote carries stays in its
+    bucket, in place, with the note rule 4 attaches.
 
     Runs once, from :func:`_normalise_fact_check_results`, so Section 1,
     Section 2 and :func:`find_contradictions` all read the same buckets. It used
@@ -741,16 +814,23 @@ def _demote_unevidenced_verdicts(data, own_site_url=None, quote_checks=None):
     for bucket in _VERDICT_BUCKETS:
         items = data.get(bucket) or []
         kept = []
+        changed = False
         for item in items:
-            outcome = _demote_unevidenced_verdict(bucket, item, own_host, quote_checks)
+            outcome = _demote_unevidenced_verdict(
+                bucket, item, own_host, quote_checks, model
+            )
             if outcome is None:
                 kept.append(item)
+            elif outcome[0] == bucket:
+                kept.append(outcome[1])
+                changed = True
             else:
                 moved.setdefault(outcome[0], []).append(outcome[1])
-        if len(kept) != len(items):
+                changed = True
+        if changed:
             replaced[bucket] = kept
     if not moved:
-        return data
+        return {**data, **replaced} if replaced else data
 
     log.info(
         "Fact check: %d verdict(s) lacked the evidence the prompt requires (a "
@@ -938,7 +1018,9 @@ def _normalise_fact_check_results(results, own_site_url=None, quote_checks=None)
             continue
         data, result_notes = _coerce_fact_check_buckets(result["data"], model_name)
         notes.extend(result_notes)
-        data = _demote_unevidenced_verdicts(data, own_site_url, quote_checks)
+        data = _demote_unevidenced_verdicts(
+            data, own_site_url, quote_checks, model_name
+        )
         # Identity, not ``result_notes``: a present-but-null bucket is rewritten
         # and deliberately not reported, and gating the replacement on the notes
         # would drop exactly that repair on the floor.

@@ -950,3 +950,16 @@ maximum:
                                   # grounded models out of six; this makes four.
                                   # Scoped to fact_check because every search
                                   # bills and no other domain benefits.
+      search_max_uses: 40   # Searches one fact_check call may run. Without
+                            # this, litellm sets the tool's max_uses from
+                            # search_context_size (medium = 5), and on the
+                            # 2026-10-28 brockovich run opus-5 spent all five
+                            # on the first few of ~260 claims and wrote
+                            # "search budget exhausted" against the rest
+                            # (#444). A ceiling, not a spend: Anthropic bills
+                            # $10 per 1,000 searches made, so 40 is at most
+                            # $0.40 against a ~$1 claude:fact_check call and an
+                            # ~$8 run. Gemini ran 33 searches on that draft;
+                            # 40 gives claude the same reach with headroom.
+                            # Unmeasured above 10 on a long draft: read the
+                            # next maximum run's api_call_log for the count.
