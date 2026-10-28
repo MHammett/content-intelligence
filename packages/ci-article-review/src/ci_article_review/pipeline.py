@@ -1422,6 +1422,9 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
             verify_claim = _claim_for_verifier(claim, source_field, draft)
             if verify_claim != claim:
                 entry["verify_claim"] = verify_claim
+            hints = _locate_hints(cited, known_urls, own, item)
+            if hints:
+                entry["locate_hints"] = hints
             claims.append(entry)
     log.info(
         "Citations: %d of %d claim(s) traced to a citation in the draft",
@@ -1429,6 +1432,28 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
         len(claims),
     )
     return claims
+
+
+def _locate_hints(cited, known_urls, own_url, item) -> dict:
+    """``{url: [text, ...]}``: where in each candidate the evidence probably is.
+
+    Two sources, both already in hand. The draft's citation entry for the URL,
+    which often names the place ("p. 110 (Council Bluffs, IA: 1,410.3 million
+    gallons withdrawn ...)"), and the fact-check model's quote from the URL it
+    named itself. The resolver uses them only to choose which part of a long
+    document the verifier is shown (``extract.select_excerpt_with_window``,
+    issue #440); the verdict is still the verifier's, on the claim alone. A
+    paraphrased quote still helps here: its figures are the page's.
+    """
+    hints: dict = {}
+    quote = consolidation._evidence_quote(item) if isinstance(item, dict) else ""
+    for url in known_urls:
+        texts = list(cited.descriptions_for(url)) if cited else []
+        if quote and own_url and url == own_url:
+            texts.append(quote)
+        if texts:
+            hints[url] = texts
+    return hints
 
 
 def _read_handoff_file(path: str) -> str:

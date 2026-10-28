@@ -809,8 +809,12 @@ def _quote_is_grounded(quote, content):
     return normalised_quote in _normalise_for_match(content)
 
 
-def _verify_relevance(claim, content, api_keys, author=None):
+def _verify_relevance(claim, content, api_keys, author=None, hints=()):
     """Ask a cheap/fast model whether ``content`` actually supports ``claim``.
+
+    ``hints`` (the draft's citation entry for this URL, a fact-check model's
+    quote from it) only steer which part of a long document is shown; the
+    model is asked about ``claim`` alone (issue #440).
 
     ``known_url`` citations often come from an ungrounded model recalling a
     URL from training data rather than a live search — the URL loading is not
@@ -848,7 +852,7 @@ def _verify_relevance(claim, content, api_keys, author=None):
     # genuinely long documents, and mistral-small at $0.15/M input prices even
     # the worst case (every call maxed) at under $0.09 for the pass.
     excerpt, window = extract.select_excerpt_with_window(
-        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL
+        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL, hints=hints
     )
     user_prompt = _build_verification_prompt(claim, excerpt, author)
 
@@ -934,6 +938,7 @@ def _resolve_known_url(
     author=None,
     verify_claim=None,
     page_cache=None,
+    locate_hints=(),
 ):
     """Resolve a claim whose source URL is already known (e.g. supplied by the
     fact-check model itself), bypassing the narrow adapter matching entirely.
@@ -1252,7 +1257,7 @@ def _resolve_known_url(
     # the cleaned text, and ``verified_as`` records what that was.
     _step("relevance")
     verdict_info, verification_call_log = _verify_relevance(
-        verify_claim or claim, verify_content, api_keys, author
+        verify_claim or claim, verify_content, api_keys, author, hints=locate_hints
     )
     if call_log is not None and verification_call_log is not None:
         call_log.append(verification_call_log)
@@ -1475,6 +1480,7 @@ def _resolve_candidates(
     author=None,
     verify_claim=None,
     page_cache=None,
+    locate_hints=None,
 ):
     """Check a claim against the sources cited for it, best candidate first.
 
@@ -1500,6 +1506,7 @@ def _resolve_candidates(
             author=author,
             verify_claim=verify_claim,
             page_cache=page_cache,
+            locate_hints=tuple((locate_hints or {}).get(url, ())),
         )
         if verify_claim:
             result["verified_as"] = verify_claim
@@ -1555,6 +1562,7 @@ def _resolve_one(
     verify_claim=None,
     page_cache=None,
     clock=None,
+    locate_hints=None,
 ):
     """Resolve a single claim against the configured sources, in order.
 
@@ -1584,6 +1592,7 @@ def _resolve_one(
             author,
             verify_claim,
             page_cache,
+            locate_hints=locate_hints,
         )
     finally:
         _clock.current = None
@@ -1604,6 +1613,7 @@ def _resolve_one_steps(
     author,
     verify_claim,
     page_cache,
+    locate_hints=None,
 ):
     checksum_index = checksum_index if checksum_index is not None else {}
 
@@ -1617,6 +1627,7 @@ def _resolve_one_steps(
             author=author,
             verify_claim=verify_claim,
             page_cache=page_cache,
+            locate_hints=locate_hints,
         )
 
     for source_config in citation_sources:
@@ -2817,6 +2828,10 @@ def resolve_citations(
         entry.get("verify_claim") if isinstance(entry, dict) else None
         for entry in claims
     ]
+    hints_per_claim = [
+        entry.get("locate_hints") if isinstance(entry, dict) else None
+        for entry in claims
+    ]
     call_log = verification_call_log if verification_call_log is not None else []
     checksum_index = build_checksum_index(history_root) if history_root else {}
 
@@ -2834,7 +2849,7 @@ def resolve_citations(
     jobs = [
         (
             str(idx),
-            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim, clock=clock: (
+            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim, clock=clock, hints=hints: (
                 _resolve_one(
                     claim,
                     citation_sources,
@@ -2846,13 +2861,17 @@ def resolve_citations(
                     verify_claim,
                     page_cache,
                     clock=clock,
+                    locate_hints=hints,
                 )
             ),
             _RESOLVE_TIMEOUT_SECONDS,
         )
-        for idx, ((claim, known_urls, _bucket), verify_claim, clock) in enumerate(
-            zip(normalized, verify_claims, clocks)
-        )
+        for idx, (
+            (claim, known_urls, _bucket),
+            verify_claim,
+            clock,
+            hints,
+        ) in enumerate(zip(normalized, verify_claims, clocks, hints_per_claim))
     ]
 
     overran = set()
