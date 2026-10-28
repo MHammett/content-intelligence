@@ -315,8 +315,11 @@ class TestVerificationCallsAreThrottled:
         """Guards against the semaphore being defined but never acquired."""
         import inspect
 
-        src = inspect.getsource(resolver._verify_relevance)
-        assert "_VERIFY_SEMAPHORE" in src, "verification call is not throttled"
+        # Every function that makes the model call: the single-claim check and
+        # the batched one (#453).
+        for fn in (resolver._verify_one, resolver._RelevanceBatch._ask):
+            src = inspect.getsource(fn)
+            assert "_VERIFY_SEMAPHORE" in src, f"{fn.__name__} is not throttled"
 
     def test_concurrent_verifications_never_exceed_the_bound(self):
         import threading
