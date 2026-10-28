@@ -5117,3 +5117,113 @@ class TestRetriesAreCounted:
         assert result["failed"] is False
         assert result["discarded_attempts"]["count"] == 2
         assert result["discarded_attempts"]["unbilled"] == 2
+
+
+class TestSearchMaxUses:
+    """``search_max_uses`` sends Anthropic's server tool with that count (#444).
+
+    ``web_search_options`` is portable, but litellm sets the tool's ``max_uses``
+    from ``search_context_size`` through a three-entry table (low 1, medium 5,
+    high 10). So "medium" was a ceiling of five searches, and a ``maximum``
+    fact_check over ~260 claims used all five on the first few and wrote
+    "search budget exhausted" against the rest. A count in the config sends
+    the tool itself, with that ``max_uses`` and nothing else deciding it.
+    """
+
+    def _sent(self, provider, cfg):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call(provider, provider_config=cfg)
+        return seen
+
+    def test_a_count_sends_the_server_tool_with_that_max_uses(self):
+        sent = self._sent("claude", {"web_search": True, "search_max_uses": 40})
+        assert sent["tools"] == [
+            {
+                "type": client._CLAUDE_WEB_SEARCH_TOOL,
+                "name": "web_search",
+                "max_uses": 40,
+            }
+        ]
+
+    def test_the_tool_is_never_sent_beside_web_search_options(self):
+        """Both on one request puts two web_search tools on the wire."""
+        sent = self._sent("claude", {"web_search": True, "search_max_uses": 40})
+        assert "web_search_options" not in sent
+
+    def test_without_a_count_the_portable_form_is_sent_as_before(self):
+        sent = self._sent("claude", {"web_search": True})
+        assert sent["web_search_options"] == {"search_context_size": "medium"}
+        assert "tools" not in sent
+
+    def test_a_count_as_a_string_is_read(self):
+        sent = self._sent("claude", {"web_search": True, "search_max_uses": "12"})
+        assert sent["tools"][0]["max_uses"] == 12
+
+    @pytest.mark.parametrize("bad", [0, -1, "many", ""])
+    def test_an_invalid_count_falls_back_to_the_portable_form(self, bad, caplog):
+        client._search_max_uses_warnings_given.clear()
+        with caplog.at_level(logging.WARNING):
+            sent = self._sent("claude", {"web_search": True, "search_max_uses": bad})
+        assert "tools" not in sent
+        assert sent["web_search_options"] == {"search_context_size": "medium"}
+        if bad != "":
+            assert "search_max_uses" in caplog.text
+
+    def test_without_web_search_the_count_sends_nothing(self):
+        sent = self._sent("claude", {"search_max_uses": 40})
+        assert "tools" not in sent
+        assert "web_search_options" not in sent
+
+    def test_grok_ignores_the_count_with_a_warning(self, caplog):
+        """grok's search is web_search_options only; the key cannot bite there."""
+        client._search_max_uses_warnings_given.clear()
+        with caplog.at_level(logging.WARNING):
+            sent = self._sent("grok", {"web_search": True, "search_max_uses": 40})
+        assert "tools" not in sent
+        assert sent["web_search_options"] == {"search_context_size": "medium"}
+        assert "only claude" in caplog.text
+
+    def test_the_schema_still_goes_on_the_wire_beside_the_tool(self):
+        """Only gemini loses its schema when grounded; claude keeps it."""
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        schema = {"name": "answer", "schema": {"type": "object", "properties": {}}}
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call(
+                "claude",
+                provider_config={"web_search": True, "search_max_uses": 40},
+                response_schema=schema,
+            )
+        assert seen["tools"][0]["max_uses"] == 40
+        assert "response_format" in seen
+
+    def test_searches_are_still_counted_from_the_server_tool_block(self):
+        stream = _completion_stream(text='{"flags": []}', usage=_with_searches(23))
+        with patch.object(client.litellm, "completion", return_value=stream):
+            result = _call(
+                "claude",
+                provider_config={
+                    "model": "claude-opus-5",
+                    "web_search": True,
+                    "search_max_uses": 40,
+                },
+            )
+        assert result["searches"] == 23
+
+    def test_a_call_with_the_tool_counts_as_able_to_search(self):
+        params = client._provider_params(
+            "claude", {"web_search": True, "search_max_uses": 3}
+        )
+        assert client._search_enabled("claude", {"web_search": True}, params)
+        bare = client._provider_params("claude", {})
+        assert not client._search_enabled("claude", {}, bare)
