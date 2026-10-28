@@ -784,6 +784,21 @@ without a GitHub `document_source`, a public repository without
 whose pull request is merged or closed. It prints the commit URL and then the
 review URL.
 
+**A run read from a tag, attached with `--pr N`.** A run of an accepted round
+(`--round N`, read from its tag) names no pull request, so it has nowhere to go
+until the next round is opened. `ci-docs push-run REPORT --pr N` writes it to
+open round pull request N, but only when the commit it reviewed is an ancestor
+of N's head (`GET /compare`, status `ahead` or `identical`): that is how any
+review stands to the revision after it, and the existing compare-and-swap on
+the pipeline's files still applies. The review keeps the commit it reviewed in
+its marker and in `pipeline/run.json` (`reviewed_commit`, `round` of the tag),
+records `pull_request: N` there, and says in the commit message and the review
+which tag it was read from; the drift lines name the files that changed since.
+The review is posted on N's head, because GitHub's review must name a commit of
+the pull request. The report on disk is not changed. `--pr` naming a different
+pull request than the one a report was read from is refused. It exists for the
+case where a round's tag was reviewed after the next round had been opened.
+
 ## Replay, offline and experiments
 
 Unchanged from #410: a replay's report is a code test and is never written back
