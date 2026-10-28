@@ -1133,6 +1133,23 @@ conversation<TAB>slug<TAB>name<TAB>confidence
   Drive, a file, a reproduction's claimed time); the project document's
   `created_at` is used only when nothing else has a time, and the event then
   carries a `hint` saying so.
+* **Rounds follow the author's `rN` labels.** The repository tags a round by its
+  number, and an AI reading the history must see the author's numbers, so when
+  the article's submitted drafts carry `rN` labels in their file names the scan
+  does not start a round at every submitted draft. A submitted draft starts a new
+  round only when its `rN` is **higher than the highest `rN` of the round before
+  it**. A resubmission under the same `rN` (a copy renamed `-superseded-<date>`,
+  an `a` copy) is a later version inside that round; a `vN` or unlabelled draft
+  (`-v4-prerun`) never starts a round; everything before the first `rN` draft is
+  round 1, pre-submission drafting. A run's own number and a reproduction's label
+  do not count as `rN` labels. `check` refuses a plan in which a round carries
+  `rN` labels but not `rK` for its own number K (`r1` then `r3` gives "round 2
+  carries r3, not r2"); the labels are never renumbered. A round with no `rN`
+  label at all is left alone. An article with no `rN` label keeps the grouping
+  above, including the 48-hour gap rule for a chat-only article.
+* **A review document is left out by default.** `apply` refuses an included
+  review (it has no place in an article's folder), so the scan sets `include:
+  false` on a document of kind `review` and says why in `why`.
 * **Metadata goes with the draft it labels.** An author often saves
   `<slug>-metadata-rN.md` seconds or minutes before `<slug>-draft-rN.md`, which
   by time ends the round before. A metadata event whose label is the label of

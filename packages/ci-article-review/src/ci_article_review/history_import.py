@@ -1519,7 +1519,13 @@ def _build_events(collector):
                 kind=item.kind,
                 sha=_sha(item.text),
                 recovered=item.recovered,
-                include=item.kind != "unknown",
+                include=item.kind not in ("unknown", "review"),
+                why=(
+                    "a review document has no place in an article's folder (apply "
+                    "refuses it); set include to true only if that changes"
+                    if item.kind == "review"
+                    else None
+                ),
             ),
         )
         event.holders.append(holder)
@@ -1719,12 +1725,40 @@ def _mark_suspect_runs(run_events):
         event.run_data["suspect_why"] = "; ".join(reasons) if reasons else None
 
 
+def _round_number(event):
+    """The ``rN`` number a draft's file names give it (the highest), or ``None``.
+
+    A run's own number is not a label, and neither is a reproduction's.
+    """
+    numbers = [
+        int(h.label[1:])
+        for h in event.holders
+        if h.label and h.label[0] == "r" and h.source != "recovered"
+    ]
+    return max(numbers) if numbers else None
+
+
 def _group_rounds(events, gap=None):
     """Rounds: a new one at each included, submitted draft version.
+
+    When the article's submitted drafts carry ``rN`` labels, the rounds follow the
+    labels instead, because the repository tags a round by its number and an AI
+    reading the history must see the author's numbers: a submitted draft starts a
+    new round only when its ``rN`` is higher than the highest of the round before
+    it. A resubmission under the same ``rN`` (a copy renamed ``-superseded``, an
+    ``a`` copy) is a later version in that round; a ``vN`` or unlabelled draft
+    never starts one; everything before the first ``rN`` draft is round 1,
+    pre-submission drafting. ``check`` refuses a plan whose round K does not carry
+    ``rK`` (``_check_round_labels``), so a skipped label is never renumbered here.
 
     With a ``gap`` (an article that exists only in chats, issue #430) a new round
     also starts after a silence longer than that between two events.
     """
+    labelled = any(
+        e.kind == "draft" and e.include and e.submitted and _round_number(e) is not None
+        for e in events
+    )
+    highest = 0
 
     def tiebreak(e):
         path = e.run_data["path"] if e.kind == "run" else e.holders[0].path
@@ -1752,6 +1786,16 @@ def _group_rounds(events, gap=None):
             continue
         starts = event.kind == "draft" and event.submitted and event.include
         silent = gap is not None and previous is not None and event.at - previous > gap
+        if labelled:
+            number = _round_number(event) if starts else None
+            opens = number is not None and highest and number > highest
+            if number is not None:
+                highest = max(highest, number)
+            if not rounds or opens:
+                rounds.append({"events": [], "started": False})
+            previous = event.at
+            rounds[-1]["events"].append(event)
+            continue
         if not rounds or (starts and rounds[-1]["started"]) or silent:
             rounds.append({"events": [], "started": False})
         previous = event.at
@@ -2444,6 +2488,51 @@ def _load_source(source, context=None):
     return normalise(raw), None
 
 
+def _plan_round_labels(event):
+    """The ``rN`` numbers a draft record carries: its label and the others it was filed under."""
+    labels = {event.get("label"), *(event.get("other_labels") or [])}
+    return {int(x[1:]) for x in labels if re.fullmatch(r"r\d+", str(x))}
+
+
+def _check_round_labels(rounds):
+    """Round K may not carry ``rN`` labels without carrying ``rK``.
+
+    Applies when the article's submitted drafts carry ``rN`` labels. A round that
+    carries none (drafting before the first submission, a round the author never
+    labelled) is left alone; a round whose labels are all other numbers means a
+    label was skipped or a draft sits in the wrong round, and is refused rather
+    than renumbered.
+    """
+    events = [e for g in rounds for e in g.get("events", []) if e.get("include")]
+    drafts = [e for e in events if e.get("kind") == "draft"]
+    if not any(e.get("submitted") and _plan_round_labels(e) for e in drafts):
+        return []
+    problems = []
+    for group in rounds:
+        number = group.get("round")
+        included = [e for e in group.get("events", []) if e.get("include")]
+        if not included or not isinstance(number, int):
+            continue
+        carried = sorted(
+            {
+                n
+                for e in included
+                if e.get("kind") == "draft"
+                for n in _plan_round_labels(e)
+            }
+        )
+        if carried and number not in carried:
+            found = ", ".join(f"r{n}" for n in carried)
+            problems.append(
+                f"round {number} carries {found}, not r{number}: the rounds must "
+                "follow the author's rN labels, so round K carries the draft "
+                "labelled rK (a label was skipped, or a draft is in the wrong "
+                "round); fix the plan, because the repository tags a round by its "
+                "number"
+            )
+    return problems
+
+
 def check_plan(plan):
     """Problems with an edited plan, as a list of strings (empty means it is fine)."""
     if not isinstance(plan, dict) or plan.get("version") != PLAN_VERSION:
@@ -2515,6 +2604,7 @@ def check_plan(plan):
             )
         if accepted:
             previous_end = accepted
+    problems.extend(_check_round_labels(rounds))
     return problems
 
 
