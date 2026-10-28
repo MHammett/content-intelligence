@@ -786,6 +786,7 @@ class GitHubRepo:
         author=None,
         committer=None,
         deletes=None,
+        parent=None,
     ):
         """Add ``files`` (path -> bytes) to ``branch`` in one fast-forward commit.
 
@@ -817,6 +818,19 @@ class GitHubRepo:
         updating it, GitHub refuses the update as not a fast forward and the
         whole call starts again from the new head, up to ``retries`` more times,
         before ``kind="conflict"``.
+
+        ``parent`` is the commit SHA the caller knows the branch is at, because it
+        made that commit itself a moment ago. The commit is then built on
+        ``parent`` without reading the branch's ref first. Reason: github.com has
+        been seen (undocumented; three times in one 68-commit import) answering
+        ``GET git/ref`` with the head from *before* a ref update the same client
+        made seconds earlier, so a read-then-write loop saw its own previous
+        commit as "someone else's change" and the ``replace`` check refused. Commit
+        objects are immutable, so reading ``parent`` by SHA cannot lag. The ref is
+        still updated with ``force: false``: if another writer really did move the
+        branch, GitHub refuses the update as not a fast forward and the call falls
+        back to the ordinary read of the branch, where ``replace`` and ``deletes``
+        refuse any file that writer changed. Nothing is ever forced.
         """
         replace = dict(replace or {})
         deletes = dict(deletes or {})
@@ -832,11 +846,18 @@ class GitHubRepo:
                 raise ValueError(
                     f"deletes[{path!r}] must be the 40-hex blob SHA the file is expected to have"
                 )
+        if parent is not None and not _FULL_SHA.match(parent):
+            raise ValueError("parent must be the 40-hex commit SHA the branch is at")
         self._refuse_secrets(files, message, refuse_if_contains)
 
         blob_shas = {}  # local blob sha -> sha GitHub holds, valid across retries
+        known = parent  # trusted for the first attempt only
         for attempt in range(retries + 1):
-            head, tree, head_url = self._head(branch)
+            if known is not None:
+                head, tree, head_url = self._commit_head(known)
+                known = None
+            else:
+                head, tree, head_url = self._head(branch)
             to_write, unchanged = self._classify(files, replace, head)
             to_delete = self._classify_deletes(deletes, head)
             if not to_write and not to_delete:
@@ -923,6 +944,7 @@ class GitHubRepo:
         author=None,
         committer=None,
         retries=3,
+        parent=None,
     ):
         """Merge ``other_sha`` into ``branch`` as a merge commit built by hand.
 
@@ -938,12 +960,23 @@ class GitHubRepo:
 
         A branch that moves between the check and the update is retried from the
         new head, up to ``retries`` more times, before ``kind="conflict"``.
-        ``author`` and ``committer`` are as for ``commit_files``.
+        ``author`` and ``committer`` are as for ``commit_files``, and so is
+        ``parent``: the head the caller knows ``branch`` is at, trusted for the
+        first attempt in place of a ref read that may lag the caller's own last
+        update (a stale head here would become the merge's first parent and
+        silently drop the previous merge from the branch's first-parent chain).
         """
         self._refuse_token(commit_message=message)
+        if parent is not None and not _FULL_SHA.match(parent):
+            raise ValueError("parent must be the 40-hex commit SHA the branch is at")
         other = self.resolve(other_sha)
+        known = parent  # trusted for the first attempt only
         for attempt in range(retries + 1):
-            head, _, head_url = self._head(branch)
+            if known is not None:
+                head, _, head_url = self._commit_head(known)
+                known = None
+            else:
+                head, _, head_url = self._head(branch)
             status = self._compare_status(head, other)
             if status == "identical":
                 return CommitResult(
@@ -1321,9 +1354,12 @@ class GitHubRepo:
             )
         if not 200 <= resp.status_code < 300:
             raise self._http_error(resp, f"read branch {branch}")
-        head = resp.json()["object"]["sha"]
-        commit = self._request("GET", f"/repos/{self.repo}/git/commits/{head}").json()
-        return head, commit["tree"]["sha"], commit.get("html_url", "")
+        return self._commit_head(resp.json()["object"]["sha"])
+
+    def _commit_head(self, sha):
+        """(commit sha, tree sha, commit page URL) of the commit ``sha``."""
+        commit = self._request("GET", f"/repos/{self.repo}/git/commits/{sha}").json()
+        return sha, commit["tree"]["sha"], commit.get("html_url", "")
 
     def _classify(self, files, replace, head):
         """Split ``files`` into what to write and what is already there.
