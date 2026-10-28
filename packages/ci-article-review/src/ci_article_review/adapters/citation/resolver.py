@@ -549,7 +549,9 @@ def _check_drift(result, checksum_index):
         "note": (
             "This source's content differs from the last time it was "
             f"checksummed (run {prior_run} of '{prior_article}'{when}). "
-            "A claim previously verified against it may need re-checking."
+            "This run read the current text and it still supports this "
+            "claim; other articles verified against the older text may want "
+            "a look."
         ),
     }
     return result
