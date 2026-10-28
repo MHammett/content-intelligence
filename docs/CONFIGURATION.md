@@ -551,6 +551,7 @@ pipeline:
   link_validation: true         # check HTTP status of every URL in the draft
   wayback_link_check: true      # also query the Wayback Machine for each URL
   wayback_snapshot_stale_days: 180  # snapshots older than this are flagged [STALE]
+  wayback_lookup_cache: true    # remember archive.org answers between runs
 
   drafting_model: claude        # excluded from voice_style — see below
   prompt_cache_layout: false    # see "Prompt cache layout"
@@ -567,6 +568,8 @@ uv run ci-review --draft handoff.md --publication mypub --retry-failed pipeline_
 ```
 
 **`wayback_snapshot_stale_days`** controls when a Wayback Machine snapshot is considered stale. At 180 days (default), a snapshot from more than six months ago triggers a `[STALE]` flag and a manual re-archive recommendation. Lower this for publications with high source-freshness standards (e.g., 90 days for breaking-news adjacent pieces). It applies to both draft link validation and resolved citation URLs.
+
+**`wayback_lookup_cache`** (default `true`) keeps archive.org's answers in `wayback_lookups.sqlite` under the history root, so a URL looked up in an earlier run is not asked about again for 7 days if a snapshot exists and 1 day if none does. Within a run the link pass and Section 9 always share one lookup per URL, whatever this is set to; `false` only stops the file. A lookup that did not complete is never remembered, and submitting a URL for capture forgets it. The run's log line `Wayback lookups:` and `report.json`'s `wayback_lookups` say how many lookups went to archive.org. Delete the file to start over. See [CITATIONS.md](CITATIONS.md#wayback-machine-behavior).
 
 Archiving is not check-only: resolved citation URLs that aren't archived yet are submitted to archive.org's Save Page Now, and a fetch the origin refused (401/403/429), that never reached it (timeout, DNS failure), or that stopped at a certificate which failed verification falls back to reading an archived snapshot. Both are covered in [CITATIONS.md](CITATIONS.md#wayback-machine-behavior).
 
@@ -1984,7 +1987,7 @@ export CI_HISTORY_ROOT="$HOME/ci-history"
 ```
 
 - **Unset or blank, nothing changes:** history stays in `pipeline_history/` under the working directory.
-- **What it moves:** everything `pipeline_history/` holds, for `ci-review` (saved runs, the daily `pipeline_<date>.log`, the `_replay/` tree that `--replay` writes, and the prior-run and archive lookups that a draft run and `--archive-only` make) and for the readers `ci-history-report` and `ci-voice-patterns`. A leading `~` is expanded; a relative path is relative to the working directory, as the default is. When it is set, the run's log starts with a `History root:` line saying where history went.
+- **What it moves:** everything `pipeline_history/` holds, for `ci-review` (saved runs, the daily `pipeline_<date>.log`, the `_replay/` tree that `--replay` writes, the prior-run and archive lookups that a draft run and `--archive-only` make, and the `wayback_lookups.sqlite` store of archive.org answers they share) and for the readers `ci-history-report` and `ci-voice-patterns`. A leading `~` is expanded; a relative path is relative to the working directory, as the default is. When it is set, the run's log starts with a `History root:` line saying where history went.
 - **Readers keep their flag.** `--history-root DIR` on `ci-history-report` and `ci-voice-patterns` still wins over the variable. `ci-review` has no such flag; for a one-off, set the variable for the one command.
 - **`--replay <capture>` and `--retry-failed <capture>` take a path you give them**, so they are not moved: pass the capture's real location, which is now under the shared directory.
 - **Why a variable and not a `user.yaml` key:** `configs/` is git-ignored and per checkout too, so a key there would have to be copied into every new worktree, and `main()` opens the history directory (for its log file) before it loads any config. The variable is shared by every checkout and read first.

@@ -1132,6 +1132,7 @@ content-intelligence/
 │   │   │   │       ├── page_cache.py         one fetch per page per run, shared by the quote check and Section 9
 │   │   │   │       ├── pagination.py         reads past page one of a paginated source
 │   │   │   │       ├── wayback.py            Wayback archive check + Save Page Now submission
+│   │   │   │       ├── wayback_lookup_cache.py  one archive.org lookup per URL per run, remembered across runs
 │   │   │   │       ├── topic_match.py        keyword gating for pointer-only adapters
 │   │   │   │       └── sources/              10 adapters: census, crossref, eia, epa, ferc,
 │   │   │   │                                 fhwa, fred, icc, ilga, pjm

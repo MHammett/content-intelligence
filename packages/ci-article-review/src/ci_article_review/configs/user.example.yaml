@@ -305,6 +305,10 @@ pipeline:
   link_validation: true             # check HTTP status of every URL in the draft
   wayback_link_check: true          # also query the Wayback Machine for each URL
   wayback_snapshot_stale_days: 180  # snapshots older than this are flagged [STALE]
+  # Remember archive.org's answers between runs (wayback_lookups.sqlite under
+  # the history root): a snapshot that exists for 7 days, "none" for 1 day.
+  # Within a run the link pass and Section 9 share one lookup per URL either way.
+  wayback_lookup_cache: true
 
   # Optional Save Page Now capture options, passed straight through to
   # archive.org when this run submits a citation for archiving. Every one is
