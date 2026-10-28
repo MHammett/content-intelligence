@@ -651,3 +651,235 @@ def test_the_command_refuses_a_map_without_an_export_and_a_bad_floor(mapped, tmp
         mapped, tmp_path, "--chat-map", str(mapped.map), "--min-chat-words", "-3"
     )
     assert code != 0
+
+
+# ---------------------------------------------------------------------------
+# Side documents and fragments (issue #434)
+# ---------------------------------------------------------------------------
+
+ARTICLE_LINES = 400  # about 3,600 words: a section of 50 lines is 12.5% of it
+
+
+def attachment(uuid, moment, name, text):
+    return message(
+        uuid,
+        "human",
+        moment,
+        "Here is a file.",
+        attachments=[
+            {
+                "file_name": name,
+                "file_size": 1,
+                "file_type": "md",
+                "extracted_content": text,
+            }
+        ],
+    )
+
+
+def article_chat(mapped, *, side=(), extra=()):
+    """The mapped conversation: a draft and two edits, then what a test adds."""
+    base = prose("a", ARTICLE_LINES)
+    first = base.replace("Sentence 7 of part a", "Sentence 7 of part a, revised,")
+    second = first.replace(
+        "Sentence 9 of part a", "Sentence 9 of part a, also revised,"
+    )
+    mapped.texts = {"base": base, "first": first, "second": second}
+    mapped.conversations[0]["chat_messages"] = [
+        create("d1", when(1, 10), mapped.path, base, "t1"),
+        replace(
+            "d2",
+            when(1, 11),
+            mapped.path,
+            "Sentence 7 of part a",
+            "Sentence 7 of part a, revised,",
+            "t2",
+        ),
+        replace(
+            "d3",
+            when(1, 12),
+            mapped.path,
+            "Sentence 9 of part a",
+            "Sentence 9 of part a, also revised,",
+            "t3",
+        ),
+        *side,
+        *extra,
+    ]
+    mapped.write()
+
+
+def side_documents():
+    return [
+        create("s1", when(1, 13), "/tmp/verification-log.md", prose("v", 60), "u1"),
+        create("s2", when(1, 14), "/tmp/research-batch.md", prose("w", 90), "u2"),
+    ]
+
+
+def sha_of(text):
+    return hi._sha(hi.normalise(text))
+
+
+def by_sha(plan):
+    return {e["sha256"]: e for e in drafts_of(plan)}
+
+
+def test_a_side_document_of_a_linked_chat_is_left_out_with_its_reason(mapped):
+    article_chat(mapped, side=side_documents())
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    for text in mapped.texts.values():
+        assert found[sha_of(text)]["include"] is True
+    for name, words in (("v", 60), ("w", 90)):
+        left = found[sha_of(prose(name, words))]
+        assert left["include"] is False
+        assert left["corroborated"] is False
+        assert "side document" in left["why"]
+        assert "set include to true" in left["why"]
+    assert [e["include"] for e in drafts_of(plan)].count(True) == 3
+    assert plan["chat"]["kept"]["not_versions"] == {"not_related": 2}
+    assert plan["chat"]["kept"]["chat_only"] == 3
+
+
+def test_a_body_only_version_is_kept_and_a_cut_out_section_is_not(mapped):
+    base = prose("a", ARTICLE_LINES)
+    body = "\n".join(base.split("\n")[40:])  # the draft without its first tenth
+    cut = "\n".join(base.split("\n")[100:150])  # a section: 12.5% of the draft
+    article_chat(
+        mapped,
+        extra=[
+            attachment("b1", when(1, 13), f"{SLUG}-body.md", body),
+            attachment("c1", when(1, 14), f"{SLUG}-cut.md", cut),
+        ],
+    )
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    assert found[sha_of(body)]["include"] is True
+    left = found[sha_of(cut)]
+    assert left["include"] is False
+    assert left["why"].startswith("a fragment")
+    assert plan["chat"]["kept"]["not_versions"] == {"fragment": 1}
+    kept = [e["sha256"] for e in drafts_of(plan) if e["include"]]
+    assert len(kept) == 4  # the draft, its two edits and the body-only version
+
+
+def test_the_edit_chain_of_one_message_is_unaffected(mapped):
+    article_chat(mapped, side=side_documents())
+    plan, _ = mapped.scan()
+    found = by_sha(plan)
+    chain = [sha_of(t) for t in mapped.texts.values()]
+    assert all(found[sha]["include"] for sha in chain)
+    assert [found[sha]["at"] for sha in chain] == sorted(
+        found[sha]["at"] for sha in chain
+    )
+
+
+def test_a_left_out_document_is_in_the_summary_and_the_timeline(mapped):
+    article_chat(mapped, side=side_documents())
+    plan, stats = mapped.scan()
+    lines = "\n".join(hi.format_summary(stats))
+    assert "2 side documents" in lines
+    assert "chat:m1/s1" in lines and "chat:m1/s2" in lines
+    assert "set include to true" in lines
+    assert "Sentence" not in lines
+    timeline = hi.format_timeline(plan)
+    assert sum("excluded" in line for line in timeline) == 2
+
+
+def test_the_author_can_put_a_left_out_document_back_by_setting_include(mapped):
+    article_chat(mapped, side=side_documents())
+    plan, _ = mapped.scan()
+    by_sha(plan)[sha_of(prose("v", 60))]["include"] = True
+    assert hi.check_plan(plan) == []
+
+
+def test_a_document_another_source_holds_anchors_the_comparison(mapped):
+    base = prose("a", ARTICLE_LINES)
+    put(
+        mapped.base / "files",
+        f"{SLUG}-draft-v1.md",
+        base.replace("Sentence 5 of part a", "Sentence 5 of part a, filed,"),
+        when(1, 8),
+    )
+    article_chat(mapped, side=side_documents())
+    plan, _ = mapped.scan(files=[mapped.base / "files"])
+    found = by_sha(plan)
+    # The chat's draft resembles the file's: kept, and not chat-only.
+    assert found[sha_of(base)]["include"] is True
+    assert "corroborated" not in found[sha_of(base)]
+    assert found[sha_of(prose("v", 60))]["include"] is False
+    assert found[sha_of(prose("w", 90))]["include"] is False
+
+
+def test_a_side_document_does_not_move_a_round_boundary(mapped):
+    article_chat(
+        mapped,
+        side=[create("s1", when(2, 18), "/tmp/log.md", prose("v", 60), "u1")],
+        extra=[
+            replace(
+                "d4",
+                when(4, 10),
+                mapped.path,
+                "Sentence 11 of part a",
+                "Sentence 11 of part a, much later,",
+                "t4",
+            )
+        ],
+    )
+    plan, _ = mapped.scan()
+    # The edit is 70 hours after the one before it; the side document 30 hours
+    # in does not bridge that silence.
+    assert len(plan["rounds"]) == 2
+    assert [e["include"] for e in plan["rounds"][1]["events"]] == [True]
+
+
+def test_when_no_two_documents_share_text_none_can_be_told_apart_and_all_stay(
+    mapped,
+):
+    mapped.conversations[0]["chat_messages"] = [
+        create("a1", when(1, 10), "/tmp/one.md", prose("p", 60), "u1"),
+        create("a2", when(1, 11), "/tmp/two.md", prose("q", 60), "u2"),
+    ]
+    mapped.write()
+    plan, _ = mapped.scan()
+    assert [e["include"] for e in drafts_of(plan)] == [True, True]
+    assert plan["chat"]["kept"]["undecided"] == 2
+    assert any("share no text" in w for w in plan["warnings"])
+
+
+def test_a_single_document_is_kept_as_before(mapped):
+    mapped.conversations[0]["chat_messages"] = [
+        create("a1", when(1, 10), "/tmp/one.md", prose("p", 60), "u1")
+    ]
+    mapped.write()
+    plan, _ = mapped.scan()
+    assert [e["include"] for e in drafts_of(plan)] == [True]
+
+
+def test_the_edits_of_a_side_document_are_left_out_with_it(mapped):
+    article_chat(
+        mapped,
+        side=[
+            create("s1", when(1, 13), "/tmp/log.md", prose("v", 60), "u1"),
+            replace(
+                "s2",
+                when(1, 14),
+                "/tmp/log.md",
+                "Sentence 3 of part v",
+                "Sentence 3 of part v, amended,",
+                "u2",
+            ),
+        ],
+    )
+    plan, _ = mapped.scan()
+    assert [e["include"] for e in drafts_of(plan)].count(False) == 2
+    assert plan["chat"]["kept"]["chat_only"] == 3
+
+
+def test_the_command_prints_each_left_out_document_with_its_reason(mapped, tmp_path):
+    article_chat(mapped, side=side_documents())
+    code, printed = run_cli(mapped, tmp_path, "--chat-map", str(mapped.map))
+    assert code == 0
+    assert "Left out of the draft history, not versions of the article" in printed
+    assert "chat:m1/s1" in printed
+    assert "Sentence" not in printed

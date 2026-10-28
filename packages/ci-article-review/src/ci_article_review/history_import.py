@@ -100,6 +100,29 @@ _CHAT_SHARE_OF_CANDIDATE = 0.6
 #: fragment and not a version.
 _CHAT_SHARE_OF_VERSION = 0.5
 
+#: A version only a chat holds (issue #430) must also be a version *of this
+#: article* (issue #434). A linked conversation holds the article's drafts and
+#: also its side documents (a verification log, a research batch, a source
+#: excerpt), and a whole document of enough words passes the rule above either
+#: way. The test is 8-word shingle containment: the share of a document's
+#: 8-word windows that appear in the article's other versions. Measured on three
+#: real articles, every side document scored 0.00-0.03 and the genuine drafts
+#: scored 0.14 or more against the others (lowest 0.14, 0.35, 0.47, most far
+#: higher). 0.10 is over three times the highest side document and below the
+#: lowest genuine draft.
+_SHINGLE_WORDS = 8
+_RELATED_SHARE = 0.10
+
+#: A text that sits inside a version it is a small part of is a fragment, not a
+#: version: a section cut from a 51 KB draft (about 6 KB, 0.87 of it inside the
+#: draft) covers 12% of the draft, and the body-only versions of a draft cover
+#: 76% or more. A text is a fragment when at least ``_FRAGMENT_INSIDE`` of it is
+#: inside some version and it covers less than ``_COVERS_SHARE`` of every other
+#: version. Half is also what ``_CHAT_SHARE_OF_VERSION`` already asks of a text
+#: that resembles a version.
+_FRAGMENT_INSIDE = 0.5
+_COVERS_SHARE = 0.5
+
 #: How far from a reproduction's claimed time an export version may be and still
 #: stand in for it (the label must match too).
 _REPRODUCTION_WINDOW = timedelta(days=3)
@@ -429,6 +452,9 @@ class Event:
     attached_to: object = None
     #: kept from a linked conversation although no other source holds a similar version
     uncorroborated: bool = False
+    #: left out of the plan as not a version of the article: "not_related" or
+    #: "fragment" (``why`` says which, with the numbers); include: true keeps it
+    unrelated: object = None
 
     @property
     def label(self):
@@ -935,6 +961,102 @@ def _chat_only_problem(candidate, text, part, kept_shas, terms, min_words):
     return None
 
 
+def _shingles(text):
+    """The set of ``_SHINGLE_WORDS``-word windows of a text (hashed)."""
+    words = normalise(text).split()
+    size = _SHINGLE_WORDS
+    if not words:
+        return frozenset()
+    if len(words) <= size:
+        return frozenset([hash(tuple(words))])
+    return frozenset(
+        hash(tuple(words[i : i + size])) for i in range(len(words) - size + 1)
+    )
+
+
+def _share(part, whole):
+    """The share of ``part``'s shingles that ``whole`` holds."""
+    return len(part & whole) / len(part) if part else 0.0
+
+
+def _not_versions(alone, anchors):
+    """Which texts only a linked chat holds are not versions of the article.
+
+    ``alone`` is ``[(sha, text)]`` in time order. ``anchors`` are the texts of
+    the versions another source holds (a run, a file, Drive, a reproduction, or
+    a chat text that resembles one). Returns ``(left_out, undecided)``:
+    ``{sha: (code, share)}`` and how many texts could not be judged.
+
+    A text is kept while ``_RELATED_SHARE`` of its shingles are in the versions
+    kept so far: the anchors first, then the chat's own texts one after another
+    until none more joins, so a draft that grew over a conversation is followed
+    from version to version. With no anchor the biggest group of texts that
+    share text with one another (by words) is the article; if no two share any,
+    nothing says which is the article and none is left out. Of the kept, a
+    fragment is left out (see ``_FRAGMENT_INSIDE``).
+    """
+    order = [sha for sha, _ in alone]
+    shingles = {sha: _shingles(text) for sha, text in alone}
+    words = {sha: len(text.split()) for sha, text in alone}
+    held = [_shingles(text) for text in anchors]
+    kept = []
+    if not held:
+        group = {sha: {sha} for sha in order}
+        for i, a in enumerate(order):
+            for b in order[i + 1 :]:
+                related = max(
+                    _share(shingles[a], shingles[b]), _share(shingles[b], shingles[a])
+                )
+                if related >= _RELATED_SHARE:
+                    merged = group[a] | group[b]
+                    for member in merged:
+                        group[member] = merged
+        biggest = max(
+            (frozenset(g) for g in group.values()),
+            key=lambda g: (sum(words[s] for s in g), len(g)),
+            default=frozenset(),
+        )
+        if len(biggest) < 2:
+            return {}, len(order)
+        kept = [sha for sha in order if sha in biggest]
+    union = set()
+    for part in [*held, *(shingles[sha] for sha in kept)]:
+        union |= part
+    left = [sha for sha in order if sha not in kept]
+    grew = True
+    while grew:
+        grew = False
+        for sha in list(left):
+            if _share(shingles[sha], union) >= _RELATED_SHARE:
+                left.remove(sha)
+                kept.append(sha)
+                union |= shingles[sha]
+                grew = True
+    out = {sha: ("not_related", _share(shingles[sha], union)) for sha in left}
+    everyone = [*held, *(shingles[sha] for sha in kept)]
+    for sha in kept:
+        mine = shingles[sha]
+        others = [o for o in everyone if o is not mine]
+        inside = any(_share(mine, o) >= _FRAGMENT_INSIDE for o in others)
+        covers = max((_share(o, mine) for o in others), default=0.0)
+        if inside and covers < _COVERS_SHARE:
+            out[sha] = ("fragment", covers)
+    return out, 0
+
+
+_UNRELATED_WHY = {
+    "not_related": (
+        "only {share:.0%} of its text is in the article's other versions (at "
+        "least {need:.0%} is expected): it looks like a side document of the "
+        "conversation, not a draft"
+    ),
+    "fragment": (
+        "a fragment: most of it is inside another version, which it covers only "
+        "{share:.0%} of (at least {need:.0%} is expected of a version)"
+    ),
+}
+
+
 def _ingest_chat(chat, versions, version_for, ref_texts, terms):
     """Turn the export's candidates into draft versions (or sources of existing ones).
 
@@ -1066,6 +1188,38 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
         }
         for sha in alone:
             versions[sha].uncorroborated = True
+        corroborated = len(kept_shas) - len(alone)
+        held_texts = [
+            *ref_texts,
+            *(versions[sha].text for sha in explicit_kept - alone),
+        ]
+        in_order = [
+            (sha, versions[sha].text)
+            for sha in sorted(
+                alone,
+                key=lambda sha: (min(h.time for h in versions[sha].holders), sha),
+            )
+        ]
+        left_out, undecided = _not_versions(in_order, held_texts)
+        for sha, (code, share) in left_out.items():
+            need = _RELATED_SHARE if code == "not_related" else _COVERS_SHARE
+            version = versions[sha]
+            version.include = False
+            version.unrelated = code
+            version.why = _UNRELATED_WHY[code].format(share=share, need=need) + (
+                "; set include to true in the plan to keep it"
+            )
+        alone = alone - set(left_out)
+        chat["report"].update(
+            {
+                "not_versions": {
+                    code: sum(1 for c, _ in left_out.values() if c == code)
+                    for code in _UNRELATED_WHY
+                    if any(c == code for c, _ in left_out.values())
+                },
+                "undecided": undecided,
+            }
+        )
         chat["report"].update(
             {
                 "chat_only": len(alone),
@@ -1076,7 +1230,7 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
                     )
                     if n
                 },
-                "corroborated": len(kept_shas) - len(alone),
+                "corroborated": corroborated,
                 "chat_only_skipped": dict(sorted(skipped.items())),
             }
         )
@@ -1278,6 +1432,14 @@ def _build_events(collector):
             collector.terms,
         )
 
+    if chat is not None and chat["report"].get("undecided"):
+        collector.warnings.append(
+            f"--chat-export: {chat['report']['undecided']} documents only a linked "
+            "conversation holds share no text with one another, so none could be "
+            "told from a side document of the conversation; all are kept. Set "
+            "include to false in the plan for any that is not the article"
+        )
+
     # Reproductions: any other source holding the version wins.
     for item, holder, text in sorted(
         recovered_drafts, key=lambda r: (r[1].path, r[1].part or "")
@@ -1419,6 +1581,13 @@ def _group_rounds(events, gap=None):
     rounds = []
     previous = None
     for event in placed:
+        if event.unrelated:
+            # Left out as not a version: it joins the round that is open, and it
+            # neither starts one nor ends a silence.
+            if not rounds:
+                rounds.append({"events": [], "started": False})
+            rounds[-1]["events"].append(event)
+            continue
         starts = event.kind == "draft" and event.submitted and event.include
         silent = gap is not None and previous is not None and event.at - previous > gap
         if not rounds or (starts and rounds[-1]["started"]) or silent:
@@ -1556,7 +1725,7 @@ def scan(
     # a round ends: a silence of more than 48 hours does.
     chat_only_article = (
         not run_events
-        and any(d.uncorroborated for d in drafts)
+        and any(d.uncorroborated and d.include for d in drafts)
         and not any(d.submitted and d.include for d in drafts)
     )
     rounds = _group_rounds(all_events, _ROUND_GAP if chat_only_article else None)
@@ -1777,6 +1946,17 @@ def _stats(collector, drafts, others, run_events, rounds, root, root_why, keys, 
             "chat_map": chat["chat_map"] is not None,
             "min_chat_words": chat["min_words"],
             **chat["report"],
+            "left_out_documents": [
+                {
+                    "id": d.id,
+                    "source": d.holders[0].path,
+                    "via": d.holders[0].via,
+                    "words": len(d.text.split()),
+                    "why": d.why,
+                }
+                for d in drafts
+                if d.unrelated
+            ],
         }
     return stats
 
@@ -1928,6 +2108,19 @@ def _format_chat(chat):
         lines.append(
             f"  Not kept from linked conversations (at least {chat['min_chat_words']} "
             f"words, whole documents only): {left or 'none'}"
+        )
+    for code, label in (("not_related", "side documents"), ("fragment", "fragments")):
+        count = chat.get("not_versions", {}).get(code)
+        if count:
+            lines.append(
+                f"  Left out of the draft history, not versions of the article "
+                f"({count} {label}); each is in the plan with include: false and "
+                "its reason"
+            )
+    for item in chat.get("left_out_documents", []):
+        lines.append(
+            f"    {item['id']}  {item['source']}  {item['via']}  {item['words']} "
+            f"words: {item['why']}"
         )
     lines.append(
         f"  Reproductions: {chat.get('confirmed', 0)} confirmed by the export, "
