@@ -29,6 +29,12 @@ that was absent then must still be absent. Anything else is refused and nothing
 is overwritten. A report under ``_replay/`` is never pushed, and nothing is
 written to a pull request that has been merged or closed.
 
+A run read from a tag or a ref (``--round`` of an accepted round) names no pull
+request. ``push-run --pr N`` attaches it to open round pull request N, but only
+when the commit it reviewed is an ancestor of that pull request's head, which is
+how any review stands to the revision after it. The review then says it is of
+that commit and was read from the tag, not from the pull request.
+
 Every failure is a ``GitHubDocumentsError`` (a ``ValueError``, which
 ``pipeline.main`` turns into one plain message and exit 1); the local files are
 already saved by then and the message says how to retry.
@@ -124,7 +130,9 @@ def _load_report(path):
 class _Plan:
     """What a saved run would write: the article, its numbers and the files."""
 
-    def __init__(self, slug, run_number, run_name, folder, source, files):
+    def __init__(
+        self, slug, run_number, run_name, folder, source, files, attached=False
+    ):
         self.slug = slug
         self.run_number = run_number
         #: ``run_N_<ts>``: how the run's files are named in ``pipeline_history``.
@@ -133,6 +141,8 @@ class _Plan:
         self.source = source
         #: ``{path in the repository: LF bytes}``
         self.files = files
+        #: Read from a tag or a ref and attached to a pull request by ``--pr``.
+        self.attached = attached
 
     @property
     def names(self):
@@ -183,12 +193,13 @@ def _run_json(report, report_path, run_number, source, run_name):
     return (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def plan_files(report_path, report, *, include_capture):
+def plan_files(report_path, report, *, include_capture, pr=None):
     """The files a saved run writes back, read from beside its report.
 
     Everything comes from the report and the files next to it. The folder is
     where the draft was read from (the directory of the first file in
-    ``document_source``), so ``path_prefix`` need not be known here.
+    ``document_source``), so ``path_prefix`` need not be known here. ``pr``
+    names the pull request for a run that was read from a tag or a ref.
     """
     report_path = Path(report_path)
     if "_replay" in report_path.resolve().parts:
@@ -203,12 +214,29 @@ def plan_files(report_path, report, *, include_capture):
             "reviewed from --github, so there is no folder to write it to."
         )
     pull = source.get("pull_request")
-    if isinstance(pull, bool) or not isinstance(pull, int) or pull < 1:
+    named = not (isinstance(pull, bool) or not isinstance(pull, int) or pull < 1)
+    attached = False
+    if pr is not None:
+        if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
+            raise GitHubDocumentsError(
+                f"--pr must be a pull request number, not {pr!r}."
+            )
+        if named and pull != pr:
+            raise GitHubDocumentsError(
+                f"{report_path.name} was read from pull request #{pull}, so it is "
+                f"written there, not to #{pr}. Leave out --pr."
+            )
+        if not named:
+            # A copy: the report on disk keeps saying where the run read from.
+            source = {**source, "pull_request": pr}
+            attached = True
+    elif not named:
         raise GitHubDocumentsError(
             f"{report_path.name}: document_source names no pull request. It was "
             "read from a tag or a ref (--round of an accepted round, or "
             "--github-ref), and a review is written only to a round's open pull "
-            "request. Review the round's pull request to get one."
+            "request. Pass --pr N to attach it to open round pull request N, "
+            "whose head must descend from the commit it reviewed."
         )
     read = source.get("files") or []
     first = read[0].get("path") if read and isinstance(read[0], dict) else None
@@ -262,7 +290,7 @@ def plan_files(report_path, report, *, include_capture):
                     f"{local} is missing, so this run cannot be written back."
                 ) from None
             log.warning("%s was not saved, so it is not written back.", local.name)
-    return _Plan(slug, run_number, run_name, folder, source, files)
+    return _Plan(slug, run_number, run_name, folder, source, files, attached)
 
 
 def _drift_lines(client, plan, branch):
@@ -400,7 +428,18 @@ def _open_pull(client, plan, repo_name, report_path):
             f"not from a branch of {repo_name}. A fork's branch is never written."
         )
     ref = plan.source.get("ref")
-    if isinstance(ref, str) and ref and ref != pull.head_ref:
+    if plan.attached:
+        # The run read a tag or a ref, not this branch. Its review applies here
+        # only if the branch grew from what it reviewed.
+        status = client.compare(plan.commit, pull.head_sha).status
+        if status not in ("ahead", "identical"):
+            raise GitHubDocumentsError(
+                f"{report_path.name} reviewed {plan.commit[:7]}, which is not an "
+                f"ancestor of pull request #{number}'s head {pull.head_sha[:7]} "
+                f"(compare: {status}). Its review is not of this branch's history, "
+                "so nothing was written."
+            )
+    elif isinstance(ref, str) and ref and ref != pull.head_ref:
         raise GitHubDocumentsError(
             f"Pull request #{number} is from {pull.head_ref!r}, but "
             f"{report_path.name} was read from {ref!r}. Nothing was written."
@@ -414,6 +453,7 @@ def push_saved_run(
     settings,
     api_keys,
     repo=None,
+    pr=None,
     client=None,
     token_lookup=None,
     session=None,
@@ -429,14 +469,18 @@ def push_saved_run(
     ``settings`` is the normalised ``github_documents`` block (``include_capture``
     and ``allow_public_repo`` are read here); ``api_keys`` is the merged key
     table, none of whose values may appear in what is sent. ``repo`` stands
-    in for the repository the report names. Raises ``GitHubDocumentsError`` with
+    in for the repository the report names; ``pr`` attaches a run read from a
+    tag or a ref to that open pull request (``plan_files``). Raises ``GitHubDocumentsError`` with
     a plain message, before anything is sent for every refusal that can be
     decided locally.
     """
     report_path = Path(report_path)
     report = _load_report(report_path)
     plan = plan_files(
-        report_path, report, include_capture=bool(settings.get("include_capture"))
+        report_path,
+        report,
+        include_capture=bool(settings.get("include_capture")),
+        pr=pr,
     )
     repo_name = (repo or plan.source.get("repo") or "").strip()
     if not repo_name or not plan.commit:
@@ -470,6 +514,12 @@ def push_saved_run(
                 f"{report_path.name} was read from."
             )
         drift = _drift_lines(client, plan, branch)
+        if plan.attached:
+            drift.insert(
+                0,
+                f"Read from {plan.source.get('ref') or 'a ref'} at {plan.commit[:7]}, "
+                f"not from this pull request; attached with --pr {plan.pull_number}.",
+            )
         # Refuse a body that holds a key before anything at all is sent, not
         # after the commit has landed. The commit's SHA, which the final body
         # links, is the only thing that differs.
@@ -509,8 +559,13 @@ def push_saved_run(
                 f"#{plan.pull_number}, so none was posted: {existing.html_url}"
             )
             return PushResult(result, existing, False)
+        # A commit outside the pull request cannot carry its review, so an
+        # attached run's review is posted on the head it was checked against.
         review = client.create_review(
-            plan.pull_number, commit_id=plan.commit, body=body, event="COMMENT"
+            plan.pull_number,
+            commit_id=pull.head_sha if plan.attached else plan.commit,
+            body=body,
+            event="COMMENT",
         )
         out(f"Posted the review on pull request #{plan.pull_number}: {review.html_url}")
         return PushResult(result, review, True)

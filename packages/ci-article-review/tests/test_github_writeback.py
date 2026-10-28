@@ -119,6 +119,25 @@ class RoundGitHub(StrictGitHub):
             "html_url": f"https://github.com/{REPO}/pull/{number}",
         }
 
+    def _ancestors(self, sha):
+        seen, todo = [], [sha]
+        while todo:
+            commit = todo.pop()
+            if commit not in seen:
+                seen.append(commit)
+                todo.extend(self.commits[commit]["parents"])
+        return seen
+
+    def _compare(self, base, head):
+        """``GET /compare/base...head`` as GitHub answers it, for linear histories."""
+        if base == head:
+            return {"status": "identical", "ahead_by": 0, "behind_by": 0}
+        if base in self._ancestors(head):
+            return {"status": "ahead", "ahead_by": 1, "behind_by": 0}
+        if head in self._ancestors(base):
+            return {"status": "behind", "ahead_by": 0, "behind_by": 1}
+        return {"status": "diverged", "ahead_by": 1, "behind_by": 1}
+
     def _route(self, method, path, headers, params, body):
         if (method, path) == ("GET", "/pulls"):
             # The listing the automatic tagging step (#418) reads before a
@@ -134,6 +153,9 @@ class RoundGitHub(StrictGitHub):
             )
         if method == "GET" and path.startswith("/git/matching-refs/"):
             return Resp(200, [])  # no tags: nothing to tell from a tagged round
+        compared = re.fullmatch(r"/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)", path)
+        if method == "GET" and compared:
+            return Resp(200, self._compare(*compared.groups()))
         found = re.fullmatch(r"/pulls/(\d+)(/reviews)?", path)
         if not found:
             return super()._route(method, path, headers, params, body)
@@ -1253,3 +1275,97 @@ class TestPushRunCommand:
         toml = Path(documents_cli.__file__).parents[2] / "pyproject.toml"
         scripts = tomllib.loads(toml.read_text(encoding="utf-8"))["project"]["scripts"]
         assert [k for k in scripts if k.startswith("ci-docs")] == ["ci-docs"]
+
+
+TAG = f"{SLUG}/r4"
+
+
+def tag_source(fake, commit=None):
+    """``document_source`` as ``--round 4`` of an accepted round leaves it: a tag, no pull request."""
+    return {**read_source(fake, commit), "ref": TAG, "pull_request": None}
+
+
+class TestAttachingARunReadFromATag:
+    """``push-run --pr N``: a run of an accepted round's tag, written to the next round's pull request."""
+
+    def test_it_is_written_to_the_pull_request_and_says_where_it_was_read(
+        self, client, tmp_path
+    ):
+        reviewed = client.read_at
+        # The next round's branch has a revision on top of what was reviewed.
+        client.external_commit(
+            BRANCH, {f"{FOLDER}/draft.md": b"# Example\n\nRevised.\n"}
+        )
+        head = client.branches[BRANCH]
+        path = saved_run(tmp_path, tag_source(client, reviewed))
+        result, lines = push(path, pr=PR)
+        assert set(result.written) == set(OWNED)
+        run = json.loads(client.file(f"{FOLDER}/pipeline/run.json", BRANCH))
+        assert run["reviewed_commit"] == reviewed and run["pull_request"] == PR
+        [review] = client.posted()
+        # Posted on the head it was checked against; the marker names what it reviewed.
+        assert review["commit_id"] == head
+        assert review_body.is_review_of(review["body"], 4, reviewed)
+        assert f"Read from {TAG} at {reviewed[:7]}" in review["body"]
+        assert f"Read from {TAG}" in client.commits[client.branches[BRANCH]]["message"]
+        # The report on disk still says it was read from the tag.
+        assert (
+            json.loads(path.read_text(encoding="utf-8"))["document_source"][
+                "pull_request"
+            ]
+            is None
+        )
+        # A second push is a no-op in both halves.
+        again, _ = push(path, pr=PR)
+        assert not again.written and not again.review_posted
+        assert len(client.posted()) == 1
+
+    def test_a_commit_that_is_not_an_ancestor_of_the_head_is_refused(
+        self, client, tmp_path
+    ):
+        client.branches["elsewhere"] = client.branches["main"]
+        stray = client.external_commit(
+            "elsewhere",
+            {f"{FOLDER}/draft.md": b"other\n", f"{FOLDER}/metadata.md": b"m\n"},
+        )
+        path = saved_run(tmp_path, tag_source(client, stray))
+        head = client.branches[BRANCH]
+        with pytest.raises(GitHubDocumentsError, match="not an ancestor"):
+            push(path, pr=PR)
+        assert client.branches[BRANCH] == head
+        assert client.writes == [] and client.review_posts == []
+
+    def test_a_closed_pull_request_still_gets_nothing(self, client, tmp_path):
+        path = saved_run(tmp_path, tag_source(client))
+        client.pulls[PR].update(state="closed", merged=True)
+        with pytest.raises(gw.PullRequestClosed):
+            push(path, pr=PR)
+        assert client.writes == []
+
+    def test_a_run_read_from_a_pull_request_goes_only_to_that_one(
+        self, client, tmp_path
+    ):
+        path = saved_run(tmp_path, read_source(client))
+        with pytest.raises(
+            GitHubDocumentsError, match=f"#{PR}, so it is written there"
+        ):
+            push(path, pr=PR + 1)
+        assert client.requests == []
+        # Naming its own pull request is the same as naming none.
+        assert push(path, pr=PR)[0].written
+
+    def test_without_pr_the_refusal_says_how_to_attach_it(self, client, tmp_path):
+        with pytest.raises(GitHubDocumentsError, match="Pass --pr N"):
+            push(saved_run(tmp_path, tag_source(client)))
+        assert client.requests == []
+
+    def test_the_command_takes_pr(self, cli_client, tmp_path):
+        path = saved_run(tmp_path, tag_source(cli_client))
+        with patch.object(
+            gw,
+            "GitHubRepo",
+            lambda repo, token, session=None: GitHubRepo(repo, token, session=session),
+        ):
+            code, out = run_cli(cli_client, path, "--pr", PR)
+        assert code == 0 and "Wrote 4 file(s)" in out
+        assert len(cli_client.posted()) == 1
