@@ -218,7 +218,9 @@ def _read_response(resp, url):
     else:
         text, kind = resolver._extract_fetched(resp, url)
         texts, partial = [text], False
-        encoding = resp.encoding or "utf-8"
+        # The same charset choice as ``_extract_fetched`` (issue #439), so the
+        # two views of one page agree on what its dashes and quotes are.
+        encoding = extract.response_encoding(resp)
         if kind == "html":
             decoded = raw.decode(encoding, errors="replace")
             texts.append(all_page_text(decoded))

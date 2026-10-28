@@ -584,3 +584,28 @@ class TestDemotion:
             results, None, {(_URL, _QUOTE): {"found": False}}
         )
         assert repr(results) == before
+
+
+class TestPageCharsetFollowsTheDocument:
+    """Both views of a page are decoded by its declared charset (issue #439).
+
+    The second view, ``all_page_text``, decoded the raw bytes with
+    ``resp.encoding`` on its own, so it could disagree with the extracted view
+    about what a dash was; now both go through ``extract.response_encoding``.
+    """
+
+    _BODY = (
+        '<html><head><meta charset="UTF-8"></head><body><nav>Home</nav><article>'
+        "<p>Once built, a large data center may employ only 20–50 full-time workers. "
+        "Protecting local watersheds is part of the pledge, especially where water stress "
+        "is growing, and the design consumes zero water for cooling.</p>"
+        "</article></body></html>"
+    )
+
+    def test_a_quote_with_a_dash_is_found_on_a_bare_text_html_page(self):
+        resp = _Resp(self._BODY, content_type="text/html")
+        resp.encoding = "ISO-8859-1"  # what requests reports for that header
+        page = qc._read_response(resp, _URL)
+        assert page.status == "read"
+        assert all("20–50" in t for t in page.texts)
+        assert qc.quote_found("employ only 20–50 full-time workers", page.texts) is True
