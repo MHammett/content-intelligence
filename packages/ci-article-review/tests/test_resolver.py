@@ -4106,3 +4106,55 @@ class TestARefusedSubmissionIsRecordedWithItsCode:
         wb = entry["wayback"]
         assert wb["archive_outcome"] == wayback.ARCHIVE_SUBMITTED
         assert "submission_error_code" not in wb
+
+
+class TestPageCharsetFollowsTheDocument:
+    """A UTF-8 page served as bare ``text/html`` is decoded as UTF-8 (issue #439).
+
+    ``requests`` reports ``ISO-8859-1`` for such a response. Reading the page
+    with that turned every en dash into mojibake, the verifier was shown the
+    mojibake, and its verbatim quote failed ``_quote_is_grounded``: five of
+    five claims against one site came back unverifiable in a real run.
+    """
+
+    _BODY = (
+        '<html><head><meta charset="UTF-8"></head><body><article>'
+        "<p>Once built, a large data center may employ only 20–50 full-time workers.</p>"
+        "<p>It projects 7–12% of national electricity by 2028.</p>"
+        "</article></body></html>"
+    )
+
+    def _resp(self, content_type):
+        return type(
+            "R",
+            (),
+            {
+                "status_code": 200,
+                "url": "https://example.com/facts",
+                "content": self._BODY.encode("utf-8"),
+                "headers": {"Content-Type": content_type},
+                "encoding": "ISO-8859-1" if "charset" not in content_type else "utf-8",
+            },
+        )()
+
+    def test_a_bare_text_html_header_keeps_the_dashes(self):
+        text, kind = resolver._extract_fetched(
+            self._resp("text/html"), "https://example.com/facts"
+        )
+        assert kind == "html"
+        assert "20–50 full-time workers" in text
+        assert "â€" not in text
+
+    def test_the_verifier_quote_is_then_grounded(self):
+        text, _ = resolver._extract_fetched(
+            self._resp("text/html"), "https://example.com/facts"
+        )
+        assert resolver._quote_is_grounded(
+            "a large data center may employ only 20–50 full-time workers", text
+        )
+
+    def test_a_header_charset_is_still_honoured(self):
+        text, _ = resolver._extract_fetched(
+            self._resp("text/html; charset=utf-8"), "https://example.com/facts"
+        )
+        assert "20–50 full-time workers" in text

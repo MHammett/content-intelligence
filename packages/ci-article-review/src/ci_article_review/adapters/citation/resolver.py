@@ -444,7 +444,10 @@ def _extract_fetched_with_coverage(resp, url):
             resp.content,
             content_type=resp.headers.get("Content-Type"),
             url=url,
-            encoding=resp.encoding or "utf-8",
+            # Not ``resp.encoding``: that is Latin-1 for any text/html body
+            # whose header names no charset, and the page's own declaration
+            # is what a browser would honour (issue #439).
+            encoding=extract.response_encoding(resp),
         )
         try:
             setattr(resp, _EXTRACTED_ATTR, (url, extracted))
