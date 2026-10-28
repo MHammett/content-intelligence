@@ -3535,6 +3535,15 @@ def run_draft_pipeline(
             len(broken),
             len(not_archived),
         )
+        # When archive.org's breaker opened, if it did, so Section 9 can tell
+        # whether it has been shut long enough to try again (issue #445).
+        if wayback.note_breaker_state():
+            log.warning(
+                "archive.org rate-limited link validation; its lookups were "
+                "skipped after the breaker opened. Section 9 tries again if "
+                "it starts at least %d min from now.",
+                wayback.BREAKER_COOLDOWN_SECONDS // 60,
+            )
     else:
         # Not checked, rather than checked and empty. An empty list here was
         # indistinguishable from a draft with no links, so every reader took it
@@ -4480,6 +4489,9 @@ def run_draft_pipeline(
         or None
     )
     if claims:
+        # A breaker the link pass tripped half an hour ago is not a reason for
+        # every citation to go without its archive lookup (issue #445).
+        wayback.reopen_breaker_if_cooled()
         citation_results = resolve_citations(
             claims,
             citation_sources,
@@ -4730,6 +4742,11 @@ def run_draft_pipeline(
     # and what the circuit breaker counts against.
     report["wayback_lookups"] = wayback.lookup_cache_summary()
     wayback.close_lookup_cache()
+    # Only when the breaker opened, so a run archive.org never refused carries
+    # no new field (and the golden report stays as it was).
+    breaker = wayback.breaker_summary()
+    if breaker:
+        report["wayback_breaker"] = breaker
     if report["wayback_lookups"]["lookups"]:
         wl = report["wayback_lookups"]
         log.info(

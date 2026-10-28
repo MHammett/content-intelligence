@@ -2068,12 +2068,17 @@ def _note_breaker_state():
     exists to explain is precisely the run with zero targets, which returns
     early and never reaches the end of that function. It has to sit outside.
     """
-    if wayback.rate_limited_out():
+    if wayback.note_breaker_state():
+        summary = wayback.breaker_summary()
+        when = summary.get("first_seen_open_utc")
+        reopened = summary.get("reopened", 0)
         log.warning(
             "archive.org's rate-limit breaker was open at the end of the "
-            "archiving pass — lookups and submissions after it tripped were "
+            "archiving pass%s%s — lookups and submissions after it tripped were "
             "skipped, so an unknown archive status this run is this, not a "
-            "statement about the pages"
+            "statement about the pages",
+            f" (first seen open at {when})" if when else "",
+            f", after {reopened} retry(ies) this run" if reopened else "",
         )
 
 
