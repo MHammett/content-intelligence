@@ -19,6 +19,7 @@ raising: callers must be able to tell "read it, and here is the text" from
 would collapse that distinction into a generic failure.
 """
 
+import codecs
 import logging
 import re
 import time
@@ -442,6 +443,81 @@ def looks_like_binary(text):
         return False
     bad = sum(1 for c in text if c == "\ufffd" or (ord(c) < 0x20 and c not in "\t\n\r"))
     return bad / len(text) > _MAX_UNDECODABLE_RATIO
+
+
+#: ``<meta charset="...">`` or ``<meta http-equiv="Content-Type" content="...;
+#: charset=...">`` in the head of an HTML document, and the ``encoding`` of an
+#: XML declaration. Matched on bytes: the declaration is ASCII whatever the
+#: document's own encoding is, which is the point of it.
+_DECLARED_CHARSET = re.compile(
+    rb"""charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)|<\?xml[^>]*encoding=["']([A-Za-z0-9_.:-]+)""",
+    re.IGNORECASE,
+)
+#: How far into the body a charset declaration is looked for. The HTML standard
+#: tells browsers to scan the first 1024 bytes; real pages put it behind a long
+#: run of ``<link>`` and ``<script>`` tags often enough that this reads further.
+_CHARSET_SCAN_BYTES = 8192
+
+
+def response_encoding(resp):
+    """The charset to decode ``resp.content`` with.
+
+    ``requests`` sets ``resp.encoding`` to ``ISO-8859-1`` for any ``text/*``
+    body whose ``Content-Type`` header names no charset (an RFC 2616 default
+    that HTML pages have not followed in twenty years), and the readers here
+    used to pass that straight through. A UTF-8 page served with a bare
+    ``text/html`` header, which is what static hosting commonly sends, was then
+    decoded as Latin-1: every en dash, curly quote and emoji became mojibake,
+    the relevance verifier was shown the mojibake, and the verbatim quote it
+    gave back could never be found in it (issue #439; five of five claims
+    against one such site were reported unverifiable, and all five verified
+    once decoded correctly).
+
+    The order is the one a browser uses. A charset in the header wins. Failing
+    that, the document's own declaration (``<meta charset>``, the http-equiv
+    form, or an XML declaration), provided Python knows the codec. Failing
+    that, the body is tried as UTF-8 and kept if it decodes without error,
+    since UTF-8 is self-validating and legacy-encoded text with any non-ASCII
+    bytes almost never passes. Only then the library's guess
+    (``apparent_encoding``, where the response type offers one), and last of
+    all whatever the response said, or UTF-8.
+
+    A PDF never gets here in a way that matters -- its bytes go to the PDF
+    extractor -- but the function is cheap on one anyway, because the
+    declaration scan reads only the first few kilobytes and the UTF-8 probe
+    is skipped when the body does not look like text.
+    """
+    headers = getattr(resp, "headers", None) or {}
+    content_type = str(headers.get("Content-Type") or "")
+    declared_in_header = "charset=" in content_type.lower()
+    own = getattr(resp, "encoding", None)
+    if declared_in_header and own:
+        return own
+
+    raw = getattr(resp, "content", b"") or b""
+    if isinstance(raw, str):
+        return own or "utf-8"
+    if looks_like_pdf(content_type, None, raw):
+        return own or "utf-8"
+
+    match = _DECLARED_CHARSET.search(raw[:_CHARSET_SCAN_BYTES])
+    if match:
+        declared = (match.group(1) or match.group(2) or b"").decode("ascii", "ignore")
+        try:
+            return codecs.lookup(declared).name
+        except LookupError:
+            pass
+
+    try:
+        raw.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        pass
+
+    apparent = getattr(resp, "apparent_encoding", None)
+    if apparent:
+        return apparent
+    return own or "utf-8"
 
 
 def extract_response_text(raw, content_type=None, url=None, encoding="utf-8"):
