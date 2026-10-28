@@ -5785,29 +5785,14 @@ def _print_draft_summary(
             print(
                 f"  {len(stale)} resolved URL(s) have a stale Wayback snapshot (>180 days)"
             )
+        # A note, not a warning: every source here was read again this run and
+        # still supports its claim (issue #446; see the report's drift note).
         changed = [c for c in verified if c.get("content_changed_since")]
         if changed:
-            print(f"\n{'!' * 60}")
             print(
-                f"WARNING: {len(changed)} verified source(s) have changed content "
-                "since a prior run checksummed them:"
+                f"  {len(changed)} verified source(s) have changed text since an "
+                "earlier run checksummed them; each still supports its claim."
             )
-            for c in changed:
-                drift = c["content_changed_since"]
-                print(f"  {c.get('url')}")
-                print(
-                    f"    Last matched in run {drift.get('prior_run')} of "
-                    f"'{drift.get('prior_article')}'"
-                    + (
-                        f" on {drift.get('prior_date')}"
-                        if drift.get("prior_date")
-                        else ""
-                    )
-                )
-            print(
-                "Claims previously verified against these sources may need re-checking."
-            )
-            print("!" * 60)
 
     # Section 10 — only on an --expand run. Silence otherwise: a line reading
     # "0 candidates" for a pass nobody asked for is worse than no line.

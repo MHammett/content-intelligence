@@ -194,16 +194,7 @@ An `--offline` replay has no Section 9, so its ledger says `citations_resolved: 
 
 The checksum recorded on a verified citation isn't only a fingerprint of what was fetched — it's comparable across runs. Before resolution starts, the pipeline builds a URL → prior-checksum index from every report under `pipeline_history/`: every run, every article, since the same primary sources (EPA eGRID, EIA state profiles) get cited across many articles for one publication. When a citation resolves and its URL is already in that index with a different checksum, the entry gains a `content_changed_since` field recording the prior checksum, and which run of which article last saw it.
 
-It surfaces as its own block above the tiers in the readable report, and in the console summary:
-
-```
-############################################################
-WARNING: 2 verified source(s) have changed content since a prior run checksummed them:
-  https://www.eia.gov/electricity/state/illinois/
-    Last matched in run 3 of 'grid-reliability-piece' on 2026-01-04T09:12:00
-Claims previously verified against these sources may need re-checking.
-############################################################
-```
+It surfaces as a note above the "Read, and supports the claim" block, as a line under each changed entry ("Text changed since run 3 of 'grid-reliability-piece' on 2026-01-04T09:12:00; read again and still supports this claim."), and as one line in the console summary. It used to be a warning section of its own. That was dropped because every flagged entry was read again in the same run and still supports its claim, so it asks nothing of this article's author (issue #446). On news pages, whose extracted text changes daily with a "related stories" block, it fired on six still-supporting sources in one run. The flag is for the other articles that cite the same page.
 
 **What a mismatch proves:** that the bytes at that URL are not the bytes that were there the last time this pipeline fetched it. That's all. It does not say what changed, how much, or whether it matters.
 
