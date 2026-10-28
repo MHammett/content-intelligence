@@ -471,6 +471,10 @@ _INFRA_KEYS = frozenset(
         "search_recency_filter",
         "search_domain_filter",
         "search_context_size",
+        # How many searches one claude call may run (the server tool's
+        # max_uses). The maximum preset sets one, like the stream budgets
+        # above; a user's value wins over it, as for every key here.
+        "search_max_uses",
     }
 )
 

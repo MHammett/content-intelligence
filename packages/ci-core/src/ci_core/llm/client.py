@@ -308,6 +308,66 @@ _JSON_OBJECT_PROVIDERS = frozenset({"grok", "mistral"})
 # weakness the citation tiers exist to expose.
 _WEB_SEARCH_PROVIDERS = frozenset({"grok", "claude"})
 
+#: Anthropic's web search server tool, sent directly when the config names a
+#: search count. ``web_search_options`` is the portable spelling, and litellm
+#: turns it into this same tool -- but it sets the tool's ``max_uses`` from
+#: ``search_context_size`` through a three-entry table (low 1, medium 5, high
+#: 10; ``ANTHROPIC_WEB_SEARCH_TOOL_MAX_USES`` in litellm's constants). So the
+#: "context size" was a search ceiling of 5 by default, and in a ``maximum``
+#: fact_check over ~260 claims the model used all five and wrote "search
+#: budget exhausted" against the rest (issue #444). ``search_max_uses`` sends
+#: the tool with the count it names, bounded by nothing but the config.
+#:
+#: The dated type matters: this is the tool the 2026-09-18 measurement ran on
+#: (the ``web_search_20260209`` dynamic-filtering variant cost +41% and found
+#: less at this workload; the memory note "claude dynamic-filtering web search
+#: measured" has the numbers). litellm passes any ``web_search_*`` type and its
+#: extra keys through to Anthropic unchanged (``_map_tool_helper``, hosted
+#: tools), and reports its searches in ``usage.server_tool_use`` the same way.
+_CLAUDE_WEB_SEARCH_TOOL = "web_search_20250305"
+
+_search_max_uses_warnings_given: set = set()
+
+
+def _search_max_uses(provider, cfg):
+    """The ``search_max_uses`` the config asks for, or 0 when the portable
+    ``web_search_options`` form should be sent instead.
+
+    Only claude has a server tool to carry it; grok's search goes through
+    ``web_search_options`` alone, so the key is ignored there, with one
+    warning per process so a config that expects it to bite finds out.
+    """
+    raw = (cfg or {}).get("search_max_uses")
+    if raw in (None, ""):
+        return 0
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        count = 0
+    if count < 1:
+        if ("invalid", provider) not in _search_max_uses_warnings_given:
+            _search_max_uses_warnings_given.add(("invalid", provider))
+            log.warning(
+                "models.%s.search_max_uses is %r; it must be a whole number of "
+                "searches, 1 or more. Sending web_search_options instead.",
+                provider,
+                raw,
+            )
+        return 0
+    if provider != "claude":
+        if ("unsupported", provider) not in _search_max_uses_warnings_given:
+            _search_max_uses_warnings_given.add(("unsupported", provider))
+            log.warning(
+                "models.%s.search_max_uses is set, but only claude's search "
+                "takes a count; %s searches through web_search_options, where "
+                "search_context_size is the only control. Ignored.",
+                provider,
+                provider,
+            )
+        return 0
+    return count
+
+
 # ...except that Mistral's adapter treated response_format as incompatible with
 # reasoning mode and sent one or the other, never both. A live check on
 # 2026-08-16 found the combination now succeeds, so that may no longer hold —
@@ -1338,9 +1398,22 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
     # time it arrives it is a plain bool. Only fact_check has any use for it,
     # and every search bills.
     if provider in _WEB_SEARCH_PROVIDERS and (cfg or {}).get("web_search"):
-        params["web_search_options"] = {
-            "search_context_size": cfg.get("search_context_size", "medium")
-        }
+        max_uses = _search_max_uses(provider, cfg)
+        if max_uses:
+            # The server tool itself, with the count the config asked for.
+            # Never beside web_search_options: litellm turns that into a second
+            # web_search tool and both reach the wire (issue #444).
+            params["tools"] = [
+                {
+                    "type": _CLAUDE_WEB_SEARCH_TOOL,
+                    "name": "web_search",
+                    "max_uses": max_uses,
+                }
+            ]
+        else:
+            params["web_search_options"] = {
+                "search_context_size": cfg.get("search_context_size", "medium")
+            }
 
     # A schema, where the provider enforces one. Gemini is excluded while
     # grounded — the provider 400s on that combination, and its search matters
@@ -1786,8 +1859,10 @@ def _search_enabled(provider, cfg, params):
 
     Read off what the request carries rather than the provider's name alone:
     gemini's search is a tool that a no-reasoning retry sends without, and
-    claude's and grok's are ``web_search_options``, present only where the
-    config asked for them. Perplexity bills a fee on every sonar request.
+    claude's and grok's are ``web_search_options`` -- or, for claude with a
+    ``search_max_uses``, the ``web_search_*`` server tool itself -- present
+    only where the config asked for them. Perplexity bills a fee on every
+    sonar request.
     """
     if provider == "perplexity":
         return True
@@ -1798,7 +1873,12 @@ def _search_enabled(provider, cfg, params):
             isinstance(tool, dict) and "googleSearch" in tool
             for tool in params.get("tools") or []
         )
-    return "web_search_options" in params
+    if "web_search_options" in params:
+        return True
+    return any(
+        isinstance(tool, dict) and str(tool.get("type", "")).startswith("web_search")
+        for tool in params.get("tools") or []
+    )
 
 
 def _read_searches(provider, assembled, model=""):
