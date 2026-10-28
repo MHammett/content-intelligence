@@ -101,7 +101,7 @@ _CHAT_SHARE_OF_CANDIDATE = 0.6
 _CHAT_SHARE_OF_VERSION = 0.5
 
 #: A version only a chat holds (issue #430) must also be a version *of this
-#: article* (issue #434). A linked conversation holds the article's drafts and
+#: article* (PR #435). A linked conversation holds the article's drafts and
 #: also its side documents (a verification log, a research batch, a source
 #: excerpt), and a whole document of enough words passes the rule above either
 #: way. The test is 8-word shingle containment: the share of a document's
@@ -117,8 +117,9 @@ _RELATED_SHARE = 0.10
 #: version: a section cut from a 51 KB draft (about 6 KB, 0.87 of it inside the
 #: draft) covers 12% of the draft, and the body-only versions of a draft cover
 #: 76% or more. A text is a fragment when at least ``_FRAGMENT_INSIDE`` of it is
-#: inside some version and it covers less than ``_COVERS_SHARE`` of every other
-#: version. Half is also what ``_CHAT_SHARE_OF_VERSION`` already asks of a text
+#: inside a version written before it (or at the same time) and it covers less
+#: than ``_COVERS_SHARE`` of every other version. A smaller text that a later
+#: version expanded is an earlier draft, not a fragment. Half is also what ``_CHAT_SHARE_OF_VERSION`` already asks of a text
 #: that resembles a version.
 _FRAGMENT_INSIDE = 0.5
 _COVERS_SHARE = 0.5
@@ -961,6 +962,35 @@ def _chat_only_problem(candidate, text, part, kept_shas, terms, min_words):
     return None
 
 
+_EXTENSION_RE = re.compile(r"\.[a-z]{1,5}$")
+_VERSION_MARKER_RE = re.compile(
+    r"[-_ ](?:v\d+|r\d+|final|draft|\d{4}-\d{2}-\d{2}|\d{8}|superseded.*)$"
+)
+
+
+def _name_stem(name):
+    """A file name's stem: what stays the same as a document is versioned.
+
+    Lowercase the name, drop its extension, then drop trailing version markers
+    one after another: ``-vN``, ``-rN``, ``-final``, ``-draft``, ``-superseded``
+    and whatever follows it, and a date (``-YYYY-MM-DD`` or ``-YYYYMMDD``); the
+    separator before a marker is ``-``, ``_`` or a space. Two names belong to
+    one document only when their whole stems are equal: ``a-draft.md`` and
+    ``a-v2.md`` are both ``a``, and ``a-check-r1.md`` is ``a-check``. Nothing
+    joins on a prefix. A name with nothing left has no stem (``None``).
+    """
+    if not isinstance(name, str):
+        return None
+    stem = _EXTENSION_RE.sub("", name.strip().lower())
+    while True:
+        found = _VERSION_MARKER_RE.search(stem)
+        if not found:
+            break
+        stem = stem[: found.start()]
+    stem = stem.strip(" -_")
+    return stem or None
+
+
 def _shingles(text):
     """The set of ``_SHINGLE_WORDS``-word windows of a text (hashed)."""
     words = normalise(text).split()
@@ -979,26 +1009,34 @@ def _share(part, whole):
     return len(part & whole) / len(part) if part else 0.0
 
 
-def _not_versions(alone, anchors):
+def _not_versions(alone, anchors, stems, anchor_stems, bases):
     """Which texts only a linked chat holds are not versions of the article.
 
-    ``alone`` is ``[(sha, text)]`` in time order. ``anchors`` are the texts of
-    the versions another source holds (a run, a file, Drive, a reproduction, or
-    a chat text that resembles one). Returns ``(left_out, undecided)``:
-    ``{sha: (code, share)}`` and how many texts could not be judged.
+    ``alone`` is ``[(sha, text, time)]`` in time order. ``anchors`` are
+    ``[(text, time)]`` of the versions another source holds (a run, a file,
+    Drive, a reproduction, or a chat text that resembles one). ``stems`` maps a
+    sha to the name stems (``_name_stem``) of the files the chat wrote it as,
+    ``anchor_stems`` is the set of stems of the other sources' files, and
+    ``bases`` maps an edit's sha to the shas of the texts it edited. Returns
+    ``(left_out, undecided, by_name)``: ``{sha: (code, share)}``, how many texts
+    could not be judged, and the shas kept only because of their name.
 
     A text is kept while ``_RELATED_SHARE`` of its shingles are in the versions
     kept so far: the anchors first, then the chat's own texts one after another
     until none more joins, so a draft that grew over a conversation is followed
-    from version to version. With no anchor the biggest group of texts that
-    share text with one another (by words) is the article; if no two share any,
-    nothing says which is the article and none is left out. Of the kept, a
-    fragment is left out (see ``_FRAGMENT_INSIDE``).
+    from version to version. A text that does not relate is still kept when its
+    file name has the same stem as a kept version's (a first draft the article
+    was later rewritten from), or when it is an edit of a kept text. With no
+    anchor the biggest group of texts that share text with one another (by
+    words) is the article; if no two share any, nothing says which is the
+    article and none is left out. Of the kept, a fragment is left out (see
+    ``_FRAGMENT_INSIDE``).
     """
-    order = [sha for sha, _ in alone]
-    shingles = {sha: _shingles(text) for sha, text in alone}
-    words = {sha: len(text.split()) for sha, text in alone}
-    held = [_shingles(text) for text in anchors]
+    order = [sha for sha, _, _ in alone]
+    shingles = {sha: _shingles(text) for sha, text, _ in alone}
+    words = {sha: len(text.split()) for sha, text, _ in alone}
+    when = {sha: time for sha, _, time in alone}
+    held = [(_shingles(text), time) for text, time in anchors]
     kept = []
     if not held:
         group = {sha: {sha} for sha in order}
@@ -1017,31 +1055,49 @@ def _not_versions(alone, anchors):
             default=frozenset(),
         )
         if len(biggest) < 2:
-            return {}, len(order)
+            return {}, len(order), set()
         kept = [sha for sha in order if sha in biggest]
     union = set()
-    for part in [*held, *(shingles[sha] for sha in kept)]:
+    for part in [*(h for h, _ in held), *(shingles[sha] for sha in kept)]:
         union |= part
     left = [sha for sha in order if sha not in kept]
+    by_name = set()
     grew = True
     while grew:
         grew = False
+        known = set(anchor_stems)
+        for sha in kept:
+            known |= stems.get(sha, set())
         for sha in list(left):
-            if _share(shingles[sha], union) >= _RELATED_SHARE:
+            related = _share(shingles[sha], union) >= _RELATED_SHARE
+            named = bool(stems.get(sha, set()) & known) or bool(
+                bases.get(sha, set()) & set(kept)
+            )
+            if related or named:
                 left.remove(sha)
                 kept.append(sha)
                 union |= shingles[sha]
                 grew = True
+                if not related:
+                    by_name.add(sha)
+                break  # the names known have grown: look again from the top
     out = {sha: ("not_related", _share(shingles[sha], union)) for sha in left}
-    everyone = [*held, *(shingles[sha] for sha in kept)]
+    everyone = [(h, time) for h, time in held]
+    everyone += [(shingles[sha], when[sha]) for sha in kept]
     for sha in kept:
-        mine = shingles[sha]
-        others = [o for o in everyone if o is not mine]
-        inside = any(_share(mine, o) >= _FRAGMENT_INSIDE for o in others)
-        covers = max((_share(o, mine) for o in others), default=0.0)
+        if sha in by_name:
+            continue
+        mine, moment = shingles[sha], when[sha]
+        others = [(o, t) for o, t in everyone if o is not mine]
+        inside = any(
+            _share(mine, o) >= _FRAGMENT_INSIDE
+            and (t is None or moment is None or t <= moment)
+            for o, t in others
+        )
+        covers = max((_share(o, mine) for o, _ in others), default=0.0)
         if inside and covers < _COVERS_SHARE:
             out[sha] = ("fragment", covers)
-    return out, 0
+    return out, 0, by_name
 
 
 _UNRELATED_WHY = {
@@ -1057,7 +1113,9 @@ _UNRELATED_WHY = {
 }
 
 
-def _ingest_chat(chat, versions, version_for, ref_texts, terms):
+def _ingest_chat(
+    chat, versions, version_for, ref_texts, terms, ref_times=(), ref_names=()
+):
     """Turn the export's candidates into draft versions (or sources of existing ones).
 
     A candidate is kept when it resembles a known version (see ``_resembles``);
@@ -1080,6 +1138,7 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
     verdict, grown, weak_only, first_edit = {}, set(), set(), {}
     kept_shas, kept_by_via, dropped_by_via = set(), {}, {}
     kept_tokens, explicit_kept, skipped = {}, set(), {}
+    stems, bases = {}, {}  # sha -> file name stems; edit sha -> the shas it edited
     kept = dropped = 0
     ordered = sorted(
         chat["candidates"],
@@ -1142,6 +1201,10 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
         if linked:
             explicit_kept.add(sha)
         first_edit.setdefault(sha, candidate.edit)
+        if _name_stem(candidate.name):
+            stems.setdefault(sha, set()).add(_name_stem(candidate.name))
+        if candidate.edit and isinstance(candidate.base, str):
+            bases.setdefault(sha, set()).add(_sha(_draft_text(candidate.base)))
         existed = sha in versions
         version = version_for(sha, text)
         version.holders.append(
@@ -1189,18 +1252,31 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
         for sha in alone:
             versions[sha].uncorroborated = True
         corroborated = len(kept_shas) - len(alone)
+        times = list(ref_times) + [None] * (len(ref_texts) - len(ref_times))
         held_texts = [
-            *ref_texts,
-            *(versions[sha].text for sha in explicit_kept - alone),
+            *zip(ref_texts, times),
+            *(
+                (versions[sha].text, min(h.time for h in versions[sha].holders))
+                for sha in explicit_kept - alone
+            ),
         ]
         in_order = [
-            (sha, versions[sha].text)
+            (sha, versions[sha].text, min(h.time for h in versions[sha].holders))
             for sha in sorted(
                 alone,
                 key=lambda sha: (min(h.time for h in versions[sha].holders), sha),
             )
         ]
-        left_out, undecided = _not_versions(in_order, held_texts)
+        anchor_stems = set(ref_names)
+        for sha in explicit_kept - alone:
+            anchor_stems |= stems.get(sha, set())
+        left_out, undecided, by_name = _not_versions(
+            in_order, held_texts, stems, anchor_stems, bases
+        )
+        for sha in by_name:
+            versions[
+                sha
+            ].note = "kept by file name: it has the same name stem as a kept version"
         for sha, (code, share) in left_out.items():
             need = _RELATED_SHARE if code == "not_related" else _COVERS_SHARE
             version = versions[sha]
@@ -1217,6 +1293,7 @@ def _ingest_chat(chat, versions, version_for, ref_texts, terms):
                     for code in _UNRELATED_WHY
                     if any(c == code for c, _ in left_out.values())
                 },
+                "kept_by_name": len(by_name),
                 "undecided": undecided,
             }
         )
@@ -1430,6 +1507,23 @@ def _build_events(collector):
                 *(text for _, _, text in recovered_drafts),
             ],
             collector.terms,
+            [
+                min((h.time for h in v.holders if h.time), default=None)
+                for v in versions.values()
+            ]
+            + [holder.time for _, holder, _ in recovered_drafts],
+            {
+                stem
+                for stem in (
+                    _name_stem(Path(h.path).name)
+                    for h in [
+                        *(h for v in versions.values() for h in v.holders),
+                        *(holder for _, holder, _ in recovered_drafts),
+                    ]
+                    if h.source in ("file", "drive", "recovered")
+                )
+                if stem
+            },
         )
 
     if chat is not None and chat["report"].get("undecided"):
@@ -2117,6 +2211,11 @@ def _format_chat(chat):
                 f"({count} {label}); each is in the plan with include: false and "
                 "its reason"
             )
+    if chat.get("kept_by_name"):
+        lines.append(
+            f"  Kept by file name: {chat['kept_by_name']} chat-only document(s) "
+            "unlike the other versions but named like one (same name stem)"
+        )
     for item in chat.get("left_out_documents", []):
         lines.append(
             f"    {item['id']}  {item['source']}  {item['via']}  {item['words']} "

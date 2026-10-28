@@ -1078,27 +1078,42 @@ conversation<TAB>slug<TAB>name<TAB>confidence
   kind, how many resembled another source, and how many candidates were not
   kept and why (`not_a_whole_file`, `not_prose`, `not_a_draft`, `short`,
   `near_duplicate`, `edit_base_not_kept`).
-* **Side documents and fragments (issue #434).** A linked conversation also
+* **Side documents and fragments (PR #435).** A linked conversation also
   holds documents that are not the article: a verification log, a research
   batch, a source excerpt, a section cut from the draft. A chat-only version is
   kept as a draft only if it **relates to the article's other versions** and is
   **not a fragment of one**, judged by 8-word shingles (the share of a text's
-  8-word windows found elsewhere). At least **10%** of its windows must be in
-  the versions kept so far (those another source holds, then the chat's own,
-  followed from one to the next): on three real articles every side document
-  scored 0.00-0.03 and the lowest genuine draft 0.14. And it must not be mostly
-  inside another version while covering **less than half** of every version it
-  overlaps: a section cut from a draft covered about 12% of it, the body-only
-  versions 76% or more. A text that fails is not dropped: it stays in the plan
-  with `"include": false` and a `why` naming the rule and the share, and the
-  summary lists each by event id, conversation and message. To put one back, set
-  its `include` to `true` in `plan.json` (`check` then validates it like any
-  event); `--include` does not apply, as it only names `--files`. Left-out
-  documents do not move a round boundary. With no version from another source,
-  the biggest group of mutually related texts is taken as the article; when no
-  two texts share anything, nothing says which is the article, so all stay and a
-  warning says so. A genuine early draft under half the size of the next
-  version reads as a fragment: set its `include` back to `true`.
+  8-word windows found elsewhere):
+  * *Related.* At least **10%** of its windows are in the versions kept so far
+    (those another source holds, then the chat's own, followed from one to the
+    next). On three real articles every side document scored 0.00-0.03 and the
+    lowest genuine draft 0.14.
+  * *Or named like a kept version.* An article rewritten heavily shares little
+    with its own first draft, so a text whose **file name stem** equals the stem
+    of a kept version's file name (from the chat or from another source) is kept
+    anyway, with a `note` saying so; so are the edits of a text that was kept.
+    The stem is the name lowercased, without its extension, with trailing
+    version markers dropped one after another: `-vN`, `-rN`, `-final`,
+    `-draft`, `-superseded` and whatever follows it, and a date (`-YYYY-MM-DD`
+    or `-YYYYMMDD`), after `-`, `_` or a space. The whole stem must be equal:
+    `x-draft.md` and `x-v2.md` are `x`, `x-citation-check-r1.md` is
+    `x-citation-check`, and nothing joins on a prefix.
+  * *Not a fragment.* A text that is at least half inside a version **written
+    before it (or at the same time)** while covering less than **half** of every
+    version it overlaps is a fragment: a section cut from a draft covered about
+    12% of it, the body-only versions 76% or more. A smaller text that a *later*
+    version expanded is an earlier draft and stays.
+
+  A text that fails is not dropped: it stays in the plan with `"include": false`
+  and a `why` naming the rule and the share, and the summary lists each by
+  event id, conversation and message. To put one back, set its `include` to
+  `true` in `plan.json` (`check` then validates it like any event); `--include`
+  does not apply, as it only names `--files`. Left-out documents do not move a
+  round boundary. With no version from another source, the biggest group of
+  mutually related texts is taken as the article; when no two texts share
+  anything, nothing says which is the article, so all stay and a warning says
+  so. A genuine early draft that was written after a larger text it sits inside
+  reads as a fragment: set its `include` back to `true`.
 * **Rounds for a chat-only article.** A round normally starts at a submitted
   version (a run's draft, or a file named with a `vNN` or `rN`). An article with
   no runs and no labelled files has none, so its versions are placed in one
