@@ -804,6 +804,10 @@ thorough:
 #   other three rows are unaffected and the comparison this table was built for
 #   still holds.
 #
+# EVERY `maximum` COST HERE PREDATES search_max_uses (#444): claude:fact_check
+#   then searched at most 5 times. A search costs ~$0.10 all-in on opus-5
+#   (#465), so at the cap of 20 add ~$1.5 on a long draft that uses it.
+#
 # THE REPRO COLUMNS ARE 5.6-ERA AND DESCRIBE A LINE-UP THAT NO LONGER SHIPS.
 #   Three of the six models moved in the week after: gemini-2.5-pro ->
 #   gemini-3.5-flash (#252), sonar-reasoning-pro -> sonar (#258), and every
@@ -950,16 +954,22 @@ maximum:
                                   # grounded models out of six; this makes four.
                                   # Scoped to fact_check because every search
                                   # bills and no other domain benefits.
-      search_max_uses: 40   # Searches one fact_check call may run. Without
+      search_max_uses: 20   # Searches one fact_check call may run. Without
                             # this, litellm sets the tool's max_uses from
-                            # search_context_size (medium = 5), and on the
-                            # 2026-10-28 brockovich run opus-5 spent all five
-                            # on the first few of ~260 claims and wrote
-                            # "search budget exhausted" against the rest
-                            # (#444). A ceiling, not a spend: Anthropic bills
-                            # $10 per 1,000 searches made, so 40 is at most
-                            # $0.40 against a ~$1 claude:fact_check call and an
-                            # ~$8 run. Gemini ran 33 searches on that draft;
-                            # 40 gives claude the same reach with headroom.
-                            # Unmeasured above 10 on a long draft: read the
-                            # next maximum run's api_call_log for the count.
+                            # search_context_size (medium = 5), and on a
+                            # 2026-10-28 run of a ~10,700-word draft opus-5
+                            # spent all five on the first few of ~260 claims
+                            # and wrote "search budget exhausted" against the
+                            # rest (#444).
+                            #
+                            # The search fee ($10 per 1,000) is the small part.
+                            # Each search's results are input that every later
+                            # turn of the call re-reads, so a search costs
+                            # ~$0.10 all-in on opus-5: ~$0.06 input, $0.01 fee,
+                            # the rest longer output. Measured on that draft
+                            # (#465): 5 searches, $0.99 a call; 38 searches
+                            # under a cap of 40, $4.15, which confirmed 49
+                            # claims where 5 searches confirmed 8. 20 is the
+                            # interim cap from #465, ~$2.4 a call; 40 cost
+                            # ~$1.7 more a run on a long draft. Not yet
+                            # measured at 20 itself.
