@@ -2513,9 +2513,8 @@ def _keep_earlier_billing(failed, fresh):
         "count": sum(s.get("count", 0) for s in summaries),
         "costed": sum(s.get("costed", 0) for s in summaries),
         "reasons": sorted({r for s in summaries for r in s.get("reasons") or ()}),
-        # Summed key by key, so a failed attempt's `cached` share keeps its
-        # cheaper rate; the client's own summary records none, and cost.py
-        # prices a missing share at the full input rate.
+        # Summed key by key, so each attempt's `cached` share keeps its
+        # cheaper rate; cost.py prices a missing share at the full input rate.
         "tokens": total,
     }
     # One count per attempt, concatenated rather than summed: cost.py bills a
@@ -4178,6 +4177,10 @@ def run_draft_pipeline(
             log_entry["provider_cost_usd"] = result["provider_cost_usd"]
         if result.get("discarded_attempts"):
             log_entry["discarded_attempts"] = result["discarded_attempts"]
+        # A grounded answer that did not parse and was reformatted with search
+        # off. Its tokens are already in `tokens`; this says they are there.
+        if result.get("json_repair"):
+            log_entry["json_repair"] = result["json_repair"]
         # How long each stream went silent, before and after real output — the
         # numbers the socket budgets bound. See ci_core.llm.client._StreamTiming.
         if result.get("stream_timing"):

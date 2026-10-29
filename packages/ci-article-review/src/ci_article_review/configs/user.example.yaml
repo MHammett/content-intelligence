@@ -160,8 +160,9 @@ models:
 #    effort: high               # "low" | "medium" | "high" — adaptive thinking depth
 #    timeout_seconds: 360
 #    web_search: [fact_check]   # live search on fact_check only (bills per search)
-#    search_max_uses: 40        # searches one call may run; without it litellm caps
-#                               # a call at 5 (search_context_size medium)
+#    search_max_uses: 20        # searches one call may run; without it litellm caps
+#                               # a call at 5 (search_context_size medium). Each
+#                               # search costs ~$0.10 all-in on opus-5 (#465)
 #
 #  claude:
 #    model: claude-sonnet-5

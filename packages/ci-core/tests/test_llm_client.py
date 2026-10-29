@@ -539,6 +539,44 @@ class TestRefusedAttemptsAreNotBilled:
         assert summary["count"] == 3
         assert summary["unbilled"] == 2
 
+    def test_a_discarded_attempts_cache_reads_are_kept(self):
+        """Dropped, they were priced at the full input rate: $7.28 reported
+        for an attempt billed ~$1.65 on 2026-10-29 (issue #465)."""
+        cached = {
+            "reason": "MalformedJSONError",
+            "usage": _usage(1000, 50, anthropic_cached=800),
+        }
+        summary = client._summarise_discarded([cached, cached])
+        assert summary["tokens"] == {"prompt": 2000, "completion": 100, "cached": 1600}
+
+    def test_a_retried_attempts_cache_reads_reach_the_cost(self):
+        """From the wire to cost.calculate, priced at opus-5's cache-read rate.
+
+        1M prompt tokens, 900k read from cache: $0.95 at $5/$0.50 per 1M,
+        where the unfixed summary priced it at $5.00.
+        """
+        from ci_core.llm import cost
+
+        streams = [
+            _completion_stream(
+                text="prose", usage=_usage(1_000_000, 0, anthropic_cached=900_000)
+            ),
+            _completion_stream(usage=_usage(0, 0)),
+        ]
+        with patch.object(client.litellm, "completion", side_effect=streams):
+            result = _call(
+                "claude", retry=True, provider_config={"model": "claude-opus-5"}
+            )
+        entry = {"pass": "claude:x", "model": "claude-opus-5", **result}
+        assert cost.calculate([entry])["total_input_usd"] == pytest.approx(0.95)
+
+    def test_an_uncached_summary_keeps_its_shape(self):
+        plain = {"reason": "MalformedJSONError", "usage": _usage(1000, 50)}
+        assert client._summarise_discarded([plain])["tokens"] == {
+            "prompt": 1000,
+            "completion": 50,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Result contract
@@ -3329,6 +3367,101 @@ def _with_searches(n):
     return usage
 
 
+class TestGroundedMalformedJsonIsRepaired:
+    """An answer that searched and then failed to parse is reformatted by a
+    call with search off, not asked again from scratch (issue #465).
+
+    On 2026-10-29 a claude:fact_check answer that had searched 20 times over
+    1,456,437 prompt tokens did not parse, and the retry ran every search
+    again. The repair sends only the instructions and the answer.
+    """
+
+    _CFG = {"model": "claude-opus-5", "web_search": True, "search_max_uses": 20}
+
+    def _run(self, streams, provider="claude", cfg=None):
+        seen = []
+
+        def _capture(**kwargs):
+            seen.append(kwargs)
+            return streams[len(seen) - 1]
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            result = _call(
+                provider,
+                system_prompt="Return JSON with a flags list.",
+                user_prompt="THE DRAFT",
+                retry=True,
+                provider_config=cfg if cfg is not None else self._CFG,
+            )
+        return result, seen
+
+    def test_the_repair_searches_nothing_and_is_not_sent_the_draft(self):
+        result, seen = self._run(
+            [
+                _completion_stream(text='flags: ["a"]', usage=_with_searches(20)),
+                _completion_stream(text='{"flags": ["a"]}', usage=_usage(300, 40)),
+            ]
+        )
+        assert len(seen) == 2
+        repair = seen[1]
+        assert "tools" not in repair and "web_search_options" not in repair
+        assert repair["messages"][0]["content"] == client._JSON_REPAIR_SYSTEM
+        sent = repair["messages"][1]["content"]
+        assert 'flags: ["a"]' in sent and "Return JSON with a flags list." in sent
+        assert "THE DRAFT" not in sent
+
+        assert result["failed"] is False
+        assert result["data"] == {"flags": ["a"]}
+        assert result["raw"] == '{"flags": ["a"]}'
+        assert result["searches"] == 20
+        # Billed as more of this call's own tokens, and said so.
+        assert result["tokens"] == {"prompt": 400, "completion": 90}
+        assert result["json_repair"]["tokens"] == {"prompt": 300, "completion": 40}
+        assert "discarded_attempts" not in result
+
+    def test_a_failed_repair_is_not_followed_by_a_full_retry(self):
+        result, seen = self._run(
+            [
+                _completion_stream(text="prose", usage=_with_searches(20)),
+                _completion_stream(text="still prose", usage=_usage(300, 40)),
+            ]
+        )
+        assert len(seen) == 2
+        assert result["failed"] is True
+        assert result["error"] == "Malformed JSON response"
+        assert result["raw"] == "prose"
+        assert result["searches"] == 20
+        assert result["tokens"] == {"prompt": 400, "completion": 90}
+        assert result["json_repair"]["failed"] is True
+
+    def test_gemini_is_repaired_without_its_search_tool(self):
+        """gemini's googleSearch rides on its reasoning parameters."""
+        first = _completion_stream(text="prose")
+        first.append(
+            _chunk(vertex_ai_grounding_metadata=[{"webSearchQueries": ["q1", "q2"]}])
+        )
+        result, seen = self._run(
+            [first, _completion_stream(text='{"flags": []}')],
+            provider="gemini",
+            cfg={},
+        )
+        assert any("googleSearch" in t for t in seen[0]["tools"])
+        assert "tools" not in seen[1]
+        assert result["failed"] is False
+        assert result["searches"] == 2
+
+    def test_perplexity_is_still_retried(self):
+        """sonar searches on every request, so a repair would search too."""
+        result, seen = self._run(
+            [_completion_stream(text="prose"), _completion_stream()],
+            provider="perplexity",
+            cfg={"model": "sonar-reasoning-pro"},
+        )
+        assert len(seen) == 2
+        assert seen[1]["messages"][1]["content"] == "THE DRAFT"
+        assert "json_repair" not in result
+
+
 def _search_item(item_id, action="search"):
     """An OpenAI web_search_call output item, in the dict shape."""
     return {
@@ -3404,9 +3537,13 @@ class TestSearchCountsReachTheResult:
         assert result["searches"] == 3
 
     def test_a_retried_attempt_keeps_its_own_count(self):
-        """The discarded attempt's searches were billed like its tokens."""
+        """The discarded attempt's searches were billed like its tokens.
+
+        A stall, not a malformed answer: one that searched is now reformatted
+        rather than retried (TestGroundedMalformedJsonIsRepaired).
+        """
         streams = [
-            _completion_stream(text="not json", usage=_with_searches(4)),
+            client.StreamStalled("stalled"),
             _completion_stream(usage=_with_searches(2)),
         ]
         with patch.object(client.litellm, "completion", side_effect=streams):
@@ -3416,7 +3553,23 @@ class TestSearchCountsReachTheResult:
                 provider_config={"model": "claude-opus-5", "web_search": True},
             )
         assert result["searches"] == 2
-        assert result["discarded_attempts"]["searches"] == [4]
+        assert result["discarded_attempts"]["count"] == 1
+
+    def test_a_malformed_attempt_that_did_not_search_is_still_retried(self):
+        """Nothing to repeat, so the retry is the same price as a repair."""
+        streams = [
+            _completion_stream(text="not json", usage=_with_searches(0)),
+            _completion_stream(usage=_with_searches(2)),
+        ]
+        with patch.object(client.litellm, "completion", side_effect=streams):
+            result = _call(
+                "claude",
+                retry=True,
+                provider_config={"model": "claude-opus-5", "web_search": True},
+            )
+        assert result["searches"] == 2
+        assert result["discarded_attempts"]["searches"] == [0]
+        assert "json_repair" not in result
 
     def _gemini(self, *metadata_per_chunk):
         chunks = _completion_stream()
