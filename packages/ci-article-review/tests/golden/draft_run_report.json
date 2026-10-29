@@ -534,6 +534,12 @@
   },
   "model_failure_details": [],
   "model_failures": [],
+  "page_store": {
+    "bytes_not_downloaded": 0,
+    "live": 0,
+    "persistent": true,
+    "stored_hits": 0
+  },
   "pre_analysis": {
     "links": null,
     "links_skipped_reason": "disabled",

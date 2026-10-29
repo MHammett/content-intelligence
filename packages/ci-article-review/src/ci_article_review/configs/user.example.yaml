@@ -312,6 +312,10 @@ pipeline:
   # the history root): a snapshot that exists for 7 days, "none" for 1 day.
   # Within a run the link pass and Section 9 share one lookup per URL either way.
   wayback_lookup_cache: true
+  # Keep fetched citation pages (page_store.sqlite under the history root) and
+  # reuse one on the next run only when its origin answers 304 Not Modified.
+  # Pages with no ETag/Last-Modified are fetched in full every run, as before.
+  page_store: true
 
   # Optional Save Page Now capture options, passed straight through to
   # archive.org when this run submits a citation for archiving. Every one is
