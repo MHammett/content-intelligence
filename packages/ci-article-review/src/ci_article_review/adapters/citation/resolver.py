@@ -573,7 +573,9 @@ def _check_drift(result, checksum_index):
         "note": (
             "This source's content differs from the last time it was "
             f"checksummed (run {prior_run} of '{prior_article}'{when}). "
-            "A claim previously verified against it may need re-checking."
+            "This run read the current text and it still supports this "
+            "claim; other articles verified against the older text may want "
+            "a look."
         ),
     }
     return result
@@ -634,6 +636,36 @@ def _fetch_following_page(url, timeout=15):
     resp = safe_get(url, timeout=timeout)
     resp.raise_for_status()
     return resp
+
+
+#: A Google Drive file link that opens the viewer: ``/file/d/<id>/view`` (or
+#: ``/edit``, ``/preview``, nothing) and the older ``/open?id=<id>``.
+_DRIVE_VIEWER = re.compile(
+    r"^https?://drive\.google\.com/(?:file/d/([A-Za-z0-9_-]{10,})(?:/[a-z]*)?/?(?:[?#].*)?"
+    r"|open\?(?:[^#]*&)?id=([A-Za-z0-9_-]{10,})(?:[&#].*)?)$"
+)
+
+
+def direct_document_url(url):
+    """The URL that returns a cited document's bytes, when the cited one does not.
+
+    A Google Drive viewer link returns a JavaScript shell (90 KB of script, no
+    document text), so a claim cited to one could never be checked: two claims
+    on brockovich-fact-check run 2 (issue #447). For a publicly shared file
+    ``uc?export=download&id=<id>`` returns the file itself, redirecting to
+    drive.usercontent.google.com; checked live on that run's file, a 12.6 MB
+    PDF. Over 25 MB, Drive serves a virus-scan page needing a confirm token
+    first. ``gdown`` handles that, but a downloader dependency for one URL
+    shape is not worth it here: the scan page is HTML and is reported as
+    unreadable, which is true. A private file fails exactly as it did.
+
+    Anything else comes back unchanged.
+    """
+    match = _DRIVE_VIEWER.match(url or "")
+    if not match:
+        return url
+    file_id = match.group(1) or match.group(2)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 def _get_page(url, timeout=15, page_cache=None):
@@ -813,7 +845,7 @@ def _normalise_for_match(text):
     return " ".join((text or "").split()).casefold()
 
 
-def _quote_is_grounded(quote, content):
+def _quote_is_grounded(quote, content, claim=None):
     """True if ``quote`` actually occurs in the page text.
 
     The verifier's verdict is the one thing an injected page most wants to
@@ -829,12 +861,41 @@ def _quote_is_grounded(quote, content):
     """
     normalised_quote = _normalise_for_match(quote)
     if len(normalised_quote) < _MIN_QUOTE_CHARS:
-        return False
+        return _short_figure_is_grounded(normalised_quote, content, claim)
     return normalised_quote in _normalise_for_match(content)
 
 
-def _verify_relevance(claim, content, api_keys, author=None, url=None):
+#: A short quote that is nothing but a figure: "9,683", "4.4%", "$40". A quote
+#: with a word in it ("$40 billion") is not one.
+_BARE_FIGURE = re.compile(r"[$]?\d[\d,.]*%?")
+
+
+def _short_figure_is_grounded(normalised_quote, content, claim):
+    """A quote shorter than ``_MIN_QUOTE_CHARS`` that is exactly the claim's figure.
+
+    A stats page lays its headline number out as a block of its own ("9,683 /
+    Total Reports"), and the verifier, asked for the sentence it relied on,
+    quotes the number. The 12-character floor then threw away a correct
+    "supports" against the archived copy the draft cited (issue #442). The floor
+    exists because a few characters match almost any page by chance; a figure of
+    three or more digits that the claim itself states, found on the page, does
+    not match by chance and carries no instruction a page could inject.
+    """
+    if not claim or not _BARE_FIGURE.fullmatch(normalised_quote):
+        return False
+    if sum(ch.isdigit() for ch in normalised_quote) < 3:
+        return False
+    return normalised_quote in _normalise_for_match(
+        claim
+    ) and normalised_quote in _normalise_for_match(content)
+
+
+def _verify_relevance(claim, content, api_keys, author=None, hints=(), url=None):
     """Ask a cheap/fast model whether ``content`` actually supports ``claim``.
+
+    ``hints`` (the draft's citation entry for this URL, a fact-check model's
+    quote from it) only steer which part of a long document is shown; the
+    model is asked about ``claim`` alone (issue #440).
 
     ``known_url`` citations often come from an ungrounded model recalling a
     URL from training data rather than a live search — the URL loading is not
@@ -872,7 +933,7 @@ def _verify_relevance(claim, content, api_keys, author=None, url=None):
     # genuinely long documents, and mistral-small at $0.15/M input prices even
     # the worst case (every call maxed) at under $0.09 for the pass.
     excerpt, window = extract.select_excerpt_with_window(
-        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL
+        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL, hints=hints
     )
     batch = _relevance_batch
     # Only a page sent whole: a windowed one shows each claim different text.
@@ -933,7 +994,9 @@ def _interpret_verdict(data, claim, content, window):
         }
 
     quote = str(data.get("quote", ""))
-    if verdict in _SUPPORTING_VERDICTS and not _quote_is_grounded(quote, content):
+    if verdict in _SUPPORTING_VERDICTS and not _quote_is_grounded(
+        quote, content, claim
+    ):
         # A "supports" verdict promotes the citation to the strongest tier, so
         # it is the answer an injected page most wants to produce. Requiring the
         # model to hand back text that is actually in the document turns the
@@ -964,7 +1027,7 @@ def _interpret_verdict(data, claim, content, window):
         # What the model was shown: the whole text, or a window of it. A
         # negative verdict on a window is a verdict about the window.
         "window": window,
-        "quote_grounded": bool(quote) and _quote_is_grounded(quote, content),
+        "quote_grounded": bool(quote) and _quote_is_grounded(quote, content, claim),
     }
 
 
@@ -989,15 +1052,48 @@ def _interpret_verdict(data, claim, content, window):
 # archive fallback, a further page appended), is checked on its own. A batch
 # that fails, or answers without a usable entry for a claim, sends that claim
 # down the single-claim path, which is what it would have had without batching.
+#
+# Only a "supports" with a quote found on the page is taken from a batch, and
+# only when no other claim in the batch quoted the same sentence for its own
+# "supports" (``_claims_sharing_a_quote``). Every other batched answer (a
+# negative verdict, an ungrounded quote, an unrecognised verdict, a shared
+# quote) is thrown away and that claim gets the single-claim check, so a batch
+# can only ever confirm what a single check would have to quote the page to
+# confirm. See ``_BATCH_RELEVANCE_ENABLED`` for why.
 
-#: Off: measured, and it costs verdict quality (2026-10-28, ``tools/
+#: Off. Measured three ways, and no form of it both keeps verdict quality and
+#: saves calls on a real run.
+#:
+#: 1. Taking every batched verdict cost verdict quality (2026-10-28, ``tools/
 #: ab_relevance_batch.py``). On 136 real claims against the 47 pages they cite,
 #: the single-claim check run twice agreed with itself on 94% of claims; the
-#: batched check agreed with it on 81%. It lost 19 of 102 "supports": 12 to a
-#: quote no longer copied verbatim (so the grounding check refused it) and the
-#: rest to verdicts flipping to "not_addressed" or "contradicts", which is the
-#: costly direction for an author. Two-claim batches were no better (43 of 53).
-#: Kept so the measurement can be rerun against a stronger verifier model.
+#: batched check agreed with it on 81%. Its losses were all on one side: it
+#: dropped 19 of 102 "supports", 12 to a quote no longer copied verbatim (so the
+#: grounding check refused it) and the rest to verdicts flipping to
+#: "not_addressed" or "contradicts", the costly direction for an author. Where
+#: the batch did say "supports", it agreed with the single check on 81 of 83.
+#: Two-claim batches were no better (43 of 53).
+#:
+#: 2. Keeping only a grounded "supports" and checking everything else alone
+#:    (2026-10-29, 129 claims): 97% agreement against a 94% noise floor, 95
+#:    calls instead of 129, 24% fewer prompt tokens. But one kept "supports"
+#:    was cross-claim contamination: "The range of on-site use under that
+#:    starts at zero" quoted the sentence that answered its sibling, and the
+#:    single check said "not_addressed" all three times it was asked.
+#: 3. Adding ``_claims_sharing_a_quote`` to catch that (131 claims): quality
+#:    held (97% against a 96% floor, "supports" 97 against 99 and 97), but
+#:    claims about one page often rest on one sentence, so 71 of 131 went back
+#:    to the single check: 117 calls instead of 131, 10% fewer prompt tokens.
+#:
+#: That last form, run end to end on Section 9 of a real saved run
+#: (data-center-district-heating run 5, 111 claims): 107 relevance calls
+#: against 106 with batching off, 3% more prompt tokens, 57% more completion
+#: tokens, and 39% more time in the relevance step. Only 42 claims ever
+#: reached a batch; 26 of them were checked again, so the 17 batch calls cost
+#: what the 16 kept verdicts saved. The rate limits that motivated batching
+#: (#361, #389, #396) have refused no relevance check in any saved run since
+#: 2026-10-26. Kept so the measurement can be rerun against a stronger
+#: verifier model: ``tools/ab_relevance_batch.py``.
 _BATCH_RELEVANCE_ENABLED = False
 
 #: Most claims asked about in one call. Output grows with each claim; a page
@@ -1014,6 +1110,44 @@ _VERIFY_BATCH_WAIT_SECONDS = 90
 #: own threads, five calls deep, and threading it through every signature
 #: between here and the verifier would touch all of them.
 _relevance_batch = None
+
+
+def _is_kept_batch_verdict(info):
+    """True for the one batched answer that is taken: a checked "supports",
+    which ``_interpret_verdict`` only returns with a quote found on the page."""
+    return bool(info.get("checked")) and info.get("verdict") in _SUPPORTING_VERDICTS
+
+
+def _quote_sentences(quote):
+    """The sentences of a quote, normalised as grounding normalises them, that
+    are long enough to mean something (``_MIN_QUOTE_CHARS``)."""
+    return {
+        sentence
+        for sentence in re.split(r"(?<=[.!?])\s+", _normalise_for_match(quote))
+        if len(sentence) >= _MIN_QUOTE_CHARS
+    }
+
+
+def _claims_sharing_a_quote(kept):
+    """Claim numbers among ``kept`` whose "supports" rests on a sentence another
+    claim's "supports" in the same batch also quoted.
+
+    Two claims leaning on one sentence is how a batch lets one claim's evidence
+    answer another. Measured 2026-10-29: in a batch of four claims about one
+    Microsoft page, the fragment "The range of on-site use under that starts at
+    zero" came back "supports", quoting the sentence that answered its sibling
+    about zero-water cooling; the single check, run three times, said
+    "not_addressed" every time. Both claims are checked again on their own,
+    which costs a call when the shared sentence really does support both.
+    """
+    first_quoted_by = {}
+    shared = set()
+    for number, info in kept.items():
+        for sentence in _quote_sentences(info.get("quote", "")):
+            other = first_quoted_by.setdefault(sentence, number)
+            if other != number:
+                shared.update((number, other))
+    return sorted(shared)
 
 
 def _no_batch(entries):
@@ -1060,7 +1194,15 @@ class _RelevanceBatch:
         self._verdicts = {}
         #: sha256 of the page text -> Event set when its batch has answered.
         self._in_flight = {}
-        self.stats = {"batches": 0, "claims_in_batches": 0, "served": 0}
+        #: ``kept``: batched "supports" verdicts taken. ``rechecked``: batched
+        #: answers thrown away, each claim then checked on its own.
+        self.stats = {
+            "batches": 0,
+            "claims_in_batches": 0,
+            "served": 0,
+            "kept": 0,
+            "rechecked": 0,
+        }
         #: (url, claim) pairs that have had their check, and pairs some batch
         #: has already asked about. A sibling in either is never asked again.
         self._done = set()
@@ -1176,20 +1318,34 @@ class _RelevanceBatch:
                 continue
             if 1 <= number <= len(asked) and number not in by_number:
                 by_number[number] = entry
+        kept = {}
+        rechecked = 0
+        for number, sibling in enumerate(asked, 1):
+            entry = by_number.get(number)
+            if entry is None:
+                continue
+            info = _interpret_verdict(entry, sibling, content, window)
+            if _is_kept_batch_verdict(info):
+                kept[number] = info
+            else:
+                # A batch is trusted only to confirm; see the section comment.
+                # The claim gets the single-claim check.
+                rechecked += 1
+        for number in _claims_sharing_a_quote(kept):
+            del kept[number]
+            rechecked += 1
         mine = None
         with self._lock:
             self.stats["batches"] += 1
             self.stats["claims_in_batches"] += len(asked)
-            for number, sibling in enumerate(asked, 1):
-                entry = by_number.get(number)
-                if entry is None:
-                    continue
-                info = _interpret_verdict(entry, sibling, content, window)
+            self.stats["rechecked"] += rechecked
+            self.stats["kept"] += len(kept)
+            for number, info in kept.items():
                 info["batch_size"] = len(asked)
                 if number == 1:
                     mine = info
                 else:
-                    self._verdicts[(key, sibling)] = info
+                    self._verdicts[(key, asked[number - 1])] = info
         if mine is None:
             self._orphan_log(call_log_entry)
             return None
@@ -1214,6 +1370,7 @@ def _resolve_known_url(
     author=None,
     verify_claim=None,
     page_cache=None,
+    locate_hints=(),
 ):
     """Resolve a claim whose source URL is already known (e.g. supplied by the
     fact-check model itself), bypassing the narrow adapter matching entirely.
@@ -1285,10 +1442,11 @@ def _resolve_known_url(
     coverage = None
     try:
         _step("fetch")
-        resp = _get_page(known_url, timeout, page_cache)
+        fetch_url = direct_document_url(known_url)
+        resp = _get_page(fetch_url, timeout, page_cache)
         _step("extract")
         content, content_kind, coverage = _extract_fetched_with_coverage(
-            resp, known_url
+            resp, fetch_url
         )
         # Where the fetch actually landed. `safe_get` follows redirects one
         # validated hop at a time and returns the last hop's response, so this
@@ -1302,7 +1460,10 @@ def _resolve_known_url(
         # redirect URLs were 817 of the 2,682 characters in one Section 9 entry,
         # while the page behind them was a Jalopnik article the pipeline had
         # already fetched, read and checksummed.
-        final_url = getattr(resp, "url", "") or ""
+        #
+        # Not for a rewritten Drive link: the download host it lands on is
+        # not a page a reader opens, and the viewer link the draft cites is.
+        final_url = "" if fetch_url != known_url else getattr(resp, "url", "") or ""
     except UnsafeURLError as e:
         # Distinct from a fetch failure, and never eligible for the Wayback
         # fallback: archive.org has no snapshot of an internal host, and asking
@@ -1480,11 +1641,19 @@ def _resolve_known_url(
         result["note"] = _UNVERIFIABLE_NOTES["access_wall"]
         return _check_drift(result, checksum_index)
 
-    if len(content.strip()) < _MIN_VERIFIABLE_CHARS:
+    if len(content.strip()) < _MIN_VERIFIABLE_CHARS or (
+        content_kind == "pdf"
+        # A partial read is never reported as a mismatch anyway (see below),
+        # so only a PDF read whole needs telling apart from a scan.
+        and not (coverage or {}).get("partial")
+        and extract.looks_like_scanned_pdf(content, (coverage or {}).get("pages_read"))
+    ):
         # We fetched a real document but could not read it: a PDF with no text
         # layer (or no pypdf installed), a JS-only render, a bot wall. Say that
         # — do NOT run verification and report "does not support the claim",
-        # which asserts something false about a source we never read.
+        # which asserts something false about a source we never read. A scan
+        # with a stamp on every page clears the character floor and is the
+        # same case (issue #447).
         result["verification"] = "unverifiable"
         result["note"] = _UNVERIFIABLE_NOTES.get(
             content_kind, _UNVERIFIABLE_NOTES["default"]
@@ -1536,8 +1705,8 @@ def _resolve_known_url(
         verify_content,
         api_keys,
         author,
-        # Only with batching on: off, the call is exactly master's.
-        **({"url": known_url} if _BATCH_RELEVANCE_ENABLED else {}),
+        hints=locate_hints,
+        url=known_url,
     )
     if call_log is not None and verification_call_log is not None:
         call_log.append(verification_call_log)
@@ -1763,6 +1932,8 @@ def _resolve_candidates(
     author=None,
     verify_claim=None,
     page_cache=None,
+    locate_hints=None,
+    secondary_urls=None,
 ):
     """Check a claim against the sources cited for it, best candidate first.
 
@@ -1776,7 +1947,17 @@ def _resolve_candidates(
     That ordering matters for honesty as much as cost. Reporting "the source
     does not support this" after checking one of three cited sources says
     something false about a draft that cited the right source second.
+
+    ``secondary_urls`` are candidates that reached the claim only through a
+    neighbouring span's marker or a weak span match. They are tried, and may
+    support the claim, but when none supports it the reported failure is drawn
+    from the claim's own sources whenever one of those was tried (issue #441).
+    On brockovich-fact-check run 2 a TV guest listing one span earlier won the
+    headline for three facility-count claims because the draft's own source, a
+    759,000-character JSON file, could only be read in part and a partial read
+    ranks below a clean "not addressed".
     """
+    secondary = set(secondary_urls or ())
     attempts = []
     for url in known_urls:
         result = _resolve_known_url(
@@ -1788,6 +1969,7 @@ def _resolve_candidates(
             author=author,
             verify_claim=verify_claim,
             page_cache=page_cache,
+            locate_hints=tuple((locate_hints or {}).get(url, ())),
         )
         if verify_claim:
             result["verified_as"] = verify_claim
@@ -1796,11 +1978,26 @@ def _resolve_candidates(
             # citation list where only the third entry carries the claim is
             # worth knowing about, and it is invisible otherwise.
             if attempts:
-                result["alternates_checked"] = [a.get("url") for a in attempts]
+                result["alternates_checked"] = [a.get("url") for _u, a in attempts]
+                if draft_citations.is_archive_url(url) and any(
+                    a.get("relevance_verdict") == "contradicts" for _u, a in attempts
+                ):
+                    # A dated figure checked against the live page first: the
+                    # live page now says something else, and the archived copy
+                    # the draft cites says what the draft says (issue #442).
+                    result["note"] = (
+                        f"{result.get('note', '').rstrip()} The archived copy "
+                        "the draft cites supports this; a live page checked "
+                        "first now reads differently, which is a change in the "
+                        "page, not an error in the claim."
+                    ).lstrip()
             return result
-        attempts.append(result)
+        attempts.append((url, result))
 
-    best = max(attempts, key=_informativeness)
+    pairs = attempts
+    own = [result for url, result in pairs if url not in secondary]
+    attempts = [result for _url, result in pairs]
+    best = max(own or attempts, key=_informativeness)
     others = [a.get("url") for a in attempts if a is not best]
     if others:
         best["alternates_checked"] = others
@@ -1843,6 +2040,8 @@ def _resolve_one(
     verify_claim=None,
     page_cache=None,
     clock=None,
+    locate_hints=None,
+    secondary_urls=None,
 ):
     """Resolve a single claim against the configured sources, in order.
 
@@ -1872,6 +2071,8 @@ def _resolve_one(
             author,
             verify_claim,
             page_cache,
+            locate_hints=locate_hints,
+            secondary_urls=secondary_urls,
         )
     finally:
         _clock.current = None
@@ -1892,6 +2093,8 @@ def _resolve_one_steps(
     author,
     verify_claim,
     page_cache,
+    locate_hints=None,
+    secondary_urls=None,
 ):
     checksum_index = checksum_index if checksum_index is not None else {}
 
@@ -1905,6 +2108,8 @@ def _resolve_one_steps(
             author=author,
             verify_claim=verify_claim,
             page_cache=page_cache,
+            locate_hints=locate_hints,
+            secondary_urls=secondary_urls,
         )
 
     for source_config in citation_sources:
@@ -2288,12 +2493,17 @@ def _note_breaker_state():
     exists to explain is precisely the run with zero targets, which returns
     early and never reaches the end of that function. It has to sit outside.
     """
-    if wayback.rate_limited_out():
+    if wayback.note_breaker_state():
+        summary = wayback.breaker_summary()
+        when = summary.get("first_seen_open_utc")
+        reopened = summary.get("reopened", 0)
         log.warning(
             "archive.org's rate-limit breaker was open at the end of the "
-            "archiving pass — lookups and submissions after it tripped were "
+            "archiving pass%s%s — lookups and submissions after it tripped were "
             "skipped, so an unknown archive status this run is this, not a "
-            "statement about the pages"
+            "statement about the pages",
+            f" (first seen open at {when})" if when else "",
+            f", after {reopened} retry(ies) this run" if reopened else "",
         )
 
 
@@ -3105,6 +3315,17 @@ def resolve_citations(
         entry.get("verify_claim") if isinstance(entry, dict) else None
         for entry in claims
     ]
+    hints_per_claim = [
+        entry.get("locate_hints") if isinstance(entry, dict) else None
+        for entry in claims
+    ]
+    secondary_per_claim = [
+        set(entry.get("neighbour_urls") or ())
+        | set(entry.get("weak_source_urls") or ())
+        if isinstance(entry, dict)
+        else set()
+        for entry in claims
+    ]
     call_log = verification_call_log if verification_call_log is not None else []
     checksum_index = build_checksum_index(history_root) if history_root else {}
 
@@ -3122,7 +3343,7 @@ def resolve_citations(
     jobs = [
         (
             str(idx),
-            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim, clock=clock: (
+            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim, clock=clock, hints=hints, secondary=secondary: (
                 _resolve_one(
                     claim,
                     citation_sources,
@@ -3134,12 +3355,20 @@ def resolve_citations(
                     verify_claim,
                     page_cache,
                     clock=clock,
+                    locate_hints=hints,
+                    secondary_urls=secondary,
                 )
             ),
             _RESOLVE_TIMEOUT_SECONDS,
         )
-        for idx, ((claim, known_urls, _bucket), verify_claim, clock) in enumerate(
-            zip(normalized, verify_claims, clocks)
+        for idx, (
+            (claim, known_urls, _bucket),
+            verify_claim,
+            clock,
+            hints,
+            secondary,
+        ) in enumerate(
+            zip(normalized, verify_claims, clocks, hints_per_claim, secondary_per_claim)
         )
     ]
 
@@ -3178,11 +3407,14 @@ def resolve_citations(
     call_log.extend(batch.orphan_calls)
     if batch.stats["batches"]:
         log.info(
-            "Relevance checks: %d batched call(s) covered %d claims; %d verdict(s) "
-            "served to a claim citing the same page instead of a call of its own",
+            "Relevance checks: %d batched call(s) covered %d claims; %d "
+            '"supports" kept (%d served to a claim citing the same page instead '
+            "of a call of its own), %d answer(s) checked again on their own",
             batch.stats["batches"],
             batch.stats["claims_in_batches"],
+            batch.stats["kept"],
             batch.stats["served"],
+            batch.stats["rechecked"],
         )
 
     ordered: dict[int, dict] = {}

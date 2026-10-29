@@ -214,8 +214,50 @@ def parse_citation_block(block):
             url = url.rstrip(".,;:")
             if url not in urls:
                 urls.append(url)
+        if _LIVE_PAGE_MOVED.search(text):
+            # The author says the live page has moved on and gives the archived
+            # copy: that copy is the source, so it is tried first (issue #442).
+            urls = _archive_first(urls)
         entries[key.lower()] = {"urls": urls, "text": text.strip()}
     return entries
+
+
+#: An entry saying its live page no longer shows what was cited: "live page has
+#: since updated", "the live file has since grown", "page has since changed".
+_LIVE_PAGE_MOVED = re.compile(
+    r"\b(?:live|current)\s+(?:page|file|site|version|copy)\s+has\s+since\b"
+    r"|\bhas\s+since\s+(?:been\s+)?(?:updated|changed|grown|moved|revised)\b",
+    re.IGNORECASE,
+)
+
+#: A claim pinned to a date: "as of October 4", "on July 30, 2026",
+#: "as of 2025". A figure like that is true of the page on that date, and the
+#: archived copy the draft cites is the page on that date.
+_DATED_CLAIM = re.compile(
+    r"\b(?:as\s+of|on|through)\s+(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
+    r"[a-z]*\.?\s+\d{1,2}(?:,\s*\d{4})?|\d{4}-\d{2}-\d{2}|\d{4}\b)",
+    re.IGNORECASE,
+)
+
+_ARCHIVE_HOSTS = (
+    "web.archive.org/",
+    "archive.org/wayback/",
+    "archive.ph/",
+    "archive.today/",
+)
+
+
+def is_archive_url(url):
+    """True for a URL on a web archive (the Wayback Machine, archive.today)."""
+    lowered = (url or "").lower()
+    return any(host in lowered for host in _ARCHIVE_HOSTS)
+
+
+def _archive_first(urls):
+    """``urls`` with archived copies ahead of live ones, order otherwise kept."""
+    return [u for u in urls if is_archive_url(u)] + [
+        u for u in urls if not is_archive_url(u)
+    ]
 
 
 def iter_blocks(body):
@@ -309,8 +351,11 @@ class DraftCitations:
     def marker_count(self):
         return len(self.entries)
 
-    def _urls_for_keys(self, keys):
+    def _urls_for_keys(self, keys, prefer_archive=False):
         """Candidate URLs for ``keys``, breadth-first across the markers.
+
+        ``prefer_archive`` puts each marker's archived copy ahead of its live
+        URL, for a claim pinned to a date (see ``_DATED_CLAIM``).
 
         Order is one URL from each marker, then each marker's second, and so on
         — not marker 1's URLs exhausted before marker 2 is reached. The caller
@@ -326,12 +371,28 @@ class DraftCitations:
         represented before any source is examined twice.
         """
         per_key = [self.entries.get(key, {}).get("urls", []) for key in keys]
+        if prefer_archive:
+            per_key = [_archive_first(u) for u in per_key]
         urls = []
         for depth in range(max((len(u) for u in per_key), default=0)):
             for candidate in per_key:
                 if depth < len(candidate) and candidate[depth] not in urls:
                     urls.append(candidate[depth])
         return urls
+
+    def descriptions_for(self, url):
+        """The text of every citation entry that lists ``url``, URLs removed.
+
+        An entry's description is the author naming what the source says and
+        often where ("Google, 2025 Environmental Report, p. 110 (Council
+        Bluffs, IA: 1,410.3 million gallons withdrawn)"). The resolver uses it
+        to find that place in a long document (issue #440).
+        """
+        return [
+            " ".join(_URL.sub(" ", entry["text"]).split())
+            for entry in self.entries.values()
+            if url in entry.get("urls", ())
+        ]
 
     def candidates_for(self, claim, source_text=""):
         """URLs the draft cites for ``claim``, best first (empty when none).
@@ -343,15 +404,37 @@ class DraftCitations:
 
         Returns at most ``MAX_CANDIDATES`` URLs.
         """
+        ordered, _direct = self._ranked_keys(claim, source_text)
+        dated = bool(_DATED_CLAIM.search(claim or ""))
+        return self._urls_for_keys(ordered, prefer_archive=dated)[:MAX_CANDIDATES]
+
+    def neighbour_urls_for(self, claim, source_text=""):
+        """Candidates that reached ``claim`` only as the preceding span's markers.
+
+        ``candidates_for`` includes the span before the claim's own, because a
+        marker covers back to the previous marker and the first sentence of a
+        span may belong to it. That makes those URLs worth trying for support.
+        It does not make a failure on one of them a finding about the claim: on
+        brockovich-fact-check run 2, three claims about a facility count were
+        reported as not supported by a TV guest listing that sat one span
+        earlier, while the draft's own source for them was listed under
+        "alternates" (issue #441). The resolver uses this set to keep such a
+        URL out of the headline when the claim's own source was tried.
+        """
+        ordered, direct = self._ranked_keys(claim, source_text)
+        neighbours = [k for k in ordered if k not in direct]
+        direct_urls = set(self._urls_for_keys(list(direct)))
+        return [u for u in self._urls_for_keys(neighbours) if u not in direct_urls]
+
+    def _ranked_keys(self, claim, source_text=""):
+        """``(ordered marker keys, keys on the claim's own spans or named)``."""
         if not self.entries:
-            return []
+            return [], set()
 
         # 1. The claim (or the model's note about it) names a marker outright.
         named = [k for k in _marker_keys(f"{claim} {source_text}") if k in self.entries]
-        if named:
-            urls = self._urls_for_keys(named)
-            if urls:
-                return urls[:MAX_CANDIDATES]
+        if named and self._urls_for_keys(named):
+            return named, set(named)
 
         # 2. Locate the claim in the body and read the markers off its spans.
         claim_words, claim_numbers = _tokens(claim), _numbers(claim)
@@ -361,15 +444,17 @@ class DraftCitations:
         ]
         matched = [row for row in scored if row[0] >= _MIN_SCORE]
         if not matched:
-            return []
+            return [], set()
 
         # Every marker on a span the claim plausibly belongs to is a candidate,
         # scored by its best such span. A claim restated in a summary bullet and
         # again in the body legitimately has two homes; which one the author
         # meant is settled below, not by whichever wording the model echoed.
         by_key = {}
+        direct = set()
         for score, index, span in matched:
             keys = list(span["markers"])
+            direct.update(span["markers"])
             # The preceding span's markers too — see the module docstring on why
             # the enclosing marker is not always the one meant for the first
             # sentence of a span. Discounted so it never outranks a direct hit.
@@ -391,7 +476,7 @@ class DraftCitations:
             return by_key[key] + _DESCRIPTION_WEIGHT * overlap
 
         ordered = sorted(by_key, key=lambda k: (-rank(k), k))
-        return self._urls_for_keys(ordered)[:MAX_CANDIDATES]
+        return ordered, direct
 
     def fallback_candidates_for(self, claim):
         """Draft citations for a claim that only *nearly* located itself.

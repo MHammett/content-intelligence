@@ -57,6 +57,13 @@ dependencies = [
     # already in uv.lock.
     # Pinned to a minor: 0.x releases are generated and may break anywhere.
     "perplexityai>=0.43.6,<0.44",
+    # ci_core.http's page store (#451): a fetched citation page is kept and
+    # revalidated with If-None-Match / If-Modified-Since on the next run, so an
+    # unchanged page costs its host a 304 instead of the whole body. Chosen over
+    # a hand-rolled store after a 2026-10-28 probe: with expire_after=0 and
+    # cache_control=False it revalidates every reuse, keeps nothing that has no
+    # validator, and survived two processes x eight threads on one SQLite file.
+    "requests-cache>=1.3.3,<2",
 ]
 
 [project.optional-dependencies]

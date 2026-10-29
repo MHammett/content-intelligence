@@ -749,10 +749,11 @@ class TestSection9Citations:
 
         assert "| Fetched, but could not be read | 1 |" in md
 
-    def test_content_drift_called_out_above_the_tiers(self):
-        """A source that changed since it was last checksummed gets its own
-        block — buried in the verified entry's key/value bullets it would read
-        as just another field."""
+    def test_content_drift_is_a_note_and_a_named_line_under_the_entry(self):
+        """Drift is never a warning section (issue #446): only checksum-tier
+        entries are compared, so every one was read again this run and still
+        supports its claim. It stays visible as a note above the block and a
+        named line directly under the entry, not one more key/value field."""
         report = _base_report(
             section_9_citations=[
                 {
@@ -773,14 +774,17 @@ class TestSection9Citations:
             ]
         )
         md = render_report_markdown(report)
-        assert "### ⚠ Content changed since prior checksum (1)" in md
+        assert "Content changed since prior checksum" not in md
+        assert "1 source(s) in the next block have changed text" in md
+        assert "nothing here needs re-checking" in md
 
-        drift_section = md.split("### ⚠ Content changed")[1].split(
-            "### Read, and supports the claim"
-        )[0]
-        assert "https://example.gov/budget.pdf" in drift_section
-        assert "run 4 of 'prior-article' on 2026-01-01T00:00:00" in drift_section
-        assert "may need re-checking" in drift_section
+        block = md.split("### Read, and supports the claim")[1]
+        entry = block.split('- "The bridge cost $4 million."')[1]
+        assert (
+            "  - Text changed since run 4 of 'prior-article' on "
+            "2026-01-01T00:00:00; read again and still supports this claim."
+        ) in entry
+        assert "https://example.gov/budget.pdf" in entry
         # The entry still renders in its tier; it is not moved out of the
         # confirmed block.
         assert (
@@ -817,12 +821,11 @@ class TestSection9Citations:
             ]
         )
         md = render_report_markdown(report)
-        drift_section = md.split("### ⚠ Content changed")[1].split(
-            "### Read, and supports the claim"
-        )[0]
+        entry = md.split("### Read, and supports the claim")[1]
 
-        assert f"- URL: {landed}" in drift_section
-        assert redirect not in drift_section
+        assert landed in entry
+        assert redirect not in entry
+        assert "Text changed since run 4 of 'prior-article'" in entry
 
     def test_the_drift_block_still_names_a_citation_that_never_redirected(self):
         """No ``final_url`` means the requested URL is where it landed."""
@@ -838,11 +841,10 @@ class TestSection9Citations:
             ]
         )
         md = render_report_markdown(report)
-        drift_section = md.split("### ⚠ Content changed")[1].split(
-            "### Read, and supports the claim"
-        )[0]
+        entry = md.split("### Read, and supports the claim")[1]
 
-        assert "- URL: https://example.gov/budget.pdf" in drift_section
+        assert "https://example.gov/budget.pdf" in entry
+        assert "Text changed since run 4" in entry
 
     def test_no_drift_block_when_nothing_changed(self):
         report = _base_report(

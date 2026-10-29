@@ -94,7 +94,9 @@ LONG = (
     + "The cap on Project Cardinal is 42,000 gallons per day. "
     + "More unrelated business about the fall festival. " * 400
 )
-WHOLE_PDF = extract.read_coverage("pdf", pages_total=12, pages_read=12)
+# Four pages: SHORT is ~400 characters, and spread over 12 pages that is a scan's
+# stamp, which the resolver now reports unreadable rather than judging (#447).
+WHOLE_PDF = extract.read_coverage("pdf", pages_total=4, pages_read=4)
 CAPPED_PDF = extract.read_coverage(
     "pdf", pages_total=612, pages_read=400, stopped_by="page_cap"
 )
@@ -163,7 +165,7 @@ class TestResolverTellsNotFoundFromNotThere:
         result, _ = _resolve(SHORT, "pdf", WHOLE_PDF, "not_addressed")
 
         assert result["verification"] == "content_mismatch"
-        assert result["read_coverage"]["pages_read"] == 12
+        assert result["read_coverage"]["pages_read"] == WHOLE_PDF["pages_read"]
 
     def test_a_grounded_contradiction_counts_even_on_a_partial_read(self):
         """Text that was found is evidence whatever was left unread."""
@@ -195,7 +197,7 @@ class TestResolverTellsNotFoundFromNotThere:
 
         assert result["verification"] == "checksum"
         assert result["read_coverage"]["partial"] is False
-        assert result["read_coverage"]["pages_total"] == 12
+        assert result["read_coverage"]["pages_total"] == WHOLE_PDF["pages_total"]
 
     def test_a_partial_read_is_not_handed_back_for_a_reask(self):
         result, _ = _resolve(SHORT, "pdf", CAPPED_PDF, "not_addressed")

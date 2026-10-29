@@ -1,6 +1,7 @@
 """Batched relevance checks (issue #453): claims citing one page share one
-mistral-small call when the page is sent whole, and every other case keeps the
-single-claim check it had before.
+mistral-small call when the page is sent whole, only a grounded "supports" is
+taken from that call, and every other case keeps the single-claim check it had
+before.
 
 ``llm.call_provider`` is replaced with a recording fake, so nothing here makes
 a model call.
@@ -104,7 +105,13 @@ class TestOneCallPerPage:
         assert first_log["pass"] == "citation_verification:known_url_batch"
         # The call is logged once, by the claim that made it.
         assert second_log is None
-        assert batch.stats == {"batches": 1, "claims_in_batches": 2, "served": 1}
+        assert batch.stats == {
+            "batches": 1,
+            "claims_in_batches": 2,
+            "served": 1,
+            "kept": 2,
+            "rechecked": 0,
+        }
 
     def test_the_page_is_sent_once_and_the_claims_before_it(self, calls):
         _with_batch([(A, [URL]), (B, [URL]), (C, [URL])])
@@ -203,21 +210,132 @@ class TestEverythingElseKeepsTheSingleCheck:
             "citation_verification:known_url_batch"
         ]
 
-    def test_a_batched_supports_still_needs_a_quote_on_the_page(self, calls):
+    def test_a_batched_supports_without_a_quote_on_the_page_is_rechecked(self, calls):
+        # 12 of the 19 "supports" full batching lost were this: the batch
+        # paraphrased the quote. The single check is asked instead.
         def invented(system, user):
-            return {
-                "results": [
-                    _verdict(1, quote="Text that is not on the page at all."),
-                    _verdict(2),
-                ]
-            }
+            if system is resolver._BATCH_VERIFICATION_SYSTEM_PROMPT:
+                return {
+                    "results": [
+                        _verdict(1, quote="Text that is not on the page at all."),
+                        _verdict(2),
+                    ]
+                }
+            return _default_answer(system, user)
 
         calls.answer[0] = invented
+        batch = _with_batch([(A, [URL]), (B, [URL])])
+        info, entry = _verify(A)
+        assert info["checked"] and info["verdict"] == "supports"
+        assert "batch_size" not in info
+        assert entry["pass"] == "citation_verification:known_url"
+        assert [e["pass"] for e in batch.orphan_calls] == [
+            "citation_verification:known_url_batch"
+        ]
+        assert _verify(B)[0]["batch_size"] == 2
+        assert batch.stats["kept"] == 1 and batch.stats["rechecked"] == 1
+
+
+class TestOnlyASupportsIsTakenFromABatch:
+    """The rest of the measured losses: a batch flipping a claim negative."""
+
+    @staticmethod
+    def _batch_says(verdicts):
+        def answer(system, user):
+            if system is resolver._BATCH_VERIFICATION_SYSTEM_PROMPT:
+                return {
+                    "results": [
+                        _verdict(i, verdict=v, quote="" if v != "supports" else None)
+                        for i, v in enumerate(verdicts, 1)
+                    ]
+                }
+            return _default_answer(system, user)
+
+        return answer
+
+    @pytest.mark.parametrize(
+        "verdict", ["not_addressed", "contradicts", "inconclusive"]
+    )
+    def test_a_negative_for_a_sibling_sends_it_to_the_single_check(
+        self, calls, verdict
+    ):
+        calls.answer[0] = self._batch_says(["supports", verdict])
+        batch = _with_batch([(A, [URL]), (B, [URL])])
+        assert _verify(A)[0]["batch_size"] == 2
+        info, entry = _verify(B)
+        # The single check, which the fake answers "supports" with a real quote.
+        assert entry["pass"] == "citation_verification:known_url"
+        assert info["verdict"] == "supports" and "batch_size" not in info
+        assert batch.stats["rechecked"] == 1
+        assert batch.orphan_calls == []
+
+    def test_a_negative_for_the_claim_that_asked_keeps_the_batch_cost(self, calls):
+        calls.answer[0] = self._batch_says(["not_addressed", "supports"])
+        batch = _with_batch([(A, [URL]), (B, [URL])])
+        info, entry = _verify(A)
+        assert entry["pass"] == "citation_verification:known_url"
+        assert "batch_size" not in info
+        # The batch call was still made and billed: logged once, as an orphan.
+        assert [e["pass"] for e in batch.orphan_calls] == [
+            "citation_verification:known_url_batch"
+        ]
+        second, second_log = _verify(B)
+        assert second["batch_size"] == 2 and second_log is None
+        assert len(calls) == 2
+
+    def test_two_supports_resting_on_one_sentence_are_both_rechecked(self, calls):
+        # The 2026-10-29 Microsoft case: a fragment came back "supports" by
+        # quoting the sentence that answered its sibling.
+        shared = "The district heating network delivers 40 MW of recovered heat."
+
+        def answer(system, user):
+            if system is resolver._BATCH_VERIFICATION_SYSTEM_PROMPT:
+                return {
+                    "results": [
+                        _verdict(1, quote=shared),
+                        _verdict(2, quote=shared + " It began operating in 2015"),
+                        _verdict(3),
+                    ]
+                }
+            return _default_answer(system, user)
+
+        calls.answer[0] = answer
+        batch = _with_batch([(A, [URL]), (B, [URL]), (C, [URL])])
+        first, first_log = _verify(A)
+        assert "batch_size" not in first
+        assert first_log["pass"] == "citation_verification:known_url"
+        second, second_log = _verify(B)
+        assert "batch_size" not in second
+        assert second_log["pass"] == "citation_verification:known_url"
+        # A quote of its own is kept.
+        assert _verify(C)[0]["batch_size"] == 3
+        assert batch.stats["kept"] == 1 and batch.stats["rechecked"] == 2
+
+    def test_a_negative_from_the_single_check_stands(self, calls):
+        def answer(system, user):
+            if system is resolver._BATCH_VERIFICATION_SYSTEM_PROMPT:
+                return {"results": [_verdict(1), _verdict(2, "not_addressed", "")]}
+            return {"verdict": "not_addressed", "quote": "", "reason": "r"}
+
+        calls.answer[0] = answer
         _with_batch([(A, [URL]), (B, [URL])])
-        info, _ = _verify(A)
-        assert info["checked"] is False
-        assert "could not quote supporting text" in info["reason"]
-        assert _verify(B)[0]["verdict"] == "supports"
+        _verify(A)
+        info, _ = _verify(B)
+        assert info["checked"] and info["verdict"] == "not_addressed"
+
+
+class TestClaimsSharingAQuote:
+    def test_sentences_shorter_than_the_floor_do_not_count(self):
+        kept = {1: {"quote": "Yes. The plant opened in 2015."}, 2: {"quote": "Yes."}}
+        assert resolver._claims_sharing_a_quote(kept) == []
+
+    def test_case_and_whitespace_do_not_hide_a_shared_sentence(self):
+        kept = {
+            1: {"quote": "The plant opened in 2015."},
+            2: {"quote": "It is big.  the PLANT opened   in 2015."},
+            3: {"quote": "Something else entirely here."},
+        }
+        assert resolver._claims_sharing_a_quote(kept) == [1, 2]
 
 
 class TestPrompts:

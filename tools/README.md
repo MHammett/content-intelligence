@@ -9,7 +9,7 @@ says in its own docstring what it is for and why it exists.
 | `publish_rehearsal.py` | Run the real `ci-review --publish` with every socket blocked and WordPress faked. The only safe way to exercise the one path with irreversible side effects. |
 | `image_metadata.py` | `report` what an image carries (read with exifread, not Pillow), or `make` one that carries a phone's GPS block, orientation and ICC profile. |
 | `media_exif_audit.py` | Report which images already in a WordPress media library carry EXIF or a GPS block. GETs only; deletes nothing. |
-| `ab_relevance_batch.py` | Compare batched against single-claim relevance verdicts on real claims and the pages they cite (issue #453). Makes mistral-small calls, about $0.10 a run. Arguments: history root, `.env` path, output JSON. |
+| `ab_relevance_batch.py` | Compare the shipped batched relevance check (a batched "supports" kept, everything else checked alone) against the single-claim check run twice, on real claims and the pages they cite (issue #453). Makes mistral-small calls, about $0.10 a run. Arguments: history root, `.env` path, output JSON, optional `slug/run_prefix` pairs. |
 | `tidy.py` | List merged branches, removable worktrees and orphan directories left by finished sessions, and print the commands to clear them. Read-only; deletes nothing. See `docs/LANDING-A-PR.md`, "After it lands". |
 
 The procedure these belong to is in

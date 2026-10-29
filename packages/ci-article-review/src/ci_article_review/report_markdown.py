@@ -2718,26 +2718,22 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
         )
         lines.append("")
 
+    # Text that changed since an earlier run checksummed it. Only the checksum
+    # tier is compared (``resolver._check_drift``), so every entry here was read
+    # again in this run and still supports its claim: the change asks nothing
+    # of this article's author. It used to head a warning section of its own,
+    # which on news pages (a rotating "related stories" block changes the
+    # extracted text daily) fired on six still-supporting sources in one run
+    # (brockovich-fact-check run 2, issue #446). It is now a note, and a line
+    # under each entry in the block below.
     changed = [c for c in verified if c.get("content_changed_since")]
     if changed:
-        lines.append(f"### ⚠ Content changed since prior checksum ({len(changed)})")
-        for c in changed:
-            drift = c["content_changed_since"]
-            when = f" on {drift['prior_date']}" if drift.get("prior_date") else ""
-            lines.append(f'- "{c.get("claim", "")}"')
-            # Where the fetch landed, not the address the model cited. A
-            # grounded-model citation arrives as a `grounding-api-redirect`
-            # wrapper that names no publication and expires within days; this
-            # block is telling the author to go and re-check a source, so it
-            # has to name one they can open. Every other URL in the section
-            # goes through `_citation_pair` for this reason -- the drift block
-            # predates it and kept reading `url` directly.
-            lines.append(f"  - URL: {_citation_pair(c)[0]}")
-            lines.append(
-                f"  - Last matched in run {drift.get('prior_run')} of "
-                f"'{drift.get('prior_article')}'{when} — content has since changed. "
-                "Previously-verified claim may need re-checking."
-            )
+        lines.append(
+            f"_{len(changed)} source(s) in the next block have changed text since "
+            "an earlier run checksummed them (each is marked). Each was read again "
+            "in this run and still supports its claim, so nothing here needs "
+            "re-checking; the note is for other articles that cite the same page._"
+        )
         lines.append("")
 
     if verified:
@@ -2757,6 +2753,14 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
         for c in verified:
             lines.append(f'- "{c.get("claim", "")}"')
             lines.extend(_render_archive_pair(c))
+            drift = c.get("content_changed_since")
+            if drift:
+                when = f" on {drift['prior_date']}" if drift.get("prior_date") else ""
+                lines.append(
+                    f"  - Text changed since run {drift.get('prior_run')} of "
+                    f"'{drift.get('prior_article')}'{when}; read again and still "
+                    "supports this claim."
+                )
             for kv in _kv_lines(
                 c,
                 exclude=(

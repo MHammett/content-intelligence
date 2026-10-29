@@ -145,18 +145,104 @@ def quote_found(quote, texts):
     when nothing is left to compare (a quote that was only an ellipsis), which
     the caller treats like any other check that could not be made.
     """
-    pieces = [_compact(p) for p in _ELLIPSIS.split(str(quote or ""))]
-    pieces = [p for p in pieces if p]
+    return quote_match(quote, texts)[0]
+
+
+#: A figure in a quote: digits with thousands separators and a decimal part.
+#: What a model re-types from a table row.
+_FIGURE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+#: How far apart, in compacted characters, the figures of a re-typed table row
+#: may sit on the page and still count as one row. A row of a water table is a
+#: name and four numbers, under 100 characters compacted; 300 leaves room for
+#: a long row label and a footnote marker without reaching the next row's
+#: figures, which on the pages measured sit several hundred characters on.
+_FIGURES_SPAN = 300
+
+#: A single figure is only distinctive enough to stand for a row when it has
+#: at least this many digits; "20" is on every page, "14103" is not.
+_LONE_FIGURE_DIGITS = 4
+
+
+def _figures_in(raw_piece):
+    """The compacted figures of a raw (uncompacted) quote piece, in order."""
+    return [_compact(f) for f in _FIGURE.findall(raw_piece)]
+
+
+def _figures_in_order(figures, haystack):
+    """True if ``figures`` occur in ``haystack`` in order inside ``_FIGURES_SPAN``.
+
+    Tried from every occurrence of the first figure, because the same number
+    can open several rows of a table and only one of them carries the rest.
+    """
+    if not figures:
+        return False
+    start = haystack.find(figures[0])
+    while start != -1:
+        pos = start + len(figures[0])
+        ok = True
+        for figure in figures[1:]:
+            pos = haystack.find(figure, pos)
+            if pos == -1:
+                ok = False
+                break
+            pos += len(figure)
+        if ok and pos - start <= _FIGURES_SPAN:
+            return True
+        start = haystack.find(figures[0], start + 1)
+    return False
+
+
+def quote_match(quote, texts):
+    """``(found, how)``: :func:`quote_found` plus how the match was made.
+
+    ``how`` is ``"verbatim"`` when every piece of the quote is on the page as
+    written, ``"figures"`` when a piece was not but its figures are, in order
+    and close together, and ``None`` otherwise.
+
+    **The figures path exists for table rows.** A model asked to copy a table
+    row "verbatim" routinely re-types it with the column headings as labels:
+    ``Council Bluffs, IA ... Water withdrawal: 1,410.3 million gallons; Water
+    consumption: 1,010.2 million gallons`` for a page that reads ``Council
+    Bluffs, IA Million gallons 1,410.3 400.1 1,010.2 6.7``. The words are the
+    model's, the figures are the page's, and the verdict rests on the figures.
+    So a piece that is not on the page as written still counts when it carries
+    at least two figures, or one of :data:`_LONE_FIGURE_DIGITS` digits or more,
+    and all of them occur on the page in the quote's order within
+    :data:`_FIGURES_SPAN` compacted characters. A piece with fewer figures than
+    that is prose, and prose has to match as written: the path can turn a miss
+    into a match only on numbers the page actually carries together, never the
+    other way round. Measured on the 2026-10-28 brockovich run: gemini's and
+    mistral's Council Bluffs rows, both demoted as not found, both carry the
+    page's own figures in the page's own order.
+    """
+    raw_pieces = [p for p in _ELLIPSIS.split(str(quote or "")) if _compact(p)]
+    pieces = [(_compact(p), p) for p in raw_pieces]
     # Short fragments around an ellipsis are noise, but a quote that is short
     # throughout is still the whole claim to be checked.
-    pieces = [p for p in pieces if len(p) >= _MIN_PIECE_CHARS] or pieces
+    pieces = [pair for pair in pieces if len(pair[0]) >= _MIN_PIECE_CHARS] or pieces
     if not pieces:
-        return None
+        return None, None
+    best = False
     for text in texts:
         haystack = _compact(text)
-        if all(piece in haystack for piece in pieces):
-            return True
-    return False
+        if all(piece in haystack for piece, _raw in pieces):
+            return True, "verbatim"
+        if all(
+            piece in haystack or _figures_match(raw, haystack) for piece, raw in pieces
+        ):
+            best = "figures"
+    if best:
+        return True, best
+    return False, None
+
+
+def _figures_match(raw_piece, haystack):
+    figures = _figures_in(raw_piece)
+    distinctive = len(figures) >= 2 or (
+        len(figures) == 1 and len(figures[0]) >= _LONE_FIGURE_DIGITS
+    )
+    return distinctive and _figures_in_order(figures, haystack)
 
 
 class _AllText(HTMLParser):
@@ -205,6 +291,11 @@ def _pdf_text(raw):
     text, coverage = extract.extract_pdf_text_with_coverage(
         raw, max_pages=_PDF_MAX_PAGES
     )
+    if not coverage.get("partial") and extract.looks_like_scanned_pdf(
+        text, coverage.get("pages_read")
+    ):
+        # A scan's stamp is not its text; "" makes it "too short", not a miss.
+        return "", False
     return text, bool(coverage.get("partial"))
 
 
@@ -306,15 +397,25 @@ def _landing_page(url, page):
 
 
 def _targets(results):
-    """``{(url, quote): None}`` for every verdict a page can be held to.
+    """``[(url, quote), ...]`` for every verdict a page can be held to.
 
     The same verdicts, by the same reading of URL and quote, that
     ``consolidation._demote_unevidenced_verdict`` keeps after its own rules; a
     verdict that fails those never gets this far, so fetching for it would be
     wasted. Ordered by first appearance so ``_MAX_URLS`` cuts predictably.
     """
+    return list(_offerers(results))
+
+
+def _offerers(results):
+    """``{(url, quote): {"claims": [...], "models": [...]}}``, first appearance first.
+
+    Who offered each quote, and for which claim. Consolidation reads this to
+    tell a quote one model paraphrased from the same page another model quoted
+    verbatim for the same sentence (``_demote_unevidenced_verdict``, rule 4).
+    """
     targets = {}
-    for (_model, domain), result in (results or {}).items():
+    for (model, domain), result in (results or {}).items():
         if domain != "fact_check" or not isinstance(result, dict):
             continue
         data = result.get("data")
@@ -330,8 +431,15 @@ def _targets(results):
                 url = consolidation._evidence_url(item)
                 quote = consolidation._evidence_quote(item)
                 if url and quote:
-                    targets.setdefault((url, quote), None)
-    return list(targets)
+                    offered = targets.setdefault(
+                        (url, quote), {"claims": [], "models": []}
+                    )
+                    claim = str(item.get("claim") or "")
+                    if claim and claim not in offered["claims"]:
+                        offered["claims"].append(claim)
+                    if model not in offered["models"]:
+                        offered["models"].append(model)
+    return targets
 
 
 def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL, cache=None):
@@ -343,13 +451,17 @@ def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL, cache=None):
     reuse these fetches; it is not used when ``fetch`` is given.
 
     Returns ``(checks, summary)``. ``checks`` maps ``(url, quote)`` to
-    ``{"found": True | False | None, "reason": str, "chars": int}``; ``found`` is
-    ``None`` whenever nothing was established. ``summary`` counts the outcomes
-    for the report.
+    ``{"found": True | False | None, "reason": str, "chars": int, "matched":
+    "verbatim" | "figures" | None, "claims": [...], "models": [...]}``;
+    ``found`` is ``None`` whenever nothing was established, ``matched`` says
+    how a found quote was matched (see :func:`quote_match`), and ``claims`` /
+    ``models`` are the claims the quote was offered for and the models that
+    offered it. ``summary`` counts the outcomes for the report.
     """
     if fetch is None:
         fetch = lambda url, timeout: fetch_page(url, timeout, cache=cache)  # noqa: E731
-    pairs = _targets(results)
+    offerers = _offerers(results)
+    pairs = list(offerers)
     urls = list(dict.fromkeys(url for url, _quote in pairs))
     fetched_urls, over_limit = urls[:_MAX_URLS], set(urls[_MAX_URLS:])
     if over_limit:
@@ -388,7 +500,7 @@ def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL, cache=None):
                 "reason": f"page not read ({page.status}: {page.detail})",
             }
         else:
-            found = quote_found(quote, page.texts)
+            found, how = quote_match(quote, page.texts)
             if found is False and page.partial:
                 checks[(url, quote)] = {
                     "found": None,
@@ -399,10 +511,12 @@ def check_quotes(results, fetch=None, max_parallel=_MAX_PARALLEL, cache=None):
                     "found": found,
                     "reason": "" if found is not None else "nothing to compare",
                     "chars": max((len(t) for t in page.texts), default=0),
+                    "matched": how,
                 }
         landed = _landing_page(url, page)
         if landed:
             checks[(url, quote)]["final_url"] = landed
+        checks[(url, quote)].update(offerers[(url, quote)])
 
     outcome_counts = Counter(
         {True: "found", False: "not_found", None: "unchecked"}[c["found"]]

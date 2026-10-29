@@ -199,7 +199,7 @@ class TestTheResolverUsesIt:
     def _resolve(self, pages, verdict="supports"):
         seen = {}
 
-        def fake_verify(claim, content, api_keys, author=None):
+        def fake_verify(claim, content, api_keys, author=None, hints=(), url=None):
             seen["content"] = content
             return {
                 "checked": True,

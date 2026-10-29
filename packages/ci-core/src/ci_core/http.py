@@ -9,8 +9,11 @@ the string from drifting back to per-package values.
 import ipaddress
 import logging
 import socket
+import sqlite3
 import ssl
 import sys
+import threading
+from datetime import timedelta
 from importlib import metadata
 from urllib.parse import urlparse
 
@@ -280,6 +283,121 @@ def _guard(url):
         )
 
 
+# ---------------------------------------------------------------------------
+# Page store: fetched pages kept between runs, reused only after a 304
+# ---------------------------------------------------------------------------
+#
+# Every review fetched every citation page again, although most of a draft's
+# sources do not change between rounds: on the four ``maximum`` runs of one
+# article (2026-10-25 to 10-28), 49 of 76 Section 9 URLs were the previous run's.
+# Of 131 real citation URLs that answered a HEAD on 2026-10-28, 75 sent an ETag
+# or Last-Modified, and 21 of the 22 PDFs did; the PDFs are the slow ones
+# (issue #395: 190-663 s each).
+#
+# The policy is "never serve a body the origin has not just vouched for". A
+# stored page is reused only when the origin answers a conditional request with
+# 304 Not Modified; a page with no validator is fetched in full every time, as
+# before, and is not stored. That matters beyond politeness: Section 9's
+# content-drift check compares this run's checksum with earlier runs', and a
+# body served blind from a store would hide a change for as long as it lived.
+#
+# requests-cache does this with ``expire_after=EXPIRE_IMMEDIATELY`` (stored,
+# revalidated on every use when a validator exists, otherwise not kept) and
+# ``cache_control=False`` (an origin's ``max-age`` does not let a page skip the
+# revalidation). Only 200s are kept, only GETs, and never a streamed response.
+# The store is opened by the pipeline at run start and is off otherwise, so
+# library callers and tests see plain ``requests`` behaviour.
+
+#: The store, while a run has one open: ``{"path", "max_body_bytes"}``.
+_page_store = None
+_page_store_lock = threading.Lock()
+_page_store_stats = {"stored_hits": 0, "bytes_not_downloaded": 0, "live": 0}
+
+#: Largest body kept. A page above it is still returned, just not stored.
+PAGE_STORE_MAX_BODY_BYTES = 32 * 1024 * 1024
+#: Entries older than this are deleted when the store is opened.
+PAGE_STORE_MAX_AGE_DAYS = 14
+
+
+def _cached_session(path, max_body_bytes):
+    import requests_cache
+
+    session = requests_cache.CachedSession(
+        str(path),
+        backend="sqlite",
+        expire_after=requests_cache.EXPIRE_IMMEDIATELY,
+        cache_control=False,
+        allowable_codes=(200,),
+        allowable_methods=("GET",),
+        filter_fn=lambda resp: len(resp.content) <= max_body_bytes,
+        wal=True,
+        busy_timeout=10000,
+    )
+    session.mount("https://", _OSTrustAdapter())
+    return session
+
+
+def open_page_store(path, *, max_body_bytes=PAGE_STORE_MAX_BODY_BYTES):
+    """Keep pages fetched by ``safe_get`` in ``path`` (a SQLite file) until
+    ``close_page_store``. Returns True if the store opened.
+
+    Old entries are pruned here. A store that cannot be opened is logged and
+    left off: fetching every page live, as before, is always a correct outcome.
+    """
+    global _page_store
+    close_page_store()
+    try:
+        with _cached_session(path, max_body_bytes) as session:
+            session.cache.delete(older_than=timedelta(days=PAGE_STORE_MAX_AGE_DAYS))
+    except (sqlite3.Error, OSError, ImportError) as exc:
+        log.warning(
+            "Page store %s could not be opened; pages are fetched live: %s", path, exc
+        )
+        return False
+    with _page_store_lock:
+        _page_store = {"path": str(path), "max_body_bytes": max_body_bytes}
+        for key in _page_store_stats:
+            _page_store_stats[key] = 0
+    return True
+
+
+def close_page_store():
+    """Stop using the store. Counts stay readable until the next open."""
+    global _page_store
+    with _page_store_lock:
+        _page_store = None
+
+
+def page_store_stats():
+    """``{"stored_hits", "bytes_not_downloaded", "live", "persistent"}`` for the
+    log and the report: pages an origin answered 304 for, the body bytes that
+    saved, and fetches that went out in full while the store was open."""
+    with _page_store_lock:
+        return {**_page_store_stats, "persistent": _page_store is not None}
+
+
+def _stored_or_live_get(url, **kwargs):
+    """One hop of ``safe_get``: through the page store when one is open."""
+    store = _page_store
+    if store is None or kwargs.get("stream"):
+        return os_trust_get(url, **kwargs)
+    try:
+        with _cached_session(store["path"], store["max_body_bytes"]) as session:
+            resp = session.get(url, **kwargs)
+    except sqlite3.Error as exc:
+        # The store failed, not the origin. A request exception (timeout, DNS,
+        # TLS) is not caught here: it propagates exactly as a live fetch's would.
+        log.debug("Page store unavailable for %s, fetching live: %s", url, exc)
+        return os_trust_get(url, **kwargs)
+    with _page_store_lock:
+        if getattr(resp, "from_cache", False):
+            _page_store_stats["stored_hits"] += 1
+            _page_store_stats["bytes_not_downloaded"] += len(resp.content)
+        else:
+            _page_store_stats["live"] += 1
+    return resp
+
+
 def safe_get(url, *, timeout=15, headers=None, allow_redirects=True, **kwargs):
     """``requests.get`` with the SSRF guard applied to every hop.
 
@@ -296,7 +414,9 @@ def safe_get(url, *, timeout=15, headers=None, allow_redirects=True, **kwargs):
     current = url
     for _hop in range(_MAX_REDIRECTS + 1):
         _guard(current)
-        resp = os_trust_get(
+        # The page store sits here, under the guard: every hop is validated
+        # before anything, cached or not, is read for it.
+        resp = _stored_or_live_get(
             current, timeout=timeout, headers=headers, allow_redirects=False, **kwargs
         )
         if not allow_redirects or not resp.is_redirect:
