@@ -4765,13 +4765,20 @@ def run_draft_pipeline(
         report["wayback_breaker"] = breaker
     if report["wayback_lookups"]["lookups"]:
         wl = report["wayback_lookups"]
+        not_sent = (
+            f", {wl['skipped']} not sent because archive.org's rate limit had "
+            f"tripped the circuit breaker"
+            if wl["skipped"]
+            else ""
+        )
         log.info(
             "Wayback lookups: %d asked, %d sent to archive.org, %d answered from "
-            "this run, %d from earlier runs",
+            "this run, %d from earlier runs%s",
             wl["lookups"],
             wl["live"],
             wl["run_hits"],
             wl["store_hits"],
+            not_sent,
         )
     # Pages an origin answered 304 for, and the body bytes that saved it.
     report["page_store"] = page_store_stats()
@@ -6388,10 +6395,17 @@ def run_archive_only(
         f"{stale} with only a stale one, {missing} with none{not_checked}."
     )
     remembered = lookups["store_hits"]
-    if remembered:
+    skipped = lookups["skipped"]
+    if remembered or skipped:
         print(
             f"{lookups['live']} lookup(s) sent to archive.org; {remembered} answered "
-            f"from earlier runs."
+            f"from earlier runs"
+            + (
+                f"; {skipped} not sent because archive.org's rate limit had "
+                f"tripped the circuit breaker."
+                if skipped
+                else "."
+            )
         )
     print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
 
