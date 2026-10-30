@@ -268,7 +268,6 @@ def check(
             # The leader's answer, written while this thread waited for the lock.
             cache.note("run_hits")
             return hit
-        cache.note("live")
         result = _spn_check(
             url,
             timeout=timeout,
@@ -276,6 +275,16 @@ def check(
             cdx_fallback=cdx_fallback,
             cdx_timeout=cdx_timeout,
         )
+        # Counted after the call, because only its answer says whether a
+        # request went out: an open breaker and an archive URL are both
+        # answered by spn-client without one. Counting before it reported 306
+        # breaker skips as "sent to archive.org" (2026-10-29).
+        if _lookup_was_skipped(result):
+            cache.note("skipped")
+        elif isinstance(result, dict) and result.get("is_archive_url"):
+            cache.note("archive_urls")
+        else:
+            cache.note("live")
         cache.put(url, result, cdx_fallback=cdx_fallback)
         return result
 
@@ -404,7 +413,17 @@ FALLBACK_REASON_LABELS = {
 #: tripped earlier this run ..."). ``check()`` sets no field for either; only
 #: ``submit()`` sets ``rate_limited``. Matched on the words, lower-cased, so a
 #: change of status-line casing does not hide it.
-_RATE_LIMIT_ERROR_MARKERS = ("too many requests", "rate limit tripped")
+_BREAKER_SKIP_MARKER = "rate limit tripped"
+_RATE_LIMIT_ERROR_MARKERS = ("too many requests", _BREAKER_SKIP_MARKER)
+
+
+def _lookup_was_skipped(result):
+    """True if spn-client's circuit breaker answered ``check()`` without asking
+    archive.org. Unlike a 429, which is a request archive.org refused, a skip
+    sent nothing, so it must not count as a lookup archive.org saw."""
+    if not isinstance(result, dict) or result.get("archived") is not None:
+        return False
+    return _BREAKER_SKIP_MARKER in str(result.get("error") or "").lower()
 
 
 def lookup_was_rate_limited(result):

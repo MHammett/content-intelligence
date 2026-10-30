@@ -142,8 +142,12 @@ class LookupCache:
             "run_hits": 0,
             # Answered from the on-disk store, i.e. an earlier run.
             "store_hits": 0,
-            # Went to archive.org.
+            # Went to archive.org: the requests it saw, refused ones included.
             "live": 0,
+            # Not sent, because spn-client's circuit breaker was open.
+            "skipped": 0,
+            # Web Archive links, read off their own timestamp without a request.
+            "archive_urls": 0,
             # Answers written to the store this run.
             "stored": 0,
         }

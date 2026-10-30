@@ -477,3 +477,75 @@ class TestTheStoreIsNeverAReasonForFewerAnswers:
         assert set(stored) <= set(wlc._ANSWER_FIELDS)
         assert "snapshot_age_days" not in stored
         assert "url" not in stored
+
+
+class TestOnlyRequestsCountAsSent:
+    """``live`` is what archive.org saw. spn-client answers two kinds of
+    ``check()`` without a request, and those must not be counted as sent: on
+    2026-10-29 the log said every lookup was sent while the breaker had
+    skipped 306 of 483. These call the real ``spn_client.check``, so a change
+    to how it words a skip fails here; the socket guard fails them if it
+    makes a request instead."""
+
+    @pytest.fixture(autouse=True)
+    def _memory_only(self):
+        wayback.open_lookup_cache(None)
+        yield
+        wayback.open_lookup_cache(None)
+
+    def test_a_lookup_the_breaker_skipped_was_not_sent(self, monkeypatch):
+        monkeypatch.setattr(
+            spn_client.client,
+            "_rate_limited_lookups",
+            spn_client.client._CIRCUIT_TRIP_AFTER,
+        )
+        result = wayback.check(URL)
+        assert result["archived"] is None
+        assert "rate limit tripped" in result["error"]
+        summary = wayback.lookup_cache_summary()
+        assert summary["live"] == 0
+        assert summary["skipped"] == 1
+
+    def test_an_archive_link_was_not_sent(self):
+        result = wayback.check(f"https://web.archive.org/web/{_ts(3)}/{URL}")
+        assert result["is_archive_url"] is True
+        summary = wayback.lookup_cache_summary()
+        assert summary["live"] == 0
+        assert summary["archive_urls"] == 1
+
+    def test_a_refused_lookup_was_sent(self, live):
+        # A 429 is a request archive.org saw and refused: it counts toward the
+        # throttle, so it counts as sent.
+        live.answers[URL] = _unanswered(URL)
+        wayback.check(URL)
+        summary = wayback.lookup_cache_summary()
+        assert summary["live"] == 1
+        assert summary["skipped"] == 0
+
+    def test_every_ask_is_counted_once(self, live, monkeypatch):
+        live.answers[URL] = _archived(URL)
+        wayback.check(URL)
+        wayback.check(URL)
+        # The rest through the real spn-client, which answers both unasked.
+        monkeypatch.setattr(wayback, "_spn_check", spn_client.check)
+        wayback.check(f"https://web.archive.org/web/{_ts(3)}/{OTHER}")
+        monkeypatch.setattr(
+            spn_client.client,
+            "_rate_limited_lookups",
+            spn_client.client._CIRCUIT_TRIP_AFTER,
+        )
+        wayback.check(OTHER)
+        s = wayback.lookup_cache_summary()
+        assert (s["live"], s["run_hits"], s["archive_urls"], s["skipped"]) == (
+            1,
+            1,
+            1,
+            1,
+        )
+        assert s["lookups"] == (
+            s["live"]
+            + s["run_hits"]
+            + s["store_hits"]
+            + s["archive_urls"]
+            + s["skipped"]
+        )
