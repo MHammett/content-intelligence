@@ -68,6 +68,7 @@ import yaml
 from ci_core.console import force_utf8_stdio
 from ci_core.github_repo import GitHubRepo, GitHubRepoError, resolve_token
 
+from . import checkout_freshness
 from . import documents_init as di
 from .github_documents import GitHubDocumentsError
 
@@ -618,6 +619,12 @@ def main(
 ):
     """Entry point. ``environ``, ``run``, ``session`` and ``sleep`` are for tests."""
     args = build_parser().parse_args(argv)
+    if args.command not in ("ls",) and not (
+        args.command == "import" and args.import_command != "apply"
+    ):
+        behind = checkout_freshness.commits_behind()
+        if behind is not None:
+            print(behind.describe(), file=sys.stderr)
     if args.command == "import" and args.import_command != "apply":
         # Local files only: no token, no network, nothing to catch from GitHub.
         return _import(args, environ, out)

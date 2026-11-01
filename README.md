@@ -534,6 +534,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is 
 | `--github-ref REF` | With `--github`: read a branch, tag or commit SHA as it is. Never written back: a usage error with `--write-back`. |
 | `--github-repo OWNER/NAME` | With `--github`: read from this repository instead of `github_documents.repo`, for this run only |
 | `--write-back` / `--no-write-back` | With `--github`: deliver the review to the round's pull request (a commit to its branch and one pull request review), or don't, overriding `github_documents.write_back`. A usage error without `--github`, and `--write-back` is one with `--replay`, `--offline`, `--only-model`, `--only-domain`, `--no-timeout` or `--github-ref`. See [Writing the review back](#writing-the-review-back-to-github) |
+| `--allow-stale` | Run `--write-back` although this checkout is behind `origin/master`. Every run prints how many commits it lacks (after a `git fetch`); a `--write-back` from an out-of-date checkout is refused without this flag. Nothing is checked when git, `origin` or a checkout is missing |
 | `--publish PATH` | Publish an approved publication handoff (saves as draft unless `--publish-live`) |
 | `--metadata PATH` | Metadata-only file (PRIMARY CLAIM, TARGET AUDIENCE, etc., no DRAFT section) to pair with `--raw-draft`. Requires `--raw-draft`. |
 | `--publication NAME` | Publication config to use (`configs/NAME.yaml`) — **required** |
@@ -1111,6 +1112,7 @@ content-intelligence/
 │   │   │   ├── reproducibility.py     scores this run's findings against earlier runs of
 │   │   │   │                          the same draft, free, from pipeline_history/
 │   │   │   ├── check.py               connectivity/credential check for all services
+│   │   │   ├── checkout_freshness.py  warns, or refuses a write-back, when the running checkout is behind origin/master
 │   │   │   ├── discover.py            live model discovery — queries provider APIs
 │   │   │   ├── live_model_check.py    caches that discovery and reports, in the run
 │   │   │   │                          report, when a model newer than the one used shipped
