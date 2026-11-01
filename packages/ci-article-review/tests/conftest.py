@@ -63,6 +63,15 @@ def _watch(reader, reads):
 
 
 @pytest.fixture(autouse=True)
+def checkout_freshness_off(monkeypatch):
+    """No test runs ``git fetch`` against the real remote, or fails because the
+    checkout it runs in is behind it. A test of the check passes its own repos."""
+    from ci_article_review import checkout_freshness
+
+    monkeypatch.setattr(checkout_freshness, "commits_behind", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
 def history_root_env_unset(monkeypatch):
     """No test inherits the developer's ``CI_HISTORY_ROOT``.
 

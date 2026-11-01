@@ -68,6 +68,7 @@ from .handoff_parser import (
 )
 from . import history as hist
 from .history_analytics import resolve_history_root
+from . import checkout_freshness
 from . import consolidation
 from . import claim_status
 from . import handoff_gaps
@@ -6510,6 +6511,13 @@ def build_parser():
         "retries it.",
     )
     parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="Run --write-back even when this checkout is behind origin/master. "
+        "Without it a write-back from an out-of-date checkout is refused; any "
+        "other run only warns.",
+    )
+    parser.add_argument(
         "--metadata",
         metavar="METADATA_PATH",
         help="Path to a metadata file (PRIMARY CLAIM, TARGET AUDIENCE, etc., no "
@@ -6758,6 +6766,13 @@ def main():
                 f"--write-back does not combine with {flag} — that is not a "
                 "review of the article to hand back"
             )
+
+    if not checkout_freshness.enforce(
+        refuse=bool(args.write_back),
+        allow_stale=args.allow_stale,
+        err=lambda m: print(m, file=sys.stderr),
+    ):
+        sys.exit(2)
 
     if args.retry_failed and args.replay:
         parser.error(
