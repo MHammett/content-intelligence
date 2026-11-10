@@ -56,7 +56,7 @@ class TestProvenanceBlock:
         assert prov["marked"] is True
 
     def test_a_non_marking_provider_is_not_flagged(self):
-        assert _build_provenance("openai")["marked"] is False
+        assert _build_provenance("mistral")["marked"] is False
 
     def test_an_unrecognised_name_is_recorded_verbatim_as_unknown(self):
         prov = _build_provenance("gpt-4o")
@@ -85,7 +85,7 @@ class TestRendering:
         assert "rather than absent" in rendered("gemini")
 
     def test_a_non_marking_provider_renders_nothing(self):
-        assert rendered("openai") == ""
+        assert rendered("mistral") == ""
 
     def test_an_undeclared_drafter_renders_nothing(self):
         assert rendered("") == ""
@@ -109,5 +109,10 @@ class TestStaleRegistryWarning:
         assert "200 days ago" in out
         assert "re-check" in out
 
-    def test_a_fresh_registry_adds_no_staleness_line(self):
+    def test_a_fresh_registry_adds_no_staleness_line(self, monkeypatch):
+        # Pinned: this read the real registry date and so failed on its own
+        # once the registry turned 60 days old, whatever the change under test.
+        from ci_core.llm import watermarking
+
+        monkeypatch.setattr(watermarking, "staleness", lambda today=None: ("ok", 3))
         assert "days ago" not in rendered("claude")
