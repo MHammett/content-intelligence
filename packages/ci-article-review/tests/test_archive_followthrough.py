@@ -545,3 +545,74 @@ class TestWriteBackCarriesTheArchiveStatus:
         (tmp_path / f"{name}_review.md").write_text("review", encoding="utf-8")
         plan = github_writeback.plan_files(path, report, include_capture=False)
         assert "pipeline/archive.md" not in plan.names
+
+
+class TestOffSiteSnapshots:
+    """A capture that landed on another site is not an archive of the cited page."""
+
+    BOT_WALL = "https://web.archive.org/web/20261110140334/https://unblock.federalregister.gov/"
+
+    def _entry(self, url, snap):
+        return {"url": url, "wayback": {"archived": True, "snapshot_url": snap}}
+
+    def test_an_ecfr_capture_of_the_bot_check_is_not_archived(self):
+        entry = self._entry(
+            "https://www.ecfr.gov/current/title-47/section-1.50007", self.BOT_WALL
+        )
+        assert resolver.demote_off_site_snapshots([entry]) == [entry]
+        wb = entry["wayback"]
+        assert wb["archived"] is False
+        assert "snapshot_url" not in wb
+        assert wb["off_site_snapshot_url"] == self.BOT_WALL
+        assert wb["archive_outcome"] == wayback.ARCHIVE_CAPTURE_FAILED
+        assert "federalregister.gov" in wb["archive_outcome_detail"]
+
+    @pytest.mark.parametrize(
+        "url, snap",
+        [
+            (
+                "https://docs.fcc.gov/public/attachments/DA-26-563A1.pdf",
+                "http://web.archive.org/web/20261110174938/https://docs.fcc.gov/public/attachments/DA-26-563A1.pdf",
+            ),
+            (
+                "https://www.rfc-editor.org/rfc/rfc6811",
+                "https://web.archive.org/web/20261110173905/https://www.rfc-editor.org/info/rfc6811/",
+            ),
+            (
+                "https://docs.fcc.gov/x.pdf",
+                "https://web.archive.org/web/20261110000000id_/https://www.fcc.gov/x.pdf",
+            ),
+            (
+                "https://web.archive.org/web/20190718193106/https://blogs.oracle.com/x",
+                "https://web.archive.org/web/20190718193106/https://blogs.oracle.com/x",
+            ),
+        ],
+    )
+    def test_a_capture_on_the_same_site_is_kept(self, url, snap):
+        entry = self._entry(url, snap)
+        assert resolver.demote_off_site_snapshots([entry]) == []
+        assert entry["wayback"]["snapshot_url"] == snap
+
+    def test_a_bot_wall_capture_does_not_make_the_host_look_serving(self):
+        walled = _entry("https://www.ecfr.gov/current/title-47/section-1.1")
+        gone = _entry("https://www.ecfr.gov/current/title-47/section-1.80")
+        ids = iter(["job-wall", "job-404"])
+
+        def status(job, **k):
+            if job == "job-404":
+                return {
+                    "state": "failed",
+                    "error_code": "error:not-found",
+                    "retry_category": "permanent",
+                }
+            return {"state": "success", "snapshot_url": self.BOT_WALL}
+
+        sub = _run_pass(
+            [walled, gone],
+            submit=lambda url, **k: {"submitted": True, "job_id": next(ids)},
+            job_status=status,
+            poll_budget=5,
+        )
+        assert sub.call_count == 2
+        assert walled["wayback"]["capture_redirected_off_site"] is True
+        assert "capture_retried_after_not_found" not in gone["wayback"]

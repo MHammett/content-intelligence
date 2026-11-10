@@ -6371,6 +6371,11 @@ def archive_draft_sources(
             capture_settings,
             prior_pending=prior_pending,
         )
+    # Every entry, the looked-up and the handled ones too: a lookup can return
+    # an old capture of a bot wall just as a new capture can.
+    from .adapters.citation.resolver import demote_off_site_snapshots
+
+    demote_off_site_snapshots(results)
     return results
 
 

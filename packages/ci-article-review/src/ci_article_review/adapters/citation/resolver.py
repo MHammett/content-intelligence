@@ -2679,6 +2679,9 @@ def _submit_one_per_url(
 
     # Two refusals that have a better answer than "failed".
     _adopt_same_day_snapshots(targets)
+    # Before the 404 retry reads "which hosts served a capture": a capture of a
+    # bot wall is not the host serving.
+    demote_off_site_snapshots(targets)
     retry = _not_found_on_serving_hosts(targets)
     if retry:
         log.info(
@@ -2735,6 +2738,72 @@ def _adopt_same_day_snapshots(entries):
             "already made today is recorded instead"
         )
         wb["adopted_same_day_snapshot"] = True
+
+
+_SNAPSHOT_ORIGINAL_RE = re.compile(
+    r"^https?://web\.archive\.org/web/\d{4,14}[a-z_]*/(.+)$", re.IGNORECASE
+)
+
+
+def _site_of(url):
+    """The last two labels of a URL's host (``ecfr.gov``, ``fcc.gov``).
+
+    A rough registrable domain, good enough for the question it answers: is a
+    snapshot of the site that was cited? It is wrong for a two-label public
+    suffix such as ``co.uk``, where it treats two sites as one, which is the
+    lenient direction: a real off-site snapshot there goes unflagged, nothing
+    real is ever flagged.
+    """
+    host = _host_of(url)
+    if not host:
+        return None
+    return ".".join(host.split(".")[-2:])
+
+
+def demote_off_site_snapshots(entries):
+    """Refuse a snapshot that is of another site than the one cited.
+
+    archive.org follows redirects when it captures, and names the snapshot by
+    where it landed. On 2026-11-10, 15 of carrier-security-compliance's 28
+    eCFR citations had a "snapshot" of ``unblock.federalregister.gov``:
+    ecfr.gov sends archive.org's crawler to its bot check, so the capture is of
+    that page, not of the regulation, and the report counted it as archived.
+    The same block is the likelier reading of the eCFR 404s that run 2 took
+    for transient. A snapshot whose original URL is on a different site from the
+    cited URL is therefore recorded as a failed capture, with the snapshot it
+    did produce kept under ``off_site_snapshot_url`` for anyone who wants to
+    look. A redirect within one site (``http`` to ``https``, ``docs.fcc.gov`` to
+    ``www.fcc.gov``) is not touched. Returns the entries it demoted.
+    """
+    demoted = []
+    for entry in entries:
+        wb = entry.get("wayback") or {}
+        snap = wb.get("snapshot_url")
+        cited = entry.get("url")
+        if not (snap and cited):
+            continue
+        if _SNAPSHOT_ORIGINAL_RE.match(cited):
+            # The citation is itself a snapshot; there is nothing to compare.
+            continue
+        m = _SNAPSHOT_ORIGINAL_RE.match(snap)
+        if not m:
+            continue
+        landed = _site_of(m.group(1))
+        if not landed or landed == _site_of(cited):
+            continue
+        wb["off_site_snapshot_url"] = snap
+        for key in _SNAPSHOT_FIELDS:
+            wb.pop(key, None)
+        wb["archived"] = False
+        wb["archive_outcome"] = wayback.ARCHIVE_CAPTURE_FAILED
+        wb["archive_outcome_detail"] = (
+            f"archive.org's snapshot is of {landed}, not of the cited site: the "
+            f"page redirected the capture (often to a bot check), so the cited "
+            f"page is not archived. Snapshot: {snap}"
+        )
+        wb["capture_redirected_off_site"] = True
+        demoted.append(entry)
+    return demoted
 
 
 def _host_of(url):
