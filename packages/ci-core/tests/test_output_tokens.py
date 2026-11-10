@@ -10,7 +10,7 @@ Two more findings reshaped it on 2026-10-24. The answer term stopped growing at
 the size table's 1.8x while fact_check's output did not: on a 190,170-char
 draft at `maximum`, mistral:fact_check wrote 154 `confirmed` entries (109,656
 chars of JSON) and hit its 50,000 ceiling before any other bucket, so the
-answer term is now also a line through the origin (0.25 tokens per character)
+answer term is now also a line through the origin (0.25, then 0.35 from 2026-11-10, tokens per character)
 and the larger of the two wins. And a no-effort pass kept client.py's flat
 8000, which cut claude-haiku-4-5:argument_integrity off at exactly 8000 tokens
 twice at `wide` (2026-09-28, 2026-10-04; 38,021 chars of flags written), so
@@ -71,7 +71,7 @@ class TestFormula:
         term is the table's figure exactly; nothing under that size moved when
         the line was added."""
         cfg = ot._CONFIG
-        for chars in (6000, 18167, 27113, 62000):
+        for chars in (6000, 18167, 27113, 38000):
             expected = cfg["reasoning_tokens"]["high"] + cfg["answer_tokens"][
                 "fact_check"
             ] * _size_mult(chars)
@@ -247,6 +247,20 @@ class TestTheAnswerGrowsWithTheDraft:
             got = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", chars)
             assert got == pytest.approx(32000 + rate * chars, abs=1), chars
 
+    def test_issue_476_mid_size_draft_gets_room_past_the_cut(self):
+        """mistral:fact_check on a 73,793-char draft at `maximum` was sent
+        50,449 and finished `length` at exactly that, in `confirmed`, after 166
+        entries (2026-10-28, brockovich-fact-check run 2). Rates of 193-304
+        tokens an entry put a finished ~200-entry pass at 47,000-61,000. The
+        largest finished pass on record is 47,309 (81,404 chars, ceiling 54,400)."""
+        cut = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", 73793)
+        assert cut >= 57000, cut
+        assert cut > 50449
+        assert (
+            ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", 81404)
+            >= 1.25 * 47309
+        )
+
     def test_the_line_only_ever_lifts(self):
         """Whichever term is larger wins, so adding the line lowered nothing."""
         for chars in (500, 2182, 27113, 62000, 135514, 190170):
@@ -315,7 +329,7 @@ class TestNoEffortPassesAreCapped:
             "mistral", {"model": "mistral-small-latest"}, "fact_check", 190170
         )
         assert large > small
-        assert large >= 0.25 * 190170, "the per-character line applies here too"
+        assert large >= 0.35 * 190170, "the per-character line applies here too"
 
     def test_a_thinking_budget_stands_in_for_the_reasoning_term(self):
         """The client sends the budget in place of any effort, and the thinking
