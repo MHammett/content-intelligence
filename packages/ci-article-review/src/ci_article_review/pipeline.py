@@ -5700,6 +5700,12 @@ def _print_draft_summary(
             )
             print(f"    Claim: {c['claim'][:100]}")
         print("!" * 60)
+    excluded = report.get("contradictions_unsearched_excluded", 0)
+    if excluded:
+        print(
+            f"\n({excluded} more claim(s) were 'unverifiable' only from a model "
+            "that did not search on that call; not counted as contradictions.)"
+        )
 
     # Citation resolution summary
     citations = report.get("section_9_citations", [])

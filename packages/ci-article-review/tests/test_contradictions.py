@@ -115,9 +115,10 @@ class TestUnverifiableIsAChallenge:
     model that cannot possibly have checked it.
     """
 
-    def _res(self, model, confirmed=None, unverifiable=None):
+    def _res(self, model, confirmed=None, unverifiable=None, searched=True):
         return (model, "fact_check"), {
             "failed": False,
+            "grounding_available": searched,
             "data": {
                 "confirmed": confirmed or [],
                 "contradicted": [],
@@ -175,3 +176,40 @@ class TestUnverifiableIsAChallenge:
         assert len(found) == 1
         assert found[0]["confirmed_by"] == ["openai"]
         assert found[0]["challenged_by"] == ["claude"]
+
+
+class TestUnsearchedUnverifiable:
+    """Issue #477: "unverifiable" from a call that could not search is no evidence."""
+
+    _CLAIM = "The plant opened in 2019."
+
+    def _results(self, searched):
+        r = TestUnverifiableIsAChallenge()._res
+        return dict(
+            [
+                r("gemini", confirmed=[{"claim": self._CLAIM}]),
+                r("grok", unverifiable=[{"claim": self._CLAIM}], searched=searched),
+            ]
+        )
+
+    def test_searched_unverifiable_counts(self):
+        found = find_contradictions(self._results(searched=True))
+        assert [c["challenged_by"] for c in found] == [["grok"]]
+
+    def test_unsearched_unverifiable_does_not_count(self):
+        assert find_contradictions(self._results(searched=False)) == []
+
+    def test_absent_grounding_key_is_unsearched(self):
+        results = self._results(searched=True)
+        del results[("grok", "fact_check")]["grounding_available"]
+        assert find_contradictions(results) == []
+
+    def test_include_unsearched_restores_old_behaviour(self):
+        found = find_contradictions(self._results(False), include_unsearched=True)
+        assert len(found) == 1
+
+    def test_unsearched_contradicted_still_counts(self):
+        results = self._results(searched=False)
+        data = results[("grok", "fact_check")]["data"]
+        data["unverifiable"], data["contradicted"] = [], [{"claim": self._CLAIM}]
+        assert len(find_contradictions(results)) == 1
