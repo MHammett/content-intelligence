@@ -313,6 +313,9 @@ pipeline:
   # the history root): a snapshot that exists for 7 days, "none" for 1 day.
   # Within a run the link pass and Section 9 share one lookup per URL either way.
   wayback_lookup_cache: true
+  # Archive every URL in the draft's Sources list after Pass 3, not only the
+  # claim citations that resolved. No model calls; archive.org requests only.
+  archive_all_sources: true
   # Keep fetched citation pages (page_store.sqlite under the history root) and
   # reuse one on the next run only when its origin answers 304 Not Modified.
   # Pages with no ETag/Last-Modified are fetched in full every run, as before.

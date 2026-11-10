@@ -804,8 +804,43 @@ case where a round's tag was reviewed after the next round had been opened.
 Unchanged from #410: a replay's report is a code test and is never written back
 (`--replay` with `--write-back` is a usage error, and `push-run` refuses
 `_replay/`); `--offline` and the calibration flags are treated the same way;
-`--retry-failed` files into real history and may write back; `--publish` and
-`--archive-only` do not read from GitHub.
+`--retry-failed` files into real history and may write back; `--publish` does
+not read from GitHub. `--archive-only` does: see below.
+
+## Archiving before a merge
+
+The publication's rule is that every cited URL has a Wayback snapshot before an
+article publishes. A review cannot guarantee it alone: a revision after the
+review adds URLs no run has seen (11 and 9 in the two rounds that prompted this,
+2026-11-10). So the last step before a merge is an archive pass on the head
+commit:
+
+```
+ci-review --archive-only --github <slug> --publication <name>
+```
+
+It reads the round like any `--github` run (the open pull request's head, or
+`--pr`/`--round`), archives every URL in `draft.md`'s Sources list, and commits
+two pipeline-owned files to the round's branch in one commit
+(`archive: <slug> rN at <commit>`):
+
+- `pipeline/archive.md`: the commit it checked, the counts, a table of every URL
+  without a fresh snapshot and why, then every URL with its snapshot.
+- `pipeline/archive.json`: the same per URL (`status` is `archived`, `stale`,
+  `pending`, `missing` or `not checked`, with `failure_kind` for a failed
+  submission), plus the job ids still running, which the next pass reconciles
+  first.
+
+The write needs the same token and permissions as `--write-back`, and replaces
+an earlier copy only if it is still the blob the pass read. `--no-write-back`
+prints without committing, and `--github-ref` never commits. A full review that
+is written back commits the same two files from its own Sources pass
+(`docs/CITATIONS.md`, "Then every other URL in the Sources list").
+
+The managed `AGENTS.md` tells the drafting side to ask for this pass, to read
+`pipeline/archive.md` (the one `pipeline/` file it reads, and only to check the
+merge), to treat a status whose `Draft:` commit is not the head as out of date,
+and to give every gap an outcome in the close-out note before the merge.
 
 ## Importing an article's history
 
@@ -1397,8 +1432,8 @@ the repository under the retired per-round names (`<slug>-draft-rN.md`, `-vM`).
 
 ## What does not change
 
-- `--draft`, `--raw-draft`, `--metadata`, `--url`, `--publish`, `--archive-only`,
-  `--replay`, `--retry-failed` and `--offline` behave as they do today. Without
+- `--draft`, `--raw-draft`, `--metadata`, `--url`, `--publish`, `--archive-only`
+  (from a file), `--replay`, `--retry-failed` and `--offline` behave as they do today. Without
   `--github` no GitHub code runs and no token is looked for.
 - `pipeline_history/`, `CI_HISTORY_ROOT`, the `run_N_*` names, the `_replay/` tree
   and `ci-history-report` are untouched.

@@ -4642,6 +4642,24 @@ def run_draft_pipeline(
         )
     report["section_9_citations"] = citation_results
 
+    # Every URL in the Sources list, not only the claim citations that resolved.
+    # Pass 3 archives those; this archives the rest (data queries no claim names,
+    # pages the relevance check read as not supporting the claim) and records
+    # the status of every one. Same machinery as --archive-only, without its
+    # CDX second opinion, which is too slow for a full review (#305).
+    # Only when the draft has a citation block, so a draft without one carries no
+    # new field (and the golden report stays as it was).
+    if not offline and pipeline_cfg.get("archive_all_sources", True):
+        source_archive = _archive_remaining_sources(
+            handoff.get("draft") or corrected_draft,
+            citation_results,
+            pre_analysis.get("links"),
+            api_keys,
+            pipeline_cfg.get("wayback_capture"),
+        )
+        if source_archive is not None:
+            report["source_archive"] = source_archive
+
     # One net status per claim, built here and only here: after consolidation
     # (Section 2 is final) and after citation resolution and re-ask (Section 9
     # is final). Every reader — the Section 2 entries, the console line below,
@@ -6269,8 +6287,168 @@ def run_publish_pipeline(
         sys.exit(1)
 
 
+def archive_draft_sources(
+    text,
+    api_keys,
+    capture_settings=None,
+    *,
+    handled=None,
+    known=None,
+    cdx_fallback=True,
+    prior_pending=None,
+):
+    """Archive every URL in ``text``'s citation block; return one entry per URL.
+
+    Returns ``None`` when the text has no citation block, else a list of
+    ``{"marker", "url", "wayback", "source"}`` in citation-block order, one per
+    (marker, URL) pair. ``source`` says where the status came from: ``"claim"``
+    for a URL the full review's Pass 3 already looked up and submitted
+    (``handled``: url -> that citation's ``wayback`` dict, copied, never shared),
+    ``"sources"`` for one this pass looked up and submitted itself.
+
+    ``known`` (url -> ``wayback`` dict) is a lookup already made this run, the
+    link pass's, used instead of asking archive.org again. ``prior_pending`` is
+    passed through to the reconcile step: job ids an earlier archive pass left
+    running that local history does not hold.
+
+    This is the one place both ``--archive-only`` and a full review archive a
+    draft's Sources list. A full review used to archive only claim citations
+    that resolved, and on 2026-11-10 that left 30 of 87 and 28 of 103 cited URLs
+    in two articles without a snapshot: data queries no claim pointed at, pages
+    the relevance check marked ``content_mismatch``, and URLs added after the
+    review ran.
+    """
+    citations = draft_citations.DraftCitations(text or "")
+    if not citations:
+        return None
+    from .adapters.citation.resolver import _submit_missing_archives
+
+    handled = handled or {}
+    known = known or {}
+    targets = [
+        (marker, url)
+        for marker, entry in citations.entries.items()
+        for url in entry["urls"]
+    ]
+    checked = {}
+    for _, url in targets:
+        if url in checked or url in handled:
+            continue
+        prior = known.get(url)
+        if isinstance(prior, dict) and prior.get("archived") is not None:
+            checked[url] = dict(prior)
+        else:
+            checked[url] = wayback.check(url, cdx_fallback=cdx_fallback)
+    results = []
+    to_submit = []
+    for marker, url in targets:
+        if url in handled:
+            results.append(
+                {
+                    "marker": marker,
+                    "url": url,
+                    "wayback": dict(handled[url] or {}),
+                    "source": "claim",
+                }
+            )
+            continue
+        entry = {
+            # ``resolved`` is what the submission pass filters on. Here it means
+            # "a cited URL", which is the whole point of this pass.
+            "resolved": True,
+            "marker": marker,
+            "url": url,
+            "wayback": dict(checked[url]),
+            "source": "sources",
+        }
+        results.append(entry)
+        to_submit.append(entry)
+    if to_submit:
+        _submit_missing_archives(
+            to_submit,
+            api_keys.get("archive_org"),
+            _history_root(),
+            capture_settings,
+            prior_pending=prior_pending,
+        )
+    # Every entry, the looked-up and the handled ones too: a lookup can return
+    # an old capture of a bot wall just as a new capture can.
+    from .adapters.citation.resolver import demote_off_site_snapshots
+
+    demote_off_site_snapshots(results)
+    return results
+
+
+def _archive_remaining_sources(text, citation_results, links, api_keys, capture):
+    """A full review's archive pass over the Sources list. Returns the
+    ``archive_draft_sources`` entries, or ``None`` when there is no list.
+
+    A URL Pass 3 submitted (a resolved claim citation) keeps the status Pass 3
+    gave it; everything else is looked up (the link pass's answer when it has
+    one) and submitted if missing or stale. Never raises: archiving is a
+    side-duty of a review, and a failure here leaves the report without the
+    field rather than without the review.
+    """
+    handled = {}
+    for r in citation_results or []:
+        if r.get("resolved") and r.get("url") and r["url"] not in handled:
+            handled[r["url"]] = r.get("wayback") or {}
+    known = {
+        entry["url"]: entry["wayback"]
+        for entry in links or []
+        if isinstance(entry, dict) and entry.get("url") and entry.get("wayback")
+    }
+    try:
+        wayback.reopen_breaker_if_cooled()
+        results = archive_draft_sources(
+            text,
+            api_keys,
+            capture,
+            handled=handled,
+            known=known,
+            cdx_fallback=False,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Sources archive pass failed: %s", exc)
+        return None
+    if results:
+        c = archive_status_counts(results)
+        own = sum(1 for r in results if r.get("source") == "sources")
+        log.info(
+            "Sources archive: %d cited URL(s), %d of them beyond the claim "
+            "citations; %d with a fresh snapshot, %d stale only, %d without, "
+            "%d not checked",
+            len(results),
+            own,
+            c["fresh"],
+            c["stale"],
+            c["missing"],
+            c["unchecked"],
+        )
+    return results
+
+
+def archive_status_counts(results):
+    """``{"fresh", "stale", "missing", "unchecked"}`` over ``archive_draft_sources`` results."""
+    counts = {"fresh": 0, "stale": 0, "missing": 0, "unchecked": 0}
+    for entry in results or []:
+        wb = entry.get("wayback") or {}
+        if wb.get("snapshot_url"):
+            counts["stale" if wb.get("snapshot_stale") else "fresh"] += 1
+        elif wb.get("archived") is None:
+            counts["unchecked"] += 1
+        else:
+            counts["missing"] += 1
+    return counts
+
+
 def run_archive_only(
-    draft_path, publication_name, config_dir="configs", api_key_overrides=None
+    draft_path,
+    publication_name,
+    config_dir="configs",
+    api_key_overrides=None,
+    handoff=None,
+    write_back=False,
 ):
     """``--archive-only``: submit/verify Wayback snapshots for a draft's cited
     URLs, with zero model-provider calls.
@@ -6281,47 +6459,27 @@ def run_archive_only(
     there is no flag to isolate one pipeline pass the way ``--only-domain``
     isolates one ensemble domain. This calls the same archiving primitives
     directly instead of reimplementing pacing, dedupe-by-URL, staleness or the
-    outcome bookkeeping — ``wayback.check`` and
-    ``adapters.citation.resolver._submit_missing_archives`` are exactly what
-    Pass 3 calls, just fed synthetic per-URL entries instead of resolved
-    claims, and rendered with ``report_markdown``'s own archive-outcome prose
-    so the wording matches Section 9 exactly rather than a second copy of it.
+    outcome bookkeeping (``archive_draft_sources``, which a full review now
+    calls too), and renders with ``report_markdown``'s own archive-outcome
+    prose so the wording matches Section 9 exactly rather than a second copy
+    of it.
 
-    URLs come from ``adapters.citation.draft_citations.DraftCitations``, read
-    directly off the whole file — the same citation-block parser Pass 3 uses
-    to find a claim's citation, just consulted for every URL in the block
-    instead of only the ones a claim cites.
+    The draft is ``draft_path`` (``--draft``/``--raw-draft``) or, with
+    ``--github``, ``handoff``: the round read from the document repository.
+    With ``write_back`` the per-URL status is committed to the round's branch
+    as ``pipeline/archive.md`` and ``pipeline/archive.json``
+    (``github_archive``), so the drafting side can see which cited URLs still
+    have no snapshot without reading the review's report. Capture jobs still
+    running in the last ``archive.json`` on that branch are asked about first,
+    since local history never held them.
     """
-    text = _read_handoff_file(draft_path)
-    citations = draft_citations.DraftCitations(text)
-    if not citations:
-        print(
-            f"No citation block found in {draft_path} (looked for a heading like "
-            f"'## Sources' / '## Citations' / '## References'). Nothing to archive."
-        )
-        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
-        return
-
-    targets = [
-        (marker, url)
-        for marker, entry in citations.entries.items()
-        for url in entry["urls"]
-    ]
-    if not targets:
-        print(
-            f"The citation block in {draft_path} has {citations.marker_count} "
-            f"entrie(s) but no URLs. Nothing to archive."
-        )
-        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
-        return
-
-    unique_urls = {url for _, url in targets}
-    log.info(
-        "Archive-only: %d citation URL(s) found in %s (%d unique)",
-        len(targets),
-        draft_path,
-        len(unique_urls),
-    )
+    if handoff is not None:
+        text = handoff.get("draft") or ""
+        where = (handoff.get("document_source") or {}).get("commit_sha", "")[:12]
+        where = f"the round at {where}" if where else "the round"
+    else:
+        text = _read_handoff_file(draft_path)
+        where = draft_path
 
     user_config = load_user_config(config_dir)
     pub_config_raw = load_publication_config(publication_name, config_dir)
@@ -6331,11 +6489,12 @@ def run_archive_only(
     api_keys = config["api_keys"]
     capture_settings = config["pipeline"].get("wayback_capture")
 
-    # One check() per unique URL, not per marker — a source cited under two
-    # markers (or twice in one entry) gets checked once and each entry below
-    # gets its own copy of the result, never a shared dict two mutations could
-    # step on.
-    #
+    prior = {}
+    if handoff is not None:
+        from . import github_archive
+
+        prior = github_archive.prior_pending_jobs(handoff, user_config)
+
     # cdx_fallback=True because this mode's whole job is to decide, from this
     # answer, whether to spend a capture request. The availability API alone
     # never lists a warc/revisit record, so a page that has not changed reads
@@ -6354,23 +6513,42 @@ def run_archive_only(
         if config["pipeline"].get("wayback_lookup_cache", True)
         else None
     )
-    checked = {url: wayback.check(url, cdx_fallback=True) for url in unique_urls}
-    results = [
-        {"resolved": True, "url": url, "marker": marker, "wayback": dict(checked[url])}
-        for marker, url in targets
-    ]
+    try:
+        results = archive_draft_sources(
+            text,
+            api_keys,
+            capture_settings,
+            cdx_fallback=True,
+            prior_pending=prior,
+        )
+    finally:
+        lookups = wayback.lookup_cache_summary()
+        wayback.close_lookup_cache()
+    breaker = wayback.breaker_summary()
 
-    from .adapters.citation.resolver import _submit_missing_archives
-
-    _submit_missing_archives(
-        results, api_keys.get("archive_org"), _history_root(), capture_settings
+    if results is None:
+        print(
+            f"No citation block found in {where} (looked for a heading like "
+            f"'## Sources' / '## Citations' / '## References'). Nothing to archive."
+        )
+        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+        return None
+    if not results:
+        print(
+            f"The citation block in {where} has entries but no URLs. "
+            f"Nothing to archive."
+        )
+        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+        return results
+    log.info(
+        "Archive-only: %d citation URL(s) found in %s (%d unique)",
+        len(results),
+        where,
+        len({r["url"] for r in results}),
     )
-    lookups = wayback.lookup_cache_summary()
-    wayback.close_lookup_cache()
 
     from .report_markdown import _render_archive_pair
 
-    fresh = stale = missing = unchecked = 0
     for entry in results:
         print(f"\n[{entry['marker']}]")
         for line in _render_archive_pair(entry):
@@ -6378,45 +6556,49 @@ def run_archive_only(
 
         wb = entry.get("wayback") or {}
         outcome = wb.get("archive_outcome")
-        if wb.get("snapshot_url"):
-            if wb.get("snapshot_stale"):
-                stale += 1
-            else:
-                fresh += 1
+        if wb.get("snapshot_url") and outcome not in (None, wayback.ARCHIVE_ARCHIVED):
             # _render_archive_pair shows a snapshot that exists and stops, so a
             # stale one whose re-capture this run requested and did not get
             # rendered exactly like one nobody asked about. For a mode whose whole
             # job is that request, the outcome is the point. Seen in the first
             # live run: one source printed only its 2024 snapshot flagged STALE,
             # with no trace of what happened to the re-archive.
-            if outcome not in (None, wayback.ARCHIVE_ARCHIVED):
-                label = wayback.ARCHIVE_OUTCOME_LABELS.get(outcome, outcome)
-                detail = wb.get("archive_outcome_detail")
-                print(
-                    f"  - Re-archive attempt: {label}"
-                    f"{f' — {detail}' if detail else ''}. "
-                    f"The snapshot above is the one that exists."
-                )
-        elif wb.get("archived") is None:
-            # The lookup itself did not complete (breaker tripped, archive.org
-            # refused it). That establishes nothing about the page, and the
-            # second live run showed what counting it as "none" does: both
-            # sources printed "NOT CHECKED" above and the summary called them
-            # "0 with a snapshot, 2 with none".
-            unchecked += 1
-        else:
-            missing += 1
+            label = wayback.ARCHIVE_OUTCOME_LABELS.get(outcome, outcome)
+            detail = wb.get("archive_outcome_detail")
+            print(
+                f"  - Re-archive attempt: {label}"
+                f"{f' — {detail}' if detail else ''}. "
+                f"The snapshot above is the one that exists."
+            )
 
+    counts = archive_status_counts(results)
+    # A lookup that did not complete (breaker tripped, archive.org refused it)
+    # establishes nothing about the page, and the second live run showed what
+    # counting it as "none" does: both sources printed "NOT CHECKED" above and
+    # the summary called them "0 with a snapshot, 2 with none".
     not_checked = (
-        f", {unchecked} not checked (the archive.org lookup did not complete, "
-        f"which says nothing about whether they are archived)"
-        if unchecked
+        f", {counts['unchecked']} not checked (the archive.org lookup did not "
+        f"complete, which says nothing about whether they are archived)"
+        if counts["unchecked"]
         else ""
     )
     print(
-        f"\n{len(results)} citation URL(s): {fresh} with a fresh Wayback snapshot, "
-        f"{stale} with only a stale one, {missing} with none{not_checked}."
+        f"\n{len(results)} citation URL(s): {counts['fresh']} with a fresh Wayback "
+        f"snapshot, {counts['stale']} with only a stale one, {counts['missing']} "
+        f"with none{not_checked}."
     )
+    refused = sum(
+        1
+        for r in results
+        if (r.get("wayback") or {}).get("submission_failure_kind") == "connection"
+    )
+    if refused:
+        print(
+            f"{refused} submission(s) got no answer from archive.org (connection "
+            f"refused or dropped). That is the connection, not archive.org's "
+            f"policy; the rate-limit breaker "
+            f"{'had tripped' if breaker else 'never tripped'} this run."
+        )
     remembered = lookups["store_hits"]
     skipped = lookups["skipped"]
     if remembered or skipped:
@@ -6430,7 +6612,19 @@ def run_archive_only(
                 else "."
             )
         )
+    if write_back and handoff is not None:
+        from . import github_archive
+
+        github_archive.write_archive_status(
+            handoff,
+            results,
+            settings=user_config.get("github_documents"),
+            api_keys=api_keys,
+            breaker=breaker,
+            lookups=lookups,
+        )
     print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -6487,7 +6681,7 @@ def build_parser():
         "of the article's one open round (an open pull request from a branch "
         "round/SLUG/rN) unless --pr, --round or --github-ref says otherwise. "
         "Needs GITHUB_TOKEN or `gh auth login` for a private repository. Not "
-        "combinable with --metadata, --archive-only or --publish.",
+        "combinable with --metadata or --publish.",
     )
     github_read = parser.add_mutually_exclusive_group()
     github_read.add_argument(
@@ -6670,7 +6864,10 @@ def build_parser():
         "check-then-submit-if-missing-or-stale machinery Pass 3 uses for a full "
         "review, just run directly against the draft's URLs instead of behind "
         "fact-check claim resolution. Costs nothing in provider terms. Requires "
-        "--draft or --raw-draft; mutually exclusive with --offline.",
+        "--draft, --raw-draft or --github; mutually exclusive with --offline. "
+        "With --github it commits pipeline/archive.md and pipeline/archive.json "
+        "(the status of every cited URL) to the round's branch, unless "
+        "--no-write-back or --github-ref.",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable DEBUG logging"
@@ -6805,13 +7002,8 @@ def main():
     if args.retry_failed and args.publish:
         parser.error("--retry-failed only applies to draft review runs, not --publish")
 
-    if args.archive_only and args.github:
-        parser.error(
-            "--archive-only does not read from GitHub — it requires --draft or "
-            "--raw-draft"
-        )
-    if args.archive_only and not (args.draft or args.raw_draft):
-        parser.error("--archive-only requires --draft or --raw-draft")
+    if args.archive_only and not (args.draft or args.raw_draft or args.github):
+        parser.error("--archive-only requires --draft, --raw-draft or --github")
     if args.archive_only and args.offline:
         parser.error(
             "--archive-only and --offline are mutually exclusive — archive-only's "
@@ -6854,7 +7046,25 @@ def main():
         sys.exit(1)
 
     try:
-        if args.archive_only:
+        if args.archive_only and args.github:
+            # Writes the archive status back unless told not to, or reading a
+            # ref, which is never written to. Not github_documents.write_back:
+            # that setting is about reviews, and a status file the pass does
+            # not write is the gap this mode exists to close.
+            write_back = args.write_back is not False and args.github_ref is None
+            settings = normalize_github_documents(
+                load_user_config(args.config_dir).get("github_documents")
+            )
+            handoff = _read_github_handoff(args, settings, write_back)
+            run_archive_only(
+                None,
+                args.publication,
+                config_dir=args.config_dir,
+                api_key_overrides=api_key_overrides,
+                handoff=handoff,
+                write_back=write_back,
+            )
+        elif args.archive_only:
             run_archive_only(
                 args.draft or args.raw_draft,
                 args.publication,
