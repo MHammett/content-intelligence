@@ -60,6 +60,13 @@ _BLOCK_HEADING = re.compile(
 #: entry starts at the beginning of a line.
 _ENTRY = re.compile(rf"(?ms)^\[({_ONE})\]\s+(.*?)(?=^\[{_ONE}\]\s|\Z)")
 
+#: The same entry written as a markdown numbered list, ``7. Description...``,
+#: which the body still cites as ``[7]``. Read only when the block has no
+#: bracketed entry, so a ``1.`` inside a bracketed entry's text never splits it.
+_NUMBERED_ENTRY = re.compile(
+    rf"(?ms)^ {{0,3}}({_ONE})[.)]\s+(.*?)(?=^ {{0,3}}{_ONE}[.)]\s|\Z)"
+)
+
 _URL = re.compile(r"https?://[^\s<>\"'\)\]]+")
 
 #: Start of a markdown list item — ``- ``, ``* ``, ``+ ``, or ``1. ``.
@@ -208,7 +215,7 @@ def parse_citation_block(block):
     fix by adding a citation.
     """
     entries = {}
-    for key, text in _ENTRY.findall(block):
+    for key, text in _ENTRY.findall(block) or _NUMBERED_ENTRY.findall(block):
         urls = []
         for url in _URL.findall(text):
             url = url.rstrip(".,;:")

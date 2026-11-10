@@ -69,6 +69,29 @@ class TestCitationBlock:
         entries = dc.parse_citation_block("[5] A print-only report, 2024.")
         assert entries["5"]["urls"] == []
 
+    def test_a_numbered_list_block_is_read_like_bracketed_entries(self):
+        """A drafting tool writes the block as a markdown list and the body
+        still cites ``[2]``; reading none of it made every lookup miss."""
+        draft = (
+            "Nuclear is 53%. [2] Heat reuse saves gas. [10]\n\n### Sources\n\n"
+            "1. First, 2024. https://example.org/one\n"
+            "2. EIA, Illinois profile,\n   continued line. https://eia.example/il\n"
+            "10. Tenth. https://example.org/ten\n"
+        )
+        c = dc.DraftCitations(draft)
+        assert c.marker_count == 3
+        assert c.entries["2"]["urls"] == ["https://eia.example/il"]
+        assert "continued line" in c.entries["2"]["text"]
+        assert c.entries["10"]["urls"] == ["https://example.org/ten"]
+        assert c.candidates_for("Nuclear is 53%") == ["https://eia.example/il"]
+
+    def test_a_numbered_line_inside_a_bracketed_entry_does_not_split_it(self):
+        entries = dc.parse_citation_block(
+            "[1] Report, see\n2. its second chapter. https://example.org/a\n"
+        )
+        assert list(entries) == ["1"]
+        assert entries["1"]["urls"] == ["https://example.org/a"]
+
 
 class TestSegmentation:
     def test_a_marker_cites_the_text_before_it(self):
