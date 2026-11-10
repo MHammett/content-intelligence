@@ -109,5 +109,10 @@ class TestStaleRegistryWarning:
         assert "200 days ago" in out
         assert "re-check" in out
 
-    def test_a_fresh_registry_adds_no_staleness_line(self):
+    def test_a_fresh_registry_adds_no_staleness_line(self, monkeypatch):
+        # Pinned: the real registry ages past the notice threshold on its own
+        # (issue #473), and this test is about the renderer, not the calendar.
+        from ci_core.llm import watermarking
+
+        monkeypatch.setattr(watermarking, "staleness", lambda today=None: ("ok", 0))
         assert "days ago" not in rendered("claude")
