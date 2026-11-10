@@ -1771,6 +1771,22 @@ second post and uploads the featured image a second time.
 
 ---
 
+### Labels the handoff parser does not read
+
+The parser reads exact, case-sensitive labels. A near miss (`Category:` for
+`WordPress category:`, `WordPress slug:` for `Slug:`, `Open Graph title:` for
+`OG title:`, `SEO title (Rank Math):` for `SEO title:`) does not fail: the field
+reads as absent, so a post could go out uncategorised or without Rank Math's
+title and Open Graph fields. So every `Label:`-shaped line (a capital, 3-41
+characters, a colon) under PUBLICATION PARAMETERS or SEO METADATA that is not a
+label the parser reads is logged as a WARNING naming the line and the nearest
+known label, and `--publish` prints the same list under "HANDOFF LINES THAT WERE
+NOT READ", before anything else, so it shows even when the run is then refused.
+Lines inside a bracketed placeholder are skipped. This only warns: the accepted
+format is unchanged, and the parser's result carries the list as `unread_labels`.
+
+---
+
 ### SEO suggestions
 
 The pre-analysis SEO pass reports what's missing. The suggestion pass proposes

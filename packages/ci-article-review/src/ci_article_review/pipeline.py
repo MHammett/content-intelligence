@@ -62,6 +62,7 @@ from .config_loader import (
 )
 from .handoff_parser import (
     parse_draft_submission,
+    describe_unread_label,
     parse_publication_handoff,
     build_handoff_from_raw_text,
     build_handoff_from_raw_draft_and_metadata,
@@ -6051,6 +6052,13 @@ def run_publish_pipeline(
     log.info(f"Parsing publication handoff: {handoff_path}")
     handoff_text = _read_handoff_file(handoff_path)
     pub_handoff = parse_publication_handoff(handoff_text)
+    if pub_handoff.get("unread_labels"):
+        # Above everything else, including the refusals below: this is the
+        # moment a person is reading, and a refusal is often the symptom.
+        print("\nHANDOFF LINES THAT WERE NOT READ (check the label spelling):")
+        for item in pub_handoff["unread_labels"]:
+            print(f"  - {describe_unread_label(item)}")
+        print()
 
     if not pub_handoff["final_draft"]:
         log.error(
