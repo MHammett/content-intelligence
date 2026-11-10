@@ -2482,6 +2482,10 @@ def _submit_missing_archives(
         for r in results
         if r.get("resolved")
         and r.get("url")
+        # A citation that is itself a snapshot is the archive. Re-capturing it
+        # asks archive.org to archive its own page, and on 2026-11-10 two such
+        # citations were submitted and reported as stale gaps.
+        and not draft_citations.is_archive_url(r["url"])
         and (
             r.get("wayback", {}).get("archived") is False
             or r.get("wayback", {}).get("snapshot_stale")

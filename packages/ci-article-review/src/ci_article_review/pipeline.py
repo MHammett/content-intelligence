@@ -6361,6 +6361,16 @@ def archive_draft_sources(
             "wayback": dict(checked[url]),
             "source": "sources",
         }
+        if draft_citations.is_archive_url(url):
+            # The citation is a snapshot: it is the archive, at the date the
+            # author chose. Its age is not staleness, and there is nothing to
+            # capture (the submission pass skips it for the same reason).
+            entry["wayback"].update(
+                archived=True,
+                snapshot_url=url,
+                snapshot_stale=False,
+                cited_snapshot=True,
+            )
         results.append(entry)
         to_submit.append(entry)
     if to_submit:
