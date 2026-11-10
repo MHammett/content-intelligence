@@ -290,6 +290,30 @@ def plan_files(report_path, report, *, include_capture, pr=None):
                     f"{local} is missing, so this run cannot be written back."
                 ) from None
             log.warning("%s was not saved, so it is not written back.", local.name)
+    if report.get("source_archive"):
+        # The status of every cited URL, in the same two files an
+        # ``--archive-only --github`` pass writes, so a review and an archive
+        # pass leave the drafting side one place to look.
+        from . import github_archive
+
+        rows = github_archive.status_rows(report["source_archive"])
+        stub = {"document_source": source}
+        generated = str(report.get("generated") or "")
+        breaker = report.get("wayback_breaker")
+        files[f"{folder}/pipeline/{github_archive.ARCHIVE_MD}"] = (
+            github_archive.render_markdown(
+                stub, rows, generated=generated, breaker=breaker
+            ).encode("utf-8")
+        )
+        files[f"{folder}/pipeline/{github_archive.ARCHIVE_JSON}"] = (
+            github_archive.render_json(
+                stub,
+                rows,
+                generated=generated,
+                breaker=breaker,
+                lookups=report.get("wayback_lookups"),
+            ).encode("utf-8")
+        )
     return _Plan(slug, run_number, run_name, folder, source, files, attached)
 
 

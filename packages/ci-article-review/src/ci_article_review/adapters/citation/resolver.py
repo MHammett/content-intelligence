@@ -7,6 +7,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 
 from ci_core.concurrency import run_all_bounded
@@ -1926,6 +1927,7 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
             )
             if category:
                 wb["submission_retry_category"] = category
+            _record_failure_kind(wb, sub)
     elif sub.get("archived") and sub.get("snapshot_url"):
         _record_archived(wb, sub)
         if entry.get("url"):
@@ -1941,6 +1943,64 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
         wb["archive_outcome_detail"] = sub.get("error_summary") or (
             "archive.org accepted the request but named no snapshot, and an "
             "unauthenticated submission has no job id to ask about it"
+        )
+
+
+#: Why a submission failed, as ``wayback.submission_failure_kind`` records it.
+#: Two of these are archive.org deciding, two are the connection, and an author
+#: does different things about each: wait for tomorrow, re-source the page, or
+#: run the pass again.
+FAILURE_POLICY = "archive_policy"  # archive.org answered and refused (an error code)
+FAILURE_RATE_LIMITED = "rate_limited"  # a 429, or skipped because the breaker was open
+FAILURE_CONNECTION = "connection"  # refused, dropped or unresolved: no answer at all
+FAILURE_HTTP = "http_error"  # archive.org answered with an error status
+FAILURE_OTHER = "other"
+
+
+def _failure_kind(sub):
+    """Classify a failed ``wayback.submit`` result. See ``FAILURE_*``.
+
+    Read off the fields spn-client sets rather than the message text, except for
+    the transport case: spn-client folds a ``ConnectionError`` into
+    ``error_summary`` ("could not reach archive.org ...") and keeps no exception
+    type, so that sentence, which it owns, is what marks it.
+    """
+    if sub.get("error_code"):
+        return FAILURE_POLICY
+    if sub.get("rate_limited"):
+        return FAILURE_RATE_LIMITED
+    summary = sub.get("error_summary") or ""
+    if summary.startswith("could not reach archive.org"):
+        return FAILURE_CONNECTION
+    if summary.startswith("archive.org answered HTTP"):
+        return FAILURE_HTTP
+    return FAILURE_OTHER
+
+
+def _record_failure_kind(wb, sub):
+    """Say whether a failed submission was archive.org's policy or the network.
+
+    Run 2 of chinese-carrier-bans and carrier-security-compliance (2026-11-10)
+    reported 13 refused connections in the same words as archive.org's own
+    refusals, with nothing to say whether the rate-limit breaker had tripped.
+    It had not, and no 429 preceded them. Re-running archive-only the same
+    afternoon reproduced it: web.archive.org refused every connection for about
+    50 seconds while archive.org, on the same address, answered 200 throughout.
+    That is a throttle below the 429 this pipeline listens for, not this
+    machine's network, and not a judgement about the page. So the record says
+    which it was, and whether the breaker was open when it happened.
+    """
+    kind = _failure_kind(sub)
+    breaker_open = bool(wayback.rate_limited_out())
+    wb["submission_failure_kind"] = kind
+    wb["breaker_open_at_failure"] = breaker_open
+    if kind == FAILURE_CONNECTION:
+        detail = (wb.get("archive_outcome_detail") or "").rstrip(". ")
+        wb["archive_outcome_detail"] = (
+            f"{detail}. This was the connection to archive.org, not a refusal "
+            f"by archive.org: no answer came back. The rate-limit breaker "
+            f"{'was' if breaker_open else 'was not'} open, and archive.org "
+            f"sent no 429 for this request. Run the archive pass again later"
         )
 
 
@@ -2153,7 +2213,9 @@ def _note_breaker_state():
         )
 
 
-def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
+def _reconcile_prior_captures(
+    targets, history_root, access_key, secret_key, prior_pending=None
+):
     """Ask archive.org what became of captures an earlier run left pending.
 
     Returns the subset of ``targets`` still worth submitting.
@@ -2176,13 +2238,21 @@ def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
     Never raises: a citation whose prior job cannot be read is simply submitted
     again, which is exactly what would have happened before this existed.
     """
-    if not (access_key and secret_key and history_root):
+    if not (access_key and secret_key and (history_root or prior_pending)):
         return targets
-    try:
-        pending = build_pending_capture_index(history_root)
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning(f"Could not read prior Wayback capture jobs: {exc}")
-        return targets
+    pending = {}
+    if history_root:
+        try:
+            pending = build_pending_capture_index(history_root)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning(f"Could not read prior Wayback capture jobs: {exc}")
+    # Jobs an earlier archive-only pass left running are not in local history
+    # (archive-only saves no report); the caller hands them in. A job id in
+    # history wins over one of the same URL handed in: history is per URL, the
+    # most recent run's.
+    for url, prior in (prior_pending or {}).items():
+        if url not in pending and isinstance(prior, dict) and prior.get("job_id"):
+            pending[url] = prior
     if not pending:
         return targets
 
@@ -2231,7 +2301,15 @@ def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
                     "error_code": status.get("error_code"),
                     "retry_category": category,
                 }
-                if category == "permanent":
+                if (
+                    category == "permanent"
+                    and status.get("error_code") != "error:not-found"
+                ):
+                    # A 404 is the exception: it is the target host's answer
+                    # on one afternoon, not archive.org's, and on 2026-11-10
+                    # four eCFR sections got it while 17 others on ecfr.gov
+                    # captured. It is resubmitted, once per run, below.
+                    #
                     # archive.org cannot capture this page — not this run, not
                     # any run. Resubmitting spends a capture request against a
                     # 3/min (anonymous) or 7/min (authenticated) ceiling to buy
@@ -2343,7 +2421,11 @@ def _poll_capture_outcomes(entries, access_key, secret_key):
 
 
 def _submit_missing_archives(
-    results, archive_org_creds=None, history_root=None, capture_settings=None
+    results,
+    archive_org_creds=None,
+    history_root=None,
+    capture_settings=None,
+    prior_pending=None,
 ):
     """Follow-up pass: request Wayback archiving for resolved citations whose
     URL isn't archived yet, and establish what became of the request.
@@ -2470,12 +2552,15 @@ def _submit_missing_archives(
             access_key,
             secret_key,
             options,
+            prior_pending=prior_pending,
         )
     finally:
         _fan_out_submission_outcomes(by_url, before)
 
 
-def _submit_one_per_url(targets, history_root, access_key, secret_key, options=None):
+def _submit_one_per_url(
+    targets, history_root, access_key, secret_key, options=None, prior_pending=None
+):
     """Run the archiving pass over one representative citation per URL.
 
     Split out of ``_submit_missing_archives`` so that the deduplication and the
@@ -2486,7 +2571,9 @@ def _submit_one_per_url(targets, history_root, access_key, secret_key, options=N
     # Settle last run's unfinished business first: a capture still running does
     # not want a second submission queued behind it, and one that failed has a
     # reason worth reporting before we try again.
-    targets = _reconcile_prior_captures(targets, history_root, access_key, secret_key)
+    targets = _reconcile_prior_captures(
+        targets, history_root, access_key, secret_key, prior_pending
+    )
     if not targets:
         return
 
@@ -2589,6 +2676,99 @@ def _submit_one_per_url(targets, history_root, access_key, secret_key, options=N
 
     # Bounded wait on anything archive.org queued rather than captured inline.
     _poll_capture_outcomes(targets, access_key, secret_key)
+
+    # Two refusals that have a better answer than "failed".
+    _adopt_same_day_snapshots(targets)
+    retry = _not_found_on_serving_hosts(targets)
+    if retry:
+        log.info(
+            "Wayback: retrying %d capture(s) that came back 404 from a host "
+            "archive.org captured other pages from this run",
+            len(retry),
+        )
+        for entry in retry:
+            entry["wayback"]["capture_retried_after_not_found"] = True
+            _submit_one(entry)
+        _poll_capture_outcomes(retry, access_key, secret_key)
+
+
+#: archive.org's code for a URL it will capture only once a day.
+DAILY_LIMIT_CODE = "error:too-many-daily-captures"
+
+
+def _adopt_same_day_snapshots(entries):
+    """After a once-a-day refusal, record the snapshot that refusal implies.
+
+    archive.org refuses a second capture of some resources in one day ("This URL
+    has been already captured 1 times today"). The refusal is itself evidence
+    that a snapshot from today exists: on 2026-11-10 DOC-426316 was refused for
+    carrier-security-compliance because chinese-carrier-bans' run had captured
+    it hours earlier, and the report said ``submit_failed``. One lookup finds
+    that snapshot. It bypasses the run's lookup memo, which holds the "not
+    archived" answer the run started with, and uses CDX, which sees a capture
+    the availability API has not indexed yet.
+
+    Only a snapshot no more than a day old is adopted. An older one is what the
+    run had already, and the refusal stays recorded beside it.
+    """
+    for entry in entries:
+        wb = entry.get("wayback") or {}
+        if wb.get("submission_error_code") != DAILY_LIMIT_CODE:
+            continue
+        url = entry.get("url")
+        if not url:
+            continue
+        wayback.forget_lookup(url)
+        try:
+            found = wayback.check(url, cdx_fallback=True)
+        except Exception as exc:  # pragma: no cover - check swallows
+            log.warning(f"Wayback lookup after a daily-limit refusal raised: {exc}")
+            continue
+        age = found.get("snapshot_age_days") if isinstance(found, dict) else None
+        if not (found.get("archived") and found.get("snapshot_url")):
+            continue
+        if not isinstance(age, int) or age > 1:
+            continue
+        _record_archived(wb, found)
+        wb["archive_outcome_detail"] = (
+            "archive.org refused a second capture today and the snapshot it "
+            "already made today is recorded instead"
+        )
+        wb["adopted_same_day_snapshot"] = True
+
+
+def _host_of(url):
+    try:
+        return (urlsplit(url).hostname or "").lower() or None
+    except ValueError:
+        return None
+
+
+def _not_found_on_serving_hosts(entries):
+    """Captures that failed 404 from a host that served other captures this pass.
+
+    archive.org's ``error:not-found`` is categorised ``permanent``, and for a page
+    that is gone it is. But on 2026-11-10 four eCFR sections came back 404 in a
+    run that captured 17 other ecfr.gov sections, and the same sections load in a
+    browser: a 404 from a host that is plainly serving is more likely the host's
+    bad moment than a missing page. One retry each, in the same pass, settles it
+    for the price of one capture request. A URL already retried is not retried
+    again, and a host with no successful capture this pass is not second-guessed.
+    """
+    serving = {
+        _host_of(e.get("url"))
+        for e in entries
+        if (e.get("wayback") or {}).get("archive_outcome") == wayback.ARCHIVE_ARCHIVED
+        and e.get("url")
+    }
+    serving.discard(None)
+    return [
+        e
+        for e in entries
+        if (e.get("wayback") or {}).get("capture_error_code") == "error:not-found"
+        and not e["wayback"].get("capture_retried_after_not_found")
+        and _host_of(e.get("url")) in serving
+    ]
 
 
 #: Bound on concurrent snapshot reads for archive-match verification, and the

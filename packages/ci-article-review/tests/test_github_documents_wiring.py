@@ -208,7 +208,6 @@ class TestUsageErrors:
                 "--write-back does not combine with --github-ref",
             ),
             (["--github", SLUG, "--metadata", "m.md"], "--metadata"),
-            (["--github", SLUG, "--archive-only"], "--archive-only"),
             (["--github", SLUG, "--publish", "p.md"], "not allowed with"),
             (["--github", SLUG, "--draft", "h.md"], "not allowed with"),
             (["--github", SLUG, "--raw-draft", "d.md"], "not allowed with"),
@@ -226,6 +225,42 @@ class TestUsageErrors:
 
     def test_github_alone_is_a_complete_source(self, run_main):
         assert run_main("--github", SLUG, load=lambda *a, **k: fake_handoff()) == 0
+
+
+class TestArchiveOnlyFromGithub:
+    """``--archive-only --github``: the round is read, archived, and written back."""
+
+    def _run(self, run_main, *extra):
+        seen = {}
+
+        def load(slug, **kw):
+            seen.update(slug=slug, **kw)
+            return fake_handoff()
+
+        with patch("ci_article_review.pipeline.run_archive_only") as archive:
+            code = run_main("--github", SLUG, "--archive-only", *extra, load=load)
+        return code, seen, archive
+
+    def test_it_reads_the_round_and_writes_back_by_default(self, run_main):
+        code, seen, archive = self._run(run_main)
+        assert code == 0
+        assert seen["write_back"] is True
+        kwargs = archive.call_args.kwargs
+        assert kwargs["handoff"]["document_source"] == SOURCE
+        assert kwargs["write_back"] is True
+        run_main.run.assert_not_called()
+
+    def test_no_write_back_reads_without_the_write_pre_flight(self, run_main):
+        code, seen, archive = self._run(run_main, "--no-write-back")
+        assert code == 0
+        assert seen["write_back"] is False
+        assert archive.call_args.kwargs["write_back"] is False
+
+    def test_a_ref_is_read_and_never_written(self, run_main):
+        code, seen, archive = self._run(run_main, "--github-ref", "main")
+        assert code == 0
+        assert seen["ref"] == "main"
+        assert archive.call_args.kwargs["write_back"] is False
 
 
 class TestGithubReachesThePipeline:

@@ -528,7 +528,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is 
 | `--draft PATH` | Run the review pipeline on a draft handoff document |
 | `--raw-draft PATH` | Run on a plain article file with no handoff headers (e.g. pasted straight out of a chat session) — the whole file becomes the article body |
 | `--url URL` | Fetch a published web page and run the review on its extracted content |
-| `--github SLUG` | Read the article folder `SLUG` from the GitHub document repository (`github_documents` in `user.yaml`) at the head of the article's one open round (an open pull request from a branch `round/SLUG/rN`) unless `--pr`, `--round` or `--github-ref` says otherwise. See [Reading a draft from GitHub](#reading-a-draft-from-github). Not combinable with `--metadata` or `--archive-only`. |
+| `--github SLUG` | Read the article folder `SLUG` from the GitHub document repository (`github_documents` in `user.yaml`) at the head of the article's one open round (an open pull request from a branch `round/SLUG/rN`) unless `--pr`, `--round` or `--github-ref` says otherwise. See [Reading a draft from GitHub](#reading-a-draft-from-github). Not combinable with `--metadata`. |
 | `--pr N` | With `--github`: read pull request `N`, which must be from a branch `round/SLUG/rN` of the document repository. Use it when the article has more than one open round. |
 | `--round N` | With `--github`: read round `N`: the open pull request from `round/SLUG/rN` if there is one, else the tag `SLUG/rN`. Only the open pull request can be written back to. |
 | `--github-ref REF` | With `--github`: read a branch, tag or commit SHA as it is. Never written back: a usage error with `--write-back`. |
@@ -548,7 +548,7 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is 
 | `--expand` | Add the **expansion pass**: a sixth review domain that proposes additional sources, topics, angles and data fitting the draft's existing primary claim, instead of judging what is already there. Its output is SECTION 10, and every URL it proposes is fetched and marked resolved or not. Off by default — it costs extra model calls, and it earns them early in a draft rather than on a final revision. See [Expansion pass](#expansion-pass). |
 | `--no-seo-suggestions` | Skip both SEO model calls for this run — the [metadata suggestions](docs/CONFIGURATION.md#seo-suggestions) (focus keyword candidates, meta description, OG title, OG description, schema type) and the [structure review](docs/CONFIGURATION.md#seo-structure-review). Deterministic on-page checks still run. Permanent off: `seo_rules.suggestions` / `seo_rules.content_review`. |
 | `--retry-failed RESULTS_JSON` | Fill in the gaps from a prior run: make model calls only for the (model, domain) pairs marked failed in a `run_N_results.json`, merging the new attempts onto everything that already succeeded. Requires the same draft-loading flags (`--draft`/`--url`/`--raw-draft`/`--github`) as the original run. Mutually exclusive with `--replay`, which makes no model calls at all. |
-| `--archive-only` | Submit/verify Wayback snapshots for every URL in the draft's own citation block, then exit — zero model-provider calls, only HTTP to archive.org. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`. See [Archiving citations without the rest of the pipeline](#archiving-citations-without-the-rest-of-the-pipeline). |
+| `--archive-only` | Submit/verify Wayback snapshots for every URL in the draft's own citation block, then exit — zero model-provider calls, only HTTP to archive.org. Requires `--draft`, `--raw-draft` or `--github`; mutually exclusive with `--offline`. With `--github` it commits `pipeline/archive.md` and `pipeline/archive.json` to the round's branch unless `--no-write-back` or `--github-ref`. See [Archiving citations without the rest of the pipeline](#archiving-citations-without-the-rest-of-the-pipeline). |
 | `--verbose`, `-v` | DEBUG logging |
 
 **Calibration flags** (for measuring/tuning timeouts — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#wall-clock-backstop-is-automatic-sliding-scale)):
@@ -662,7 +662,17 @@ Every other way to reach the Wayback archiving machinery runs it behind fact-che
 uv run ci-review --raw-draft handoff.md --publication mypub --archive-only
 ```
 
-It reads every URL out of the draft's own citation block (`## Sources` / `## Citations` / etc. — whatever heading [docs/CITATIONS.md](docs/CITATIONS.md) documents), checks each one's current Wayback status, and submits the ones that are missing or stale — the same dedupe-by-URL, pacing and outcome bookkeeping a normal run's Pass 3 uses, just run directly against the draft's URLs instead of only the ones a resolved fact-check claim cites. Each URL's outcome prints in the same wording Section 9 uses, ending with `Estimated cost: $0.0000 (no model calls)` so it's never mistaken for a real spend line. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`, which turns off the very network calls this flag exists to make.
+It reads every URL out of the draft's own citation block (`## Sources` / `## Citations` / etc. — whatever heading [docs/CITATIONS.md](docs/CITATIONS.md) documents), checks each one's current Wayback status, and submits the ones that are missing or stale — the same dedupe-by-URL, pacing and outcome bookkeeping a normal run's Pass 3 uses, just run directly against the draft's URLs instead of only the ones a resolved fact-check claim cites. Each URL's outcome prints in the same wording Section 9 uses, ending with `Estimated cost: $0.0000 (no model calls)` so it's never mistaken for a real spend line. Requires `--draft`, `--raw-draft` or `--github`; mutually exclusive with `--offline`, which turns off the very network calls this flag exists to make.
+
+**For an article in the document repository**, read the round from GitHub and write the result back to it:
+
+```powershell
+uv run ci-review --archive-only --github my-article --publication mypub
+```
+
+It reads the round's `draft.md` at the head of its open pull request, archives every URL in its Sources list, and commits `pipeline/archive.md` (one row per cited URL: its snapshot, or why there is none) and `pipeline/archive.json` (the same, with the capture jobs still running) to the round's branch. The next pass on that round asks archive.org about those jobs before submitting again. `--no-write-back` prints the result without committing; `--github-ref` reads a ref and never commits. The managed `AGENTS.md` makes this pass, on the head commit, the last step before a round merges ([docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md#archiving-before-a-merge)).
+
+**What the pass says about a failure.** A refused or dropped connection to archive.org is reported as that, apart from archive.org's own refusals, with whether the rate-limit breaker had tripped: on 2026-11-10 web.archive.org refused every connection for about 50 seconds, with no 429 first, while archive.org answered on the same address. Run the pass again later. A URL archive.org refused because it was already captured that day gets that day's snapshot recorded. A capture that came back 404 from a host that served other captures in the same pass is retried once.
 
 **A page that has not changed is not re-submitted.** archive.org's availability API never lists a `warc/revisit` record (its pointer for an unchanged page), so an unchanged page reads stale on every run however often it is captured. For a URL that API calls stale or missing, this mode also asks archive.org's CDX index, which does list them, and trusts a revisit only after finding a `200` capture with the same content digest. That second lookup is slow, roughly 10 to 50 seconds per URL when it answers, so a draft with many stale sources takes minutes; a URL the first lookup already shows as fresh costs one request. The full review's own lookups do not use it. A CDX lookup that fails is printed as an `Archive lookup note`, because the answer then rests on the weaker source alone.
 
@@ -1091,6 +1101,7 @@ content-intelligence/
 │   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
 │   │   │   ├── github_documents.py    reads one round of an article from a GitHub repository (--github)
 │   │   │   ├── github_writeback.py    commits a run's review to the round's branch and posts the pull request review (--write-back, ci-docs push-run)
+│   │   │   ├── github_archive.py      pipeline/archive.md and archive.json: every cited URL's Wayback status on the round's branch (--archive-only --github)
 │   │   │   ├── review_body.py         the body of that review: summary and a checklist of the Section 1 findings
 │   │   │   ├── github_put.py          ci-docs ls and put: an article's rounds and files; one file onto the open round's branch
 │   │   │   ├── github_rounds.py       automatic round tagging, and ci-docs tag and accept
