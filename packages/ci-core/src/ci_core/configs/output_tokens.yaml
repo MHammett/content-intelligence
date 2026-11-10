@@ -109,19 +109,59 @@ answer_tokens:
 # The same model on the same article wrote 2x the entries one run apart, so
 # the ceiling has to cover the heavy tail, not the median. Per entry the size
 # is steady, 240-720 chars (~70-200 tokens) across every model and draft;
-# what grows is the count. 0.25 tokens per character is the run-24 pass
+# what grows is the count. 0.25 tokens per character was the run-24 pass
 # extrapolated to finishing its remaining six buckets at its own per-entry
 # size (~250 entries x 712 chars / 4 ≈ 44,500 tokens on 190,170 chars), and
 # gives that pass 79,543 instead of 50,000. Below the crossover the table
 # still decides, so nothing under 56,000 chars changes. A ceiling, not a
 # target: it bills only what is generated. With the anchor above, the line
-# decides from about 90,000 chars (where 16,000 x 1.4 = 22,400 meets 0.25 x
-# 89,600) and the table below it, so nothing under that size changes.
+# decides from about 40,000 chars at 0.35 (where 16,000 x 0.85 = 13,600 meets
+# 0.35 x 38,900; it was ~90,000 at 0.25) and the table below it.
 #
 # Only fact_check has a line; the flag domains do not grow with the claim
 # count and keep the table alone.
+# RE-MEASURED 2026-11-10 (issue #476), 22 saved mistral-medium-3-5 `high`
+# fact_check calls with a recorded max_tokens, drafts of 2K-215K chars. Seven
+# finished `length` at the ceiling they were sent, and the line decided none of
+# the mid-size ones: the table did below ~64K chars, and 0.25 only just beat it
+# above.
+#
+#   chars    sent     completion   entries   finish
+#   41,621   45,600   45,600       133       length   (table)
+#   43,138   45,600   45,600        78       length   (table)
+#   49,280   45,600   45,600       100       length   (table)
+#   52,508   48,000   48,000        61       length   (table)
+#   57,439   48,000   48,000        52       length   (table)
+#   73,793   50,449   50,449       166       length   (the 0.25 line; #476)
+#   79,604   51,901   37,827       196       stop
+#   81,404   54,400   47,309       204       stop     (largest finished)
+#  190,170   50,000   50,000       154+      length   (run 24, before the line)
+#
+# Tokens per entry (reasoning included) ran 193-304 on the finished heavy
+# drafts, so a 166-entry pass cut at 50,449 had not finished: ~200 entries is
+# ~47,000-61,000. The 52- and 61-entry cuts are reasoning that ran away (900+
+# tokens an entry), which no per-character ceiling is sized for and which this
+# change does not claim to fix. Output speed on the 17 finished calls over
+# 25,000 tokens was 143-210 tokens a second, 3x the 50 the wall-clock model
+# assumes.
+#
+# 0.25 -> 0.35. The rate is the largest that keeps a 62,000-char `maximum`
+# fact_check inside the task ceiling at the 50 tokens a second floor:
+# (1100 - 15) x 50 = 54,250 tokens, less the 32,000 reasoning term, over
+# 62,000 chars is 0.359 (test_output_ceiling pins that size). Past it a pass
+# is bounded by the wall clock rather than the ceiling at the floor rate, as
+# it already was past ~81,000 chars, but at the speeds measured above a
+# 1,085 s budget reaches 155,000+ tokens. Ceilings at mistral `high`:
+#
+#   chars     was      now      seconds to fill at 50/s (now)
+#   73,793    50,449   57,828   1,157
+#   190,170   79,543   98,560   1,971
+#
+# Not raised further: 0.5 would give 69,000 at 73,793 chars but 1,260 s at the
+# floor on a 62,000-char draft, which turns a truncation into a timeout.
+# A ceiling bills only what is generated.
 answer_tokens_per_char:
-  fact_check: 0.25
+  fact_check: 0.35
 
 # The answer term never goes below this, so a no-effort pass is never sent
 # less than the flat 8000 client.py sent before 2026-10-24 — a 2,000-char
