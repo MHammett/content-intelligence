@@ -1748,7 +1748,7 @@ def _normalise_flags_results(results):
 # ---------------------------------------------------------------------------
 
 
-def find_contradictions(results):
+def find_contradictions(results, *, include_unsearched=False):
     """Surface claims confirmed by one fact-check model but challenged by another.
 
     Returns a list of contradiction dicts.  Each entry has:
@@ -1770,6 +1770,24 @@ def find_contradictions(results):
     "I have a family." — unfalsifiable first-person statements that two models
     reported as *confirmed*. Surfacing the disagreement is what makes that
     visible.
+
+    An ``unverifiable`` only counts if the call could check (issue #477)
+    -------------------------------------------------------------------
+    Counting it is about *evidence*: a model that looked and found nothing
+    disagrees with one that found a source. A model with no search on that
+    call (grok after #372, answering from training data) says "unverifiable"
+    for "I cannot check", which is not evidence about the claim. On run 25 it
+    was 12 of 13 entries, all against claims that grounded models had
+    confirmed. So an ``unverifiable`` from a call whose result does not show it
+    grounded is dropped, unless ``include_unsearched`` is true (the pipeline
+    uses that to say how many it dropped).
+
+    "Could check" is ``grounding_available``, which every provider sets only
+    when a search actually ran (``ci_core.llm.client._extras_from``). A key that
+    is absent counts as not grounded: grok and claude with no search tool carry
+    no such key. A model with the tool attached that chose to run zero
+    searches reads the same way and is dropped too: it also checked nothing.
+    ``contradicted`` and ``outdated`` are positive claims and count either way.
     """
     stances = []
 
@@ -1777,6 +1795,7 @@ def find_contradictions(results):
         if domain != "fact_check" or result.get("failed") or not result.get("data"):
             continue
         data = result["data"]
+        searched = bool(result.get("grounding_available"))
         for item in data.get("confirmed", []):
             claim = item.get("claim", "")
             if claim:
@@ -1789,6 +1808,8 @@ def find_contradictions(results):
                     }
                 )
         for bucket in ("contradicted", "outdated", "unverifiable"):
+            if bucket == "unverifiable" and not searched and not include_unsearched:
+                continue
             for item in data.get(bucket, []):
                 claim = item.get("claim", "")
                 if claim:
@@ -2310,6 +2331,10 @@ def build_report(
 
     # Cross-model contradictions — claims confirmed by one model, challenged by another
     contradictions = find_contradictions(results)
+    # ...and how many more there would be had unsearched "unverifiable"s counted.
+    unsearched_unverifiable = len(
+        find_contradictions(results, include_unsearched=True)
+    ) - len(contradictions)
 
     # Model failures (skipped entries are not failures)
     model_failures = [
@@ -2452,6 +2477,7 @@ def build_report(
         # Section 9 (citations) is attached by the pipeline after Pass 3.
         "section_10_expansion": section_10_expansion,
         "contradictions": contradictions,
+        "contradictions_unsearched_excluded": unsearched_unverifiable,
         "model_failures": model_failures,
         "model_failure_details": model_failure_details,
         "domains_not_run": domains_not_run_details,
