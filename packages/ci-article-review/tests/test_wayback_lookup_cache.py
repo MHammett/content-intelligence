@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 import spn_client
+from ci_core.http import HOST_PUBLIC
 
 from ci_article_review.adapters.citation import wayback
 from ci_article_review.adapters.citation import wayback_lookup_cache as wlc
@@ -112,17 +113,25 @@ class TestOneLookupPerUrlPerRun:
         assert "submitted" not in third
 
     def test_link_pass_and_section_9_share_one_lookup(self, live):
-        # The link pass passes a threshold, Section 9 none (spn-client's
-        # default, 30 days). Same URL, one lookup; staleness is judged by each
-        # caller's own threshold, as it would be with two live lookups.
+        # Both passes now pass the configured ``wayback_snapshot_stale_days``
+        # (issue #438). Same URL, one lookup, one verdict. Section 9 used to pass
+        # none and judge the same snapshot against spn-client's 30 days.
         assert spn_client.DEFAULT_STALE_DAYS == 30
-        live.answers[URL] = _archived(URL, days_ago=20)
-        from_links = wayback.check(URL, timeout=10, stale_days=10)
-        from_section_9 = wayback.check(URL)
+        live.answers[URL] = _archived(URL, days_ago=100)
+        from_links = wayback.check(URL, timeout=10, stale_days=180)
+        from_section_9 = wayback.check(URL, stale_days=180)
         assert len(live.calls) == 1
-        assert from_links["snapshot_stale"] is True
+        assert from_links["snapshot_stale"] is False
         assert from_section_9["snapshot_stale"] is False
-        assert from_section_9["snapshot_age_days"] == 20
+        assert from_section_9["snapshot_age_days"] == 100
+
+    def test_each_caller_is_judged_against_its_own_threshold(self, live):
+        # The memo stores the snapshot, not a verdict, so a caller that asks
+        # with a different threshold still gets its own answer.
+        live.answers[URL] = _archived(URL, days_ago=20)
+        assert wayback.check(URL, stale_days=10)["snapshot_stale"] is True
+        assert wayback.check(URL)["snapshot_stale"] is False
+        assert len(live.calls) == 1
 
     def test_a_lookup_that_did_not_complete_is_asked_again(self, live):
         # ``archived: None`` is "we never found out", and remembering it would
@@ -549,3 +558,49 @@ class TestOnlyRequestsCountAsSent:
             + s["archive_urls"]
             + s["skipped"]
         )
+
+
+class TestSection9UsesTheConfiguredStaleDays:
+    """Issue #438: ``resolve_citations`` took no threshold, so a snapshot
+    between 30 days and ``wayback_snapshot_stale_days`` old was fresh in the link
+    pass and ``[STALE]`` in Section 9 of the same report."""
+
+    @staticmethod
+    def _page():
+        body = b"<html><body><p>a claim</p></body></html>"
+        return type(
+            "R",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "content": body,
+                "text": body.decode(),
+                "headers": {"Content-Type": "text/html; charset=utf-8"},
+                "encoding": "utf-8",
+            },
+        )()
+
+    @pytest.mark.parametrize(
+        "stale_days, expect_stale", [(180, False), (60, True), (None, True)]
+    )
+    def test_known_url_citation_is_flagged_against_the_configured_days(
+        self, live, monkeypatch, stale_days, expect_stale
+    ):
+        from unittest.mock import patch
+
+        from ci_article_review.adapters.citation import resolver
+
+        live.answers[URL] = _archived(URL, days_ago=100)
+        monkeypatch.setattr(wayback, "_spn_check", live)
+        with (
+            patch.object(resolver, "safe_get", return_value=self._page()),
+            patch.object(resolver, "classify_host", return_value=HOST_PUBLIC),
+        ):
+            results = resolver.resolve_citations(
+                [{"claim": "a claim", "known_url": URL}],
+                [],
+                stale_days=stale_days,
+            )
+        assert results[0]["resolved"] is True
+        assert results[0]["wayback"]["snapshot_age_days"] == 100
+        assert results[0]["wayback"]["snapshot_stale"] is expect_stale
