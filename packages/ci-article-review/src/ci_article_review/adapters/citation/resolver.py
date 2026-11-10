@@ -668,7 +668,19 @@ def _escalate(url, timeout, page_cache=None):
     )
 
 
-def _wayback_fallback_content(url, timeout):
+def _wayback_check(url, stale_days, **kwargs):
+    """``wayback.check`` with the run's ``wayback_snapshot_stale_days``.
+
+    The threshold is passed only when one is configured, so an unset value
+    leaves spn-client's own default in force, exactly as the link pass does
+    (issue #438).
+    """
+    if stale_days is not None:
+        kwargs["stale_days"] = stale_days
+    return wayback.check(url, **kwargs)
+
+
+def _wayback_fallback_content(url, timeout, stale_days=None):
     """When the origin won't (or can't) serve the page, read archive.org's
     snapshot as the content source instead.
 
@@ -699,7 +711,7 @@ def _wayback_fallback_content(url, timeout):
     citation that was satisfied by it.
     """
     _step("archive_fallback")
-    wb = wayback.check(url, timeout=timeout)
+    wb = _wayback_check(url, stale_days, timeout=timeout)
     snapshot_url = wb.get("snapshot_url")
     if not wb.get("archived") or not snapshot_url:
         return None, wb
@@ -998,6 +1010,7 @@ def _resolve_known_url(
     verify_claim=None,
     page_cache=None,
     locate_hints=(),
+    stale_days=None,
 ):
     """Resolve a claim whose source URL is already known (e.g. supplied by the
     fact-check model itself), bypassing the narrow adapter matching entirely.
@@ -1154,7 +1167,11 @@ def _resolve_known_url(
             # was never looked up in the first place and never will be on a
             # re-run.
             fallback, wb = (
-                _wayback_fallback_content(known_url, timeout)
+                _wayback_fallback_content(
+                    known_url,
+                    timeout,
+                    **({"stale_days": stale_days} if stale_days is not None else {}),
+                )
                 if reason
                 else (None, None)
             )
@@ -1195,7 +1212,7 @@ def _resolve_known_url(
     # The fallback path already asked archive.org; don't ask twice.
     if wb is None:
         _step("archive_check")
-        wb = wayback.check(archive_lookup_url)
+        wb = _wayback_check(archive_lookup_url, stale_days)
     result = {
         "claim": claim,
         "source_name": "fact-check model",
@@ -1553,6 +1570,7 @@ def _resolve_candidates(
     page_cache=None,
     locate_hints=None,
     secondary_urls=None,
+    stale_days=None,
 ):
     """Check a claim against the sources cited for it, best candidate first.
 
@@ -1589,6 +1607,7 @@ def _resolve_candidates(
             verify_claim=verify_claim,
             page_cache=page_cache,
             locate_hints=tuple((locate_hints or {}).get(url, ())),
+            stale_days=stale_days,
         )
         if verify_claim:
             result["verified_as"] = verify_claim
@@ -1661,6 +1680,7 @@ def _resolve_one(
     clock=None,
     locate_hints=None,
     secondary_urls=None,
+    stale_days=None,
 ):
     """Resolve a single claim against the configured sources, in order.
 
@@ -1692,6 +1712,7 @@ def _resolve_one(
             page_cache,
             locate_hints=locate_hints,
             secondary_urls=secondary_urls,
+            stale_days=stale_days,
         )
     finally:
         _clock.current = None
@@ -1714,6 +1735,7 @@ def _resolve_one_steps(
     page_cache,
     locate_hints=None,
     secondary_urls=None,
+    stale_days=None,
 ):
     checksum_index = checksum_index if checksum_index is not None else {}
 
@@ -1729,6 +1751,7 @@ def _resolve_one_steps(
             page_cache=page_cache,
             locate_hints=locate_hints,
             secondary_urls=secondary_urls,
+            stale_days=stale_days,
         )
 
     for source_config in citation_sources:
@@ -1748,7 +1771,11 @@ def _resolve_one_steps(
             if result and result.get("found"):
                 resolved_url = result.get("url")
                 _step("archive_check")
-                wb = wayback.check(resolved_url) if resolved_url else {"archived": None}
+                wb = (
+                    _wayback_check(resolved_url, stale_days)
+                    if resolved_url
+                    else {"archived": None}
+                )
                 pointer_only = bool(result.get("pointer_only"))
                 return _check_drift(
                     {
@@ -2886,6 +2913,7 @@ def resolve_citations(
     author=None,
     capture_settings=None,
     page_cache=None,
+    stale_days=None,
 ):
     """
     For each claim, resolve a primary source. If the claim entry carries
@@ -2923,6 +2951,10 @@ def resolve_citations(
     ``page_cache`` (a ``page_cache.PageCache``, one per run) lets the claims of
     this call, and the quote check that ran before it, share one fetch per cited
     URL. Without it every claim fetches its own copy.
+
+    ``stale_days`` is ``pipeline.wayback_snapshot_stale_days``: the age past
+    which a snapshot is flagged ``[STALE]``, the same threshold the link pass
+    uses. None leaves spn-client's own default (30 days) in force (issue #438).
 
     Returns a list of resolution results in the original claim order.
     """
@@ -2976,6 +3008,7 @@ def resolve_citations(
                     clock=clock,
                     locate_hints=hints,
                     secondary_urls=secondary,
+                    stale_days=stale_days,
                 )
             ),
             _RESOLVE_TIMEOUT_SECONDS,

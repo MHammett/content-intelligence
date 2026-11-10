@@ -62,6 +62,7 @@ from .config_loader import (
 )
 from .handoff_parser import (
     parse_draft_submission,
+    describe_unread_label,
     parse_publication_handoff,
     build_handoff_from_raw_text,
     build_handoff_from_raw_draft_and_metadata,
@@ -4505,6 +4506,12 @@ def run_draft_pipeline(
         or (pub_config.get("author_name") or "").strip()
         or None
     )
+    # Same threshold the link pass uses (issue #438). Read here, not reused from
+    # the link block, because that block is skipped under --offline and
+    # link_validation: false while Section 9 still looks snapshots up.
+    wayback_stale_days = pipeline_cfg.get("wayback_snapshot_stale_days")
+    if wayback_stale_days is not None:
+        wayback_stale_days = int(wayback_stale_days)
     if claims:
         # A breaker the link pass tripped half an hour ago is not a reason for
         # every citation to go without its archive lookup (issue #445).
@@ -4528,6 +4535,7 @@ def run_draft_pipeline(
             # which carries no metadata at all.
             author=citation_author,
             capture_settings=pipeline_cfg.get("wayback_capture"),
+            stale_days=wayback_stale_days,
             page_cache=page_cache,
         )
         verified_count = sum(
@@ -4612,6 +4620,7 @@ def run_draft_pipeline(
                         author=citation_author,
                         capture_settings=pipeline_cfg.get("wayback_capture"),
                         page_cache=page_cache,
+                        stale_days=wayback_stale_days,
                     )
                     citation_reask.attach_source_checks(pending, checked)
                 log.info(
@@ -6043,6 +6052,13 @@ def run_publish_pipeline(
     log.info(f"Parsing publication handoff: {handoff_path}")
     handoff_text = _read_handoff_file(handoff_path)
     pub_handoff = parse_publication_handoff(handoff_text)
+    if pub_handoff.get("unread_labels"):
+        # Above everything else, including the refusals below: this is the
+        # moment a person is reading, and a refusal is often the symptom.
+        print("\nHANDOFF LINES THAT WERE NOT READ (check the label spelling):")
+        for item in pub_handoff["unread_labels"]:
+            print(f"  - {describe_unread_label(item)}")
+        print()
 
     if not pub_handoff["final_draft"]:
         log.error(
