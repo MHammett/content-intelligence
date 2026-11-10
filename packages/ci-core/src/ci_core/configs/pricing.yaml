@@ -405,6 +405,10 @@ models:
   # happens to be right, which is luck, not a reason to omit the row. Same
   # failure gemini-3.5-flash-lite had; tests/test_cost.py now guards both.
   claude-fable-5-1:             [10.00, 50.00,  0.25]   # verified 2026-09-29; 0.025x cache read
+  claude-fable-5-2:             [8.00,  40.00,  0.20]   # verified 2026-11-10
+  claude-mythos-5-2:            [8.00,  40.00,  0.20]   # verified 2026-11-10 (limited availability)
+  claude-mythos-5-1:            [10.00, 50.00,  0.25]   # verified 2026-11-10 (limited availability)
+  claude-mythos-5:              [10.00, 50.00,  1.00]   # verified 2026-11-10 (limited availability)
   claude-fable-5:               [10.00, 50.00,  1.00]
   claude-opus-5-5:              [4.00,  20.00,  0.20]   # verified 2026-09-29; 0.05x cache read
   claude-opus-5:                [5.00,  25.00,  0.50]
@@ -413,6 +417,14 @@ models:
   claude-opus-4-8:              [5.00,  25.00,  0.50]
   claude-sonnet-4-6:            [3.00,  15.00,  0.30]
   claude-haiku-4-5-20251001:    [1.00,   5.00,  0.10]
+  # Rows above added 2026-11-10 (issue #278), read from the same page: Mythos 5
+  # and 5.1 are Fable's rates (the page lists them "limited availability");
+  # Mythos 5.2 and Fable 5.2 are $8/$40 with a $0.20 cached read. Each needs its
+  # own row for the prefix reason above: mythos-5-1 would otherwise price at
+  # mythos-5's $1.00 cached read. claude-haiku-5-5 is deliberately NOT here: the
+  # page prices it by prompt size ($0.10/$0.50 up to 100k tokens, $0.50/$2.50
+  # over), and this table has one rate per model, so any row would be wrong for
+  # one of the two.
 
 # ── Search and grounding fees ──────────────────────────────────────────────────
 # [USD per 1,000 billed units, unit], charged ON TOP of the token rates above.

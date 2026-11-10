@@ -427,6 +427,33 @@ class TestAnUnsetEffortIsTheModelsDefault:
                 chars, "claude", {"model": model, "effort": "high"}, CEILING
             ), (model, chars)
 
+    def test_every_priced_claude_model_is_classified(self):
+        """Issue #263: a Claude model added to pricing.yaml must be put on one
+        side of the line, or this fails. Thinks-by-default models belong in
+        _EFFORT_WHEN_UNSET; the rest in THINK_WHEN_ASKED above. A model on
+        neither is billed for thinking the output ceiling does not know about.
+        """
+        from ci_core.llm import cost
+
+        by_default = set(ot._EFFORT_WHEN_UNSET["claude"])
+        when_asked = set(self.THINK_WHEN_ASKED)
+        priced = {m for m in cost._PRICING if m.startswith("claude-")}
+        assert not by_default & when_asked, by_default & when_asked
+        assert priced - by_default - when_asked == set(), (
+            "classify these in _EFFORT_WHEN_UNSET or THINK_WHEN_ASKED, from "
+            "platform.claude.com/docs/en/build-with-claude/effort"
+        )
+
+    def test_unset_effort_is_the_documented_default_per_model(self):
+        """Opus 5.5 and Haiku 5.5 default to medium, the rest to high (effort
+        docs); the ceiling is sized from this value, so a wrong one misprices."""
+        got = {
+            m: ot.effort_when_unset("claude", m)
+            for m in ot._EFFORT_WHEN_UNSET["claude"]
+        }
+        assert got["claude-opus-5-5"] == got["claude-haiku-5-5"] == "medium"
+        assert got["claude-sonnet-5-5"] == got["claude-opus-5"] == "high"
+
     def test_litellms_model_map_cannot_tell_the_two_kinds_apart(self):
         """Why this is a list and not a map lookup: claude-opus-5 thinks by
         default and claude-opus-4-8 does not, yet the bundled map gives them the

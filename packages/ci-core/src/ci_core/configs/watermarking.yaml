@@ -1,4 +1,4 @@
-# Provider text-watermarking registry — last verified 2026-09-05.
+# Provider text-watermarking registry — last verified 2026-11-10.
 #
 # Which providers embed a statistical watermark in generated TEXT. This is
 # provenance bookkeeping, not detection: nothing in this repo can tell whether
@@ -22,7 +22,7 @@
 # An unlisted provider is "unknown". Absence of evidence is recorded as
 # absence of evidence.
 
-registry_date: "2026-09-05"
+registry_date: "2026-11-10"
 stale_notice_days: 60
 stale_warning_days: 120
 
@@ -34,8 +34,10 @@ providers:
     method: "statistical, a SynthID-Text variant"
     note: >-
       Applies to output from supported models wherever Claude is offered, not
-      only in the EU, because the mark is applied at the model level. No opt-out
-      is documented. Anthropic has a third-party detection API in private
+      only in the EU, because the mark is applied at the model level. Anthropic's
+      page (updated 2026-09-01) says future models carry it and models launched
+      before 2026-08-02 are being added over the coming months, so an older
+      model may not yet mark. No opt-out is documented. Anthropic has a third-party detection API in private
       preview; eligible categories include media and fact-checkers.
     source: "https://www.anthropic.com/news/claude-text-watermark"
 
@@ -50,19 +52,27 @@ providers:
       Google's own developer forum at the registry date, so this is recorded as
       partial rather than yes. If this pipeline's gemini calls go through the
       API, treat the status as unresolved rather than assuming either way.
+      Update 2026-11-10: on the same forum thread a reply of 2026-08-19 says
+      API, AI Studio and Antigravity text IS SynthID-watermarked, "after
+      checking with the team". That poster is not identified as Google staff,
+      no documentation backs it, and later questions (Vertex, newer models, a
+      start date) are unanswered, so the status stays partial.
     source: "https://deepmind.google/blog/watermarking-ai-generated-text-and-video-with-synthid/"
 
   openai:
-    status: "no"
-    scope: "provenance signals on images and audio only"
-    since: null
-    method: null
+    status: "partial"
+    scope: "ChatGPT and Codex text in the EU; opt-in (off by default) for select API models worldwide"
+    since: "2026-10-05"
+    method: "textGrain (keyed word-choice shaping), per press reports of OpenAI's technical report"
     note: >-
-      Applies provenance signals to images and audio and has stated an intent
-      to extend them to all modalities including text, under the same EU Code
-      of Practice commitment. No text method announced as of the registry date.
-      Expect this entry to change.
-    source: "https://artificialintelligenceact.eu/transparency-rules-article-50/"
+      Announced 2026-10-05 to meet the EU Code of Practice on AI-generated
+      content. Not on by default for the API, and the models that support it
+      were not named in the coverage read, so a call through this pipeline is
+      not marked unless that option is switched on. Recorded as partial rather
+      than yes for that reason. Read via TechCrunch and Search Engine Journal;
+      OpenAI's own post (openai.com/index/eu-text-provenance/) returned 403 to
+      the fetcher, so re-check it against the primary text.
+    source: "https://techcrunch.com/2026/10/05/openai-will-start-watermarking-chatgpts-text-in-the-EU/"
 
   mistral:
     status: "no"
