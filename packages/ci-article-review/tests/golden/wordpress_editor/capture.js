@@ -292,7 +292,7 @@
         name,
         blocks: blocks.map((b) => ({ name: b.name, valid: allValid(b), ...(allValid(b) ? {} : { issue: firstIssue(b) }) })),
         // False is not a failure: the editor writes a heading with a class the converter does not,
-        // and spaces a list differently, and accepts both. It means "not byte for byte what I write".
+        // and accepts both. It means "not byte for byte what I write".
         round_trip: serialize(blocks) === markup,
       };
     });

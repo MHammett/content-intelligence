@@ -1,11 +1,11 @@
 {
   "provenance": {
-    "captured_on": "2026-10-05",
-    "wordpress": "7.1.2",
+    "captured_on": "2026-11-11",
+    "wordpress": "7.1.4",
     "bundles_sha256_12": {
       "blocks.min.js": "4b5f1f4b23be",
       "block-library.min.js": "42d66f582f11",
-      "block-editor.min.js": "dc8506ba37fc"
+      "block-editor.min.js": "15305fc65b29"
     },
     "script": "tests/golden/wordpress_editor/capture.js"
   },
@@ -242,6 +242,46 @@
       "round_trip": true
     },
     {
+      "name": "list-unordered",
+      "markdown": "- one\n- two",
+      "expected": "<!-- wp:list -->\n<ul class=\"wp-block-list\"><!-- wp:list-item -->\n<li>one</li>\n<!-- /wp:list-item -->\n\n<!-- wp:list-item -->\n<li>two</li>\n<!-- /wp:list-item --></ul>\n<!-- /wp:list -->",
+      "names": [
+        "core/list"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "list-ordered",
+      "markdown": "1. one\n2. two",
+      "expected": "<!-- wp:list {\"ordered\":true} -->\n<ol class=\"wp-block-list\"><!-- wp:list-item -->\n<li>one</li>\n<!-- /wp:list-item -->\n\n<!-- wp:list-item -->\n<li>two</li>\n<!-- /wp:list-item --></ol>\n<!-- /wp:list -->",
+      "names": [
+        "core/list"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "quote-paragraph-and-list",
+      "markdown": "> **TL;DR**\n> - one\n> - two",
+      "expected": "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:paragraph -->\n<p><strong>TL;DR</strong></p>\n<!-- /wp:paragraph -->\n\n<!-- wp:list -->\n<ul class=\"wp-block-list\"><!-- wp:list-item -->\n<li>one</li>\n<!-- /wp:list-item -->\n\n<!-- wp:list-item -->\n<li>two</li>\n<!-- /wp:list-item --></ul>\n<!-- /wp:list --></blockquote>\n<!-- /wp:quote -->",
+      "names": [
+        "core/quote"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
+      "name": "quote-ordered-list",
+      "markdown": "> 1. one\n> 2. two",
+      "expected": "<!-- wp:quote -->\n<blockquote class=\"wp-block-quote\"><!-- wp:list {\"ordered\":true} -->\n<ol class=\"wp-block-list\"><!-- wp:list-item -->\n<li>one</li>\n<!-- /wp:list-item -->\n\n<!-- wp:list-item -->\n<li>two</li>\n<!-- /wp:list-item --></ol>\n<!-- /wp:list --></blockquote>\n<!-- /wp:quote -->",
+      "names": [
+        "core/quote"
+      ],
+      "valid": true,
+      "round_trip": true
+    },
+    {
       "name": "separator-dashes",
       "markdown": "---",
       "expected": "<!-- wp:separator -->\n<hr class=\"wp-block-separator has-alpha-channel-opacity\"/>\n<!-- /wp:separator -->",
@@ -262,9 +302,9 @@
       "round_trip": true
     },
     {
-      "name": "quote-with-a-list-is-html",
-      "markdown": "> - one\n> - two",
-      "expected": "<!-- wp:html -->\n<blockquote>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n</blockquote>\n<!-- /wp:html -->",
+      "name": "quote-with-a-heading-is-html",
+      "markdown": "> # A heading\n>\n> text",
+      "expected": "<!-- wp:html -->\n<blockquote>\n<h1>A heading</h1>\n<p>text</p>\n</blockquote>\n<!-- /wp:html -->",
       "names": [
         "core/html"
       ],
