@@ -15,6 +15,7 @@ subprocess runner are both passed in.
 import base64
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -379,7 +380,10 @@ def test_the_repository_name_and_branch_reach_the_files_that_name_them():
     assert b"someone/else" in rendered["instructions/claude-project.md"]
     assert b"trunk" in rendered["instructions/claude-project.md"]
     ours = [d for p, d in rendered.items() if not p.startswith("templates/")]
-    assert b"{{" not in b"".join(ours)
+    # An unfilled placeholder is ``{{name}}``. A GitHub Actions expression in the
+    # archive gate workflow, ``${{ github.head_ref }}``, is meant to be there.
+    assert not re.search(rb"\{\{[a-z_]+\}\}", b"".join(ours))
+    assert b"branches: [trunk]" in rendered[".github/workflows/archive-gate.yml"]
 
 
 def _agents():

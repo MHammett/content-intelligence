@@ -26,6 +26,7 @@ articles/<slug>/       one folder per article
   publication.md         the publication handoff                           drafting side
   close-out-to-code.md   the latest close-out note to a Code session       either side
   close-out-to-chat.md   the latest close-out note to the drafting chat    either side
+  archive-exceptions.md  cited URLs the author accepts with no snapshot    the author, via either side
   review.md              the latest ci-review review on this branch        ci-review only
   pipeline/              run.json, report.json, worklist.md, archive.md    ci-review only
 ```
@@ -114,6 +115,8 @@ Every URL in the draft's Sources list must have a Wayback Machine snapshot befor
 1. Ask the Code side for an archive pass on the head commit: `ci-review --archive-only --github <slug> --publication <name>`. It makes no model calls and costs nothing. It commits `pipeline/archive.md` and `pipeline/archive.json` to the round's branch.
 2. Read `pipeline/archive.md` on the branch. This is the one file under `pipeline/` you read, and only to check the merge; never carry it into a revision. Its `Draft:` line names the commit it checked. If that is not the head commit you are about to merge, the check is out of date: ask for the pass again.
 3. Every row under "Without a fresh snapshot" needs an outcome before the merge: archived on a later pass, or a reason the author has accepted (the page refuses archive.org, or it is a data query that archive.org cannot store). Write each in the close-out note to the author. A connection refusal or a capture still running is not a reason: ask for the pass again later, once.
+
+The pull request's "archive gate" check does this comparison for you. It fails while there is no `pipeline/archive.json`, while `draft.md` differs from the draft the last pass read, and while any cited URL has no snapshot and no accepted reason. Record an accepted reason in `articles/<slug>/archive-exceptions.md`, one line per URL: `- <url>: <the author's reason>`. Add a line only when the author has accepted that URL without a snapshot, and quote the author's words in the commit message. Do not call a round ready while the check is failing.
 
 ## Accepting a round
 
