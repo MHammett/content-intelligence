@@ -837,6 +837,22 @@ prints without committing, and `--github-ref` never commits. A full review that
 is written back commits the same two files from its own Sources pass
 (`docs/CITATIONS.md`, "Then every other URL in the Sources list").
 
+**The archive gate.** `ci-docs init` also renders `.github/workflows/archive-gate.yml`
+and `.github/scripts/archive_gate.py` (sources `document_repo/archive-gate.yml.tmpl` and
+`archive_gate.py.tmpl`), a check on every pull request from a `round/` branch. It
+uses the standard library only, and it fails when:
+
+- the round has no `pipeline/archive.json`;
+- `draft.md`'s blob is not the one `archive.json` recorded, because a revision
+  since the pass may cite URLs it never saw (the archive commit itself moves the
+  head, so the commit is not what is compared);
+- a cited URL is `missing`, `pending` or `not checked` and is not listed in
+  `articles/<slug>/archive-exceptions.md` as `- <url>: <reason>`. That file is the
+  author's record of the gaps accepted; `ci-docs put` takes it.
+
+A stale snapshot passes. The check reports. It blocks a merge only if branch
+protection on the base requires it, which is the author's setting to make.
+
 The managed `AGENTS.md` tells the drafting side to ask for this pass, to read
 `pipeline/archive.md` (the one `pipeline/` file it reads, and only to check the
 merge), to treat a status whose `Draft:` commit is not the head as out of date,

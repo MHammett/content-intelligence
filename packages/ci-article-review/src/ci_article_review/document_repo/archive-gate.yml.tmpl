@@ -1,0 +1,21 @@
+# Every URL an article cites has a Wayback snapshot before its round merges.
+# The check is .github/scripts/archive_gate.py; AGENTS.md, "Before a merge",
+# says what to do when it fails.
+name: archive gate
+on:
+  pull_request:
+    branches: [{{branch}}]
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  archive-gate:
+    if: startsWith(github.head_ref, 'round/')
+    runs-on: ubuntu-latest
+    steps:
+      # The default ref, the pull request merged into the base: it has this
+      # check's script even on a round branch cut before the script existed,
+      # and the round's own article as the branch has it.
+      - uses: actions/checkout@v4
+      - name: Check every cited URL is archived
+        run: python3 .github/scripts/archive_gate.py "${{ github.head_ref }}"

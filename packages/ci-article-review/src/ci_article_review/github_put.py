@@ -14,6 +14,7 @@ takes the drafting side's own files for an author who commits from the command
 line. The file name is the name it gets::
 
     close-out-to-chat.md   close-out-to-code.md   draft.md   metadata.md   publication.md
+    archive-exceptions.md
 
 ``review.md`` and everything under ``pipeline/`` are written by the pipeline
 (``ci-review --write-back``, ``ci-docs push-run``) and are refused. An existing
@@ -67,6 +68,8 @@ PUT_NAMES = (
     "draft.md",
     "metadata.md",
     "publication.md",
+    # The author's accepted gaps, read by the archive gate check.
+    "archive-exceptions.md",
 )
 
 #: ``pipeline/`` is the one subfolder the pipeline writes.

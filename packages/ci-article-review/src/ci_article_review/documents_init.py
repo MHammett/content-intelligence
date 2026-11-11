@@ -141,6 +141,10 @@ REPO_FILES = (
     (".gitattributes", "gitattributes.tmpl", "hash"),
     ("instructions/claude-project.md", "claude-project.md.tmpl", "html"),
     (ARTICLES_README_PATH, "articles_README.md.tmpl", "html"),
+    # The archive gate: a check on round pull requests that every cited URL has
+    # a Wayback snapshot, read from pipeline/archive.json (github_archive).
+    (".github/workflows/archive-gate.yml", "archive-gate.yml.tmpl", "hash"),
+    (".github/scripts/archive_gate.py", "archive_gate.py.tmpl", "hash"),
 )
 
 
