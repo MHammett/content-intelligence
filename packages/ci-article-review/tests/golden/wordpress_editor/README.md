@@ -21,17 +21,18 @@ the string is what the editor itself would store.
 
 ## How `blocks.json` was captured
 
-On 2026-10-05, from the **WordPress 7.1.2** block editor, in a disposable
-WordPress Playground (PHP 8.3). No site was involved, and nothing was saved.
+On 2026-11-11, from the **WordPress 7.1.4** block editor, in a disposable
+WordPress Playground (PHP 8.3). No site was involved, and nothing was saved. The
+first capture, on 2026-10-05, was from 7.1.2; this one added the list cases.
 
 The build is what decides validity, so it was compared with the one the site
 runs. `blocks.min.js` (the parser, validator and serialiser) and
-`block-library.min.js` (every core block's `save()`) are byte for byte the 7.1.2
-release's, and the production site served the same two files that day
-(`4b5f1f4b23be` and `42d66f582f11`). The third file, `block-editor.min.js`, is
-`72cbf44f5f43` on the release and `dc8506ba37fc` in Playground: Playground
-prepends a short snippet and swaps one `iframe` in the editor canvas for its own
-component, which has nothing to do with how a block is written or validated.
+`block-library.min.js` (every core block's `save()`) are `4b5f1f4b23be` and
+`42d66f582f11`, the same on 7.1.2 and 7.1.4, and the production site served the
+same two files on both capture days. The third file, `block-editor.min.js`,
+differs in Playground (`15305fc65b29` on 7.1.4): Playground prepends a short
+snippet and swaps one `iframe` in the editor canvas for its own component, which
+has nothing to do with how a block is written or validated.
 
 To take the captures again, or to check what `to_blocks` writes against an
 editor, follow `docs/DEVELOPMENT.md`, "Checking block markup in the real editor".
@@ -54,12 +55,17 @@ Each of these is pinned by a case in `blocks.json`.
   Python-Markdown gives a table with only a header one empty body row.
 - **Quote.** Inner paragraphs are joined by a blank line. A citation is a
   `<cite>` straight after the last inner block, which the converter never writes
-  because Markdown has no citation. A quote holding anything other than
-  paragraphs (a list, a heading, another quote) has no faithful form, so it is
-  sent as a `wp:html` block.
+  because Markdown has no citation. A quote may also hold lists, as a TL;DR box
+  does (a bold label over a list of points): each list is a `core/list` inner
+  block. A quote holding anything else (a heading, another quote) has no
+  faithful form, so it is sent as a `wp:html` block.
+- **List.** The `core/list-item` blocks sit flush against the `<ul>` or `<ol>`
+  tags and are joined by a blank line. The editor also accepted the converter's
+  older spacing (a newline after the opening tag and after each item), but did
+  not write it back unchanged.
 - **`wp:html`.** Valid whatever it holds, and written back unchanged. It is where
   everything with no native form goes, including a `figure` written as raw HTML.
 
-The editor also accepts, without writing them back unchanged, a heading (it adds
-`class="wp-block-heading"`) and a list (it spaces the items differently). The
-converter's headings and lists are valid, and are not part of this capture.
+The editor also accepts, without writing it back unchanged, a heading (it adds
+`class="wp-block-heading"`). The converter's headings are valid, and are not
+part of this capture.

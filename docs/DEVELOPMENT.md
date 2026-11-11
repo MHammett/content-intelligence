@@ -219,9 +219,9 @@ uv run python -c "import json, pathlib; from ci_article_review.adapters.cms.bloc
 In the editor's console, after pasting `capture.js`, run
 `await wpEditorBlocks.check(<that output>)`. Every top-level block must be
 `valid: true`, and inner blocks are checked too. `round_trip: false` is not a
-failure: the editor writes a heading with a class the converter leaves out and
-spaces a list differently, and accepts both. Each of the quote, table, code and
-separator blocks is `true` for both.
+failure: the editor writes a heading with a class the converter leaves out, and
+accepts both. Each of the quote, list, table, code and separator blocks is `true`
+for both.
 
 A rehearsal and this are two halves. `tools/publish_rehearsal.py` shows what leaves
 the process, and the editor says whether it is accepted. The body a rehearsal

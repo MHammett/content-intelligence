@@ -38,6 +38,9 @@
   const text = (raw) => RichTextData.fromPlainText(raw);
   const para = (content) => ['core/paragraph', { content }];
   const quote = (...paragraphs) => ['core/quote', {}, paragraphs];
+  const item = (content) => ['core/list-item', { content }];
+  const list = (...items) => ['core/list', {}, items.map(item)];
+  const ordered = (...items) => ['core/list', { ordered: true }, items.map(item)];
   const th = (content, align) => ({ content, tag: 'th', ...(align ? { align } : {}) });
   const td = (content, align) => ({ content, tag: 'td', ...(align ? { align } : {}) });
   const table = (head, body) => ['core/table', { head: [{ cells: head }], body: body.map((cells) => ({ cells })) }];
@@ -157,15 +160,25 @@
     { name: 'code-non-ascii', markdown: '```\ncafé — “q” ✓\n```', blocks: [code('café — “q” ✓\n')] },
     { name: 'code-empty', markdown: '```\n```', blocks: [code('')] },
 
+    // core/list, alone and inside a quote: a TL;DR box is a quote of a bold label over a list.
+    { name: 'list-unordered', markdown: '- one\n- two', blocks: [list('one', 'two')] },
+    { name: 'list-ordered', markdown: '1. one\n2. two', blocks: [ordered('one', 'two')] },
+    {
+      name: 'quote-paragraph-and-list',
+      markdown: '> **TL;DR**\n> - one\n> - two',
+      blocks: [quote(para('<strong>TL;DR</strong>'), list('one', 'two'))],
+    },
+    { name: 'quote-ordered-list', markdown: '> 1. one\n> 2. two', blocks: [quote(ordered('one', 'two'))] },
+
     // core/separator
     { name: 'separator-dashes', markdown: '---', blocks: [separator()] },
     { name: 'separator-asterisks', markdown: '* * *', blocks: [separator()] },
 
     // What has no native form goes out as raw HTML, which the editor must accept as it is.
     {
-      name: 'quote-with-a-list-is-html',
-      markdown: '> - one\n> - two',
-      markup: '<!-- wp:html -->\n<blockquote>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n</blockquote>\n<!-- /wp:html -->',
+      name: 'quote-with-a-heading-is-html',
+      markdown: '> # A heading\n>\n> text',
+      markup: '<!-- wp:html -->\n<blockquote>\n<h1>A heading</h1>\n<p>text</p>\n</blockquote>\n<!-- /wp:html -->',
     },
     {
       name: 'nested-quote-is-html',
@@ -279,7 +292,7 @@
         name,
         blocks: blocks.map((b) => ({ name: b.name, valid: allValid(b), ...(allValid(b) ? {} : { issue: firstIssue(b) }) })),
         // False is not a failure: the editor writes a heading with a class the converter does not,
-        // and spaces a list differently, and accepts both. It means "not byte for byte what I write".
+        // and accepts both. It means "not byte for byte what I write".
         round_trip: serialize(blocks) === markup,
       };
     });
