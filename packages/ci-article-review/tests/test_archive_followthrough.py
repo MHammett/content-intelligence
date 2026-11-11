@@ -616,3 +616,35 @@ class TestOffSiteSnapshots:
         assert sub.call_count == 2
         assert walled["wayback"]["capture_redirected_off_site"] is True
         assert "capture_retried_after_not_found" not in gone["wayback"]
+
+
+class TestACitedSnapshotIsArchived:
+    URL = "https://web.archive.org/web/20190718193106/https://blogs.oracle.com/x"
+
+    def test_it_is_archived_fresh_and_never_submitted(self):
+        submitted = []
+
+        def fake_submit(results, *a, **k):
+            submitted.extend(r["url"] for r in results if r["url"] == self.URL)
+
+        draft = f"Body [1].\n\n## Sources\n\n1. Oracle, via the Wayback Machine. {self.URL}\n"
+        stale = {"archived": True, "is_archive_url": True, "snapshot_stale": True}
+        with (
+            patch.object(pipeline.wayback, "check", return_value=stale),
+            patch(
+                "ci_article_review.adapters.citation.resolver._submit_missing_archives",
+                fake_submit,
+            ),
+        ):
+            results = pipeline.archive_draft_sources(draft, {})
+        wb = results[0]["wayback"]
+        assert wb["snapshot_stale"] is False and wb["snapshot_url"] == self.URL
+        assert pipeline.archive_status_counts(results)["fresh"] == 1
+        rows = github_archive.status_rows(results)
+        assert rows[0]["status"] == github_archive.STATUS_ARCHIVED
+
+    def test_the_submission_pass_skips_it(self):
+        entry = _entry(self.URL, archived=True, snapshot_stale=True)
+        with patch.object(resolver, "_submit_one_per_url") as sub:
+            resolver._submit_missing_archives([entry], {})
+        sub.assert_not_called()
