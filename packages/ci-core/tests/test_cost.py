@@ -109,6 +109,10 @@ class TestClaudeRates:
         "model,rates",
         [
             ("claude-fable-5-1", (10.00, 50.00, 0.25)),
+            ("claude-fable-5-2", (8.00, 40.00, 0.20)),
+            ("claude-mythos-5-2", (8.00, 40.00, 0.20)),
+            ("claude-mythos-5-1", (10.00, 50.00, 0.25)),
+            ("claude-mythos-5", (10.00, 50.00, 1.00)),
             ("claude-fable-5", (10.00, 50.00, 1.00)),
             ("claude-opus-5-5", (4.00, 20.00, 0.20)),
             ("claude-opus-5", (5.00, 25.00, 0.50)),

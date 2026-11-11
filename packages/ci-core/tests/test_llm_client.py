@@ -539,6 +539,44 @@ class TestRefusedAttemptsAreNotBilled:
         assert summary["count"] == 3
         assert summary["unbilled"] == 2
 
+    def test_a_discarded_attempts_cache_reads_are_kept(self):
+        """Dropped, they were priced at the full input rate: $7.28 reported
+        for an attempt billed ~$1.65 on 2026-10-29 (issue #465)."""
+        cached = {
+            "reason": "MalformedJSONError",
+            "usage": _usage(1000, 50, anthropic_cached=800),
+        }
+        summary = client._summarise_discarded([cached, cached])
+        assert summary["tokens"] == {"prompt": 2000, "completion": 100, "cached": 1600}
+
+    def test_a_retried_attempts_cache_reads_reach_the_cost(self):
+        """From the wire to cost.calculate, priced at opus-5's cache-read rate.
+
+        1M prompt tokens, 900k read from cache: $0.95 at $5/$0.50 per 1M,
+        where the unfixed summary priced it at $5.00.
+        """
+        from ci_core.llm import cost
+
+        streams = [
+            _completion_stream(
+                text="prose", usage=_usage(1_000_000, 0, anthropic_cached=900_000)
+            ),
+            _completion_stream(usage=_usage(0, 0)),
+        ]
+        with patch.object(client.litellm, "completion", side_effect=streams):
+            result = _call(
+                "claude", retry=True, provider_config={"model": "claude-opus-5"}
+            )
+        entry = {"pass": "claude:x", "model": "claude-opus-5", **result}
+        assert cost.calculate([entry])["total_input_usd"] == pytest.approx(0.95)
+
+    def test_an_uncached_summary_keeps_its_shape(self):
+        plain = {"reason": "MalformedJSONError", "usage": _usage(1000, 50)}
+        assert client._summarise_discarded([plain])["tokens"] == {
+            "prompt": 1000,
+            "completion": 50,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Result contract
@@ -3215,7 +3253,10 @@ class TestClaudeThinkingIsAudible:
         assert result["raw"] == '{"flags": []}'
         (record,) = result["stream_timing"]
         assert record["first_byte_s"] < 0.3
-        assert record["first_output_s"] >= 0.6
+        # Six 0.1 s sleeps, measured on a clock Windows ticks at ~15.6 ms: 0.59 s
+        # is the same 0.6 s of thinking. What matters is that the answer came
+        # after the thinking, well past the 0.3 s first-byte allowance.
+        assert record["first_output_s"] >= 0.5
 
         silent = _slow_stream(_completion_stream(), first_delay=0.6)
         with patch.object(client.litellm, "completion", return_value=silent):
@@ -3326,6 +3367,101 @@ def _with_searches(n):
     return usage
 
 
+class TestGroundedMalformedJsonIsRepaired:
+    """An answer that searched and then failed to parse is reformatted by a
+    call with search off, not asked again from scratch (issue #465).
+
+    On 2026-10-29 a claude:fact_check answer that had searched 20 times over
+    1,456,437 prompt tokens did not parse, and the retry ran every search
+    again. The repair sends only the instructions and the answer.
+    """
+
+    _CFG = {"model": "claude-opus-5", "web_search": True, "search_max_uses": 20}
+
+    def _run(self, streams, provider="claude", cfg=None):
+        seen = []
+
+        def _capture(**kwargs):
+            seen.append(kwargs)
+            return streams[len(seen) - 1]
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            result = _call(
+                provider,
+                system_prompt="Return JSON with a flags list.",
+                user_prompt="THE DRAFT",
+                retry=True,
+                provider_config=cfg if cfg is not None else self._CFG,
+            )
+        return result, seen
+
+    def test_the_repair_searches_nothing_and_is_not_sent_the_draft(self):
+        result, seen = self._run(
+            [
+                _completion_stream(text='flags: ["a"]', usage=_with_searches(20)),
+                _completion_stream(text='{"flags": ["a"]}', usage=_usage(300, 40)),
+            ]
+        )
+        assert len(seen) == 2
+        repair = seen[1]
+        assert "tools" not in repair and "web_search_options" not in repair
+        assert repair["messages"][0]["content"] == client._JSON_REPAIR_SYSTEM
+        sent = repair["messages"][1]["content"]
+        assert 'flags: ["a"]' in sent and "Return JSON with a flags list." in sent
+        assert "THE DRAFT" not in sent
+
+        assert result["failed"] is False
+        assert result["data"] == {"flags": ["a"]}
+        assert result["raw"] == '{"flags": ["a"]}'
+        assert result["searches"] == 20
+        # Billed as more of this call's own tokens, and said so.
+        assert result["tokens"] == {"prompt": 400, "completion": 90}
+        assert result["json_repair"]["tokens"] == {"prompt": 300, "completion": 40}
+        assert "discarded_attempts" not in result
+
+    def test_a_failed_repair_is_not_followed_by_a_full_retry(self):
+        result, seen = self._run(
+            [
+                _completion_stream(text="prose", usage=_with_searches(20)),
+                _completion_stream(text="still prose", usage=_usage(300, 40)),
+            ]
+        )
+        assert len(seen) == 2
+        assert result["failed"] is True
+        assert result["error"] == "Malformed JSON response"
+        assert result["raw"] == "prose"
+        assert result["searches"] == 20
+        assert result["tokens"] == {"prompt": 400, "completion": 90}
+        assert result["json_repair"]["failed"] is True
+
+    def test_gemini_is_repaired_without_its_search_tool(self):
+        """gemini's googleSearch rides on its reasoning parameters."""
+        first = _completion_stream(text="prose")
+        first.append(
+            _chunk(vertex_ai_grounding_metadata=[{"webSearchQueries": ["q1", "q2"]}])
+        )
+        result, seen = self._run(
+            [first, _completion_stream(text='{"flags": []}')],
+            provider="gemini",
+            cfg={},
+        )
+        assert any("googleSearch" in t for t in seen[0]["tools"])
+        assert "tools" not in seen[1]
+        assert result["failed"] is False
+        assert result["searches"] == 2
+
+    def test_perplexity_is_still_retried(self):
+        """sonar searches on every request, so a repair would search too."""
+        result, seen = self._run(
+            [_completion_stream(text="prose"), _completion_stream()],
+            provider="perplexity",
+            cfg={"model": "sonar-reasoning-pro"},
+        )
+        assert len(seen) == 2
+        assert seen[1]["messages"][1]["content"] == "THE DRAFT"
+        assert "json_repair" not in result
+
+
 def _search_item(item_id, action="search"):
     """An OpenAI web_search_call output item, in the dict shape."""
     return {
@@ -3401,9 +3537,13 @@ class TestSearchCountsReachTheResult:
         assert result["searches"] == 3
 
     def test_a_retried_attempt_keeps_its_own_count(self):
-        """The discarded attempt's searches were billed like its tokens."""
+        """The discarded attempt's searches were billed like its tokens.
+
+        A stall, not a malformed answer: one that searched is now reformatted
+        rather than retried (TestGroundedMalformedJsonIsRepaired).
+        """
         streams = [
-            _completion_stream(text="not json", usage=_with_searches(4)),
+            client.StreamStalled("stalled"),
             _completion_stream(usage=_with_searches(2)),
         ]
         with patch.object(client.litellm, "completion", side_effect=streams):
@@ -3413,7 +3553,23 @@ class TestSearchCountsReachTheResult:
                 provider_config={"model": "claude-opus-5", "web_search": True},
             )
         assert result["searches"] == 2
-        assert result["discarded_attempts"]["searches"] == [4]
+        assert result["discarded_attempts"]["count"] == 1
+
+    def test_a_malformed_attempt_that_did_not_search_is_still_retried(self):
+        """Nothing to repeat, so the retry is the same price as a repair."""
+        streams = [
+            _completion_stream(text="not json", usage=_with_searches(0)),
+            _completion_stream(usage=_with_searches(2)),
+        ]
+        with patch.object(client.litellm, "completion", side_effect=streams):
+            result = _call(
+                "claude",
+                retry=True,
+                provider_config={"model": "claude-opus-5", "web_search": True},
+            )
+        assert result["searches"] == 2
+        assert result["discarded_attempts"]["searches"] == [0]
+        assert "json_repair" not in result
 
     def _gemini(self, *metadata_per_chunk):
         chunks = _completion_stream()
@@ -5025,3 +5181,205 @@ class TestRateLimitedRetriesAreSpreadOut:
 
     def test_a_zero_delay_stays_zero(self):
         assert self._waits(_rate_limited("20"), retry_delay=0) == 0
+
+
+class TestRetriesAreCounted:
+    """``retry`` is a count as well as a switch (#389).
+
+    The citation relevance check on mistral-small costs well under a cent, and
+    Mistral limits that model to 100 requests a minute on the account measured
+    2026-10-24, so a burst of three concurrent checks draws 429s. With one
+    retry, a second refusal cost the claim its verdict. A count lets a cheap
+    call try a few more times; ``True`` still means exactly one, so nothing
+    else changes.
+    """
+
+    def _run(self, retry, failures, exc_factory=lambda: _rate_limited(), delay=0):
+        attempts = []
+        slept = []
+
+        def _fn():
+            attempts.append(1)
+            if len(attempts) <= failures:
+                raise exc_factory()
+            return "answer"
+
+        with patch.object(client.time, "sleep", side_effect=slept.append):
+            result = client._with_retry(_fn, retry, delay, "x")
+        return result, len(attempts), slept
+
+    def test_true_is_still_exactly_one_retry(self):
+        assert self._run(True, failures=1)[:2] == ("answer", 2)
+        with pytest.raises(Exception, match="HTTP 429"):
+            self._run(True, failures=2)
+
+    def test_false_is_none(self):
+        with pytest.raises(Exception, match="HTTP 429"):
+            self._run(False, failures=1)
+
+    def test_a_count_allows_that_many_and_no_more(self):
+        result, attempts, slept = self._run(3, failures=3)
+        assert (result, attempts, len(slept)) == ("answer", 4, 3)
+        with pytest.raises(Exception, match="HTTP 429"):
+            self._run(3, failures=4)
+
+    @pytest.mark.parametrize("value, expected", [(0, 0), (2, 2), (None, 0), ("x", 1)])
+    def test_how_a_value_reads(self, value, expected):
+        assert client._retries_allowed(value) == expected
+
+    def test_later_refusals_wait_longer_without_a_retry_after(self):
+        """A second 429 says the window is fuller than the first wait assumed."""
+        with patch.object(client.random, "uniform", side_effect=lambda a, b: b):
+            _, _, slept = self._run(3, failures=3, delay=10)
+        # 1.5x, then 2 x 1.5x, then capped at three delays.
+        assert slept == [15, 30, 30]
+
+    def test_a_retry_after_is_honoured_on_every_attempt(self):
+        _, _, slept = self._run(
+            3, failures=3, exc_factory=lambda: _rate_limited("20"), delay=10
+        )
+        assert all(20 <= wait <= 25 for wait in slept)
+
+    def test_a_server_error_is_retried_the_same_number_of_times(self):
+        result, attempts, slept = self._run(
+            2, failures=2, exc_factory=lambda: _http_error(500), delay=10
+        )
+        assert (result, attempts, slept) == ("answer", 3, [10, 10])
+
+    def test_an_exhausted_account_is_not_retried_however_many_are_allowed(self):
+        with pytest.raises(Exception, match="HTTP 429"):
+            self._run(
+                5,
+                failures=1,
+                exc_factory=lambda: _http_error(429, "insufficient_quota"),
+            )
+
+    def test_a_count_reaches_the_call_and_the_discarded_record(self):
+        """End to end: two refusals, then an answer, and the record says so."""
+        outcomes = [_rate_limited(), _rate_limited(), _completion_stream()]
+
+        def completion(**kwargs):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with (
+            patch.object(client.litellm, "completion", side_effect=completion),
+            patch.object(client.time, "sleep"),
+        ):
+            result = _call("mistral", retry=3, retry_delay=10)
+
+        assert result["failed"] is False
+        assert result["discarded_attempts"]["count"] == 2
+        assert result["discarded_attempts"]["unbilled"] == 2
+
+
+class TestSearchMaxUses:
+    """``search_max_uses`` sends Anthropic's server tool with that count (#444).
+
+    ``web_search_options`` is portable, but litellm sets the tool's ``max_uses``
+    from ``search_context_size`` through a three-entry table (low 1, medium 5,
+    high 10). So "medium" was a ceiling of five searches, and a ``maximum``
+    fact_check over ~260 claims used all five on the first few and wrote
+    "search budget exhausted" against the rest. A count in the config sends
+    the tool itself, with that ``max_uses`` and nothing else deciding it.
+    """
+
+    def _sent(self, provider, cfg):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call(provider, provider_config=cfg)
+        return seen
+
+    def test_a_count_sends_the_server_tool_with_that_max_uses(self):
+        sent = self._sent("claude", {"web_search": True, "search_max_uses": 40})
+        assert sent["tools"] == [
+            {
+                "type": client._CLAUDE_WEB_SEARCH_TOOL,
+                "name": "web_search",
+                "max_uses": 40,
+            }
+        ]
+
+    def test_the_tool_is_never_sent_beside_web_search_options(self):
+        """Both on one request puts two web_search tools on the wire."""
+        sent = self._sent("claude", {"web_search": True, "search_max_uses": 40})
+        assert "web_search_options" not in sent
+
+    def test_without_a_count_the_portable_form_is_sent_as_before(self):
+        sent = self._sent("claude", {"web_search": True})
+        assert sent["web_search_options"] == {"search_context_size": "medium"}
+        assert "tools" not in sent
+
+    def test_a_count_as_a_string_is_read(self):
+        sent = self._sent("claude", {"web_search": True, "search_max_uses": "12"})
+        assert sent["tools"][0]["max_uses"] == 12
+
+    @pytest.mark.parametrize("bad", [0, -1, "many", ""])
+    def test_an_invalid_count_falls_back_to_the_portable_form(self, bad, caplog):
+        client._search_max_uses_warnings_given.clear()
+        with caplog.at_level(logging.WARNING):
+            sent = self._sent("claude", {"web_search": True, "search_max_uses": bad})
+        assert "tools" not in sent
+        assert sent["web_search_options"] == {"search_context_size": "medium"}
+        if bad != "":
+            assert "search_max_uses" in caplog.text
+
+    def test_without_web_search_the_count_sends_nothing(self):
+        sent = self._sent("claude", {"search_max_uses": 40})
+        assert "tools" not in sent
+        assert "web_search_options" not in sent
+
+    def test_grok_ignores_the_count_with_a_warning(self, caplog):
+        """grok's search is web_search_options only; the key cannot bite there."""
+        client._search_max_uses_warnings_given.clear()
+        with caplog.at_level(logging.WARNING):
+            sent = self._sent("grok", {"web_search": True, "search_max_uses": 40})
+        assert "tools" not in sent
+        assert sent["web_search_options"] == {"search_context_size": "medium"}
+        assert "only claude" in caplog.text
+
+    def test_the_schema_still_goes_on_the_wire_beside_the_tool(self):
+        """Only gemini loses its schema when grounded; claude keeps it."""
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        schema = {"name": "answer", "schema": {"type": "object", "properties": {}}}
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call(
+                "claude",
+                provider_config={"web_search": True, "search_max_uses": 40},
+                response_schema=schema,
+            )
+        assert seen["tools"][0]["max_uses"] == 40
+        assert "response_format" in seen
+
+    def test_searches_are_still_counted_from_the_server_tool_block(self):
+        stream = _completion_stream(text='{"flags": []}', usage=_with_searches(23))
+        with patch.object(client.litellm, "completion", return_value=stream):
+            result = _call(
+                "claude",
+                provider_config={
+                    "model": "claude-opus-5",
+                    "web_search": True,
+                    "search_max_uses": 40,
+                },
+            )
+        assert result["searches"] == 23
+
+    def test_a_call_with_the_tool_counts_as_able_to_search(self):
+        params = client._provider_params(
+            "claude", {"web_search": True, "search_max_uses": 3}
+        )
+        assert client._search_enabled("claude", {"web_search": True}, params)
+        bare = client._provider_params("claude", {})
+        assert not client._search_enabled("claude", {}, bare)

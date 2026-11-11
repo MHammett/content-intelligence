@@ -91,6 +91,21 @@ _JUDGED_PROVIDERS = (*_EFFORT_KEY, "gemini")
 _EFFORT_WHEN_UNSET = {
     "claude": {
         "claude-opus-5": "high",
+        # Added 2026-11-10 from platform.claude.com/docs/en/build-with-claude/effort
+        # (per-model sections and the effort-levels table): Opus 5.5 and Haiku
+        # 5.5 default to MEDIUM, every other model to high. Opus 5.5 "adaptive
+        # thinking is always on and can't be turned off"; Sonnet 5.5 and Haiku
+        # 5.5 think by default too ("Thinking is on by default"; Sonnet's lowest
+        # setting, thinking: between_tools, has to be asked for). "Setting
+        # effort to the model's default ... produces exactly the same behavior
+        # as omitting the effort parameter", so these ceilings follow the value
+        # below. Fable 5.2 and Mythos 5.2: "API default is high", adaptive
+        # thinking always on. Issue #278.
+        "claude-opus-5-5": "medium",
+        "claude-sonnet-5-5": "high",
+        "claude-haiku-5-5": "medium",
+        "claude-fable-5-2": "high",
+        "claude-mythos-5-2": "high",
         "claude-sonnet-5": "high",
         "claude-fable-5": "high",
         "claude-fable-5-1": "high",

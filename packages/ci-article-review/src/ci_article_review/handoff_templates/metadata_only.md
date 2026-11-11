@@ -9,7 +9,9 @@ Author: [optional — who "I" refers to in the draft. Only needed when it is not
 History key: [Optional but recommended. A short stable name for this piece, used
 as its history directory. Without it the title is the key, so revising the title
 starts a fresh history and the run loses its delta baseline. Set it once and
-never change it, however much the headline moves.]
+never change it, however much the headline moves. For an article kept in the
+document repository (ci-review --github) a missing line is not the title: the
+key is the article's folder name, the slug.]
 Drafted with: [Optional. The model you drafted this with — claude, openai, gemini,
 mistral, grok or perplexity. That model is then dropped from the voice review,
 because a model asked to flag AI phrasing in its own output is being asked to

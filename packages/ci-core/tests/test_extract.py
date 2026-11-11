@@ -413,3 +413,129 @@ class TestBodySelection:
         tr = "x" * 1000
         at_ratio = "y" * int(1000 * extract._HEURISTIC_WINS_RATIO)
         assert self._choose(trafilatura=tr, heuristic=at_ratio) == tr
+
+
+# --- response_encoding -----------------------------------------------------
+# requests sets ``encoding = "ISO-8859-1"`` for a ``text/*`` body whose header
+# names no charset. A UTF-8 page served that way (common on static hosting)
+# was decoded as Latin-1 and every dash and curly quote became mojibake, which
+# the relevance verifier then could not quote from (issue #439).
+
+_UTF8_PAGE = "<p>Once built, a large data center may employ only 20–50 workers.</p>"
+
+
+class _Resp:
+    """The slice of ``requests.Response`` the readers look at.
+
+    ``apparent_encoding`` is a property so a test can assert it was *not*
+    consulted: the library's guess is the last resort, and running it over a
+    multi-megabyte PDF would be wasted work.
+    """
+
+    def __init__(
+        self, body, content_type="text/html", encoding="ISO-8859-1", apparent=None
+    ):
+        self.content = body.encode("utf-8") if isinstance(body, str) else body
+        self.headers = {"Content-Type": content_type}
+        self.encoding = encoding
+        self._apparent = apparent
+        self.apparent_consulted = False
+
+    @property
+    def apparent_encoding(self):
+        self.apparent_consulted = True
+        if self._apparent is None:
+            raise AssertionError("apparent_encoding consulted")
+        return self._apparent
+
+
+class _BareResp:
+    """A response with no ``apparent_encoding`` at all (curl_cffi's shape)."""
+
+    def __init__(self, body, content_type="text/html", encoding="ISO-8859-1"):
+        self.content = body
+        self.headers = {"Content-Type": content_type}
+        self.encoding = encoding
+
+
+class TestResponseEncoding:
+    def test_a_charset_in_the_header_wins(self):
+        resp = _Resp(
+            _UTF8_PAGE,
+            content_type="text/html; charset=windows-1252",
+            encoding="windows-1252",
+        )
+        assert extract.response_encoding(resp) == "windows-1252"
+        assert not resp.apparent_consulted
+
+    def test_a_bare_text_html_header_defers_to_the_meta_charset(self):
+        resp = _Resp('<html><head><meta charset="UTF-8" /></head>' + _UTF8_PAGE)
+        assert extract.response_encoding(resp) == "utf-8"
+        assert not resp.apparent_consulted
+
+    def test_the_http_equiv_form_is_read_too(self):
+        head = '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+        resp = _Resp("<html><head>" + head + "</head>" + _UTF8_PAGE)
+        assert extract.response_encoding(resp) == "utf-8"
+
+    def test_an_xml_declaration_is_read(self):
+        resp = _Resp('<?xml version="1.0" encoding="UTF-8"?><feed>café</feed>')
+        assert extract.response_encoding(resp) == "utf-8"
+
+    def test_a_declared_codec_python_cannot_decode_is_ignored(self):
+        resp = _Resp('<meta charset="x-no-such-codec">' + _UTF8_PAGE)
+        # The body is valid UTF-8, so the probe settles it without the guess.
+        assert extract.response_encoding(resp) == "utf-8"
+        assert not resp.apparent_consulted
+
+    def test_an_undeclared_body_that_is_valid_utf8_is_utf8(self):
+        resp = _Resp(_UTF8_PAGE)
+        assert extract.response_encoding(resp) == "utf-8"
+        assert not resp.apparent_consulted
+
+    def test_an_undeclared_body_that_is_not_utf8_takes_the_library_guess(self):
+        latin1 = "café – 20–50".encode("windows-1252")
+        resp = _Resp(latin1, apparent="windows-1252")
+        assert extract.response_encoding(resp) == "windows-1252"
+        assert resp.apparent_consulted
+
+    def test_without_a_guess_the_response_encoding_is_kept(self):
+        resp = _BareResp("café".encode("windows-1252"))
+        assert extract.response_encoding(resp) == "ISO-8859-1"
+
+    def test_nothing_known_falls_back_to_utf8(self):
+        resp = _BareResp("café".encode("windows-1252"), content_type="", encoding=None)
+        assert extract.response_encoding(resp) == "utf-8"
+
+    def test_a_pdf_body_is_not_scanned_or_guessed(self):
+        pdf = make_pdf(["charset=utf-16 inside a PDF is not a declaration"])
+        resp = _Resp(pdf, content_type="application/pdf", encoding=None)
+        assert extract.response_encoding(resp) == "utf-8"
+        assert not resp.apparent_consulted
+
+    def test_the_declaration_is_only_looked_for_near_the_top(self):
+        padding = "<html><body>" + "x" * (extract._CHARSET_SCAN_BYTES + 10)
+        late = '<meta charset="utf-16">'
+        resp = _Resp(
+            (padding + late).encode("ascii") + "café".encode("windows-1252"),
+            apparent="windows-1252",
+        )
+        # The declaration sits past the scan window, so it is not trusted; the
+        # body is not UTF-8, so the guess decides.
+        assert extract.response_encoding(resp) == "windows-1252"
+
+    def test_the_text_a_reader_gets_keeps_its_dashes(self):
+        """End to end: the helper's answer, fed to the extractor, preserves the page."""
+        resp = _Resp(
+            '<html><head><meta charset="UTF-8"></head><body><article>'
+            + _UTF8_PAGE * 3
+            + "</article></body></html>"
+        )
+        text, kind = extract.extract_response_text(
+            resp.content,
+            content_type=resp.headers["Content-Type"],
+            encoding=extract.response_encoding(resp),
+        )
+        assert kind == "html"
+        assert "20–50 workers" in text
+        assert "â€" not in text

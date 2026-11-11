@@ -139,12 +139,31 @@ def _kv_lines(d, exclude=()):
         if key == "wayback" and isinstance(value, dict):
             lines.append(f"  - Wayback: {_wayback_summary(value)}")
             continue
+        if key == "read_coverage" and isinstance(value, dict):
+            # On every entry that reached a verdict, so "not there" and "not
+            # found in the part read" are never the same line.
+            lines.append(f"  - Read: {_coverage_summary(value)}")
+            continue
         if key == "alternates_checked" and isinstance(value, (list, tuple)):
             lines.extend(_render_alternates(value))
             continue
         label = key.replace("_", " ").capitalize()
         lines.append(f"  - {label}: {value}")
     return lines
+
+
+def _coverage_summary(read):
+    """``read_coverage`` as one line: what was read, and what stopped it."""
+    from .adapters.citation.resolver import _LIMIT_NAMES, _coverage_sentence
+
+    sentence = _coverage_sentence(read)
+    limits = [_LIMIT_NAMES.get(limit, limit) for limit in read.get("limits") or ()]
+    if limits:
+        return (
+            f"IN PART — {sentence} Left unread by {', '.join(limits)}; a claim not "
+            f"found here may still be in the document."
+        )
+    return f"in full — {sentence}"
 
 
 def _dicts(entries):
@@ -468,6 +487,42 @@ def _consensus_bands(consensus_flags, comparable_runs):
     ]
 
 
+def numbered_consensus_bands(consensus_flags, comparable_runs=0):
+    """Section 1's non-empty bands, each entry with the number the review prints.
+
+    ``[(title, note, [(number, entry), ...]), ...]``. The numbers run on across
+    the bands (1, 2, 3 ... with no restart), which is what ``#### N.`` in
+    ``review.md`` shows and what the pull request review's ``F<N>`` items cite,
+    so both are built from this one function and cannot drift apart.
+    ``consensus_flags`` is the list of entries that could be read (``_dicts``).
+    """
+    counter = 0
+    bands = []
+    for title, note, entries in _consensus_bands(consensus_flags, comparable_runs):
+        if not entries:
+            continue
+        numbered = []
+        for entry in entries:
+            counter += 1
+            numbered.append((counter, entry))
+        bands.append((title, note, numbered))
+    return bands
+
+
+def consensus_findings(report):
+    """Section 1's findings of a saved report as ``[(number, entry)]``, in review order.
+
+    ``number`` is the one ``review.md`` prints before the passage.
+    """
+    entries, _dropped = _dicts(report.get("section_1_consensus", []))
+    runs = (report.get("reproducibility") or {}).get("comparable_run_count") or 0
+    return [
+        item
+        for _title, _note, numbered in numbered_consensus_bands(entries, runs)
+        for item in numbered
+    ]
+
+
 def _render_section_1(consensus_flags, comparable_runs=0):
     lines = ["## SECTION 1: Consensus Flags", ""]
     consensus_flags, dropped = _dicts(consensus_flags)
@@ -488,16 +543,14 @@ def _render_section_1(consensus_flags, comparable_runs=0):
     )
     lines.append("")
 
-    counter = 0
-    for title, note, entries in _consensus_bands(consensus_flags, comparable_runs):
-        if not entries:
-            continue
-        lines.append(f"### {title} ({len(entries)})")
+    for title, note, numbered in numbered_consensus_bands(
+        consensus_flags, comparable_runs
+    ):
+        lines.append(f"### {title} ({len(numbered)})")
         if note:
             lines.append(f"_{note}_")
         lines.append("")
-        for entry in entries:
-            counter += 1
+        for counter, entry in numbered:
             passage = entry.get("passage", "")
             models = entry.get("models") or []
             weight = entry.get("weight_sum")
@@ -2195,6 +2248,11 @@ def _render_reask(reask):
         elif verification == "content_mismatch":
             verdict = check.get("relevance_verdict") or "does not support"
             outcome = f"fetched and read, and it does NOT support the claim ({verdict})"
+        elif verification == "partial_read":
+            outcome = (
+                "fetched and read in part, and the claim was not in the part read "
+                "— a limit of the read, not a finding against the source"
+            )
         elif verification == "unverifiable":
             outcome = "fetched, but its content could not be read or assessed"
         else:
@@ -2537,6 +2595,7 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
 
     verified = grouped["checksum"]
     mismatch = grouped["content_mismatch"]
+    partial = grouped["partial_read"]
     unverifiable = grouped["unverifiable"]
     fetch_failed = grouped["fetch_failed"]
     resolution_error = grouped["resolution_error"]
@@ -2556,10 +2615,22 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
     # says so" and "a document was read" that the tiers below exist to separate.
     lines.append(
         f"**{checked} of {total} claim(s) ({round(100 * checked / total)}%) were "
-        f"checked against a document the pipeline fetched and read** — "
+        f"checked against a document the pipeline fetched and read in full** — "
         f"{len(verified)} where the document supported the claim, "
         f"{len(mismatch)} where it did not."
     )
+    if partial:
+        # Its own sentence, in bold, because this is the number a reader most
+        # easily mistakes for refutations. It is the opposite: these claims
+        # are open, and the reading stopped before them.
+        lines.append(
+            f"**A further {len(partial)} had a document fetched and read IN PART, "
+            f"and the claim was not in the part read.** Those are not "
+            f"refutations: one of the pipeline's own limits (the PDF time budget, "
+            f"the pagination cap or the excerpt window) stopped the read, and "
+            f"each entry below says where. Open the document at the "
+            f"cited page."
+        )
     lines.append("")
     lines.append(
         f"For the other {total - checked}, no document was read. What stands "
@@ -2590,14 +2661,21 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
     if confirmed:
         supported = sum(1 for c in confirmed if _disposition(c) == "checksum")
         refuted = sum(1 for c in confirmed if _disposition(c) == "content_mismatch")
-        unread = len(confirmed) - supported - refuted
+        in_part = sum(1 for c in confirmed if _disposition(c) == "partial_read")
+        unread = len(confirmed) - supported - refuted - in_part
+        part_clause = (
+            f" {in_part} had one read in part with the claim not found in that part,"
+            if in_part
+            else ""
+        )
         lines.append(
             f"> **The fact-check pass called {len(confirmed)} of these claims "
             f'"confirmed." Of those, {supported} had a document fetched and read '
-            f"here that supports the claim, {refuted} had one that does not, and "
-            f"for {unread} no document was read at all.** A `confirmed` bucket is "
-            "that pass's judgment about the claim, not a retrieval result. Where "
-            "the two disagree, this section is the one that opened the document."
+            f"here that supports the claim, {refuted} had one that does not,"
+            f"{part_clause} and for {unread} no document was read at all.** A "
+            "`confirmed` bucket is that pass's judgment about the claim, not a "
+            "retrieval result. Where the two disagree, this section is the one "
+            "that opened the document."
         )
         lines.append("")
 
@@ -2640,26 +2718,22 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
         )
         lines.append("")
 
+    # Text that changed since an earlier run checksummed it. Only the checksum
+    # tier is compared (``resolver._check_drift``), so every entry here was read
+    # again in this run and still supports its claim: the change asks nothing
+    # of this article's author. It used to head a warning section of its own,
+    # which on news pages (a rotating "related stories" block changes the
+    # extracted text daily) fired on six still-supporting sources in one run
+    # (brockovich-fact-check run 2, issue #446). It is now a note, and a line
+    # under each entry in the block below.
     changed = [c for c in verified if c.get("content_changed_since")]
     if changed:
-        lines.append(f"### ⚠ Content changed since prior checksum ({len(changed)})")
-        for c in changed:
-            drift = c["content_changed_since"]
-            when = f" on {drift['prior_date']}" if drift.get("prior_date") else ""
-            lines.append(f'- "{c.get("claim", "")}"')
-            # Where the fetch landed, not the address the model cited. A
-            # grounded-model citation arrives as a `grounding-api-redirect`
-            # wrapper that names no publication and expires within days; this
-            # block is telling the author to go and re-check a source, so it
-            # has to name one they can open. Every other URL in the section
-            # goes through `_citation_pair` for this reason -- the drift block
-            # predates it and kept reading `url` directly.
-            lines.append(f"  - URL: {_citation_pair(c)[0]}")
-            lines.append(
-                f"  - Last matched in run {drift.get('prior_run')} of "
-                f"'{drift.get('prior_article')}'{when} — content has since changed. "
-                "Previously-verified claim may need re-checking."
-            )
+        lines.append(
+            f"_{len(changed)} source(s) in the next block have changed text since "
+            "an earlier run checksummed them (each is marked). Each was read again "
+            "in this run and still supports its claim, so nothing here needs "
+            "re-checking; the note is for other articles that cite the same page._"
+        )
         lines.append("")
 
     if verified:
@@ -2679,6 +2753,14 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
         for c in verified:
             lines.append(f'- "{c.get("claim", "")}"')
             lines.extend(_render_archive_pair(c))
+            drift = c.get("content_changed_since")
+            if drift:
+                when = f" on {drift['prior_date']}" if drift.get("prior_date") else ""
+                lines.append(
+                    f"  - Text changed since run {drift.get('prior_run')} of "
+                    f"'{drift.get('prior_article')}'{when}; read again and still "
+                    "supports this claim."
+                )
             for kv in _kv_lines(
                 c,
                 exclude=(
@@ -2782,6 +2864,32 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
             )
         lines.append("")
         for c in mismatch:
+            lines.extend(_render_mismatch_entry(c))
+        lines.append("")
+
+    if partial:
+        # Deliberately not folded into the block above. A reader who sees a
+        # verdict and a reason beside a claim reads them as a finding; these
+        # carry the same two fields and mean something weaker, so they get
+        # their own heading that says so before any entry is read.
+        lines.append(
+            f"### Read in part only — not found in the part read ({len(partial)}) "
+            "— open these at the cited page (NOT evidence against the claim)"
+        )
+        from ci_core.extract import PDF_MAX_SECONDS
+
+        lines.append(
+            "_The document was fetched and part of it read, and the claim was "
+            "not in that part. Each entry's `Read:` line says what was read and "
+            "which limit stopped it: the PDF time budget "
+            f"({PDF_MAX_SECONDS} seconds of text extraction per document), the "
+            "pagination cap, or the excerpt window the verifier is shown. A "
+            "verdict here is a verdict about the part read. The claim may sit further on in the document, and the "
+            "only way to settle it is to open the document at the page the "
+            "draft cites._"
+        )
+        lines.append("")
+        for c in partial:
             lines.extend(_render_mismatch_entry(c))
         lines.append("")
 

@@ -14,7 +14,8 @@ import pytest
 from ci_core.config_helpers import PackagedConfigError
 from ci_core.llm import watermarking as w
 
-TODAY = datetime.date(2026, 9, 5)
+# The registry date itself, so bumping the registry never breaks the age tests.
+TODAY = datetime.date.fromisoformat(str(w.REGISTRY_DATE))
 
 
 class TestRegistryContents:
@@ -44,7 +45,7 @@ class TestStatusLookup:
         assert w.status_for("claude", today=TODAY)["marked"] is True
 
     def test_a_non_marking_provider_is_not_marked(self):
-        assert w.status_for("openai", today=TODAY)["marked"] is False
+        assert w.status_for("mistral", today=TODAY)["marked"] is False
 
     def test_partial_counts_as_marked(self):
         # An unresolved API path is a reason to assume the mark is there, not a

@@ -13,7 +13,7 @@ here so this module's callers keep working unchanged.
 import logging
 
 
-from ci_core.extract import extract_article
+from ci_core.extract import extract_article, response_encoding
 from ci_core.http import USER_AGENT, UnsafeURLError, safe_get
 
 
@@ -42,7 +42,9 @@ def fetch_url(url, timeout=_FETCH_TIMEOUT):
     except UnsafeURLError as e:
         raise ValueError(str(e)) from e
     resp.raise_for_status()
-    return resp.text
+    # ``resp.text`` decodes with ``resp.encoding``, which is Latin-1 whenever
+    # the header names no charset; use the page's own declaration (issue #439).
+    return resp.content.decode(response_encoding(resp), errors="replace")
 
 
 def build_handoff_from_url(url):

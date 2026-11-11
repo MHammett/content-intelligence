@@ -11,6 +11,9 @@ archive copy, and how to summarize a wayback result for a human reader.
 
 import logging
 import ssl
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -32,15 +35,17 @@ from spn_client import (
     SystemStatusResult,
     capture_capacity,
     categorize_job_error,
-    check,
     check_job_status,
     rate_limited_out,
-    reset_rate_limit_state,
     service_health_note,
     snapshot_raw_url,
     submit,
     system_status,
 )
+from spn_client import check as _spn_check
+from spn_client import reset_rate_limit_state as _spn_reset_rate_limit_state
+
+from .wayback_lookup_cache import STORE_FILENAME, LookupCache
 
 __all__ = [
     "ARCHIVE_ARCHIVED",
@@ -66,11 +71,16 @@ __all__ = [
     "certificate_failure_summary",
     "check",
     "check_job_status",
+    "close_lookup_cache",
     "fallback_reason_for_exception",
     "fallback_reason_for_status",
+    "forget_lookup",
     "format_summary",
+    "lookup_cache_summary",
     "lookup_was_rate_limited",
+    "open_lookup_cache",
     "rate_limited_out",
+    "remember_lookup",
     "reset_rate_limit_state",
     "service_health_note",
     "snapshot_raw_url",
@@ -80,6 +90,203 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+#: The lookup memo every ``check()`` in this process reads first. Module-level
+#: for the same reason spn-client's pacing state is: the link pass and the
+#: citation resolver are separate modules that must share one answer per URL,
+#: and threading a cache object through both call chains would touch every
+#: signature between the pipeline and the lookup. Memory-only until the
+#: pipeline opens a store; ``open_lookup_cache`` replaces it at run start,
+#: which also empties the memo so one run's answers do not leak into the next
+#: run in the same process (tests, mostly).
+_lookup_cache = LookupCache()
+
+
+#: How long archive.org's circuit breaker stays shut before this run tries
+#: again. spn-client's breaker, once tripped, stays open for the rest of the
+#: process, and archive.org's throttle is episodic: all 429s for a few minutes,
+#: then all 200s (spn-client's own notes, 2026-08-12 and 08-15). On
+#: brockovich-fact-check run 2 it tripped in link validation at 05:47 and
+#: Section 9, 40 minutes later, skipped all 188 of its lookups and the archive
+#: fallback for the pages that refused us (issue #445).
+BREAKER_COOLDOWN_SECONDS = 300
+
+#: Reopenings per run. Each costs at most the five refused lookups it takes to
+#: trip again, so two bound the extra load on archive.org to ten requests.
+_MAX_BREAKER_REOPENS = 2
+
+_breaker = {"seen_open": None, "first_seen_open_utc": None, "reopened": 0}
+
+
+def reset_rate_limit_state():
+    """spn-client's run-start reset, plus this module's record of the breaker."""
+    _spn_reset_rate_limit_state()
+    _breaker.update(seen_open=None, first_seen_open_utc=None, reopened=0)
+
+
+def note_breaker_state():
+    """Record when the breaker was first seen open; return whether it is open.
+
+    spn-client does not say when it tripped, so this records when a caller
+    first saw it open, which is the latest it can have tripped.
+    """
+    if not rate_limited_out():
+        return False
+    if _breaker["seen_open"] is None:
+        _breaker["seen_open"] = time.monotonic()
+        if _breaker["first_seen_open_utc"] is None:
+            _breaker["first_seen_open_utc"] = datetime.now(timezone.utc)
+    return True
+
+
+def reopen_breaker_if_cooled(cooldown=BREAKER_COOLDOWN_SECONDS, now=None):
+    """Close an open breaker that has been open at least ``cooldown`` seconds.
+
+    Called before Section 9 resolves, so a throttle that ended while the
+    ensemble ran does not cost every citation its archive lookup. Returns True
+    when it reopened. If archive.org is still refusing, the breaker trips again
+    after spn-client's usual five refused lookups.
+    """
+    if not note_breaker_state():
+        return False
+    now = time.monotonic() if now is None else now
+    waited = now - _breaker["seen_open"]
+    if waited < cooldown or _breaker["reopened"] >= _MAX_BREAKER_REOPENS:
+        return False
+    _spn_reset_rate_limit_state()
+    _breaker["seen_open"] = None
+    _breaker["reopened"] += 1
+    log.info(
+        "archive.org's rate-limit breaker had been open for %d min; trying "
+        "archive lookups again (reopening %d of %d this run)",
+        waited // 60,
+        _breaker["reopened"],
+        _MAX_BREAKER_REOPENS,
+    )
+    return True
+
+
+def breaker_summary():
+    """``{}`` when the breaker never opened this run, else when and what followed."""
+    first = _breaker["first_seen_open_utc"]
+    if first is None and not rate_limited_out():
+        return {}
+    return {
+        "first_seen_open_utc": first.isoformat(timespec="seconds") if first else None,
+        "reopened": _breaker["reopened"],
+        "open_at_end": rate_limited_out(),
+    }
+
+
+def open_lookup_cache(history_root=None):
+    """Start a run's lookup memo, backed by the store under ``history_root``.
+
+    ``None`` keeps the memo in memory only, which is how ``--offline`` and the
+    tests run: one answer per URL per run, nothing on disk. Returns the cache so
+    a caller that wants to inspect it can.
+    """
+    global _lookup_cache
+    _lookup_cache.close()
+    path = Path(history_root) / STORE_FILENAME if history_root else None
+    _lookup_cache = LookupCache(path)
+    if path is not None and not _lookup_cache.summary()["persistent"]:
+        log.warning(
+            "Wayback lookup store %s could not be opened; lookups are not "
+            "remembered across runs this time",
+            path,
+        )
+    return _lookup_cache
+
+
+def close_lookup_cache():
+    """Close the store. The memo stays readable for the rest of the process."""
+    _lookup_cache.close()
+
+
+def lookup_cache_summary():
+    """Counts for the log and report: see ``LookupCache.summary``."""
+    return _lookup_cache.summary()
+
+
+def forget_lookup(url):
+    """Drop the remembered answer for ``url``; the next ``check()`` goes live."""
+    _lookup_cache.forget(url)
+
+
+def remember_lookup(url, answer):
+    """Remember ``answer`` (a ``wayback`` dict naming a snapshot) as what a
+    lookup of ``url`` would return.
+
+    For a capture this run completed. archive.org's availability index lags a
+    fresh capture by hours (spn-client's ``check`` docstring, point 3; seen
+    here 2026-10-28: a PDF captured at 21:15 UTC read "not archived" two
+    minutes later and was captured again). The capture's own answer is the
+    truth for the next run, where a live lookup would be a second capture.
+    """
+    _lookup_cache.put(url, answer)
+
+
+def check(
+    url,
+    timeout=10,
+    stale_days=None,
+    cdx_fallback=False,
+    cdx_timeout=60,
+):
+    """``spn_client.check`` behind the run's lookup memo.
+
+    Same signature and the same result shape, plus ``lookup_cached: True`` and
+    ``lookup_checked_at`` on an answer that came from the memo rather than from
+    archive.org, so a report can tell the two apart. See
+    :mod:`.wayback_lookup_cache` for what is remembered and for how long.
+
+    Concurrent misses for one URL take turns on a per-URL lock, so the second
+    asks the memo again and finds the first's answer instead of paying a paced
+    live call for it. A lookup that did not complete is not remembered, so a
+    waiter whose leader got ``archived: None`` asks archive.org itself, which
+    is exactly what it would have done without the memo.
+    """
+    cache = _lookup_cache
+    if not isinstance(url, str):
+        # Let spn-client raise its own ValueError for a non-URL.
+        return _spn_check(
+            url,
+            timeout=timeout,
+            stale_days=stale_days,
+            cdx_fallback=cdx_fallback,
+            cdx_timeout=cdx_timeout,
+        )
+    cache.note("lookups")
+    hit, source = cache.lookup(url, stale_days=stale_days, cdx_fallback=cdx_fallback)
+    if hit is not None:
+        cache.note(f"{source}_hits")
+        return hit
+    with cache.lock_for(url):
+        hit, _ = cache.lookup(url, stale_days=stale_days, cdx_fallback=cdx_fallback)
+        if hit is not None:
+            # The leader's answer, written while this thread waited for the lock.
+            cache.note("run_hits")
+            return hit
+        result = _spn_check(
+            url,
+            timeout=timeout,
+            stale_days=stale_days,
+            cdx_fallback=cdx_fallback,
+            cdx_timeout=cdx_timeout,
+        )
+        # Counted after the call, because only its answer says whether a
+        # request went out: an open breaker and an archive URL are both
+        # answered by spn-client without one. Counting before it reported 306
+        # breaker skips as "sent to archive.org" (2026-10-29).
+        if _lookup_was_skipped(result):
+            cache.note("skipped")
+        elif isinstance(result, dict) and result.get("is_archive_url"):
+            cache.note("archive_urls")
+        else:
+            cache.note("live")
+        cache.put(url, result, cdx_fallback=cdx_fallback)
+        return result
 
 
 #: The SPN2 capture options spn-client exposes on ``submit()`` that carry no
@@ -206,7 +413,17 @@ FALLBACK_REASON_LABELS = {
 #: tripped earlier this run ..."). ``check()`` sets no field for either; only
 #: ``submit()`` sets ``rate_limited``. Matched on the words, lower-cased, so a
 #: change of status-line casing does not hide it.
-_RATE_LIMIT_ERROR_MARKERS = ("too many requests", "rate limit tripped")
+_BREAKER_SKIP_MARKER = "rate limit tripped"
+_RATE_LIMIT_ERROR_MARKERS = ("too many requests", _BREAKER_SKIP_MARKER)
+
+
+def _lookup_was_skipped(result):
+    """True if spn-client's circuit breaker answered ``check()`` without asking
+    archive.org. Unlike a 429, which is a request archive.org refused, a skip
+    sent nothing, so it must not count as a lookup archive.org saw."""
+    if not isinstance(result, dict) or result.get("archived") is not None:
+        return False
+    return _BREAKER_SKIP_MARKER in str(result.get("error") or "").lower()
 
 
 def lookup_was_rate_limited(result):

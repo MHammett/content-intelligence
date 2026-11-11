@@ -249,7 +249,10 @@ class TestUnusableAnswers:
 
 class TestCostControls:
     def test_the_limit_bounds_the_number_of_calls(self):
-        results = [_refuted() for _ in range(5)]
+        # not_addressed: every "contradicts" is re-asked whatever the limit
+        # (issue #448, see test_section9_candidate_ranking), so the limit is
+        # exercised on the refutations it still bounds.
+        results = [_refuted(relevance_verdict="not_addressed") for _ in range(5)]
         with patch.object(
             reask.llm,
             "call_provider",

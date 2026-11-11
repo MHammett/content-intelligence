@@ -2461,3 +2461,41 @@ class TestRateLimitsReachTheMeter:
     def test_a_config_with_no_limits_still_resets_the_meter(self, tmp_path):
         configure = self._configured(tmp_path, None)
         configure.assert_called_once_with(None)
+
+
+class TestSourcesArchivePass:
+    """A full review archives every URL in the Sources list, not only claims."""
+
+    _SOURCES = "\n\n## Sources\n\n1. A data query. https://stat.ripe.net/data/x.json?resource=AS1\n"
+
+    def _run(self, tmp_path, archive, **kwargs):
+        edited = dict(_HANDOFF)
+        edited["draft"] = edited["draft"] + self._SOURCES
+        with patch.dict(_HANDOFF, edited, clear=False):
+            with _stubbed_run(
+                tmp_path,
+                extra_patches=[
+                    patch.object(pipeline, "archive_draft_sources", archive)
+                ],
+                **kwargs,
+            ) as report:
+                return report
+
+    def test_the_status_lands_in_the_report(self, tmp_path):
+        seen = {}
+
+        def archive(text, api_keys, capture=None, **kw):
+            seen.update(text=text, **kw)
+            return [{"marker": "1", "url": "u", "wayback": {}, "source": "sources"}]
+
+        report = self._run(tmp_path, archive)
+        assert "stat.ripe.net" in seen["text"]
+        assert seen["cdx_fallback"] is False
+        assert report["source_archive"][0]["url"] == "u"
+
+    def test_offline_skips_it(self, tmp_path):
+        def archive(*a, **k):
+            raise AssertionError("an offline run archived")
+
+        report = self._run(tmp_path, archive, offline=True)
+        assert "source_archive" not in report

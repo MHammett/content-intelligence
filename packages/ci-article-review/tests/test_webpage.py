@@ -150,7 +150,9 @@ class TestFetchSsrfGuard:
 
     def test_fetches_public_host(self):
         resp = MagicMock()
-        resp.text = SAMPLE_HTML
+        resp.content = SAMPLE_HTML.encode("utf-8")
+        resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        resp.encoding = "utf-8"
         resp.raise_for_status = MagicMock()
         with patch(
             "ci_article_review.analysis.webpage.safe_get", return_value=resp
@@ -158,6 +160,21 @@ class TestFetchSsrfGuard:
             html = webpage.fetch_url("https://example.com/post")
         assert html == SAMPLE_HTML
         assert mock_get.call_args.args[0] == "https://example.com/post"
+
+    def test_a_bare_text_html_header_is_decoded_by_the_meta_charset(self):
+        """requests says ISO-8859-1 for text/html with no charset; the page says UTF-8 (issue #439)."""
+        body = (
+            '<html><head><meta charset="UTF-8"></head>'
+            "<body><p>20\u201350 workers</p></body></html>"
+        )
+        resp = MagicMock()
+        resp.content = body.encode("utf-8")
+        resp.headers = {"Content-Type": "text/html"}
+        resp.encoding = "ISO-8859-1"
+        with patch("ci_article_review.analysis.webpage.safe_get", return_value=resp):
+            html = webpage.fetch_url("https://example.com/post")
+        assert "20\u201350 workers" in html
+        assert "\u00e2\u20ac" not in html
 
     def test_the_platform_user_agent_is_still_sent(self):
         """safe_get defaults to DEFAULT_HEADERS, which carries the platform UA."""
@@ -199,7 +216,9 @@ class TestUrlModeFlowsIntoReview:
         import ci_article_review.pipeline as pipeline
 
         resp = MagicMock()
-        resp.text = SAMPLE_HTML
+        resp.content = SAMPLE_HTML.encode("utf-8")
+        resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        resp.encoding = "utf-8"
         resp.raise_for_status = MagicMock()
 
         argv = [

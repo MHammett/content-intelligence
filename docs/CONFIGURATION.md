@@ -300,7 +300,7 @@ max_tokens = reasoning_tokens[effort]
            + max(answer_tokens[domain] × size_mult, answer_tokens_per_char[domain] × chars, answer_floor_tokens)
 ```
 
-clamped to the model's output limit and to what its context window leaves after the prompt. `size_mult` is the wall-clock formula's own size table, so the two scale together. The ceiling counts **thinking**: every truncated pass on record up to 2026-09 ran out while reasoning, including on drafts under 5,000 characters, which is why reasoning is a flat term (0 on a pass that does not reason — `effort` / `reasoning_effort` unset or `none`, on a model that does not think by default; see [below](#claude--adaptive-vs-extended-thinking)). The answer term scales with the draft two ways, and the larger wins: the size table, which shapes small and medium drafts, and for `fact_check` a straight line of 0.25 tokens per character, which takes over from about 90,000 characters — on a 190,170-character draft at `maximum`, `mistral:fact_check` wrote 154 `confirmed` entries and hit the table's 50,000 before any other bucket (2026-10-23); the line gives that pass 79,543. A capped model's wall-clock backstop is raised, if it has to be, to the time a healthy call needs to reach its ceiling — otherwise a longer ceiling just turns truncations into timeouts. Past roughly 120,000 characters at `maximum` that time exceeds `task_timeout_seconds` (1100) at the slowest healthy rate on record, and the task ceiling, not the token ceiling, is what bounds the pass; raise `task_timeout_seconds` for drafts that size if a `fact_check` keeps timing out.
+clamped to the model's output limit and to what its context window leaves after the prompt. `size_mult` is the wall-clock formula's own size table, so the two scale together. The ceiling counts **thinking**: every truncated pass on record up to 2026-09 ran out while reasoning, including on drafts under 5,000 characters, which is why reasoning is a flat term (0 on a pass that does not reason — `effort` / `reasoning_effort` unset or `none`, on a model that does not think by default; see [below](#claude--adaptive-vs-extended-thinking)). The answer term scales with the draft two ways, and the larger wins: the size table, which shapes small and medium drafts, and for `fact_check` a straight line of 0.35 tokens per character (0.25 until 2026-11-10), which takes over from about 40,000 characters — on a 190,170-character draft at `maximum`, `mistral:fact_check` wrote 154 `confirmed` entries and hit the table's 50,000 before any other bucket (2026-10-23); the line now gives that pass 98,560 (79,543 at 0.25). The rate is the largest that keeps a 62,000-character `maximum` pass inside `task_timeout_seconds` at the slowest rate on record; see the measurement in `output_tokens.yaml` (issue #476). A capped model's wall-clock backstop is raised, if it has to be, to the time a healthy call needs to reach its ceiling — otherwise a longer ceiling just turns truncations into timeouts. Past roughly 64,000 characters at `maximum` that time exceeds `task_timeout_seconds` (1100) at the slowest healthy rate on record, and the task ceiling, not the token ceiling, is what bounds the pass; raise `task_timeout_seconds` for drafts that size if a `fact_check` keeps timing out.
 
 The call log records `finish_reason` beside `max_tokens` and `truncated`, so a capture says whether the provider stopped on its own (`stop`), at the ceiling (`length`), or otherwise.
 
@@ -551,6 +551,9 @@ pipeline:
   link_validation: true         # check HTTP status of every URL in the draft
   wayback_link_check: true      # also query the Wayback Machine for each URL
   wayback_snapshot_stale_days: 180  # snapshots older than this are flagged [STALE]
+  wayback_lookup_cache: true    # remember archive.org answers between runs
+  archive_all_sources: true     # archive every Sources-list URL, not only resolved claims
+  page_store: true              # keep fetched citation pages; reuse only on a 304
 
   drafting_model: claude        # excluded from voice_style — see below
   prompt_cache_layout: false    # see "Prompt cache layout"
@@ -567,6 +570,12 @@ uv run ci-review --draft handoff.md --publication mypub --retry-failed pipeline_
 ```
 
 **`wayback_snapshot_stale_days`** controls when a Wayback Machine snapshot is considered stale. At 180 days (default), a snapshot from more than six months ago triggers a `[STALE]` flag and a manual re-archive recommendation. Lower this for publications with high source-freshness standards (e.g., 90 days for breaking-news adjacent pieces). It applies to both draft link validation and resolved citation URLs.
+
+**`page_store`** (default `true`) keeps each citation page Section 9 and the quote check fetch in `page_store.sqlite` under the history root, and on the next run asks the origin whether it changed (`If-None-Match` / `If-Modified-Since`). Only a `304 Not Modified` reuses the stored body; a page that changed is downloaded again, and a page that sends no `ETag` or `Last-Modified` is never stored and is fetched in full every run, so the content-drift check always reads what the origin serves today. Only `200` responses up to 32 MB are kept, entries older than 14 days are dropped when a run starts, and every redirect hop still passes the SSRF guard. Link validation's HEAD checks and the TLS-impersonation retry do not use it. Measured live on 40 citation pages of one article, 2026-10-28: the second fetch got 11 answers of 304, did not download 20.9 MB, and took 52 s instead of 69 s, with every page reading the same. The log line `Page store:` and `report.json`'s `page_store` count the 304s and the bytes saved. `false` turns it off; delete the file to start over.
+
+**`wayback_lookup_cache`** (default `true`) keeps archive.org's answers in `wayback_lookups.sqlite` under the history root, so a URL looked up in an earlier run is not asked about again for 7 days if a snapshot exists and 1 day if none does. Within a run the link pass and Section 9 always share one lookup per URL, whatever this is set to; `false` only stops the file. A lookup that did not complete is never remembered, and submitting a URL for capture forgets it. The run's log line `Wayback lookups:` and `report.json`'s `wayback_lookups` say how many lookups went to archive.org, and how many the circuit breaker kept back (`skipped`). Delete the file to start over. See [CITATIONS.md](CITATIONS.md#wayback-machine-behavior).
+
+**`archive_all_sources`** (default `true`) runs, after Pass 3, the same archive pass `--archive-only` makes over every URL in the draft's Sources list, skipping the ones Pass 3 already submitted. Without it a review archives only claim citations that resolved, which left 30 of 87 cited URLs unarchived on one article (2026-11-10). The result is `source_archive` in `report.json`, and `pipeline/archive.md` on a review written back to GitHub. It makes no model calls; it costs archive.org requests and minutes, paced as every other submission is. `--offline` skips it.
 
 Archiving is not check-only: resolved citation URLs that aren't archived yet are submitted to archive.org's Save Page Now, and a fetch the origin refused (401/403/429), that never reached it (timeout, DNS failure), or that stopped at a certificate which failed verification falls back to reading an archived snapshot. Both are covered in [CITATIONS.md](CITATIONS.md#wayback-machine-behavior).
 
@@ -879,7 +888,7 @@ how many moved and, separately, the tally: quotes found, not found, unchecked.
 
 **What counts as a miss.** Only a page that was fetched, was readable text, and
 did not contain the quote. A 404, a refusal, a timeout, a bot wall, a near-empty
-page, a PDF over 400 pages, or a run over 200 distinct URLs is *unchecked*, and
+page, a PDF the extractor stopped short of (`PDF_MAX_SECONDS` in `ci_core/extract.py`), or a run over 200 distinct URLs is *unchecked*, and
 an unchecked quote leaves its verdict where it was.
 
 **How loosely it matches.** On letters and digits only, after Unicode NFKC and
@@ -920,26 +929,34 @@ ends the citation pass with `Page cache: N page fetch(es) made, M more
 request(s) served`. Only successes are kept, so a refused or rate-limited page is
 asked for again and Section 9's 403 retry and archive.org fallback still decide
 `verified_via`. The cache lives for one run: nothing is saved with a capture or a
-report, and a replay starts empty. Not run with `--offline`, so a replay with
+report, and a replay starts empty. Between runs, `page_store` (above) lets an
+unchanged page cost its host a `304` instead of the whole body. Not run with `--offline`, so a replay with
 `--offline` keeps every verdict where the capture had it.
 
 ---
 
-### Provider token limits (rate_limits)
+### Provider rate limits (rate_limits)
 
-A provider limits the tokens one key may use in a minute, across every model on it. Mistral's is 100,000 a minute on the key measured on 2026-10-24, and a review of a 135,514-character draft spent an estimated 140,000 of them in the ensemble (42,000 output tokens logged, the rest an estimate of the prompts) before its citation relevance checks began, so five of those checks were refused with HTTP 429 and lost (issue #361). A cap on how many calls run at once does not help; the budget is tokens, and whatever ran in the last minute has spent it.
+A provider limits what one key may do in a minute: tokens, and requests. Both have cost a review findings. On 2026-10-05 a review of a 135,514-character draft spent an estimated 140,000 Mistral tokens in the ensemble before its citation relevance checks began, so five of those checks were refused with HTTP 429 and lost (issue #361). On 2026-10-24 the same checks, three at a time at about 1.1 s each, ran at about 160 requests a minute against `mistral-small`'s 100 and were refused with the token window nearly empty (issue #389). A cap on how many calls run at once fixes neither: the budgets are per minute, and whatever ran in the last minute has spent them.
 
 ```yaml
 rate_limits:
-  mistral:
+  mistral/mistral-small-latest:   # one model: wins over the provider's entry
     tokens_per_minute: 100000
+    requests_per_minute: 100
+  mistral:                        # every other Mistral model
+    tokens_per_minute: 400000
 ```
 
-With a limit set, each call to that provider reserves an estimate of its prompt (characters divided by three, so a little high) before it is sent and waits until the last minute's usage leaves room under 90% of the limit. When the call ends, the reservation is replaced with the real prompt and completion counts. A call refused with a 429 gives its reservation back and also marks the window as full, so the calls behind it wait out a minute instead of walking into the same refusal; that is how it copes with an estimate that is off, or with another review using the same key. One that failed some other way keeps its reservation, because the provider may have counted it. No call waits more than 70 seconds, and a call larger than the whole budget goes once the window is empty. A provider you leave out is not metered, and with no `rate_limits` block nothing changes.
+A key names a provider or one model as `provider/model`; the model's entry wins over the provider's. Mistral and OpenAI enforce their limits per model, so a single provider-wide figure either holds the large model to the small one's budget or lets the small one through; name the model that is actually tight.
 
-The figure is your account's, which this code cannot see: read it from the provider's console (Mistral: Admin > Limits). It is shared with anything else using the same key at the same time, such as another review running in another window, so set it a little under what the console says if you run several at once.
+With a limit set, each call it governs reserves an estimate of its prompt (characters divided by three, so a little high) and counts one request before it is sent, and waits until the last minute's usage leaves room under 90% of each limit. When the call ends, the token reservation is replaced with the real prompt and completion counts. A call refused with a 429 gives its token reservation back (the request stays counted, since the provider saw it) and marks the window as full, so the calls behind it wait out a minute instead of walking into the same refusal; that is how it copes with an estimate that is off, or with another review using the same key. One that failed some other way keeps its reservation, because the provider may have counted it. No call waits more than 70 seconds, and a call larger than the whole token budget goes once the window is empty. A provider you leave out is not metered.
 
-Mistral does send `x-ratelimit-remaining-tokens-minute`, but litellm drops the response headers of a streamed Mistral call, so the meter counts from the usage each call reports instead. Whether Mistral counts a streamed call's tokens when it starts or when it ends is not documented; the 90% headroom is there to absorb the difference.
+**What happens with nothing configured.** The meter waits for nothing, but every 429 is still counted. At the end of the run, a provider that refused calls with no `rate_limits` entry is named in a warning, with the key to set and where the figure comes from, and `rate_limit_refusals` on the report records the count per provider. A run that shows that warning is a run that lost retries, and possibly findings, to a limit a config line would have respected.
+
+The figures are your account's, which this code cannot see, and they move with cumulative spend. Read them from the console: Mistral at admin.mistral.ai › API › Limits (per model; the docs publish no numbers), OpenAI at Settings › Organization › Limits, Anthropic at Usage › Rate limits, Perplexity at Pricing › Usage tiers, xAI at the team's Models page. On the account measured 2026-10-24, `mistral-small-latest` allowed 100,000 tokens and 100 requests a minute, `mistral-medium-latest` 500,000 and 1,000, and `mistral-large-2512` 400,000 tokens but only 15 requests a minute. A limit is shared with anything else using the same key at the same time, such as another review running in another window, so set it a little under what the console says if you run several at once.
+
+Mistral does send `x-ratelimit-remaining-tokens-minute` and `x-ratelimit-remaining-req-minute`, but only on a non-streamed call; litellm drops the response headers of a streamed Mistral call, which is how every call here is made, so the meter counts from the usage each call reports instead. Whether Mistral counts a streamed call's tokens when it starts or when it ends is not documented; the 90% headroom is there to absorb the difference.
 
 ### Reproducibility context
 
@@ -1085,7 +1102,7 @@ Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article
 **When `cost_preset` is set:**
 - It overrides model names and reasoning flags for all configured providers, except the model name on Azure, where the deployment decides it
 - Provider infrastructure settings (vertex_ai, azure, credentials_file) are preserved
-- So is the per-model tuning you set under `models:`: `prompts`, `web_search` and the Perplexity search controls, `timeout_seconds`, `max_tokens`, `stream_read_timeout`, `stream_gap_timeout` and a gemini `temperature`. Where the preset sets one of these too, yours wins (a lower stream budget is warned about at load)
+- So is the per-model tuning you set under `models:`: `prompts`, `web_search`, the Perplexity search controls and Claude's `search_max_uses`, `timeout_seconds`, `max_tokens`, `stream_read_timeout`, `stream_gap_timeout` and a gemini `temperature`. Where the preset sets one of these too, yours wins (a lower stream budget is warned about at load)
 - Providers you haven't configured (no API key) are skipped
 - Setting `enabled: false` on a provider still takes precedence
 - Set `thoroughness:` separately to override just that part of the preset
@@ -1117,6 +1134,8 @@ Preset model assignments live in [`configs/presets.yaml`](../packages/ci-article
 | `maximum` | — | $6.15 (1 run) | ≈$9.6 (1 run) |
 
 A dash means no run at that size is on record. `economy` has none at any recorded size: it runs seven calls on four of `wide`'s six models where `wide` runs twelve, so on the same draft it costs less than `wide`. A `wide` run at ~1,400 words makes 30–44 calls: 12 for the review, the rest to verify and re-ask citations, 2 for SEO. Its four GPT-6-era captures span $0.63–$0.94 for one unchanged command, because Gemini's query count — which is most of the bill — varies that much run to run; quote the range, not a single run. With `--offline`, which makes only the 12 ensemble calls, two runs came to $0.38 each, but that was 2026-09-28 and has not been re-measured since either GPT-6 or the query-count rise. Before search was priced and before the move to `gemini-3.5-flash`, four runs came to $0.10–$0.15, tokens only. The three-run means are from the 2026-09-08 study behind the `thorough` change. `maximum`'s three-run mean in that study was $10.27, priced at a `gpt-5.6-sol` rate that has since been corrected; a later single run on the same draft, re-priced at current rates, gives $9.60. Cost grows far more slowly than the draft does: at `maximum`, 7.5× the characters cost about 1.6× the money.
+
+**Every `maximum` figure here also predates `search_max_uses` (#444), when `claude:fact_check` could search at most five times.** A search costs about $0.10 all-in on opus-5, mostly the input its results add (issue #465), so at today's cap of 20 a long draft that uses it costs about $1.5 more than these figures. Measured on a ~10,700-word draft: $8.37 at five searches. A run at a cap of 40 reported $19.80, but most of that was a retry and a pricing error since fixed; its searches alone added about $3.
 
 **Every figure in that table predates GPT-6 (PR #286, 2026-09-30), and the move is close to cost-neutral rather than the saving the price list suggests.** Re-pricing the surviving `maximum` capture of the ~19,500-word draft call by call under today's line-up drops its tokens from $9.60 to **$7.79**, but the same week moved Gemini from $35 per 1,000 grounded prompts to $14 per 1,000 search *queries* on a model that searches far more, which returns most or all of it: roughly **$10.09 all-in before against $9.3–10.6 after**. At `thorough` the same re-price gives $1.84 of tokens. Both are derived from real captures, not measured — no GPT-6 run of that draft exists at either tier, and the reproducibility figures behind the `thorough` change were measured on a line-up where three of six models have since moved. Re-measuring is [issue #287](https://github.com/MHammett/content-intelligence/issues/287); `PLAN.md` §5.6.1 carries the derivation and the prices of the runs it would take.
 
@@ -1192,7 +1211,7 @@ Measured no more reproducible than `wide` at 3.4× the cost, so it is no longer 
 | mistral | `mistral-medium-3-5` | `reasoning_effort` | `"high"` | Deep CoT; only `"high"` or `"none"` accepted. `stream_read_timeout: 200` |
 | perplexity | `perplexity/sonar` | — | — | Same model as every other tier; see `thorough` |
 | grok | `grok-4.6` | `reasoning_effort` | `"high"` | Full CoT depth. `xhigh` exists, unmeasured. `stream_read_timeout: 500`, same measurement as at `thorough` |
-| claude | `claude-opus-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Also sets `web_search: [fact_check]`, so it searches on that domain only |
+| claude | `claude-opus-5` | `effort` | `"high"` | Adaptive thinking; `high` is also the API default. Also sets `web_search: [fact_check]`, so it searches on that domain only, and `search_max_uses: 20`, the most searches one call may run, at about $0.10 each all-in (without it litellm caps a call at 5; see [Claude in PROVIDERS.md](PROVIDERS.md#anthropic-claude-optional)) |
 
 **Notes on the preset tables:**
 - "Not set" means the preset leaves the parameter out and the provider's own default applies. For the gpt-5.6 models that default is `medium`. It is not off.
@@ -1755,6 +1774,22 @@ second post and uploads the featured image a second time.
 
 ---
 
+### Labels the handoff parser does not read
+
+The parser reads exact, case-sensitive labels. A near miss (`Category:` for
+`WordPress category:`, `WordPress slug:` for `Slug:`, `Open Graph title:` for
+`OG title:`, `SEO title (Rank Math):` for `SEO title:`) does not fail: the field
+reads as absent, so a post could go out uncategorised or without Rank Math's
+title and Open Graph fields. So every `Label:`-shaped line (a capital, 3-41
+characters, a colon) under PUBLICATION PARAMETERS or SEO METADATA that is not a
+label the parser reads is logged as a WARNING naming the line and the nearest
+known label, and `--publish` prints the same list under "HANDOFF LINES THAT WERE
+NOT READ", before anything else, so it shows even when the run is then refused.
+Lines inside a bracketed placeholder are skipped. This only warns: the accepted
+format is unchanged, and the parser's result carries the list as `unread_labels`.
+
+---
+
 ### SEO suggestions
 
 The pre-analysis SEO pass reports what's missing. The suggestion pass proposes
@@ -1956,6 +1991,8 @@ History key: dc-environment
 
 Set it once, when you start the piece, and leave it alone however much the headline moves. Omit it and the title is used exactly as before, so existing handoffs keep working.
 
+A run read with `--github SLUG` sets the key to the slug when the handoff has none, so the history directory and the document folder are one string; see [GitHub document source](#github-document-source).
+
 ---
 
 ## History location
@@ -1975,12 +2012,33 @@ export CI_HISTORY_ROOT="$HOME/ci-history"
 ```
 
 - **Unset or blank, nothing changes:** history stays in `pipeline_history/` under the working directory.
-- **What it moves:** everything `pipeline_history/` holds, for `ci-review` (saved runs, the daily `pipeline_<date>.log`, the `_replay/` tree that `--replay` writes, and the prior-run and archive lookups that a draft run and `--archive-only` make) and for the readers `ci-history-report` and `ci-voice-patterns`. A leading `~` is expanded; a relative path is relative to the working directory, as the default is. When it is set, the run's log starts with a `History root:` line saying where history went.
+- **What it moves:** everything `pipeline_history/` holds, for `ci-review` (saved runs, the daily `pipeline_<date>.log`, the `_replay/` tree that `--replay` writes, the prior-run and archive lookups that a draft run and `--archive-only` make, the `wayback_lookups.sqlite` store of archive.org answers they share, and the `page_store.sqlite` store of fetched citation pages) and for the readers `ci-history-report` and `ci-voice-patterns`. A leading `~` is expanded; a relative path is relative to the working directory, as the default is. When it is set, the run's log starts with a `History root:` line saying where history went.
 - **Readers keep their flag.** `--history-root DIR` on `ci-history-report` and `ci-voice-patterns` still wins over the variable. `ci-review` has no such flag; for a one-off, set the variable for the one command.
 - **`--replay <capture>` and `--retry-failed <capture>` take a path you give them**, so they are not moved: pass the capture's real location, which is now under the shared directory.
 - **Why a variable and not a `user.yaml` key:** `configs/` is git-ignored and per checkout too, so a key there would have to be copied into every new worktree, and `main()` opens the history directory (for its log file) before it loads any config. The variable is shared by every checkout and read first.
 - **Moving history you already have:** copy each checkout's `pipeline_history/` into the new directory without overwriting, as described in [Replaying a run, and where run history lives](REPLAY-AND-HISTORY.md#where-a-runs-output-lives). `run_N` is per article key, and two worktrees can have written the same `run_N`.
 - **Sharing has a cost:** the run number and the delta baseline are read from the shared directory, so two sessions reviewing the same article at the same moment can pick the same `run_N`. Nothing is overwritten (file names carry a timestamp), but the numbers are not guaranteed unique.
+
+---
+
+## GitHub document source
+
+`--github SLUG` reads a draft from a separate GitHub repository. The command line, the file layout and the failure messages are in the README's [Reading a draft from GitHub](../README.md#reading-a-draft-from-github); the configuration is an optional top-level block in `user.yaml`:
+
+```yaml
+github_documents:
+  repo: MHammett/mikehammett.net-articles   # OWNER/NAME; --github-repo overrides it
+  branch: main            # the base branch rounds merge into; default: the repository's default branch
+  path_prefix: articles   # the folder holding one folder per article
+  write_back: false       # reserved: committing the review back (not built yet)
+  include_capture: false  # reserved, with write_back
+  allow_public_repo: false  # reserved, with write_back
+```
+
+- Every key has a default, so the block, and every key in it, is optional. A key left empty counts as unset; `repo: ""` is an error, raised when `--github` is used and not before.
+- The block is carried through the config merge by its own line in `merge_configs` (as `rate_limits` is). A top-level key that merge does not name is dropped without a word, and a cost preset rewrites `models:` and `pipeline:`, so a test (`test_github_documents_wiring.py`) proves the block survives both.
+- **No token key, and no `${VAR}`.** An unset `${VAR}` stops config loading for every run, and a token has no business in a config file. The token is `GITHUB_TOKEN`, then `gh auth token`.
+- Nothing reads the block unless a run passes `--github`; a mistake in it does not stop a run that does not.
 
 ---
 

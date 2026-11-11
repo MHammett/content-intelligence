@@ -61,7 +61,9 @@ The other URLs checked are recorded on the entry as `alternates_checked`, so "on
 
 ## Confidence tiers
 
-Every entry carries a `verification` field. Four values reach the report — `checksum`, `pointer`, `unverifiable`, `content_mismatch` — plus the entries that never reached a tier at all, which the readable report splits by whether a URL was tried. Six blocks in all; the table at the top of Section 9 lists them in this order and every claim appears under exactly one.
+Every entry carries a `verification` field. Five values reach the report — `checksum`, `content_mismatch`, `partial_read`, `pointer`, `unverifiable` — plus the entries that never reached a tier at all, which the readable report splits by whether a URL was tried. Seven blocks in all; the table at the top of Section 9 lists them in this order and every claim appears under exactly one.
+
+Every entry that reached a verdict also carries `read_coverage`, rendered as a `Read:` line: how many of a PDF's pages were read, how many web pages a paginated source yielded, how many characters the verifier was shown out of how many extracted, and which of the pipeline's own limits, if any, left part of the document unread. It exists so that "the source does not say this" and "the part of the source we read does not say this" are never the same line.
 
 ### Read, and supports the claim — `verification: "checksum"`
 
@@ -79,7 +81,7 @@ This tier is only reachable two ways:
 
 > **If the relevance check can't run,** the entry does not stay here — it moves to *Fetched, but could not be read* below. Reaching this tier always means a model read the extracted content and affirmed it. With no Mistral key configured, expect no verified `known_url` entries at all.
 
-**What the model actually reads.** The fetched body is reduced to readable text before verification: main-article extraction for HTML (nav, header, footer, script and style blocks stripped) and `pypdf` text extraction for PDFs. The excerpt sent to the model is then centred on the passage containing the claim's distinctive terms and figures, rather than the first N characters of the document — in a long PDF the supporting sentence is rarely near the top.
+**What the model actually reads.** The fetched body is reduced to readable text before verification: main-article extraction for HTML (nav, header, footer, script and style blocks stripped) and `pypdf` text extraction for PDFs, for up to `extract.PDF_MAX_SECONDS` (180) seconds per document, with a sanity ceiling of `extract.PDF_MAX_PAGES` (5,000) pages — the same limits the quote check uses. The verifier used to stop at 40 pages and then at 400, which is how a claim cited to page 120 of a council packet came back "not supported", and why the limit is now a time budget: a 981-page packet took 134 s to extract whole, 14.8 s of it for the first 400 pages, because later pages cost more. The budget is checked between pages and measured from the start of extraction, so it counts neither the fetch nor the time the document spent queued; at least one page is always read. The excerpt sent to the model is then a 20,000-character window centred on the passage containing the claim's distinctive terms and figures, rather than the first N characters of the document — in a long PDF the supporting sentence is rarely near the top. A document at or under 20,000 characters is sent whole. Both limits are recorded on the entry (`read_coverage`), and a negative verdict formed under either one is reported as *Read in part only*, never as a mismatch.
 
 ### Pointer only — `verification: "pointer"`
 
@@ -115,7 +117,17 @@ This is worth more attention than an ordinary unresolved entry. An ordinary one 
 
 **Every source cited for the claim failed**, not just one. When the draft cites several, all of them are checked before the entry lands here, and `alternates_checked` lists the ones that are not shown. Reporting a mismatch after checking one of three cited sources would say something false about a draft that cited the right source second.
 
-This tier asserts something about the source, so it is only ever reached when the document was genuinely read. If the content could not be extracted, or the check could not run, the entry becomes *Fetched, but could not be read* instead — never this.
+This tier asserts something about the source, so it is only ever reached when the document was genuinely read **in full**: every page of a PDF, every page of a paginated source, and the whole extracted text shown to the verifier. If the content could not be extracted, or the check could not run, the entry becomes *Fetched, but could not be read* instead; if part of the document was left unread, it becomes *Read in part only* — never this. The one exception is a `contradicts` verdict whose quoted sentence was found on the page: text that was found is evidence whatever was left unread, so that stays a mismatch.
+
+### Read in part only — `verification: "partial_read"`
+
+The document was fetched, part of it was read, and the claim was not in that part. **This is not evidence against the claim.** One of the pipeline's own limits stopped the read — the PDF time budget (`extract.PDF_MAX_SECONDS`, 180 seconds of extraction; or the 5,000-page ceiling, `extract.PDF_MAX_PAGES`, reported as the PDF page cap), the pagination cap or size budget for a multi-page web source, or the 20,000-character excerpt window the verifier is shown — and the entry's `read_coverage` says which, with the counts: pages read of pages total, characters shown of characters extracted. The relevance verdict and reason are kept, because they describe the part that was read, but the readable report renders these entries under their own heading, *Read in part only — not found in the part read*, apart from the mismatches, and the claim ledger gives them their own status (*Source read in part, claim not found in the part read*) rather than *Source read, does not support the claim*. The worklist lists each such document once, under *Open a document the run read only in part*, with the coverage line, so the author can go straight to the pages the pipeline never saw.
+
+This tier exists because the two readings had been one. On the 2026-10-24 run of a 267-claim draft, 111 entries read "does NOT support the claim"; 65 of them were PDFs and 40 were council packets the verifier had stopped reading at page 40 — the claims were cited to pages it never opened (issue #395). A reader shown "not supported" cannot tell that from a refutation, and the revision that follows treats a reading limit as a factual error.
+
+`resolved` is `false`, as for a mismatch, so nothing here is counted as verified. The entry is never handed back to the asserting model for a re-ask (that pass exists for refutations) and never counts as a contradiction in the ledger.
+
+**How much to trust it:** as an open item. The claim is neither confirmed nor refuted; the one thing that settles it is opening the document at the cited page.
 
 ### Fetched, but could not be read — `verification: "unverifiable"`
 
@@ -182,16 +194,7 @@ An `--offline` replay has no Section 9, so its ledger says `citations_resolved: 
 
 The checksum recorded on a verified citation isn't only a fingerprint of what was fetched — it's comparable across runs. Before resolution starts, the pipeline builds a URL → prior-checksum index from every report under `pipeline_history/`: every run, every article, since the same primary sources (EPA eGRID, EIA state profiles) get cited across many articles for one publication. When a citation resolves and its URL is already in that index with a different checksum, the entry gains a `content_changed_since` field recording the prior checksum, and which run of which article last saw it.
 
-It surfaces as its own block above the tiers in the readable report, and in the console summary:
-
-```
-############################################################
-WARNING: 2 verified source(s) have changed content since a prior run checksummed them:
-  https://www.eia.gov/electricity/state/illinois/
-    Last matched in run 3 of 'grid-reliability-piece' on 2026-01-04T09:12:00
-Claims previously verified against these sources may need re-checking.
-############################################################
-```
+It surfaces as a note above the "Read, and supports the claim" block, as a line under each changed entry ("Text changed since run 3 of 'grid-reliability-piece' on 2026-01-04T09:12:00; read again and still supports this claim."), and as one line in the console summary. It used to be a warning section of its own. That was dropped because every flagged entry was read again in the same run and still supports its claim, so it asks nothing of this article's author (issue #446). On news pages, whose extracted text changes daily with a "related stories" block, it fired on six still-supporting sources in one run. The flag is for the other articles that cite the same page.
 
 **What a mismatch proves:** that the bytes at that URL are not the bytes that were there the last time this pipeline fetched it. That's all. It does not say what changed, how much, or whether it matters.
 
@@ -214,6 +217,8 @@ There's no drift check on a first run against an empty or missing `pipeline_hist
 Every resolved citation URL is checked against the Wayback Machine, and the pipeline actively works to get sources archived rather than only reporting on them.
 
 **Availability check.** Each resolved URL is looked up via archive.org's availability API. The result records whether a snapshot exists, its timestamp, its age in days, and whether it's stale. "Stale" defaults to older than 180 days and is set by `pipeline.wayback_snapshot_stale_days` in `user.yaml`. If the cited URL is itself a `web.archive.org` link, its date is read straight from the URL and no archive-of-an-archive lookup happens.
+
+**One lookup per URL, remembered between runs.** A review asks about most URLs twice — link validation before the ensemble, Section 9 after it — and asks again every round, although a draft's URLs mostly do not change between rounds. Measured on four `maximum` runs of one article (2026-10-25 to 2026-10-28): 162 lookups a run, 56 URLs asked in both passes, 73 of 88 link URLs the same as the previous run; the link pass tripped the circuit breaker below and Section 9 got `archived: null` for every citation in three of the four runs. So `check()` now reads a memo first. Within a run every pass shares one answer per URL. Across runs the answers are kept in `wayback_lookups.sqlite` under the history root (so `CI_HISTORY_ROOT` shares them between worktrees): a snapshot that exists is reused for 7 days, "no snapshot" for 1 day, and a lookup that did not complete (`archived: null`) is never kept. Age and `[STALE]` are recomputed on every read against the run's `wayback_snapshot_stale_days`, so a remembered answer reads as a live one would that day; it carries `lookup_cached: true` and `lookup_checked_at` so a report can tell them apart. Submitting a URL for capture forgets its entry, and a capture that completes is remembered as the answer, because the availability index lags a fresh capture by hours and a live lookup in that window would capture the page a second time (seen 2026-10-28). `--archive-only` consults the CDX index for negatives and stale answers, so it takes a remembered negative only if CDX was consulted when it was stored, and a fresh positive from anyone. `pipeline.wayback_lookup_cache: false` turns the store off (the in-run memo stays); the run's log and `report.json` (`wayback_lookups`) say how many lookups were asked, how many went to archive.org, and how many the circuit breaker kept back (`skipped`; before 2026-10-30 these were counted as sent).
 
 **Rate limiting, pacing, and the circuit breaker.** archive.org throttles the availability API at IP level over a long window rather than per-second, and it does not warn first. Measured 2026-08-12: 12 consecutive lookups all returned 429 — including the very first — and it was still 429 after a 45-second cooldown at one request every 6 seconds. With no pacing and no backoff, the archive thread had been effectively dead for two runs: 49 resolved citations, 0 archived, ~49 rate-limited.
 
@@ -238,6 +243,14 @@ Three mechanisms now sit in front of it, because no one of them is sufficient:
 An `archived: false` entry is untouched by all of this: that is an answer, and only `null` means the run never found out.
 
 **Save Page Now submission.** After resolution finishes, any resolved citation whose URL is *not* yet archived gets submitted to archive.org's Save Page Now API. This runs as a follow-up pass at a lower concurrency than resolution itself (2 vs. 8), because each submission triggers a real page capture on archive.org's side rather than a cheap read.
+
+**Then every other URL in the Sources list.** Resolved claim citations are not every cited URL. On 2026-11-10 two articles ended a review with 30 of 87 and 28 of 103 cited URLs unarchived: data queries (RIPEstat, APNIC, PeeringDB) that no claim pointed at, pages the relevance check read as not supporting a claim (`content_mismatch`, `partial_read`), and URLs added after the review. So after Pass 3 the review runs the same pass `--archive-only` does over the draft's whole citation block (`archive_draft_sources`), reusing the link pass's lookup and skipping the URLs Pass 3 already submitted. The status of every cited URL lands in `report.json` as `source_archive`, one entry per marker and URL, with `source: claim` or `sources`; a review written back to GitHub also commits it as `pipeline/archive.md` and `pipeline/archive.json`. `pipeline.archive_all_sources: false` turns the extra pass off.
+
+**How a failed submission is classified.** `wayback.submission_failure_kind` says which of four things happened: `archive_policy` (archive.org answered and refused, with an error code), `rate_limited` (a 429, or skipped because the breaker was open), `connection` (refused, dropped or unresolved: no answer at all) or `http_error`. `breaker_open_at_failure` records whether the breaker had tripped. A `connection` failure is the network path, not a judgement about the page, and the detail says so.
+
+**A snapshot of another site is not an archive.** archive.org follows redirects when it captures and names the snapshot by where it landed. ecfr.gov sends its crawler to `unblock.federalregister.gov`, a bot check, so on 2026-11-10 15 of one article's 28 eCFR citations "had a snapshot" that was that page. A snapshot whose original URL is on a different site (the last two labels of the host) from the cited URL is now recorded as `capture_failed`, with `capture_redirected_off_site: true` and the snapshot kept as `off_site_snapshot_url`. A redirect within a site (`http` to `https`, `docs.fcc.gov` to `www.fcc.gov`) is untouched, and so is a citation that is itself a snapshot URL. For eCFR the practical fix is to cite a version archive.org can capture, such as the govinfo CFR PDF.
+
+**Two refusals with a better answer.** archive.org captures some resources once a day (`error:too-many-daily-captures`); the refusal means a snapshot from that day exists, so the pass looks it up (bypassing the run's memo, with CDX) and records it. A capture that fails `error:not-found` (the target host answered 404) from a host that served another capture in the same pass is retried once, and a prior run's 404 is resubmitted rather than dropped as permanent: on 2026-11-10 four eCFR sections got it in a run that captured 17 others on ecfr.gov.
 
 **Submitted is not archived, and the report no longer conflates the two.** This used to be fire-and-forget: the pipeline submitted, recorded `submitted: true`, and said "submitted for archiving" — which reads as *archived*. Nothing established that. A capture archive.org accepted and then dropped looked exactly like one it completed, run after run. Each citation now records an `archive_outcome`, and only one of its values claims a snapshot exists:
 

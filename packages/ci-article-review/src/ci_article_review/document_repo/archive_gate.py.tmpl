@@ -1,0 +1,121 @@
+"""Archive gate: every URL an article cites has a Wayback snapshot before its round merges.
+
+Run by .github/workflows/archive-gate.yml on each round pull request. Standard
+library only, so the workflow needs nothing installed.
+
+It reads the round's articles/<slug>/pipeline/archive.json, which
+`ci-review --archive-only --github <slug>` (or a review's write-back) commits, and
+fails when:
+
+- there is no archive.json: no archive pass has run on this round;
+- draft.md is not the draft the pass read (its blob differs from the one
+  archive.json records): a revision since the pass may cite URLs it never saw;
+- a cited URL has no snapshot (status missing, pending or not checked) and is not
+  listed in articles/<slug>/archive-exceptions.md, the author's record of the
+  URLs accepted without one.
+
+archive-exceptions.md holds one line per accepted URL, `- <url>: <reason>`; any
+other line is ignored. A stale snapshot passes: it is an archive, only an old one.
+
+Run it on an LF checkout, as GitHub Actions makes. On a checkout that rewrites
+line endings (core.autocrlf on Windows), draft.md's bytes are not the blob's and
+every pass reads as out of date.
+
+Usage: archive_gate.py [BRANCH]. The branch defaults to $GITHUB_HEAD_REF. A branch
+that is not round/<slug>/rN passes without checking anything.
+"""
+
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+GAP_STATUSES = ("missing", "pending", "not checked")
+ROUND_BRANCH = re.compile(r"^round/(?P<slug>[a-z0-9][a-z0-9-]*)/r\d+$")
+EXCEPTION_LINE = re.compile(r"^\s*[-*]\s+<?(?P<url>https?://\S+?)>?\s*(?::|\s[-—–]\s)\s*(?P<reason>\S.*)$")
+
+
+def blob_sha(data):
+    """The git blob id of ``data``, as `git hash-object` gives it."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def exceptions(path):
+    """``{url: reason}`` from archive-exceptions.md; empty if the file is absent."""
+    if not path.exists():
+        return {}
+    out = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = EXCEPTION_LINE.match(line)
+        if m:
+            out[m.group("url")] = m.group("reason").strip()
+    return out
+
+
+def check(root, slug):
+    """``(ok, lines)``: whether the round may merge, and what to say."""
+    folder = Path(root) / "articles" / slug
+    status_file = folder / "pipeline" / "archive.json"
+    draft = folder / "draft.md"
+    run = f"ci-review --archive-only --github {slug} --publication <name>"
+    if not draft.exists():
+        return True, [f"{slug}: no draft.md; nothing to check."]
+    if not status_file.exists():
+        return False, [
+            f"{slug}: no archive pass on this round (pipeline/archive.json is missing).",
+            f"Ask the Code side to run `{run}` on the head.",
+        ]
+    try:
+        doc = json.loads(status_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return False, [f"{slug}: pipeline/archive.json cannot be read ({exc}). Run `{run}` again."]
+    want = doc.get("draft_blob_sha")
+    have = blob_sha(draft.read_bytes())
+    if want != have:
+        return False, [
+            f"{slug}: draft.md changed after the last archive pass, which read "
+            f"commit {str(doc.get('commit_sha') or '?')[:12]}. A revision may cite URLs "
+            f"no pass has seen. Run `{run}` on the head.",
+        ]
+    allowed = exceptions(folder / "archive-exceptions.md")
+    rows = doc.get("urls") or []
+    gaps = [r for r in rows if r.get("status") in GAP_STATUSES]
+    excused = [r for r in gaps if r.get("url") in allowed]
+    open_gaps = [r for r in gaps if r.get("url") not in allowed]
+    lines = [
+        f"{slug}: {len(rows)} cited URL(s); {len(rows) - len(gaps)} with a snapshot, "
+        f"{len(excused)} accepted without one, {len(open_gaps)} open. "
+        f"Pass of {doc.get('generated', '?')} on commit {str(doc.get('commit_sha') or '?')[:12]}."
+    ]
+    for r in excused:
+        lines.append(f"  accepted [{r.get('marker')}] {r.get('url')}: {allowed[r['url']]}")
+    for r in open_gaps:
+        lines.append(f"  OPEN [{r.get('marker')}] {r.get('url')} ({r.get('status')}): {r.get('reason', '')}")
+    if open_gaps:
+        lines.append(
+            "Each open URL needs a snapshot (run the pass again, or cite a copy archive.org "
+            "can capture) or a line in archive-exceptions.md with the author's reason."
+        )
+    return not open_gaps, lines
+
+
+def main(argv):
+    branch = argv[1] if len(argv) > 1 else os.environ.get("GITHUB_HEAD_REF", "")
+    m = ROUND_BRANCH.match(branch or "")
+    if not m:
+        print(f"{branch or '(no branch)'} is not a round branch; nothing to check.")
+        return 0
+    ok, lines = check(".", m.group("slug"))
+    text = "\n".join(lines)
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write("## Archive gate\n\n```\n" + text + "\n```\n")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

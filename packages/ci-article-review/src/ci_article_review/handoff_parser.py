@@ -2,6 +2,7 @@
 Parse Template A (draft submission) and Template C (publication handoff) documents.
 """
 
+import difflib
 import re
 import logging
 
@@ -327,6 +328,15 @@ def parse_publication_handoff(text):
     publication_parameters, placeholder_publication_fields = _parse_key_value_block(
         pub_params_raw
     )
+    unread_labels = _unread_labels(
+        pub_params_raw, "PUBLICATION PARAMETERS", _PUBLICATION_PARAMETER_LABELS.values()
+    ) + _unread_labels(
+        seo_raw,
+        "SEO METADATA",
+        [f"{label}:" for label in _SEO_FIELD_MAP] + ["Schema type:"],
+    )
+    for item in unread_labels:
+        log.warning("Handoff: %s", describe_unread_label(item))
 
     return {
         "title": title,
@@ -339,10 +349,23 @@ def parse_publication_handoff(text):
         "placeholder_publication_fields": placeholder_publication_fields,
         "seo": _parse_seo_block(seo_raw),
         "ignored_schema_type": _ignored_schema_type(seo_raw),
+        # Lines in PUBLICATION PARAMETERS / SEO METADATA that look like a
+        # "Label:" this parser does not read. See _unread_labels.
+        "unread_labels": unread_labels,
         "embeds": section("EMBEDS AND SPECIAL ELEMENTS"),
         "disposition_log": section("DISPOSITION LOG"),
         "final_draft": section("FINAL DRAFT"),
     }
+
+
+def declares_run_number(text):
+    """Whether ``text`` carries a ``Pipeline run:`` line with a number on it.
+
+    The parsers answer 1 both for a missing line and for one that says 1, so a
+    caller that wants to default the run number to something else (a round read
+    from a document store) cannot tell the two apart from the handoff dict.
+    """
+    return _extract_raw_field(text, "Pipeline run:").isdigit()
 
 
 def _extract_raw_field(text, label):
@@ -470,16 +493,85 @@ def _parse_key_value_block(text):
     return params, placeholder_fields
 
 
+_SEO_FIELD_MAP = {
+    "Focus keyword": "focus_keyword",
+    "SEO title": "seo_title",
+    "Meta description": "meta_description",
+    "OG title": "og_title",
+    "OG description": "og_description",
+}
+
+#: A line that reads like a field label: a capital, then a short run without a
+#: colon, then a colon. The same shape the parser's own labels have.
+_LABEL_SHAPED = re.compile(r"^([A-Z][^:\n]{2,40}):")
+
+
+def _unread_labels(text, section_name, known_labels):
+    """Lines of a section that look like a ``Label:`` nothing here reads.
+
+    A label the parser does not know is not an error: the field just reads as
+    absent, and the publish carries on without it ("Category:" for "WordPress
+    category:" files the post under Uncategorized; "Open Graph title:" gives
+    Rank Math no OG title). That is a silent loss, so each such line is
+    reported with the nearest label that *is* read.
+
+    Lines inside a bracketed placeholder are skipped: the template's own
+    wrapped placeholders contain colons ("About or Contact: no date, ...").
+    The parser only reads exact, case-sensitive labels, so a wrong case counts.
+    Returns a list of ``{"section", "line", "label", "suggestion"}`` dicts;
+    ``suggestion`` is "" when nothing is close.
+    """
+    known = [k.rstrip(":") for k in known_labels]
+    known_set = set(known)
+    found = []
+    depth = 0
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        inside = depth > 0
+        depth = max(0, depth + line.count("[") - line.count("]"))
+        if inside or not line:
+            continue
+        match = _LABEL_SHAPED.match(line)
+        if not match or match.group(1) in known_set:
+            continue
+        label = match.group(1)
+        found.append(
+            {
+                "section": section_name,
+                "line": line,
+                "label": label,
+                "suggestion": _nearest_label(label, known),
+            }
+        )
+    return found
+
+
+def _nearest_label(label, known):
+    lowered = label.lower()
+    by_lower = {k.lower(): k for k in known}
+    # A known label that is a whole part of this one wins over a fuzzy match:
+    # "WordPress slug" is "Slug" with a prefix, though by ratio it is nearer
+    # "WordPress author". "Category" is likewise a part of "WordPress category".
+    # The longest such label is the most specific.
+    parts = [low for low in by_lower if low in lowered or lowered in low]
+    if parts:
+        return by_lower[max(parts, key=len)]
+    close = difflib.get_close_matches(lowered, list(by_lower), n=1, cutoff=0.6)
+    return by_lower[close[0]] if close else ""
+
+
+def describe_unread_label(item):
+    hint = f" Did you mean {item['suggestion']!r}?" if item["suggestion"] else ""
+    return (
+        f"{item['section']} line {item['line']!r} is not read: {item['label']!r} "
+        f"is not a label this parser knows, so the field is treated as absent."
+        f"{hint}"
+    )
+
+
 def _parse_seo_block(text):
     seo = {}
-    field_map = {
-        "Focus keyword": "focus_keyword",
-        "SEO title": "seo_title",
-        "Meta description": "meta_description",
-        "OG title": "og_title",
-        "OG description": "og_description",
-    }
-    for label, key in field_map.items():
+    for label, key in _SEO_FIELD_MAP.items():
         # Read exactly as a header field is. A blank label is blank, not the
         # next line: a blank "SEO title:" once put "Meta description: ..." in
         # the <title> tag. And the first line with the label is the field,

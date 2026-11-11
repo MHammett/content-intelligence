@@ -54,6 +54,7 @@ from .config_loader import (
     load_user_config,
     load_publication_config,
     merge_configs,
+    normalize_github_documents,
     parse_api_key_overrides,
     preset_names,
     retired_preset_names,
@@ -61,12 +62,14 @@ from .config_loader import (
 )
 from .handoff_parser import (
     parse_draft_submission,
+    describe_unread_label,
     parse_publication_handoff,
     build_handoff_from_raw_text,
     build_handoff_from_raw_draft_and_metadata,
 )
 from . import history as hist
 from .history_analytics import resolve_history_root
+from . import checkout_freshness
 from . import consolidation
 from . import claim_status
 from . import handoff_gaps
@@ -80,7 +83,12 @@ from ci_core.concurrency import (
     exit_without_waiting_for_foreign_threads,
     run_all_with_timeout,
 )
-from ci_core.http import impersonation_available
+from ci_core.http import (
+    close_page_store,
+    impersonation_available,
+    open_page_store,
+    page_store_stats,
+)
 from ci_core.llm.model_registry import check_model_currency
 from ci_core.llm import output_tokens
 from ci_core.llm import timeout_model
@@ -102,6 +110,8 @@ from .adapters.citation.disposition import disposition as citation_disposition
 log = logging.getLogger("pipeline")
 
 HISTORY_ROOT = "pipeline_history"
+#: The page store's file under the history root (see ``ci_core.http``).
+PAGE_STORE_FILENAME = "page_store.sqlite"
 
 
 def _history_root():
@@ -1421,6 +1431,22 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
             verify_claim = _claim_for_verifier(claim, source_field, draft)
             if verify_claim != claim:
                 entry["verify_claim"] = verify_claim
+            hints = _locate_hints(cited, known_urls, own, item)
+            if hints:
+                entry["locate_hints"] = hints
+            # URLs that reached this claim only as the preceding span's markers.
+            # They may support it; they are not reported as its failed source
+            # when its own was tried (issue #441). A URL the model named itself
+            # is its own source even if a neighbouring marker also carries it.
+            neighbours = [
+                u
+                for u in (
+                    cited.neighbour_urls_for(claim, source_field) if cited else []
+                )
+                if u in known_urls and u != own
+            ]
+            if neighbours:
+                entry["neighbour_urls"] = neighbours
             claims.append(entry)
     log.info(
         "Citations: %d of %d claim(s) traced to a citation in the draft",
@@ -1428,6 +1454,28 @@ def _collect_citation_claims(fact_check: dict, draft: str) -> list[dict]:
         len(claims),
     )
     return claims
+
+
+def _locate_hints(cited, known_urls, own_url, item) -> dict:
+    """``{url: [text, ...]}``: where in each candidate the evidence probably is.
+
+    Two sources, both already in hand. The draft's citation entry for the URL,
+    which often names the place ("p. 110 (Council Bluffs, IA: 1,410.3 million
+    gallons withdrawn ...)"), and the fact-check model's quote from the URL it
+    named itself. The resolver uses them only to choose which part of a long
+    document the verifier is shown (``extract.select_excerpt_with_window``,
+    issue #440); the verdict is still the verifier's, on the claim alone. A
+    paraphrased quote still helps here: its figures are the page's.
+    """
+    hints: dict = {}
+    quote = consolidation._evidence_quote(item) if isinstance(item, dict) else ""
+    for url in known_urls:
+        texts = list(cited.descriptions_for(url)) if cited else []
+        if quote and own_url and url == own_url:
+            texts.append(quote)
+        if texts:
+            hints[url] = texts
+    return hints
 
 
 def _read_handoff_file(path: str) -> str:
@@ -2094,6 +2142,33 @@ def _delay_start(fn, delay):
     return _delayed
 
 
+def _warn_about_unmetered_refusals(report):
+    """Say, once per provider, that it refused calls this run with no limit set.
+
+    The meter in ``ci_core.llm.ratelimit`` waits for room only where
+    ``rate_limits:`` names the provider; with nothing configured it is a no-op
+    and a run finds out about the account's limit from 429s, each of which
+    costs a retry wait and can cost a finding (#361, #389). The client counts
+    every 429 whether or not a limit is set, so the run can point at the key to
+    set and where the figure comes from. Recorded on the report too, so a saved
+    run says how often it was refused.
+    """
+    refused = llm.ratelimit.refusals()
+    if refused:
+        report["rate_limit_refusals"] = refused
+    for provider, count in sorted(llm.ratelimit.unmetered_refusals().items()):
+        log.warning(
+            "%s refused %d request(s) with HTTP 429 this run and no rate_limits.%s "
+            "is configured, so nothing waited for room. Set tokens_per_minute "
+            "and requests_per_minute from the account's console (Mistral: "
+            "admin.mistral.ai > API > Limits, per model) under rate_limits: in "
+            "user.yaml; see docs/CONFIGURATION.md.",
+            provider,
+            count,
+            provider,
+        )
+
+
 def _global_ceiling(per_task_timeouts, retry_delay):
     """Outer wall-clock bound for the whole parallel batch.
 
@@ -2440,9 +2515,8 @@ def _keep_earlier_billing(failed, fresh):
         "count": sum(s.get("count", 0) for s in summaries),
         "costed": sum(s.get("costed", 0) for s in summaries),
         "reasons": sorted({r for s in summaries for r in s.get("reasons") or ()}),
-        # Summed key by key, so a failed attempt's `cached` share keeps its
-        # cheaper rate; the client's own summary records none, and cost.py
-        # prices a missing share at the full input rate.
+        # Summed key by key, so each attempt's `cached` share keeps its
+        # cheaper rate; cost.py prices a missing share at the full input rate.
         "tokens": total,
     }
     # One count per attempt, concatenated rather than summed: cost.py bills a
@@ -3137,6 +3211,66 @@ def _grammar_skipped(reason):
     }
 
 
+def _warn_if_draft_already_reviewed(draft_text, handoff, handoff_path, publication):
+    """Say so before the ensemble runs on a draft history already has a run of.
+
+    A warning, never a block: re-running an unchanged draft is how
+    reproducibility is measured, and some of the zero-change runs in history
+    were exactly that. But most were not. Full-cost runs at
+    ``word_change_pct`` 0.0 cost $4.50, $5.66, $7.37 and $11.59 (issue #454),
+    and ``--replay`` re-runs everything downstream of the ensemble from the
+    earlier run's capture for nothing.
+
+    Returns the matches, newest first, for tests.
+    """
+    try:
+        matches = reproducibility.prior_runs_of_this_draft(
+            draft_text, _history_root(), _history_key(handoff)
+        )
+    except Exception as exc:  # an advisory must never stop a run
+        log.debug("Unchanged-draft check failed: %s", exc)
+        return []
+    if not matches:
+        return []
+    latest = matches[0]
+    with_capture = next((m for m in matches if m["results"]), None)
+    cost = latest["total_usd"]
+    preset = latest["cost_preset"]
+    detail = ", ".join(
+        part
+        for part in (
+            f"{preset}" if preset else "",
+            f"${cost:.2f}" if isinstance(cost, (int, float)) else "",
+        )
+        if part
+    )
+    lines = [
+        f"This draft is unchanged since run {latest['run_number']}"
+        f"{f' ({detail})' if detail else ''}"
+        + (f" and {len(matches) - 1} earlier run(s)" if len(matches) > 1 else "")
+        + ". This run will pay for the ensemble again."
+    ]
+    if with_capture:
+        source = f"--draft {handoff_path}" if handoff_path else "<same draft flags>"
+        lines.append(
+            "To re-run consolidation, citations and the report from that run's "
+            "ensemble for nothing, stop now and use:"
+        )
+        lines.append(
+            f"  uv run ci-review {source} --publication {publication} "
+            f"--replay {with_capture['results']} --offline"
+        )
+    else:
+        lines.append(
+            "No ensemble capture of it survives, so --replay is not available; "
+            "carry on if a fresh review is what you want."
+        )
+    # The console handler shows WARNING, so this reaches the terminal as well as
+    # the day's log file, before the first model call goes out.
+    log.warning("\n".join(lines))
+    return matches
+
+
 def run_draft_pipeline(
     handoff_path,
     publication_name,
@@ -3152,6 +3286,7 @@ def run_draft_pipeline(
     offline=False,
     api_key_overrides=None,
     expand=False,
+    write_back=False,
 ):
     """Run the full draft review pipeline.
 
@@ -3169,6 +3304,12 @@ def run_draft_pipeline(
     what it does. Off by default: it costs extra calls, and it is useful early
     in a draft's life and actively unhelpful late, when the piece should be
     converging rather than growing.
+
+    ``write_back=True`` (``--github ... --write-back``) commits the saved review
+    back to the article folder the draft was read from, after the run is saved
+    and summarised. The pre-flight (token, push permission, a private
+    repository, taken run numbers) already ran when the handoff was read, so a
+    refusal cost nothing; a failure here leaves the local files and raises.
 
     ``api_key_overrides`` (``{(provider, field): value}``, from ``--api-key``
     on the CLI) is the highest tier of this project's credential precedence —
@@ -3255,6 +3396,21 @@ def run_draft_pipeline(
     # every archive lookup here, reporting each citation as "rate limit tripped
     # earlier this run" for a limit that expired before this run began.
     wayback.reset_rate_limit_state()
+    # Fetched citation pages kept for the next run and reused only when the
+    # origin answers 304 Not Modified (ci_core.http, "Page store"). Off for
+    # --offline, which fetches nothing.
+    close_page_store()
+    if pipeline_cfg.get("page_store", True) and not offline:
+        open_page_store(Path(_history_root()) / PAGE_STORE_FILENAME)
+    # One archive.org answer per URL per run, shared by link validation and
+    # Section 9, and kept under the history root for the next run. Memory-only
+    # when the store is switched off; --offline makes no lookups at all, and
+    # opening the store would create history for a run that writes none.
+    wayback.open_lookup_cache(
+        _history_root()
+        if pipeline_cfg.get("wayback_lookup_cache", True) and not offline
+        else None
+    )
     # The handoff declares the run number, so re-running without editing it
     # writes a second report with the same number — pipeline_history ended up
     # with two run_16_* files for one article, and the later one is not
@@ -3262,7 +3418,19 @@ def run_draft_pipeline(
     # number, and say so rather than silently renumbering.
     run_number = handoff.get("run_number", 1)
     _existing = hist.existing_run_numbers(_history_root(), _history_key(handoff))
-    if run_number in _existing:
+    # A run read from a document repository (--github) may have been made on
+    # another machine or another checkout; local history never saw it, but the
+    # repository's pipeline/run.json (at the round's head and at the base branch)
+    # did. The handoff carries those numbers as taken_run_numbers, and the same
+    # bump moves past them, so run numbers keep counting up across rounds.
+    _existing |= set(handoff.get("taken_run_numbers") or ())
+    if handoff.get("run_number_declared") is False:
+        # The handoff has no 'Pipeline run:' line, and the parser's 1 stands for
+        # "no line" there. Nothing was declared, so there is nothing to warn
+        # about: the run is one past the highest number known, local or taken
+        # (1 when there are none), not 1 unless 1 happens to be taken.
+        run_number = max(_existing, default=0) + 1
+    elif run_number in _existing:
         _next = max(_existing) + 1
         log.warning(
             "Run %d already exists for this article; using %d instead. Update "
@@ -3381,6 +3549,15 @@ def run_draft_pipeline(
             len(broken),
             len(not_archived),
         )
+        # When archive.org's breaker opened, if it did, so Section 9 can tell
+        # whether it has been shut long enough to try again (issue #445).
+        if wayback.note_breaker_state():
+            log.warning(
+                "archive.org rate-limited link validation; its lookups were "
+                "skipped after the breaker opened. Section 9 tries again if "
+                "it starts at least %d min from now.",
+                wayback.BREAKER_COOLDOWN_SECONDS // 60,
+            )
     else:
         # Not checked, rather than checked and empty. An empty list here was
         # indistinguishable from a draft with no links, so every reader took it
@@ -3565,6 +3742,11 @@ def run_draft_pipeline(
     # Pre-load all prompt files before spawning threads (warms the cache)
     for prompt_name in _DOMAIN_PROMPTS.values():
         _load_prompt(prompt_name)
+
+    if not (replay_results or retry_failed_results):
+        _warn_if_draft_already_reviewed(
+            corrected_draft, handoff, handoff_path, publication_name
+        )
 
     # Pass 2: Ensemble model review — built-in domains
     drafting_model = _drafting_model(handoff, pipeline_cfg)
@@ -3997,6 +4179,10 @@ def run_draft_pipeline(
             log_entry["provider_cost_usd"] = result["provider_cost_usd"]
         if result.get("discarded_attempts"):
             log_entry["discarded_attempts"] = result["discarded_attempts"]
+        # A grounded answer that did not parse and was reformatted with search
+        # off. Its tokens are already in `tokens`; this says they are there.
+        if result.get("json_repair"):
+            log_entry["json_repair"] = result["json_repair"]
         # How long each stream went silent, before and after real output — the
         # numbers the socket budgets bound. See ci_core.llm.client._StreamTiming.
         if result.get("stream_timing"):
@@ -4320,7 +4506,16 @@ def run_draft_pipeline(
         or (pub_config.get("author_name") or "").strip()
         or None
     )
+    # Same threshold the link pass uses (issue #438). Read here, not reused from
+    # the link block, because that block is skipped under --offline and
+    # link_validation: false while Section 9 still looks snapshots up.
+    wayback_stale_days = pipeline_cfg.get("wayback_snapshot_stale_days")
+    if wayback_stale_days is not None:
+        wayback_stale_days = int(wayback_stale_days)
     if claims:
+        # A breaker the link pass tripped half an hour ago is not a reason for
+        # every citation to go without its archive lookup (issue #445).
+        wayback.reopen_breaker_if_cooled()
         citation_results = resolve_citations(
             claims,
             citation_sources,
@@ -4340,6 +4535,7 @@ def run_draft_pipeline(
             # which carries no metadata at all.
             author=citation_author,
             capture_settings=pipeline_cfg.get("wayback_capture"),
+            stale_days=wayback_stale_days,
             page_cache=page_cache,
         )
         verified_count = sum(
@@ -4357,19 +4553,28 @@ def run_draft_pipeline(
         refuted_count = sum(
             1 for r in citation_results if r.get("verification") == "content_mismatch"
         )
+        # Read in part, claim not found in that part. Counted on its own line
+        # so it is never mistaken for a refutation: the number here is a
+        # reading limit, not a finding.
+        partial_count = sum(
+            1 for r in citation_results if r.get("verification") == "partial_read"
+        )
         log.info(
             "Citations: %d claim(s), %d verified, %d read but NOT supporting "
-            "the claim, %d pointer-only, %d could not be read, %d unresolved",
+            "the claim, %d read in part with the claim not found in the part "
+            "read, %d pointer-only, %d could not be read, %d unresolved",
             len(claims),
             verified_count,
             refuted_count,
+            partial_count,
             pointer_count,
             unverifiable_count,
             len(claims)
             - verified_count
             - pointer_count
             - unverifiable_count
-            - refuted_count,
+            - refuted_count
+            - partial_count,
         )
 
         # Pass 3b — hand each refutation back to the model that asserted it.
@@ -4415,6 +4620,7 @@ def run_draft_pipeline(
                         author=citation_author,
                         capture_settings=pipeline_cfg.get("wayback_capture"),
                         page_cache=page_cache,
+                        stale_days=wayback_stale_days,
                     )
                     citation_reask.attach_source_checks(pending, checked)
                 log.info(
@@ -4435,6 +4641,24 @@ def run_draft_pipeline(
             cache_stats["reused"],
         )
     report["section_9_citations"] = citation_results
+
+    # Every URL in the Sources list, not only the claim citations that resolved.
+    # Pass 3 archives those; this archives the rest (data queries no claim names,
+    # pages the relevance check read as not supporting the claim) and records
+    # the status of every one. Same machinery as --archive-only, without its
+    # CDX second opinion, which is too slow for a full review (#305).
+    # Only when the draft has a citation block, so a draft without one carries no
+    # new field (and the golden report stays as it was).
+    if not offline and pipeline_cfg.get("archive_all_sources", True):
+        source_archive = _archive_remaining_sources(
+            handoff.get("draft") or corrected_draft,
+            citation_results,
+            pre_analysis.get("links"),
+            api_keys,
+            pipeline_cfg.get("wayback_capture"),
+        )
+        if source_archive is not None:
+            report["source_archive"] = source_archive
 
     # One net status per claim, built here and only here: after consolidation
     # (Section 2 is final) and after citation resolution and re-ask (Section 9
@@ -4553,9 +4777,49 @@ def run_draft_pipeline(
             cost_summary["continuation_calls"],
             cost_summary.get("continuation_usd", 0.0),
         )
+    _warn_about_unmetered_refusals(report)
 
     # Attach pre-analysis
     report["pre_analysis"] = pre_analysis
+    # How many archive.org lookups the run asked for and how many it answered
+    # itself. The number that matters is `live`: it is what archive.org saw,
+    # and what the circuit breaker counts against.
+    report["wayback_lookups"] = wayback.lookup_cache_summary()
+    wayback.close_lookup_cache()
+    # Only when the breaker opened, so a run archive.org never refused carries
+    # no new field (and the golden report stays as it was).
+    breaker = wayback.breaker_summary()
+    if breaker:
+        report["wayback_breaker"] = breaker
+    if report["wayback_lookups"]["lookups"]:
+        wl = report["wayback_lookups"]
+        not_sent = (
+            f", {wl['skipped']} not sent because archive.org's rate limit had "
+            f"tripped the circuit breaker"
+            if wl["skipped"]
+            else ""
+        )
+        log.info(
+            "Wayback lookups: %d asked, %d sent to archive.org, %d answered from "
+            "this run, %d from earlier runs%s",
+            wl["lookups"],
+            wl["live"],
+            wl["run_hits"],
+            wl["store_hits"],
+            not_sent,
+        )
+    # Pages an origin answered 304 for, and the body bytes that saved it.
+    report["page_store"] = page_store_stats()
+    close_page_store()
+    ps = report["page_store"]
+    if ps["stored_hits"] or ps["live"]:
+        log.info(
+            "Page store: %d page(s) unchanged since an earlier run (304, %.1f MB "
+            "not downloaded), %d fetched in full",
+            ps["stored_hits"],
+            ps["bytes_not_downloaded"] / 1_000_000,
+            ps["live"],
+        )
 
     # Fallback warnings
     fallback_warnings = [
@@ -4624,6 +4888,11 @@ def run_draft_pipeline(
         has_prior_run=prior_report is not None,
         citations=report.get("section_9_citations") or (),
     )
+    # Which committed draft this review read, when it came from a document
+    # repository (--github): the repository, the ref, the commit it was pinned
+    # to, the round, and each file's blob SHA.
+    if handoff.get("document_source"):
+        report["document_source"] = handoff["document_source"]
     if gaps:
         report["handoff_gaps"] = gaps
         log.warning(
@@ -4693,6 +4962,21 @@ def run_draft_pipeline(
         markdown_path=paths.get("markdown_path"),
         worklist_path=paths.get("worklist_path"),
     )
+
+    if write_back:
+        # Imported here so a run without --write-back never loads the GitHub code.
+        from . import github_writeback
+
+        if not paths["report_path"]:
+            raise github_writeback.GitHubDocumentsError(
+                "The report could not be saved, so there is nothing to write back."
+            )
+        github_writeback.write_back_after_run(
+            paths["report_path"],
+            settings=normalize_github_documents(config.get("github_documents")),
+            api_keys=api_keys,
+            config_dir=config_dir,
+        )
 
     return report
 
@@ -5434,6 +5718,12 @@ def _print_draft_summary(
             )
             print(f"    Claim: {c['claim'][:100]}")
         print("!" * 60)
+    excluded = report.get("contradictions_unsearched_excluded", 0)
+    if excluded:
+        print(
+            f"\n({excluded} more claim(s) were 'unverifiable' only from a model "
+            "that did not search on that call; not counted as contradictions.)"
+        )
 
     # Citation resolution summary
     citations = report.get("section_9_citations", [])
@@ -5451,6 +5741,7 @@ def _print_draft_summary(
             by_disposition[citation_disposition(c)].append(c)
         verified = by_disposition["checksum"]
         refuted = by_disposition["content_mismatch"]
+        partial = by_disposition["partial_read"]
         unverifiable = by_disposition["unverifiable"]
         pointer = by_disposition["pointer"]
         # Every citation is in exactly one bucket, so this is a true remainder
@@ -5486,9 +5777,10 @@ def _print_draft_summary(
         print(
             f"\nSection 9 — Citations: {len(citations)} claim(s) — "
             f"{len(verified)} verified, {len(refuted)} read but NOT supporting "
-            f"the claim, {len(pointer)} pointer-only (not independently "
-            f"verified), {len(unverifiable)} could not be read, "
-            f"{len(unresolved)} unresolved"
+            f"the claim, {len(partial)} read in part only (claim not found in "
+            f"the part read — a reading limit, not a finding), {len(pointer)} "
+            f"pointer-only (not independently verified), {len(unverifiable)} "
+            f"could not be read, {len(unresolved)} unresolved"
         )
         if resolution_errors:
             timed_out = sum(
@@ -5562,29 +5854,14 @@ def _print_draft_summary(
             print(
                 f"  {len(stale)} resolved URL(s) have a stale Wayback snapshot (>180 days)"
             )
+        # A note, not a warning: every source here was read again this run and
+        # still supports its claim (issue #446; see the report's drift note).
         changed = [c for c in verified if c.get("content_changed_since")]
         if changed:
-            print(f"\n{'!' * 60}")
             print(
-                f"WARNING: {len(changed)} verified source(s) have changed content "
-                "since a prior run checksummed them:"
+                f"  {len(changed)} verified source(s) have changed text since an "
+                "earlier run checksummed them; each still supports its claim."
             )
-            for c in changed:
-                drift = c["content_changed_since"]
-                print(f"  {c.get('url')}")
-                print(
-                    f"    Last matched in run {drift.get('prior_run')} of "
-                    f"'{drift.get('prior_article')}'"
-                    + (
-                        f" on {drift.get('prior_date')}"
-                        if drift.get("prior_date")
-                        else ""
-                    )
-                )
-            print(
-                "Claims previously verified against these sources may need re-checking."
-            )
-            print("!" * 60)
 
     # Section 10 — only on an --expand run. Silence otherwise: a line reading
     # "0 candidates" for a pass nobody asked for is worse than no line.
@@ -5799,6 +6076,13 @@ def run_publish_pipeline(
     log.info(f"Parsing publication handoff: {handoff_path}")
     handoff_text = _read_handoff_file(handoff_path)
     pub_handoff = parse_publication_handoff(handoff_text)
+    if pub_handoff.get("unread_labels"):
+        # Above everything else, including the refusals below: this is the
+        # moment a person is reading, and a refusal is often the symptom.
+        print("\nHANDOFF LINES THAT WERE NOT READ (check the label spelling):")
+        for item in pub_handoff["unread_labels"]:
+            print(f"  - {describe_unread_label(item)}")
+        print()
 
     if not pub_handoff["final_draft"]:
         log.error(
@@ -6003,8 +6287,178 @@ def run_publish_pipeline(
         sys.exit(1)
 
 
+def archive_draft_sources(
+    text,
+    api_keys,
+    capture_settings=None,
+    *,
+    handled=None,
+    known=None,
+    cdx_fallback=True,
+    prior_pending=None,
+):
+    """Archive every URL in ``text``'s citation block; return one entry per URL.
+
+    Returns ``None`` when the text has no citation block, else a list of
+    ``{"marker", "url", "wayback", "source"}`` in citation-block order, one per
+    (marker, URL) pair. ``source`` says where the status came from: ``"claim"``
+    for a URL the full review's Pass 3 already looked up and submitted
+    (``handled``: url -> that citation's ``wayback`` dict, copied, never shared),
+    ``"sources"`` for one this pass looked up and submitted itself.
+
+    ``known`` (url -> ``wayback`` dict) is a lookup already made this run, the
+    link pass's, used instead of asking archive.org again. ``prior_pending`` is
+    passed through to the reconcile step: job ids an earlier archive pass left
+    running that local history does not hold.
+
+    This is the one place both ``--archive-only`` and a full review archive a
+    draft's Sources list. A full review used to archive only claim citations
+    that resolved, and on 2026-11-10 that left 30 of 87 and 28 of 103 cited URLs
+    in two articles without a snapshot: data queries no claim pointed at, pages
+    the relevance check marked ``content_mismatch``, and URLs added after the
+    review ran.
+    """
+    citations = draft_citations.DraftCitations(text or "")
+    if not citations:
+        return None
+    from .adapters.citation.resolver import _submit_missing_archives
+
+    handled = handled or {}
+    known = known or {}
+    targets = [
+        (marker, url)
+        for marker, entry in citations.entries.items()
+        for url in entry["urls"]
+    ]
+    checked = {}
+    for _, url in targets:
+        if url in checked or url in handled:
+            continue
+        prior = known.get(url)
+        if isinstance(prior, dict) and prior.get("archived") is not None:
+            checked[url] = dict(prior)
+        else:
+            checked[url] = wayback.check(url, cdx_fallback=cdx_fallback)
+    results = []
+    to_submit = []
+    for marker, url in targets:
+        if url in handled:
+            results.append(
+                {
+                    "marker": marker,
+                    "url": url,
+                    "wayback": dict(handled[url] or {}),
+                    "source": "claim",
+                }
+            )
+            continue
+        entry = {
+            # ``resolved`` is what the submission pass filters on. Here it means
+            # "a cited URL", which is the whole point of this pass.
+            "resolved": True,
+            "marker": marker,
+            "url": url,
+            "wayback": dict(checked[url]),
+            "source": "sources",
+        }
+        if draft_citations.is_archive_url(url):
+            # The citation is a snapshot: it is the archive, at the date the
+            # author chose. Its age is not staleness, and there is nothing to
+            # capture (the submission pass skips it for the same reason).
+            entry["wayback"].update(
+                archived=True,
+                snapshot_url=url,
+                snapshot_stale=False,
+                cited_snapshot=True,
+            )
+        results.append(entry)
+        to_submit.append(entry)
+    if to_submit:
+        _submit_missing_archives(
+            to_submit,
+            api_keys.get("archive_org"),
+            _history_root(),
+            capture_settings,
+            prior_pending=prior_pending,
+        )
+    # Every entry, the looked-up and the handled ones too: a lookup can return
+    # an old capture of a bot wall just as a new capture can.
+    from .adapters.citation.resolver import demote_off_site_snapshots
+
+    demote_off_site_snapshots(results)
+    return results
+
+
+def _archive_remaining_sources(text, citation_results, links, api_keys, capture):
+    """A full review's archive pass over the Sources list. Returns the
+    ``archive_draft_sources`` entries, or ``None`` when there is no list.
+
+    A URL Pass 3 submitted (a resolved claim citation) keeps the status Pass 3
+    gave it; everything else is looked up (the link pass's answer when it has
+    one) and submitted if missing or stale. Never raises: archiving is a
+    side-duty of a review, and a failure here leaves the report without the
+    field rather than without the review.
+    """
+    handled = {}
+    for r in citation_results or []:
+        if r.get("resolved") and r.get("url") and r["url"] not in handled:
+            handled[r["url"]] = r.get("wayback") or {}
+    known = {
+        entry["url"]: entry["wayback"]
+        for entry in links or []
+        if isinstance(entry, dict) and entry.get("url") and entry.get("wayback")
+    }
+    try:
+        wayback.reopen_breaker_if_cooled()
+        results = archive_draft_sources(
+            text,
+            api_keys,
+            capture,
+            handled=handled,
+            known=known,
+            cdx_fallback=False,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Sources archive pass failed: %s", exc)
+        return None
+    if results:
+        c = archive_status_counts(results)
+        own = sum(1 for r in results if r.get("source") == "sources")
+        log.info(
+            "Sources archive: %d cited URL(s), %d of them beyond the claim "
+            "citations; %d with a fresh snapshot, %d stale only, %d without, "
+            "%d not checked",
+            len(results),
+            own,
+            c["fresh"],
+            c["stale"],
+            c["missing"],
+            c["unchecked"],
+        )
+    return results
+
+
+def archive_status_counts(results):
+    """``{"fresh", "stale", "missing", "unchecked"}`` over ``archive_draft_sources`` results."""
+    counts = {"fresh": 0, "stale": 0, "missing": 0, "unchecked": 0}
+    for entry in results or []:
+        wb = entry.get("wayback") or {}
+        if wb.get("snapshot_url"):
+            counts["stale" if wb.get("snapshot_stale") else "fresh"] += 1
+        elif wb.get("archived") is None:
+            counts["unchecked"] += 1
+        else:
+            counts["missing"] += 1
+    return counts
+
+
 def run_archive_only(
-    draft_path, publication_name, config_dir="configs", api_key_overrides=None
+    draft_path,
+    publication_name,
+    config_dir="configs",
+    api_key_overrides=None,
+    handoff=None,
+    write_back=False,
 ):
     """``--archive-only``: submit/verify Wayback snapshots for a draft's cited
     URLs, with zero model-provider calls.
@@ -6015,47 +6469,27 @@ def run_archive_only(
     there is no flag to isolate one pipeline pass the way ``--only-domain``
     isolates one ensemble domain. This calls the same archiving primitives
     directly instead of reimplementing pacing, dedupe-by-URL, staleness or the
-    outcome bookkeeping — ``wayback.check`` and
-    ``adapters.citation.resolver._submit_missing_archives`` are exactly what
-    Pass 3 calls, just fed synthetic per-URL entries instead of resolved
-    claims, and rendered with ``report_markdown``'s own archive-outcome prose
-    so the wording matches Section 9 exactly rather than a second copy of it.
+    outcome bookkeeping (``archive_draft_sources``, which a full review now
+    calls too), and renders with ``report_markdown``'s own archive-outcome
+    prose so the wording matches Section 9 exactly rather than a second copy
+    of it.
 
-    URLs come from ``adapters.citation.draft_citations.DraftCitations``, read
-    directly off the whole file — the same citation-block parser Pass 3 uses
-    to find a claim's citation, just consulted for every URL in the block
-    instead of only the ones a claim cites.
+    The draft is ``draft_path`` (``--draft``/``--raw-draft``) or, with
+    ``--github``, ``handoff``: the round read from the document repository.
+    With ``write_back`` the per-URL status is committed to the round's branch
+    as ``pipeline/archive.md`` and ``pipeline/archive.json``
+    (``github_archive``), so the drafting side can see which cited URLs still
+    have no snapshot without reading the review's report. Capture jobs still
+    running in the last ``archive.json`` on that branch are asked about first,
+    since local history never held them.
     """
-    text = _read_handoff_file(draft_path)
-    citations = draft_citations.DraftCitations(text)
-    if not citations:
-        print(
-            f"No citation block found in {draft_path} (looked for a heading like "
-            f"'## Sources' / '## Citations' / '## References'). Nothing to archive."
-        )
-        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
-        return
-
-    targets = [
-        (marker, url)
-        for marker, entry in citations.entries.items()
-        for url in entry["urls"]
-    ]
-    if not targets:
-        print(
-            f"The citation block in {draft_path} has {citations.marker_count} "
-            f"entrie(s) but no URLs. Nothing to archive."
-        )
-        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
-        return
-
-    unique_urls = {url for _, url in targets}
-    log.info(
-        "Archive-only: %d citation URL(s) found in %s (%d unique)",
-        len(targets),
-        draft_path,
-        len(unique_urls),
-    )
+    if handoff is not None:
+        text = handoff.get("draft") or ""
+        where = (handoff.get("document_source") or {}).get("commit_sha", "")[:12]
+        where = f"the round at {where}" if where else "the round"
+    else:
+        text = _read_handoff_file(draft_path)
+        where = draft_path
 
     user_config = load_user_config(config_dir)
     pub_config_raw = load_publication_config(publication_name, config_dir)
@@ -6065,11 +6499,12 @@ def run_archive_only(
     api_keys = config["api_keys"]
     capture_settings = config["pipeline"].get("wayback_capture")
 
-    # One check() per unique URL, not per marker — a source cited under two
-    # markers (or twice in one entry) gets checked once and each entry below
-    # gets its own copy of the result, never a shared dict two mutations could
-    # step on.
-    #
+    prior = {}
+    if handoff is not None:
+        from . import github_archive
+
+        prior = github_archive.prior_pending_jobs(handoff, user_config)
+
     # cdx_fallback=True because this mode's whole job is to decide, from this
     # answer, whether to spend a capture request. The availability API alone
     # never lists a warc/revisit record, so a page that has not changed reads
@@ -6077,21 +6512,53 @@ def run_archive_only(
     # 2026-09-28 on one NHTSA PDF). The fallback is slow, up to cdx_timeout per
     # stale or unarchived URL, which is why the full review's own lookups do not
     # use it; see content-intelligence#289 for measuring that before widening it.
-    checked = {url: wayback.check(url, cdx_fallback=True) for url in unique_urls}
-    results = [
-        {"resolved": True, "url": url, "marker": marker, "wayback": dict(checked[url])}
-        for marker, url in targets
-    ]
+    #
+    # The lookup memo is opened too: a URL this mode asked about yesterday, or
+    # a full review did, is answered from the store. A cached negative or stale
+    # answer is taken only if CDX was consulted when it was stored, a fresh
+    # positive from anyone (see wayback_lookup_cache).
+    wayback.reset_rate_limit_state()
+    wayback.open_lookup_cache(
+        _history_root()
+        if config["pipeline"].get("wayback_lookup_cache", True)
+        else None
+    )
+    try:
+        results = archive_draft_sources(
+            text,
+            api_keys,
+            capture_settings,
+            cdx_fallback=True,
+            prior_pending=prior,
+        )
+    finally:
+        lookups = wayback.lookup_cache_summary()
+        wayback.close_lookup_cache()
+    breaker = wayback.breaker_summary()
 
-    from .adapters.citation.resolver import _submit_missing_archives
-
-    _submit_missing_archives(
-        results, api_keys.get("archive_org"), _history_root(), capture_settings
+    if results is None:
+        print(
+            f"No citation block found in {where} (looked for a heading like "
+            f"'## Sources' / '## Citations' / '## References'). Nothing to archive."
+        )
+        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+        return None
+    if not results:
+        print(
+            f"The citation block in {where} has entries but no URLs. "
+            f"Nothing to archive."
+        )
+        print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+        return results
+    log.info(
+        "Archive-only: %d citation URL(s) found in %s (%d unique)",
+        len(results),
+        where,
+        len({r["url"] for r in results}),
     )
 
     from .report_markdown import _render_archive_pair
 
-    fresh = stale = missing = unchecked = 0
     for entry in results:
         print(f"\n[{entry['marker']}]")
         for line in _render_archive_pair(entry):
@@ -6099,46 +6566,75 @@ def run_archive_only(
 
         wb = entry.get("wayback") or {}
         outcome = wb.get("archive_outcome")
-        if wb.get("snapshot_url"):
-            if wb.get("snapshot_stale"):
-                stale += 1
-            else:
-                fresh += 1
+        if wb.get("snapshot_url") and outcome not in (None, wayback.ARCHIVE_ARCHIVED):
             # _render_archive_pair shows a snapshot that exists and stops, so a
             # stale one whose re-capture this run requested and did not get
             # rendered exactly like one nobody asked about. For a mode whose whole
             # job is that request, the outcome is the point. Seen in the first
             # live run: one source printed only its 2024 snapshot flagged STALE,
             # with no trace of what happened to the re-archive.
-            if outcome not in (None, wayback.ARCHIVE_ARCHIVED):
-                label = wayback.ARCHIVE_OUTCOME_LABELS.get(outcome, outcome)
-                detail = wb.get("archive_outcome_detail")
-                print(
-                    f"  - Re-archive attempt: {label}"
-                    f"{f' — {detail}' if detail else ''}. "
-                    f"The snapshot above is the one that exists."
-                )
-        elif wb.get("archived") is None:
-            # The lookup itself did not complete (breaker tripped, archive.org
-            # refused it). That establishes nothing about the page, and the
-            # second live run showed what counting it as "none" does: both
-            # sources printed "NOT CHECKED" above and the summary called them
-            # "0 with a snapshot, 2 with none".
-            unchecked += 1
-        else:
-            missing += 1
+            label = wayback.ARCHIVE_OUTCOME_LABELS.get(outcome, outcome)
+            detail = wb.get("archive_outcome_detail")
+            print(
+                f"  - Re-archive attempt: {label}"
+                f"{f' — {detail}' if detail else ''}. "
+                f"The snapshot above is the one that exists."
+            )
 
+    counts = archive_status_counts(results)
+    # A lookup that did not complete (breaker tripped, archive.org refused it)
+    # establishes nothing about the page, and the second live run showed what
+    # counting it as "none" does: both sources printed "NOT CHECKED" above and
+    # the summary called them "0 with a snapshot, 2 with none".
     not_checked = (
-        f", {unchecked} not checked (the archive.org lookup did not complete, "
-        f"which says nothing about whether they are archived)"
-        if unchecked
+        f", {counts['unchecked']} not checked (the archive.org lookup did not "
+        f"complete, which says nothing about whether they are archived)"
+        if counts["unchecked"]
         else ""
     )
     print(
-        f"\n{len(results)} citation URL(s): {fresh} with a fresh Wayback snapshot, "
-        f"{stale} with only a stale one, {missing} with none{not_checked}."
+        f"\n{len(results)} citation URL(s): {counts['fresh']} with a fresh Wayback "
+        f"snapshot, {counts['stale']} with only a stale one, {counts['missing']} "
+        f"with none{not_checked}."
     )
+    refused = sum(
+        1
+        for r in results
+        if (r.get("wayback") or {}).get("submission_failure_kind") == "connection"
+    )
+    if refused:
+        print(
+            f"{refused} submission(s) got no answer from archive.org (connection "
+            f"refused or dropped). That is the connection, not archive.org's "
+            f"policy; the rate-limit breaker "
+            f"{'had tripped' if breaker else 'never tripped'} this run."
+        )
+    remembered = lookups["store_hits"]
+    skipped = lookups["skipped"]
+    if remembered or skipped:
+        print(
+            f"{lookups['live']} lookup(s) sent to archive.org; {remembered} answered "
+            f"from earlier runs"
+            + (
+                f"; {skipped} not sent because archive.org's rate limit had "
+                f"tripped the circuit breaker."
+                if skipped
+                else "."
+            )
+        )
+    if write_back and handoff is not None:
+        from . import github_archive
+
+        github_archive.write_archive_status(
+            handoff,
+            results,
+            settings=user_config.get("github_documents"),
+            api_keys=api_keys,
+            breaker=breaker,
+            lookups=lookups,
+        )
     print(f"\nEstimated cost: ${0.0:.4f} (no model calls)")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -6186,6 +6682,66 @@ def build_parser():
         "article body. Skips primary_claim/target_audience/etc.; use --draft "
         "with a full handoff document for full review context, or pair with "
         "--metadata to supply that context from a separate file.",
+    )
+    group.add_argument(
+        "--github",
+        metavar="SLUG",
+        help="Read an article from the GitHub document repository "
+        "(github_documents in user.yaml): the folder SLUG, as it is at the head "
+        "of the article's one open round (an open pull request from a branch "
+        "round/SLUG/rN) unless --pr, --round or --github-ref says otherwise. "
+        "Needs GITHUB_TOKEN or `gh auth login` for a private repository. Not "
+        "combinable with --metadata or --publish.",
+    )
+    github_read = parser.add_mutually_exclusive_group()
+    github_read.add_argument(
+        "--pr",
+        type=int,
+        metavar="N",
+        help="With --github: read pull request N, which must be from a branch "
+        "round/SLUG/rN of the document repository. Use it when the article has "
+        "more than one open round.",
+    )
+    github_read.add_argument(
+        "--round",
+        type=int,
+        metavar="N",
+        help="With --github: read round N: the open pull request from "
+        "round/SLUG/rN if there is one, else the tag SLUG/rN. Only the open "
+        "pull request can be written back to.",
+    )
+    github_read.add_argument(
+        "--github-ref",
+        metavar="REF",
+        help="With --github: read a branch, tag or commit SHA as it is. Never "
+        "written back: a usage error with --write-back.",
+    )
+    parser.add_argument(
+        "--github-repo",
+        metavar="OWNER/NAME",
+        help="With --github: read from this repository instead of "
+        "github_documents.repo, for this run only (a scratch repository, say).",
+    )
+    parser.add_argument(
+        "--write-back",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="With --github: deliver the review to the round's pull request: "
+        "one commit to its branch (review.md, and run.json, report.json and "
+        "worklist.md under pipeline/), then one pull request review with the "
+        "summary and a checklist of the Section 1 findings. --no-write-back "
+        "overrides github_documents.write_back. Not combinable with --replay, "
+        "--offline, --only-model, --only-domain or --no-timeout, which are not "
+        "reviews to hand back, nor with --github-ref, which never writes back. "
+        "If it fails the review is still saved locally; `ci-docs push-run` "
+        "retries it.",
+    )
+    parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="Run --write-back even when this checkout is behind origin/master. "
+        "Without it a write-back from an out-of-date checkout is refused; any "
+        "other run only warns.",
     )
     parser.add_argument(
         "--metadata",
@@ -6298,7 +6854,7 @@ def build_parser():
         help="Fill in the gaps from a prior run: make model calls only for the "
         "(model, domain) pairs marked failed in a run_N_<ts>_results.json, "
         "merging the new attempts onto everything that already succeeded. "
-        "Requires the same draft-loading flags (--draft/--url/--raw-draft) as "
+        "Requires the same draft-loading flags (--draft/--url/--raw-draft/--github) as "
         "the original run, so the same runners and prompts can be rebuilt. "
         "Mutually exclusive with --replay, which makes no model calls at all.",
     )
@@ -6318,12 +6874,79 @@ def build_parser():
         "check-then-submit-if-missing-or-stale machinery Pass 3 uses for a full "
         "review, just run directly against the draft's URLs instead of behind "
         "fact-check claim resolution. Costs nothing in provider terms. Requires "
-        "--draft or --raw-draft; mutually exclusive with --offline.",
+        "--draft, --raw-draft or --github; mutually exclusive with --offline. "
+        "With --github it commits pipeline/archive.md and pipeline/archive.json "
+        "(the status of every cited URL) to the round's branch, unless "
+        "--no-write-back or --github-ref.",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable DEBUG logging"
     )
     return parser
+
+
+#: The flags that make a run something other than a review of the article, and
+#: the words the messages use for them.
+_NOT_A_REVIEW = (
+    ("replay", "--replay"),
+    ("offline", "--offline"),
+    ("only_model", "--only-model"),
+    ("only_domain", "--only-domain"),
+    ("no_timeout", "--no-timeout"),
+)
+
+
+def _write_back_conflicts(args):
+    return [flag for attr, flag in _NOT_A_REVIEW if getattr(args, attr)]
+
+
+def _decide_write_back(args, settings):
+    """Whether this run commits its review back: the flag, else the config.
+
+    A replay, an offline run or a calibration run is not a review to hand back,
+    so config's ``write_back: true`` is set aside for those, with one INFO line;
+    asking for it with the flag was already a usage error.
+    """
+    if args.write_back is not None:
+        return args.write_back
+    if settings["write_back"] is not True:
+        return False
+    if args.github_ref is not None:
+        log.info(
+            "github_documents.write_back is set but not used: --github-ref reads "
+            "a ref as it is and never writes back."
+        )
+        return False
+    conflicts = _write_back_conflicts(args)
+    if conflicts:
+        log.info(
+            "github_documents.write_back is set but not used: %s makes this run "
+            "something other than a review of the article, so nothing is "
+            "written back.",
+            ", ".join(conflicts),
+        )
+        return False
+    return True
+
+
+def _read_github_handoff(args, settings, write_back=False):
+    """Build the handoff for ``--github`` before any model call.
+
+    Imported here, and not at the top, so a run without ``--github`` never
+    imports the GitHub client or looks for a token. With ``write_back`` the
+    read also runs the write-back pre-flight.
+    """
+    from . import github_documents
+
+    return github_documents.load_handoff(
+        args.github,
+        settings=settings,
+        repo=args.github_repo,
+        ref=args.github_ref,
+        round_number=args.round,
+        pull_request=args.pr,
+        write_back=write_back,
+    )
 
 
 def main():
@@ -6338,6 +6961,48 @@ def main():
     if args.metadata and not args.raw_draft:
         parser.error("--metadata requires --raw-draft")
 
+    for flag, value in (
+        ("--pr", args.pr),
+        ("--round", args.round),
+        ("--github-ref", args.github_ref),
+        ("--github-repo", args.github_repo),
+    ):
+        if value is not None and not args.github:
+            parser.error(f"{flag} requires --github")
+    if args.round is not None and args.round < 1:
+        parser.error("--round must be 1 or more")
+    if args.pr is not None and args.pr < 1:
+        parser.error("--pr must be 1 or more")
+    if args.github and args.metadata:
+        parser.error(
+            "--github does not combine with --metadata — a round's "
+            "metadata.md is read from the repository"
+        )
+    if args.write_back is not None and not args.github:
+        parser.error(
+            ("--write-back" if args.write_back else "--no-write-back")
+            + " requires --github"
+        )
+    if args.write_back and args.github_ref is not None:
+        parser.error(
+            "--write-back does not combine with --github-ref — a ref is read as "
+            "it is and never written back; review the round's pull request "
+            "(--pr N, --round N or no flag) to write the review to it"
+        )
+    if args.write_back:
+        for flag in _write_back_conflicts(args):
+            parser.error(
+                f"--write-back does not combine with {flag} — that is not a "
+                "review of the article to hand back"
+            )
+
+    if not checkout_freshness.enforce(
+        refuse=bool(args.write_back),
+        allow_stale=args.allow_stale,
+        err=lambda m: print(m, file=sys.stderr),
+    ):
+        sys.exit(2)
+
     if args.retry_failed and args.replay:
         parser.error(
             "--retry-failed and --replay are mutually exclusive — --replay "
@@ -6347,8 +7012,8 @@ def main():
     if args.retry_failed and args.publish:
         parser.error("--retry-failed only applies to draft review runs, not --publish")
 
-    if args.archive_only and not (args.draft or args.raw_draft):
-        parser.error("--archive-only requires --draft or --raw-draft")
+    if args.archive_only and not (args.draft or args.raw_draft or args.github):
+        parser.error("--archive-only requires --draft, --raw-draft or --github")
     if args.archive_only and args.offline:
         parser.error(
             "--archive-only and --offline are mutually exclusive — archive-only's "
@@ -6391,7 +7056,25 @@ def main():
         sys.exit(1)
 
     try:
-        if args.archive_only:
+        if args.archive_only and args.github:
+            # Writes the archive status back unless told not to, or reading a
+            # ref, which is never written to. Not github_documents.write_back:
+            # that setting is about reviews, and a status file the pass does
+            # not write is the gap this mode exists to close.
+            write_back = args.write_back is not False and args.github_ref is None
+            settings = normalize_github_documents(
+                load_user_config(args.config_dir).get("github_documents")
+            )
+            handoff = _read_github_handoff(args, settings, write_back)
+            run_archive_only(
+                None,
+                args.publication,
+                config_dir=args.config_dir,
+                api_key_overrides=api_key_overrides,
+                handoff=handoff,
+                write_back=write_back,
+            )
+        elif args.archive_only:
             run_archive_only(
                 args.draft or args.raw_draft,
                 args.publication,
@@ -6458,6 +7141,29 @@ def main():
                 offline=args.offline,
                 handoff=handoff,
                 api_key_overrides=api_key_overrides,
+            )
+        elif args.github:
+            settings = normalize_github_documents(
+                load_user_config(args.config_dir).get("github_documents")
+            )
+            write_back = _decide_write_back(args, settings)
+            handoff = _read_github_handoff(args, settings, write_back)
+            run_draft_pipeline(
+                None,
+                args.publication,
+                config_dir=args.config_dir,
+                cost_preset=args.cost_preset,
+                no_timeout=args.no_timeout,
+                only_model=args.only_model,
+                only_domain=args.only_domain,
+                expand=args.expand,
+                seo_suggestions=False if args.no_seo_suggestions else None,
+                replay_results=args.replay,
+                retry_failed_results=args.retry_failed,
+                offline=args.offline,
+                handoff=handoff,
+                api_key_overrides=api_key_overrides,
+                write_back=write_back,
             )
         elif args.publish:
             run_publish_pipeline(

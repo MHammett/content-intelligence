@@ -308,6 +308,66 @@ _JSON_OBJECT_PROVIDERS = frozenset({"grok", "mistral"})
 # weakness the citation tiers exist to expose.
 _WEB_SEARCH_PROVIDERS = frozenset({"grok", "claude"})
 
+#: Anthropic's web search server tool, sent directly when the config names a
+#: search count. ``web_search_options`` is the portable spelling, and litellm
+#: turns it into this same tool -- but it sets the tool's ``max_uses`` from
+#: ``search_context_size`` through a three-entry table (low 1, medium 5, high
+#: 10; ``ANTHROPIC_WEB_SEARCH_TOOL_MAX_USES`` in litellm's constants). So the
+#: "context size" was a search ceiling of 5 by default, and in a ``maximum``
+#: fact_check over ~260 claims the model used all five and wrote "search
+#: budget exhausted" against the rest (issue #444). ``search_max_uses`` sends
+#: the tool with the count it names, bounded by nothing but the config.
+#:
+#: The dated type matters: this is the tool the 2026-09-18 measurement ran on
+#: (the ``web_search_20260209`` dynamic-filtering variant cost +41% and found
+#: less at this workload; the memory note "claude dynamic-filtering web search
+#: measured" has the numbers). litellm passes any ``web_search_*`` type and its
+#: extra keys through to Anthropic unchanged (``_map_tool_helper``, hosted
+#: tools), and reports its searches in ``usage.server_tool_use`` the same way.
+_CLAUDE_WEB_SEARCH_TOOL = "web_search_20250305"
+
+_search_max_uses_warnings_given: set = set()
+
+
+def _search_max_uses(provider, cfg):
+    """The ``search_max_uses`` the config asks for, or 0 when the portable
+    ``web_search_options`` form should be sent instead.
+
+    Only claude has a server tool to carry it; grok's search goes through
+    ``web_search_options`` alone, so the key is ignored there, with one
+    warning per process so a config that expects it to bite finds out.
+    """
+    raw = (cfg or {}).get("search_max_uses")
+    if raw in (None, ""):
+        return 0
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        count = 0
+    if count < 1:
+        if ("invalid", provider) not in _search_max_uses_warnings_given:
+            _search_max_uses_warnings_given.add(("invalid", provider))
+            log.warning(
+                "models.%s.search_max_uses is %r; it must be a whole number of "
+                "searches, 1 or more. Sending web_search_options instead.",
+                provider,
+                raw,
+            )
+        return 0
+    if provider != "claude":
+        if ("unsupported", provider) not in _search_max_uses_warnings_given:
+            _search_max_uses_warnings_given.add(("unsupported", provider))
+            log.warning(
+                "models.%s.search_max_uses is set, but only claude's search "
+                "takes a count; %s searches through web_search_options, where "
+                "search_context_size is the only control. Ignored.",
+                provider,
+                provider,
+            )
+        return 0
+    return count
+
+
 # ...except that Mistral's adapter treated response_format as incompatible with
 # reasoning mode and sent one or the other, never both. A live check on
 # 2026-08-16 found the combination now succeeds, so that may no longer hold —
@@ -841,9 +901,62 @@ class MalformedJSONError(Exception):
     at all.
     """
 
-    def __init__(self, assembled):
+    def __init__(self, assembled, retryable=True):
         super().__init__("malformed JSON response")
         self.assembled = assembled
+        # False once a repair has been tried: a fresh attempt would repeat
+        # every search the first one ran (see ``_REPAIRABLE_PROVIDERS``).
+        self.retryable = retryable
+
+
+#: Providers whose search can be left off a request, so an answer that searched
+#: and then failed to parse is reformatted by a call with no search instead of
+#: being asked again from scratch. A fresh attempt runs every search again and
+#: re-reads all of their results: on 2026-10-29 one malformed
+#: claude:fact_check had searched 20 times over 1,456,437 prompt tokens before
+#: its retry did the same work again (issue #465). Perplexity is absent because
+#: sonar searches on every request; its retry costs one request fee.
+#: openai, claude and grok drop search with the ``web_search`` key; gemini
+#: attaches its search tool to every request that carries its reasoning
+#: parameters, so its repair is sent without them.
+_REPAIRABLE_PROVIDERS = frozenset({"claude", "openai", "grok", "gemini"})
+
+#: Config keys that turn on or size a search, removed from a repair's config.
+_SEARCH_CONFIG_KEYS = ("web_search", "search_max_uses", "search_context_size")
+
+_JSON_REPAIR_SYSTEM = (
+    "You repair malformed JSON. You are given the instructions a model was "
+    "answering and the answer it wrote, which did not parse as JSON. Return "
+    "that answer as one valid JSON object in the shape the instructions ask "
+    "for. Keep every item, claim, source, URL and wording exactly as written: "
+    "do not add, drop, merge, re-judge or re-check anything. If the answer "
+    "stops part-way, end the JSON after the last complete item. Output only "
+    "the JSON object, with no prose and no code fences."
+)
+
+
+def _repair_prompt(system_prompt, content):
+    """The user prompt for a repair: the original instructions, then the answer.
+
+    The draft is left out. The repair reformats what the model already wrote;
+    it has no need of the article, which is most of the original prompt.
+    """
+    return (
+        "<instructions>\n"
+        f"{system_prompt}\n"
+        "</instructions>\n\n"
+        "<answer>\n"
+        f"{content}\n"
+        "</answer>"
+    )
+
+
+def _add_tokens(tokens, more):
+    """``tokens`` with ``more`` added key by key, as a new dict."""
+    out = dict(tokens)
+    for key, value in (more or {}).items():
+        out[key] = out.get(key, 0) + (value or 0)
+    return out
 
 
 def _close_stream(stream):
@@ -1338,9 +1451,22 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
     # time it arrives it is a plain bool. Only fact_check has any use for it,
     # and every search bills.
     if provider in _WEB_SEARCH_PROVIDERS and (cfg or {}).get("web_search"):
-        params["web_search_options"] = {
-            "search_context_size": cfg.get("search_context_size", "medium")
-        }
+        max_uses = _search_max_uses(provider, cfg)
+        if max_uses:
+            # The server tool itself, with the count the config asked for.
+            # Never beside web_search_options: litellm turns that into a second
+            # web_search tool and both reach the wire (issue #444).
+            params["tools"] = [
+                {
+                    "type": _CLAUDE_WEB_SEARCH_TOOL,
+                    "name": "web_search",
+                    "max_uses": max_uses,
+                }
+            ]
+        else:
+            params["web_search_options"] = {
+                "search_context_size": cfg.get("search_context_size", "medium")
+            }
 
     # A schema, where the provider enforces one. Gemini is excluded while
     # grounded — the provider 400s on that combination, and its search matters
@@ -1786,8 +1912,10 @@ def _search_enabled(provider, cfg, params):
 
     Read off what the request carries rather than the provider's name alone:
     gemini's search is a tool that a no-reasoning retry sends without, and
-    claude's and grok's are ``web_search_options``, present only where the
-    config asked for them. Perplexity bills a fee on every sonar request.
+    claude's and grok's are ``web_search_options`` -- or, for claude with a
+    ``search_max_uses``, the ``web_search_*`` server tool itself -- present
+    only where the config asked for them. Perplexity bills a fee on every
+    sonar request.
     """
     if provider == "perplexity":
         return True
@@ -1798,7 +1926,12 @@ def _search_enabled(provider, cfg, params):
             isinstance(tool, dict) and "googleSearch" in tool
             for tool in params.get("tools") or []
         )
-    return "web_search_options" in params
+    if "web_search_options" in params:
+        return True
+    return any(
+        isinstance(tool, dict) and str(tool.get("type", "")).startswith("web_search")
+        for tool in params.get("tools") or []
+    )
 
 
 def _read_searches(provider, assembled, model=""):
@@ -2526,8 +2659,13 @@ def _summarise_discarded(discarded):
     ``searches`` lists each attempt's own count, one entry per attempt that
     could search, rather than their sum: a per-prompt fee bills every attempt
     once, which a total would hide.
+
+    ``tokens`` keeps the cached share too. Dropping it priced every discarded
+    token at the full input rate: on 2026-10-29 a malformed claude:fact_check
+    attempt of 1,456,437 prompt tokens, most of them cache reads, was reported
+    at $7.28 where ~$1.65 was billed (issue #465).
     """
-    prompt = completion = costed = 0
+    prompt = completion = cached = costed = 0
     for attempt in discarded:
         usage = attempt.get("usage")
         if not usage:
@@ -2535,6 +2673,7 @@ def _summarise_discarded(discarded):
         tokens = _read_tokens(usage)
         prompt += tokens.get("prompt", 0)
         completion += tokens.get("completion", 0)
+        cached += tokens.get("cached", 0)
         costed += 1
     summary = {
         "count": len(discarded),
@@ -2542,6 +2681,9 @@ def _summarise_discarded(discarded):
         "reasons": sorted({a.get("reason", "unknown") for a in discarded}),
         "tokens": {"prompt": prompt, "completion": completion},
     }
+    # Only where there was some, so an uncached record keeps the shape it had.
+    if cached:
+        summary["tokens"]["cached"] = cached
     searches = [a["searches"] for a in discarded if "searches" in a]
     if searches:
         summary["searches"] = searches
@@ -2572,8 +2714,8 @@ def _retry_after_seconds(exc):
     return seconds if seconds is not None and seconds >= 0 else None
 
 
-def _retry_wait(exc, retry_delay):
-    """Seconds to wait before the one retry of a request that failed with ``exc``.
+def _retry_wait(exc, retry_delay, attempt=1):
+    """Seconds to wait before retry ``attempt`` of a request that failed with ``exc``.
 
     A rate limit gets a spread, not ``retry_delay``: calls refused together and
     told to wait the same fixed time come back together and are refused again.
@@ -2582,7 +2724,9 @@ def _retry_wait(exc, retry_delay):
     inside one second were one too many for the tier. Told when to come back
     (``Retry-After``), a call waits at least that long, plus up to half a
     ``retry_delay`` so calls told the same number still part; otherwise the delay
-    is jittered from half to one and a half times itself.
+    is jittered from half to one and a half times itself, and grows with each
+    further attempt (``attempt`` 2 waits twice as long as attempt 1), because a
+    second refusal says the window is fuller than the first wait assumed.
 
     Never longer than three ``retry_delay``: the batch's ceiling leaves one
     ``retry_delay`` and 30s of slack for a retry (``pipeline._global_ceiling``),
@@ -2593,14 +2737,37 @@ def _retry_wait(exc, retry_delay):
         return retry_delay
     said = _retry_after_seconds(exc)
     if said is None:
-        wait = retry_delay * random.uniform(0.5, 1.5)
+        wait = retry_delay * max(1, attempt) * random.uniform(0.5, 1.5)
     else:
         wait = said + random.uniform(0, retry_delay * 0.5)
     return min(wait, retry_delay * 3)
 
 
+def _retries_allowed(retry):
+    """How many retries ``retry`` asks for: a bool is one or none, an int is itself.
+
+    ``retry=True`` has always meant "one retry" and still does. A count is for a
+    call cheap enough that a second refusal should not end it: the citation
+    relevance check on mistral-small costs well under a cent and a 429 on its
+    one retry cost the claim its verdict (#389). The count stays small on
+    purpose; the limiter in ``ratelimit`` is what keeps a run from needing it.
+    """
+    if retry is True:
+        return 1
+    if retry is False or retry is None:
+        return 0
+    try:
+        return max(0, int(retry))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _with_retry(fn, retry, retry_delay, label, discarded=None):
-    """Run ``fn``, retrying once on a genuinely transient failure.
+    """Run ``fn``, retrying on a genuinely transient failure.
+
+    ``retry`` is how many times: ``True`` once (the default everywhere), ``False``
+    never, an integer that many (see ``_retries_allowed``). Each retry waits
+    ``_retry_wait``, which honours ``Retry-After`` on a 429.
 
     ``num_retries=0`` is set on the litellm call itself, so this is the only
     retry in the stack. That is deliberate: litellm reports credit exhaustion as
@@ -2625,38 +2792,45 @@ def _with_retry(fn, retry, retry_delay, label, discarded=None):
     succeeded; only the JSON parse failed), so without this branch it would
     never retry.
     """
-    try:
-        return fn()
-    except (StreamStalled, MalformedJSONError) as exc:
-        if not retry:
-            raise
-        _record_discarded(discarded, exc)
-        log.warning(
-            f"{label} {exc.__class__.__name__}. Waiting {retry_delay}s before one retry."
-        )
-        time.sleep(retry_delay)
-        return fn()
-    except Exception as exc:
-        status = _status_of(exc)
-        if not retry or status not in _RETRYABLE_STATUS:
-            raise
-        # Checked against every retryable status, not just 429. An exhausted
-        # account reaches us as a 429 directly, but mid-stream it arrives
-        # wrapped in MidStreamFallbackError, which synthesises 503 — same dead
-        # wallet, different number. The test is what the provider said, not
-        # which status code the wrapper picked.
-        if _is_terminal_quota_error(exc):
-            log.error(
-                f"{label} reported HTTP {status}, but the account is exhausted. "
-                f"Not retrying — a wait will not refill it."
+    allowed = _retries_allowed(retry)
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except (StreamStalled, MalformedJSONError) as exc:
+            if attempt >= allowed or not getattr(exc, "retryable", True):
+                raise
+            attempt += 1
+            _record_discarded(discarded, exc)
+            log.warning(
+                f"{label} {exc.__class__.__name__}. Waiting {retry_delay}s before "
+                f"retry {attempt} of {allowed}."
             )
-            raise
-        _record_discarded(discarded, exc)
-        wait = _retry_wait(exc, retry_delay)
-        shown = retry_delay if wait == retry_delay else f"{wait:.1f}"
-        log.warning(f"{label} HTTP {status}. Waiting {shown}s before one retry.")
-        time.sleep(wait)
-        return fn()
+            time.sleep(retry_delay)
+        except Exception as exc:
+            status = _status_of(exc)
+            if attempt >= allowed or status not in _RETRYABLE_STATUS:
+                raise
+            # Checked against every retryable status, not just 429. An
+            # exhausted account reaches us as a 429 directly, but mid-stream it
+            # arrives wrapped in MidStreamFallbackError, which synthesises 503
+            # — same dead wallet, different number. The test is what the
+            # provider said, not which status code the wrapper picked.
+            if _is_terminal_quota_error(exc):
+                log.error(
+                    f"{label} reported HTTP {status}, but the account is exhausted. "
+                    f"Not retrying — a wait will not refill it."
+                )
+                raise
+            attempt += 1
+            _record_discarded(discarded, exc)
+            wait = _retry_wait(exc, retry_delay, attempt)
+            shown = retry_delay if wait == retry_delay else f"{wait:.1f}"
+            log.warning(
+                f"{label} HTTP {status}. Waiting {shown}s before retry {attempt} "
+                f"of {allowed}."
+            )
+            time.sleep(wait)
 
 
 def _is_reasoning_param_error(body_text):
@@ -2726,7 +2900,9 @@ def _attempt(
         # wait is ours, not the provider's, and must not count as a first-byte
         # silence. A no-op, returning None, where no limit is set.
         ticket = ratelimit.reserve(
-            provider, ratelimit.estimate_tokens(system_prompt, user_prompt)
+            provider,
+            ratelimit.estimate_tokens(system_prompt, user_prompt),
+            model=model,
         )
         # Started before litellm is called, so no wait for the provider goes
         # unmeasured — including the one inside completion() itself, which is
@@ -2747,7 +2923,9 @@ def _attempt(
             if _status_of(exc) == 429:
                 ratelimit.release(ticket)
                 # And take it as the provider's word that the window is full.
-                ratelimit.note_refused(provider)
+                # Counted whether or not a limit is set: the end of the run
+                # warns about a provider that refused calls with none.
+                ratelimit.note_refused(provider, model=model)
             raise
         used = _read_tokens(assembled.get("usage"))
         ratelimit.settle(ticket, used["prompt"], used["completion"])
@@ -2909,10 +3087,71 @@ def _attempt(
         assembled = _invoke()
         parsed, truncated = extract_json_with_salvage(assembled["content"])
         if parsed is None:
-            raise MalformedJSONError(assembled)
+            if not _should_repair(assembled):
+                raise MalformedJSONError(assembled)
+            repaired = _repair(assembled)
+            repairs.append(repaired)
+            if repaired.get("failed"):
+                raise MalformedJSONError(assembled, retryable=False)
+            return assembled, repaired["data"], bool(repaired.get("truncated"))
         return assembled, parsed, truncated
 
+    def _should_repair(assembled):
+        # Only an answer that searched: one that did not repeats nothing on a
+        # retry, and an empty answer has nothing to reformat.
+        return (
+            searchable
+            and provider in _REPAIRABLE_PROVIDERS
+            and bool(assembled.get("searches"))
+            and bool((assembled.get("content") or "").strip())
+        )
+
+    def _repair(assembled):
+        repair_cfg = {
+            k: v for k, v in (cfg or {}).items() if k not in _SEARCH_CONFIG_KEYS
+        }
+        log.warning(
+            f"{label} answer did not parse after {assembled['searches']} "
+            f"search(es); reformatting it with search off instead of searching "
+            f"again."
+        )
+        return _attempt(
+            provider,
+            model,
+            _JSON_REPAIR_SYSTEM,
+            _repair_prompt(system_prompt, assembled["content"]),
+            api_key,
+            repair_cfg,
+            timeout,
+            False,
+            retry_delay,
+            with_reasoning=provider != "gemini",
+            response_schema=response_schema,
+        )
+
+    def _repair_field():
+        # What the repair cost, beside the tokens it is already summed into, so
+        # a reader can tell the answer was reformatted and by how much.
+        if not repairs:
+            return {}
+        last = repairs[-1]
+        return {
+            "json_repair": {
+                "failed": bool(last.get("failed")),
+                "tokens": last.get("tokens") or {},
+                "elapsed_seconds": last.get("elapsed_seconds"),
+            }
+        }
+
+    def _plus_repairs(tokens):
+        # Same model, same rates, no search: the repair is billed like more of
+        # this call's own tokens.
+        for repaired in repairs:
+            tokens = _add_tokens(tokens, repaired.get("tokens"))
+        return tokens
+
     discarded = []
+    repairs = []
     try:
         assembled, parsed, truncated = _with_retry(
             _invoke_and_parse, retry, retry_delay, label, discarded
@@ -2921,7 +3160,7 @@ def _attempt(
         elapsed = round(time.monotonic() - t0, 2)
         assembled = exc.assembled
         content = assembled["content"]
-        tokens = _read_tokens(assembled["usage"])
+        tokens = _plus_repairs(_read_tokens(assembled["usage"]))
         hit_ceiling = assembled["finish_reason"] == "length"
         log.warning(
             f"{label} returned non-JSON content after {elapsed}s"
@@ -2944,6 +3183,7 @@ def _attempt(
             # most expensive outcome — two full attempts, no usable result —
             # as the one the cost summary still could not see.
             **_discarded_field(discarded),
+            **_repair_field(),
             **_stream_timing_field(streams),
         }
     except Exception as exc:
@@ -2977,8 +3217,9 @@ def _attempt(
         }
 
     elapsed = round(time.monotonic() - t0, 2)
-    content = assembled["content"]
-    tokens = _read_tokens(assembled["usage"])
+    # A repaired answer's text is the repair's: the original did not parse.
+    content = repairs[-1]["raw"] if repairs else assembled["content"]
+    tokens = _plus_repairs(_read_tokens(assembled["usage"]))
     extras = _extras_from(assembled)
 
     # finish_reason="length" means the ceiling cut the response off even when
@@ -3021,6 +3262,7 @@ def _attempt(
     # threw away and replaced. Kept separate from ``tokens`` so the successful
     # call's own numbers stay honest; cost accounting adds them.
     result.update(_discarded_field(discarded))
+    result.update(_repair_field())
     result.update(_stream_timing_field(streams))
     return result
 
@@ -3057,7 +3299,8 @@ def call(
 
     Walks the fallback chain on capacity errors, except on Azure (see
     ``ROUTES``), and retries once without reasoning parameters when a model
-    rejects them.
+    rejects them. ``retry`` is a bool (one retry or none) or a count; see
+    ``_with_retry``.
     """
     if provider not in _PROVIDERS:
         raise KeyError(

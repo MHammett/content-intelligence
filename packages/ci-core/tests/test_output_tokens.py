@@ -10,7 +10,7 @@ Two more findings reshaped it on 2026-10-24. The answer term stopped growing at
 the size table's 1.8x while fact_check's output did not: on a 190,170-char
 draft at `maximum`, mistral:fact_check wrote 154 `confirmed` entries (109,656
 chars of JSON) and hit its 50,000 ceiling before any other bucket, so the
-answer term is now also a line through the origin (0.25 tokens per character)
+answer term is now also a line through the origin (0.25, then 0.35 from 2026-11-10, tokens per character)
 and the larger of the two wins. And a no-effort pass kept client.py's flat
 8000, which cut claude-haiku-4-5:argument_integrity off at exactly 8000 tokens
 twice at `wide` (2026-09-28, 2026-10-04; 38,021 chars of flags written), so
@@ -71,7 +71,7 @@ class TestFormula:
         term is the table's figure exactly; nothing under that size moved when
         the line was added."""
         cfg = ot._CONFIG
-        for chars in (6000, 18167, 27113, 62000):
+        for chars in (6000, 18167, 27113, 38000):
             expected = cfg["reasoning_tokens"]["high"] + cfg["answer_tokens"][
                 "fact_check"
             ] * _size_mult(chars)
@@ -247,6 +247,20 @@ class TestTheAnswerGrowsWithTheDraft:
             got = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", chars)
             assert got == pytest.approx(32000 + rate * chars, abs=1), chars
 
+    def test_issue_476_mid_size_draft_gets_room_past_the_cut(self):
+        """mistral:fact_check on a 73,793-char draft at `maximum` was sent
+        50,449 and finished `length` at exactly that, in `confirmed`, after 166
+        entries (2026-10-28, brockovich-fact-check run 2). Rates of 193-304
+        tokens an entry put a finished ~200-entry pass at 47,000-61,000. The
+        largest finished pass on record is 47,309 (81,404 chars, ceiling 54,400)."""
+        cut = ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", 73793)
+        assert cut >= 57000, cut
+        assert cut > 50449
+        assert (
+            ot.compute_max_tokens("mistral", MISTRAL_HIGH, "fact_check", 81404)
+            >= 1.25 * 47309
+        )
+
     def test_the_line_only_ever_lifts(self):
         """Whichever term is larger wins, so adding the line lowered nothing."""
         for chars in (500, 2182, 27113, 62000, 135514, 190170):
@@ -315,7 +329,7 @@ class TestNoEffortPassesAreCapped:
             "mistral", {"model": "mistral-small-latest"}, "fact_check", 190170
         )
         assert large > small
-        assert large >= 0.25 * 190170, "the per-character line applies here too"
+        assert large >= 0.35 * 190170, "the per-character line applies here too"
 
     def test_a_thinking_budget_stands_in_for_the_reasoning_term(self):
         """The client sends the budget in place of any effort, and the thinking
@@ -426,6 +440,33 @@ class TestAnUnsetEffortIsTheModelsDefault:
             ) == tm.compute_budget(
                 chars, "claude", {"model": model, "effort": "high"}, CEILING
             ), (model, chars)
+
+    def test_every_priced_claude_model_is_classified(self):
+        """Issue #263: a Claude model added to pricing.yaml must be put on one
+        side of the line, or this fails. Thinks-by-default models belong in
+        _EFFORT_WHEN_UNSET; the rest in THINK_WHEN_ASKED above. A model on
+        neither is billed for thinking the output ceiling does not know about.
+        """
+        from ci_core.llm import cost
+
+        by_default = set(ot._EFFORT_WHEN_UNSET["claude"])
+        when_asked = set(self.THINK_WHEN_ASKED)
+        priced = {m for m in cost._PRICING if m.startswith("claude-")}
+        assert not by_default & when_asked, by_default & when_asked
+        assert priced - by_default - when_asked == set(), (
+            "classify these in _EFFORT_WHEN_UNSET or THINK_WHEN_ASKED, from "
+            "platform.claude.com/docs/en/build-with-claude/effort"
+        )
+
+    def test_unset_effort_is_the_documented_default_per_model(self):
+        """Opus 5.5 and Haiku 5.5 default to medium, the rest to high (effort
+        docs); the ceiling is sized from this value, so a wrong one misprices."""
+        got = {
+            m: ot.effort_when_unset("claude", m)
+            for m in ot._EFFORT_WHEN_UNSET["claude"]
+        }
+        assert got["claude-opus-5-5"] == got["claude-haiku-5-5"] == "medium"
+        assert got["claude-sonnet-5-5"] == got["claude-opus-5"] == "high"
 
     def test_litellms_model_map_cannot_tell_the_two_kinds_apart(self):
         """Why this is a list and not a map lookup: claude-opus-5 thinks by

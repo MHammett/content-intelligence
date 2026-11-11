@@ -348,6 +348,40 @@ def _load_prior_reports(history_root, history_key, before_ts=None):
     return loaded
 
 
+def prior_runs_of_this_draft(draft_text, history_root, history_key):
+    """Earlier runs of this article whose draft is the same as ``draft_text``.
+
+    For the warning a run gives before it spends the ensemble on a draft that
+    was already reviewed (issue #454). Matched by ``draft_fingerprint``, so a
+    draft that differs only in whitespace counts as the same one, exactly as it
+    does for the reproducibility comparison.
+
+    Returns a list of dicts, newest first: ``report`` (path), ``results`` (the
+    run's ensemble capture beside it, or None when it is gone), ``run_number``,
+    ``cost_preset`` and ``total_usd``. Empty when the draft is new, when history
+    cannot be read, or when ``draft_text`` is empty.
+    """
+    fingerprint = draft_fingerprint(draft_text)
+    if fingerprint is None:
+        return []
+    matches = []
+    for _timestamp, path, prior in _load_prior_reports(history_root, history_key):
+        if draft_fingerprint(prior.get("corrected_draft")) != fingerprint:
+            continue
+        results = path.with_name(path.name.replace("_report.json", "_results.json"))
+        matches.append(
+            {
+                "report": path,
+                "results": results if results.is_file() else None,
+                "run_number": prior.get("run_number"),
+                "cost_preset": (prior.get("ensemble") or {}).get("cost_preset"),
+                "total_usd": (prior.get("cost_summary") or {}).get("total_usd"),
+            }
+        )
+    matches.reverse()
+    return matches
+
+
 def comparable_runs(report, history_root, history_key, before_ts=None):
     """Split this article's history into runs comparable to ``report``, and not.
 

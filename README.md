@@ -379,7 +379,7 @@ Two things it does deliberately:
 
 6. Repeat until the findings are ones you're content to ship, then publish with `--publish`.
 
-**Drafting in a separate chat project?** When the article changes hands between that project and a Code session, write the hand-off from `handoff_templates/close_out.md` (Template D) instead of free-hand: settled edits as exact find-and-replace text, decisions kept apart from edits, and a check that the Drive folder and the pipeline's `History key` name the same article. See [docs/CLOSE-OUT.md](docs/CLOSE-OUT.md).
+**Drafting in a separate chat project?** When the article changes hands between that project and a Code session, write the hand-off from `handoff_templates/close_out.md` (Template D) instead of free-hand: settled edits as exact find-and-replace text, decisions kept apart from edits, and a check that the Drive folder and the pipeline's `History key` name the same article. See [docs/CLOSE-OUT.md](docs/CLOSE-OUT.md). The files can also go through a private GitHub repository instead of Drive and paste: the chat project commits a draft to a branch and opens a pull request, `ci-review --github SLUG` reads it and commits the review back to the branch, a Code session puts a close-out note on the branch with `ci-docs put`, and the chat merges the pull request when the author says so (the merge is tagged for you). See [The document repository](#the-document-repository-ci-docs) and [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md).
 
 `--raw-draft` on its own works too — it just uses the whole file as the article body and skips the metadata context, which means the review models lose the author-supplied framing. Pair it with `--metadata` whenever you have that context to give.
 
@@ -521,13 +521,20 @@ It is a suggestion report only. Nothing is written to `pipeline_history/` or to 
 uv run ci-review --draft HANDOFF --publication NAME [options]
 ```
 
-Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required — they are mutually exclusive.
+Exactly one of `--draft`, `--raw-draft`, `--url`, `--github`, or `--publish` is required — they are mutually exclusive.
 
 | Flag | Purpose |
 |---|---|
 | `--draft PATH` | Run the review pipeline on a draft handoff document |
 | `--raw-draft PATH` | Run on a plain article file with no handoff headers (e.g. pasted straight out of a chat session) — the whole file becomes the article body |
 | `--url URL` | Fetch a published web page and run the review on its extracted content |
+| `--github SLUG` | Read the article folder `SLUG` from the GitHub document repository (`github_documents` in `user.yaml`) at the head of the article's one open round (an open pull request from a branch `round/SLUG/rN`) unless `--pr`, `--round` or `--github-ref` says otherwise. See [Reading a draft from GitHub](#reading-a-draft-from-github). Not combinable with `--metadata`. |
+| `--pr N` | With `--github`: read pull request `N`, which must be from a branch `round/SLUG/rN` of the document repository. Use it when the article has more than one open round. |
+| `--round N` | With `--github`: read round `N`: the open pull request from `round/SLUG/rN` if there is one, else the tag `SLUG/rN`. Only the open pull request can be written back to. |
+| `--github-ref REF` | With `--github`: read a branch, tag or commit SHA as it is. Never written back: a usage error with `--write-back`. |
+| `--github-repo OWNER/NAME` | With `--github`: read from this repository instead of `github_documents.repo`, for this run only |
+| `--write-back` / `--no-write-back` | With `--github`: deliver the review to the round's pull request (a commit to its branch and one pull request review), or don't, overriding `github_documents.write_back`. A usage error without `--github`, and `--write-back` is one with `--replay`, `--offline`, `--only-model`, `--only-domain`, `--no-timeout` or `--github-ref`. See [Writing the review back](#writing-the-review-back-to-github) |
+| `--allow-stale` | Run `--write-back` although this checkout is behind `origin/master`. Every run prints how many commits it lacks (after a `git fetch`); a `--write-back` from an out-of-date checkout is refused without this flag. Nothing is checked when git, `origin` or a checkout is missing |
 | `--publish PATH` | Publish an approved publication handoff (saves as draft unless `--publish-live`) |
 | `--metadata PATH` | Metadata-only file (PRIMARY CLAIM, TARGET AUDIENCE, etc., no DRAFT section) to pair with `--raw-draft`. Requires `--raw-draft`. |
 | `--publication NAME` | Publication config to use (`configs/NAME.yaml`) — **required** |
@@ -540,8 +547,8 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--wp-password APPLICATION_PASSWORD` | Override the WordPress application password for this run only (`--publish` mode). |
 | `--expand` | Add the **expansion pass**: a sixth review domain that proposes additional sources, topics, angles and data fitting the draft's existing primary claim, instead of judging what is already there. Its output is SECTION 10, and every URL it proposes is fetched and marked resolved or not. Off by default — it costs extra model calls, and it earns them early in a draft rather than on a final revision. See [Expansion pass](#expansion-pass). |
 | `--no-seo-suggestions` | Skip both SEO model calls for this run — the [metadata suggestions](docs/CONFIGURATION.md#seo-suggestions) (focus keyword candidates, meta description, OG title, OG description, schema type) and the [structure review](docs/CONFIGURATION.md#seo-structure-review). Deterministic on-page checks still run. Permanent off: `seo_rules.suggestions` / `seo_rules.content_review`. |
-| `--retry-failed RESULTS_JSON` | Fill in the gaps from a prior run: make model calls only for the (model, domain) pairs marked failed in a `run_N_results.json`, merging the new attempts onto everything that already succeeded. Requires the same draft-loading flags (`--draft`/`--url`/`--raw-draft`) as the original run. Mutually exclusive with `--replay`, which makes no model calls at all. |
-| `--archive-only` | Submit/verify Wayback snapshots for every URL in the draft's own citation block, then exit — zero model-provider calls, only HTTP to archive.org. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`. See [Archiving citations without the rest of the pipeline](#archiving-citations-without-the-rest-of-the-pipeline). |
+| `--retry-failed RESULTS_JSON` | Fill in the gaps from a prior run: make model calls only for the (model, domain) pairs marked failed in a `run_N_results.json`, merging the new attempts onto everything that already succeeded. Requires the same draft-loading flags (`--draft`/`--url`/`--raw-draft`/`--github`) as the original run. Mutually exclusive with `--replay`, which makes no model calls at all. |
+| `--archive-only` | Submit/verify Wayback snapshots for every URL in the draft's own citation block, then exit — zero model-provider calls, only HTTP to archive.org. Requires `--draft`, `--raw-draft` or `--github`; mutually exclusive with `--offline`. With `--github` it commits `pipeline/archive.md` and `pipeline/archive.json` to the round's branch unless `--no-write-back` or `--github-ref`. See [Archiving citations without the rest of the pipeline](#archiving-citations-without-the-rest-of-the-pipeline). |
 | `--verbose`, `-v` | DEBUG logging |
 
 **Calibration flags** (for measuring/tuning timeouts — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#wall-clock-backstop-is-automatic-sliding-scale)):
@@ -553,6 +560,79 @@ Exactly one of `--draft`, `--raw-draft`, `--url`, or `--publish` is required —
 | `--only-domain DOMAIN` | Run only one domain (`fact_check`, `voice_style`, `completeness`, `argument_integrity`, `red_team`, or `expansion` with `--expand`) |
 | `--replay RESULTS_JSON` | Replay a captured ensemble instead of calling any models — free |
 | `--offline` | Skip every pass that reaches the network (LanguageTool grammar, link validation, Wayback, citation resolution, the SEO model calls) |
+
+### Reading a draft from GitHub
+
+`--github SLUG` reads a draft from a separate GitHub repository instead of a local file, so the drafting side and the review share one versioned copy. It is additive: `--draft`, `--raw-draft`, `--url` and the Drive-and-paste workflow work exactly as before, and a run without `--github` never imports the GitHub client or looks for a token.
+
+A round is a branch `round/<slug>/rN` with an open pull request into the base branch; an accepted round is tagged `<slug>/rN`. Each article is a folder named by its slug, under `path_prefix` (default `articles`), with fixed file names:
+
+```
+articles/<slug>/draft.md       the two-file form: the draft ...
+articles/<slug>/metadata.md    ... and its metadata (read as --raw-draft --metadata reads them)
+articles/<slug>/handoff.md     Template A in one file (read as --draft reads it), when there is no draft.md
+```
+
+```powershell
+uv run ci-review --github my-article --publication your_publication_name
+uv run ci-review --github my-article --round 3 --publication your_publication_name
+uv run ci-review --github my-article --pr 12 --publication your_publication_name
+uv run ci-review --github my-article --github-ref main --publication your_publication_name
+```
+
+- **Which round.** With no flag, the head of the article's one open pull request from a branch `round/<slug>/...`; none open is an error that lists the article's tags, and two open is an error that lists them and asks for `--pr N`. `--pr N` reads that pull request. `--round N` reads the open pull request from `round/<slug>/rN`, else the tag `<slug>/rN`, else lists the rounds that exist. `--github-ref REF` reads any branch, tag or commit as it is. The three are mutually exclusive, and a pull request from a fork is refused. Only an open pull request can be written back to.
+- **Which files.** `draft.md` wins, read with `metadata.md` if present, otherwise as `--raw-draft` reads one, with the same warning about lost context; with a `handoff.md` beside it the run warns that it is stale. A folder with only `handoff.md` is read as Template A. The old per-round names (`<slug>-draft-r4.md`) are not read.
+- **One commit.** The pull request, tag or ref is resolved to a commit SHA once, and every file is read at that SHA, so a draft and its metadata cannot come from two different commits.
+- **History key.** When the handoff has no `History key:`, it is set to the slug, so `pipeline_history/<slug>/` and the document folder are one string. When it has one that is not the slug, the run warns, names both, and keeps the `History key:`, because history is the fixed point.
+- **Run number.** A `Pipeline run:` line in the handoff (or metadata) is used as written. When there is none, the run is one more than the highest run number in local history and in `articles/<slug>/pipeline/run.json` at the commit read and at the base branch (a run made on another machine is known only there), or 1 when there are none. The round is not the run number.
+- **Provenance.** `report.json` gains a `document_source` block: `kind`, `repo`, `ref` (the branch, tag or `REF`), `commit_sha`, `round` (the `N` of the branch or tag), `pull_request`, `base_sha` (the merge base of the pull request's base and the commit read), and each file's `path` and git `blob_sha`.
+- **Offline and replay.** `--offline` still reads from GitHub (the read is the input, as the page fetch is for `--url`); `--replay` and `--retry-failed` work as they do with `--raw-draft`. Nothing is written back to the repository unless you ask for it with `--write-back`, which a replay or an offline run can never do.
+
+Configuration is an optional `github_documents` block in `configs/user.yaml` (commented out in `user.example.yaml`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `repo` | `MHammett/mikehammett.net-articles` | `OWNER/NAME` of the document repository. `--github-repo` overrides it. An empty string is an error. |
+| `branch` | the repository's default branch | The base branch rounds merge into; its head is where `pipeline/run.json` is read for run numbers already taken |
+| `path_prefix` | `articles` | The folder that holds the article folders (empty: the repository root) |
+| `write_back` | `false` | Deliver the review to the round's pull request after every `--github` run, as if `--write-back` were given. `--no-write-back` overrides it; it is set aside, with one INFO line, on a replay, an offline run or a calibration run |
+| `include_capture` | `false` | Also commit the run's raw ensemble as `pipeline/results.json` |
+| `allow_public_repo` | `false` | Let write-back commit to a public repository, where the review and the worklist would be published |
+
+There is no token key. The token is `GITHUB_TOKEN` if set, else the output of `gh auth token`; a fine-grained personal access token limited to the one repository, with Contents read, is the narrowest choice. A public repository needs no token, but the run warns because drafts committed there are published.
+
+Every failure stops the run before a model is called, with one message and exit status 1: an empty `repo`, a private repository and no token (set `GITHUB_TOKEN` or run `gh auth login`), a rejected token (401), a repository that is "missing, or not visible to this token" (GitHub answers 404 for both), a missing article folder (the message lists the article folders that exist), a missing round (it lists the rounds that exist), and an exhausted rate limit (it names the reset time).
+
+### Writing the review back to GitHub
+
+`--write-back` delivers the run's review to the round's pull request, so the drafting side reads it without anybody pasting a file. It is off unless the flag or `write_back: true` turns it on, and it needs `--github` and a round's open pull request.
+
+```powershell
+uv run ci-review --github my-article --write-back --publication your_publication_name
+```
+
+It does two things, in this order. The first is one commit to the pull request's head branch, from run N (the run number the run actually used), under fixed names:
+
+| Local file in `pipeline_history/<key>/` | Path in the document repository |
+|---|---|
+| `run_N_<ts>_review.md` | `<slug>/review.md` |
+| (built from the report) | `<slug>/pipeline/run.json` |
+| `run_N_<ts>_report.json` | `<slug>/pipeline/report.json` |
+| `run_N_<ts>_worklist.md` | `<slug>/pipeline/worklist.md` |
+| `run_N_<ts>_results.json` (only with `include_capture: true`) | `<slug>/pipeline/results.json` |
+
+The paths are relative to `path_prefix`. `run.json` holds `run_number`, `history_key`, `history_name`, `reviewed_commit`, `round`, `pull_request`, `preset` and `cost_reported_usd`, which is how a later run, on any machine, numbers itself past this one. Line endings are converted to LF. The commit message names the draft files and the commit they were read at, the pull request, the run, its preset and reported cost, and the files, and says so when a reviewed draft has since been edited at its own path.
+
+The second is one pull request review (event `COMMENT`, no line comments) of the commit that was read. Its first line is a marker, `<!-- ci-review run=N commit=SHA -->`. The body is the run, preset and cost; the commit reviewed and any edits since; a line saying one run is not a measurement; one line per section with its count of findings; every Section 1 finding as a task, `- [ ] **F3** "the passage": the finding`, where `F3` is the number the finding has in Section 1 of `review.md`; and where the whole review is, with the connector call to read it. **The worklist is never in the body.** It lists documents nobody has read yet, so it is only in `pipeline/worklist.md` and the WORKLIST block that opens `review.md`. A body is cut to 60,000 characters (GitHub's limit is about 65,000): the per-section lines go first, then whole checklist items from the end, and the body says what was cut.
+
+- **Checked before any model call.** A token, push permission on the repository, an open pull request to commit to (a tag, a merged or closed round, a fork, or `--github-ref` is refused), and a private repository unless `allow_public_repo: true`. Each refusal is one message and exit status 1 and costs nothing. The run number also moves past every number in `pipeline/run.json` at the round's head and at the base branch.
+- **Only the pipeline's own files are replaced.** A file that was there at the commit the run reviewed is replaced only if it is still what it was; one that was absent must still be absent. If anyone changed one since, the write-back is refused and nothing is overwritten. There is no force. Edits to other files, such as the drafting side's revisions, are kept: the commit is built on top of them, up to three more times if the branch keeps moving, and the review still says it is of the commit that was read.
+- **If the pull request was merged or closed during the run,** nothing is written (a commit to its branch would never reach the base branch), the run exits 1, and the review stays in local history.
+- **No secrets.** Every outgoing file, the commit message and the review body are scanned for the token and for every configured API key value; a hit refuses the write before anything is sent.
+- **If it fails after the review,** the local files are already saved. The run prints the reason, says so, gives the retry command, and exits 1.
+- **Never from a replay.** A replay's report goes to `_replay/` and is a code test, not a review of the article. `--write-back` with `--replay`, `--offline`, `--only-model`, `--only-domain` or `--no-timeout` is a usage error; with `write_back: true` in config those runs ignore it and log one INFO line. `--retry-failed` may write back.
+
+The retry, and the way to hand over a run whose commit or review failed, is `ci-docs push-run`: see [`ci-docs`](#the-document-repository-ci-docs).
 
 ### Iterating on the code without paying for the ensemble
 
@@ -582,9 +662,162 @@ Every other way to reach the Wayback archiving machinery runs it behind fact-che
 uv run ci-review --raw-draft handoff.md --publication mypub --archive-only
 ```
 
-It reads every URL out of the draft's own citation block (`## Sources` / `## Citations` / etc. — whatever heading [docs/CITATIONS.md](docs/CITATIONS.md) documents), checks each one's current Wayback status, and submits the ones that are missing or stale — the same dedupe-by-URL, pacing and outcome bookkeeping a normal run's Pass 3 uses, just run directly against the draft's URLs instead of only the ones a resolved fact-check claim cites. Each URL's outcome prints in the same wording Section 9 uses, ending with `Estimated cost: $0.0000 (no model calls)` so it's never mistaken for a real spend line. Requires `--draft` or `--raw-draft`; mutually exclusive with `--offline`, which turns off the very network calls this flag exists to make.
+It reads every URL out of the draft's own citation block (`## Sources` / `## Citations` / etc. — whatever heading [docs/CITATIONS.md](docs/CITATIONS.md) documents), checks each one's current Wayback status, and submits the ones that are missing or stale — the same dedupe-by-URL, pacing and outcome bookkeeping a normal run's Pass 3 uses, just run directly against the draft's URLs instead of only the ones a resolved fact-check claim cites. Each URL's outcome prints in the same wording Section 9 uses, ending with `Estimated cost: $0.0000 (no model calls)` so it's never mistaken for a real spend line. Requires `--draft`, `--raw-draft` or `--github`; mutually exclusive with `--offline`, which turns off the very network calls this flag exists to make.
+
+**For an article in the document repository**, read the round from GitHub and write the result back to it:
+
+```powershell
+uv run ci-review --archive-only --github my-article --publication mypub
+```
+
+It reads the round's `draft.md` at the head of its open pull request, archives every URL in its Sources list, and commits `pipeline/archive.md` (one row per cited URL: its snapshot, or why there is none) and `pipeline/archive.json` (the same, with the capture jobs still running) to the round's branch. The next pass on that round asks archive.org about those jobs before submitting again. `--no-write-back` prints the result without committing; `--github-ref` reads a ref and never commits. The managed `AGENTS.md` makes this pass, on the head commit, the last step before a round merges ([docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md#archiving-before-a-merge)).
+
+**What the pass says about a failure.** A refused or dropped connection to archive.org is reported as that, apart from archive.org's own refusals, with whether the rate-limit breaker had tripped: on 2026-11-10 web.archive.org refused every connection for about 50 seconds, with no 429 first, while archive.org answered on the same address. Run the pass again later. A URL archive.org refused because it was already captured that day gets that day's snapshot recorded. A capture that came back 404 from a host that served other captures in the same pass is retried once.
 
 **A page that has not changed is not re-submitted.** archive.org's availability API never lists a `warc/revisit` record (its pointer for an unchanged page), so an unchanged page reads stale on every run however often it is captured. For a URL that API calls stale or missing, this mode also asks archive.org's CDX index, which does list them, and trusts a revisit only after finding a `200` capture with the same content digest. That second lookup is slow, roughly 10 to 50 seconds per URL when it answers, so a draft with many stale sources takes minutes; a URL the first lookup already shows as fresh costs one request. The full review's own lookups do not use it. A CDX lookup that fails is printed as an `Archive lookup note`, because the answer then rests on the weaker source alone.
+
+---
+
+## The document repository (`ci-docs`)
+
+An article can live in a private GitHub repository instead of a shared Drive folder. [docs/GITHUB-DOCUMENTS.md](docs/GITHUB-DOCUMENTS.md) is the design, and has the steps for connecting a claude.ai project to it. `ci-docs` has seven subcommands: `init` (below), `push-run`, `ls`, `put`, `tag`, `accept` and `import` (`scan` and `check`, last). `ci-docs init` is the first piece: it creates that repository, if it is missing, and commits the files that make it describe itself to whatever attaches to it (`AGENTS.md` for Codex, `CLAUDE.md` for Claude Code, a stanza for a claude.ai project's instructions, and the templates), rendered from sources packaged here. `AGENTS.md` teaches the drafting side the round loop: a branch and a pull request per round, a revision commit message that says which review findings it addressed, deferred and declined, and a merge only on the author's word.
+
+```powershell
+uv run ci-docs init --dry-run                            # print the plan; write nothing
+uv run ci-docs init --create --seed-instructions PATH    # first run: make the repository and fill it
+uv run ci-docs init                                      # later: refresh the managed files
+```
+
+| Flag | Meaning |
+|---|---|
+| `--repo OWNER/NAME` | the document repository; default `github_documents.repo` in `user.yaml`, else `MHammett/mikehammett.net-articles` |
+| `--branch NAME` | the branch to commit to; default `github_documents.branch`, else `main` |
+| `--dry-run` | print the plan, including the `gh repo create` command a missing repository would get, the settings it would change and the labels it would create; make no request that writes and run no `gh` command |
+| `--create` | if the repository does not exist, create it, always private. Without it a missing repository is reported and nothing is made |
+| `--seed-instructions PATH` | commit this local file once as `instructions/publication.md`, the publication's own drafting rules. It stays out of this repository; once it exists it is the author's file and is never touched again |
+| `--overwrite-edited` | also replace managed files that were edited in the document repository |
+| `--config-dir DIR` | where `user.yaml` is read from (default `configs`) |
+
+The token is `GITHUB_TOKEN`, else the output of `gh auth token`. A re-run adds what is missing, skips what is identical, and replaces a managed file only if the repository still holds the version the last run wrote (`.ci-docs/manifest.json` records it); one edited there is listed and left alone. `articles/README.md` is managed like the other files; no article and no existing `instructions/publication.md` is ever touched. It refuses a public repository.
+
+It also sets the repository's merge settings, once, and only when they differ: merge commits on, squash and rebase merges off, branches kept after a merge (one `PATCH`; a squash merge would replace a round's draft, review and revision commits with one, and a rebase merge would rewrite them). And it creates the issue labels `round`, `known-gap`, `research`, `decision`, `correction` and `from-review` when they are missing, never editing or deleting one that exists. The run prints both before it writes anything, and a re-run on a repository already set up sends neither.
+
+### `ci-docs push-run`
+
+`push-run` writes back a run that is already saved on disk, without running it again. It is the retry for a `ci-review --github ... --write-back` whose commit or review failed (the error prints the exact command), and the way to hand over a run you decided about later.
+
+```powershell
+uv run ci-docs push-run pipeline_history/my-article/run_4_20261026_143022_report.json
+```
+
+It reads `document_source` from the report to find the repository, the pull request and the article folder, maps the files beside the report as in [Writing the review back](#writing-the-review-back-to-github), and does the same two steps with the same refusals. It first tags any merged, untagged round of the article ([Tagging an accepted round](#tagging-an-accepted-round)). Both are safe to repeat: when every file is already identical it makes no commit, and when the pull request already has a review with this run's marker it posts none. So after a failed review post it posts only the review, and run twice it does nothing. A report under `_replay/`, one not named `run_N_<timestamp>_report.json`, one without a `document_source`, and one whose pull request is merged or closed are refused. A report whose `document_source` names no pull request (a run of an accepted round's tag, `--round N`) is refused unless `--pr N` names an open round pull request whose head descends from the commit it reviewed; it is then written there and says which tag it was read from. It prints the commit URL and then the review URL.
+
+| Flag | Meaning |
+|---|---|
+| `REPORT_JSON` | the run's `pipeline_history/<key>/run_N_<timestamp>_report.json` |
+| `--github-repo OWNER/NAME` | commit to this repository instead of the one the report names |
+| `--config-dir DIR` | where `user.yaml` is read from, for `github_documents` and the API keys the commit must not contain (default `configs`) |
+
+### Tagging an accepted round
+
+A round is accepted by merging its pull request (a merge commit), and the merge is marked by an annotated tag `<slug>/rN`, dated at the merge and tagged by the token's user, with a message such as `my-article r3: PR #12, runs 6 and 7` (the runs are read from the `<!-- ci-review run=N -->` markers of the pull request's reviews). **Nobody has to do this by hand:** the drafting chat merges the pull request when the author says so, and the next command that writes to the article tags any merged, untagged round of it first.
+
+- **When it runs.** Before their own work, in `ci-review --github SLUG --write-back` (after the permission check, before any model call), `ci-docs push-run`, `ci-docs put` and `ci-docs accept --yes` (before and after its merge).
+- **When it never runs.** In `ci-docs ls`, in a `ci-review --github` run without `--write-back`, and in `--replay`, `--offline` and calibration runs, which cannot write back. No read-only command gains a write. A round that is merged and never written to again stays untagged until the next write, or until `ci-docs tag`; the merge commit is the record either way.
+- **Safe to repeat and to race.** A round that has its tag is skipped, so a second run writes nothing. Creating the tag's ref is the compare-and-swap: if two commands tag at once, one wins and the other reads the tag back and counts it as done. A tag that exists but points at another commit is reported and left alone. No tag is ever moved or deleted.
+- **A failure is a warning.** A network error, a rate limit or a token that cannot read `GET /user` prints a warning and the command goes on with its own work.
+
+`ci-docs tag` and `ci-docs accept` are conveniences. The round loop needs neither.
+
+```powershell
+uv run ci-docs tag my-article --dry-run     # say which tags would be made; write nothing
+uv run ci-docs tag my-article               # tag now, without doing anything else
+uv run ci-docs accept my-article            # show the open round; merge nothing
+uv run ci-docs accept my-article --yes      # merge it (merge commit), then tag it
+```
+
+`accept` shows the article's one open round pull request, its head, the run of the newest `ci-review` review and whether any commit has landed since that review's commit. With `--yes` it merges with `sha` set to the head it showed, so a commit pushed after that is not merged unseen (GitHub answers 409 and nothing merges), then tags. **A merge is the author's acceptance:** a Code session passes `--yes` only when the author has said to accept the round. The normal path is the chat merging on the author's word.
+
+| Flag | Meaning |
+|---|---|
+| `SLUG` | the article's folder name |
+| `--dry-run` | `tag` only: say what would be tagged and write nothing |
+| `--pr N` | `accept` only: the round's pull request, when the article has more than one open |
+| `--yes` | `accept` only: merge (without it, only show) |
+| `--github-repo OWNER/NAME` | the document repository; default `github_documents.repo` in `user.yaml`, else `MHammett/mikehammett.net-articles` |
+| `--config-dir DIR` | where `user.yaml` is read from (default `configs`) |
+
+### `ci-docs ls` and `ci-docs put`
+
+`ls` shows an article: its rounds (tags with their dates, merged and open pull requests with branch, head and the run of the last review), then the files of `articles/<slug>/` at a ref with each file's last commit. It reads and writes nothing, tagging included. `put` commits **one** local file to the open round's branch, never to `main`: it is how a Code session hands a close-out note (Template D) to the drafting chat, and it takes the drafting side's own files too.
+
+```powershell
+uv run ci-docs ls my-article
+uv run ci-docs ls my-article --ref main
+uv run ci-docs put my-article close-out-to-chat.md
+uv run ci-docs put my-article draft.md --pr 12     # when two rounds are open
+```
+
+The file's own name is the name it gets, and it must be `close-out-to-chat.md`, `close-out-to-code.md`, `draft.md`, `metadata.md`, `publication.md` or `archive-exceptions.md` (the author's accepted archive gaps, which the archive gate check reads). `review.md` and everything under `pipeline/` belong to the pipeline and are refused, as is any other name, before a request is sent. An existing file is replaced only if it is still the blob `put` read (an edit in between is refused), and the same bytes make no commit, so the history of the file in git is the history of its versions. The commit message is `close-out: my-article r4 to-chat` (`<kind>: <slug> rN` for the others), with the note's `Contains:` line as its body. After a close-out note's commit, `put` comments on the pull request with a link to the note at that commit, which is how the other side finds out. The file is checked for the token and every configured API key, and a public repository is refused unless `allow_public_repo` is set. The old per-round names (`my-article-close-out-r4-to-chat-v2.md`) are gone.
+
+| Flag | Meaning |
+|---|---|
+| `SLUG`, `FILE` | the article's folder name; the local file to commit (`put` only) |
+| `--ref REF` | `ls` only: list the files at this branch, tag or commit (default: the open round's branch if exactly one is open, else the base branch) |
+| `--pr N` | `put` only: the round's pull request, when the article has more than one open |
+| `--github-repo OWNER/NAME` | the document repository; default `github_documents.repo` in `user.yaml`, else `MHammett/mikehammett.net-articles` |
+| `--config-dir DIR` | where `user.yaml` is read from (default `configs`); `put` also needs it for the API keys the file must not contain |
+| `--publication NAME` | `put` only: also scan for the keys in `configs/NAME.yaml` |
+
+### `ci-docs import scan` and `ci-docs import check`
+
+Step 1 of importing an article's history that predates the repository (the design is [Decision 7](docs/GITHUB-DOCUMENTS.md#importing-an-articles-history)). `scan` merges one article's local sources into an editable `plan.json` and prints a timeline; `check` validates the plan after you have edited it. Neither writes to GitHub or calls a model, and neither prints a file's contents: the plan holds paths, hashes, times and counts.
+
+```powershell
+uv run ci-docs import scan my-article --history-key my-article --history-key an-older-title-derived-key `
+    --files $HOME\Downloads\my-article-v27 --drive-dir D:\import\drive --recovered D:\import\recovered `
+    --out D:\private\my-article-plan.json
+uv run ci-docs import check D:\private\my-article-plan.json
+```
+
+A draft that is the same text in two places is one version (CRLF and trailing whitespace do not count), dated by its earliest source unless a more trusted one is within five minutes: a saved run (`generated`) beats a Drive `createdTime` beats a file's modification time. A run is linked to the submitted draft it reviewed, after undoing its LanguageTool corrections. A new round starts at each submitted draft (one a run reviewed, one with a `vNN`/`rN` label in its name, or one from Drive); later drafts are revisions inside it. A run that matches no other source, or that is one of several on one draft within 30 minutes, is marked `suspect: "experiment?"` and kept: the author sets `include: false`. A version a chat reproduced from its context (`--recovered`) is the least trusted source: it is dated only by a `<file>.json` sidecar's `claimed_at`, dropped in favour of any other source holding that version, and otherwise kept and flagged `recovered: true`. The claude.ai export (`--chat-export`) adds the versions a drafting chat produced between submissions, and it is trusted as much as a run: its time is the server's, so a chat copy of a version moves that version's date earlier if the chat held it first. Conversations carry no project id, so each is matched to the article by what it says (the slug in its text or in a file name a tool call wrote, or the title from the metadata, which is a weak link whose versions are left out of the plan for you to decide). A conversation's tool calls are replayed in order, so a `create_file` and each `str_replace` after it are separate versions; attachments and long messages come after. A text is kept only if it is a whole version of the draft (it shares most of its words with a known version and carries at least half of that version's), so outlines, sections and talk about the draft are counted and dropped. Chat versions between two submissions are revisions inside the earlier round, and a version a reproduction claimed can be confirmed or replaced by the export's copy. The summary prints the linked conversations' ids, dates and message counts, and counts per tool; names and text are never printed or written to the plan. A map (`--chat-map`) replaces the matching by what a conversation says, and a conversation it links keeps its whole documents (a file-writing tool call's full content, an attachment, a project knowledge file of at least `--min-chat-words` words) even when nothing else holds a similar version, so an article that exists only in chats still gets a history; with no run and no labelled file, such versions form one round per silence of more than 48 hours. How to produce the map and what is kept is in [Decision 7](docs/GITHUB-DOCUMENTS.md#importing-an-articles-history). `--out` inside this checkout is refused, as are a Drive file whose MD5 differs from `drive-manifest.json` and any `--history-key` that names `_experiments`, `_replay` or `_nested`.
+
+| Flag | Meaning |
+|---|---|
+| `SLUG` | the article's slug; a file is considered only if its name mentions it (or a history key) |
+| `--history-key KEY` | a `pipeline_history/` directory that belongs to the article; repeatable; default `SLUG` |
+| `--history-root DIR` | where the keys live; default `$CI_HISTORY_ROOT`, else the main checkout's `pipeline_history/`; the output says which |
+| `--files DIR` | a directory to scan, non-recursive plus one level; repeatable |
+| `--include NAME` | also read this file name from `--files`, whatever it is called; repeatable |
+| `--drive-dir DIR` | files a Code session downloaded with `download_file_content`, plus `drive-manifest.json` |
+| `--recovered DIR` | versions a chat reproduced from its context, with optional `<file>.json` sidecars |
+| `--chat-export PATH` | a claude.ai data export (the extracted directory, the ZIP, or `conversations.json`); its in-chat versions of the draft become sources, below |
+| `--conversation UUID` | a conversation of the export that belongs to the article though it never names it; repeatable; needs `--chat-export` |
+| `--chat-map FILE` | a TSV with a header `conversation<TAB>slug` (other columns ignored) saying which conversation belongs to which article; with it the linked conversations are exactly the rows for `SLUG` plus any `--conversation`, none is linked by what it says, and their whole documents are kept even when no other source holds a similar version (marked `corroborated: false` and `chat-only` in the timeline); needs `--chat-export` |
+| `--min-chat-words N` | the fewest words such a chat-only document may have (default 300) |
+| `--out PLAN.json` | where the plan goes; must be outside the checkout |
+
+### `ci-docs import apply`
+
+Step 2: write the checked plan into the document repository as **merged pull requests, one per round, in order, with the original dates on every commit** (issue #421; [Decision 7](docs/GITHUB-DOCUMENTS.md#importing-an-articles-history)).
+
+```powershell
+uv run ci-docs import apply D:\private\my-article-plan.json --repo OWNER/NAME --dry-run
+uv run ci-docs import apply D:\private\my-article-plan.json --repo OWNER/NAME
+```
+
+`--repo` is required and there is no default, so the real repository is never written by accident. `--dry-run` reads GitHub (to run every refusal below) and prints each write it would make, and makes none, not even to the plan file. For each round with an included event it writes, in order: the branch `round/<slug>/rN` from `main`; one commit per event, `author` and `committer` the token's user with the event's time as the date (`draft:` and `revise:` write `draft.md` and `metadata.md`, or `handoff.md` for a Template A round, and a commit that moves between the two forms deletes the other; `review:` writes `review.md` and `pipeline/run.json`, `report.json` and `worklist.md` as `--write-back` does; `close-out:` and `publication:` write their fixed names); the pull request, labelled `round` and `article:<slug>`; one pull request review per run (the `--write-back` body and marker, no line comments); the merge, which moves `main` to a merge commit dated `accepted_at` and reads the merged flag back; and the annotated tag `<slug>/rN` dated `accepted_at`. Every commit message ends in trailers naming where each text came from (`Imported-from: file <name>`, `drive <id>`, `chat <conversation>/<message>`, `run <name>`), never what it says, plus `Imported-at:` and `Plan-event:`; a reproduction adds `Recovered: reproduced by a chat from its context; not the original bytes`. A pull request's own timestamps are the import's (GitHub does not let anyone set them); only the commits carry the original dates. A file that holds a configured API key stops the import before anything is sent.
+
+**Refused before any write:** a plan `ci-docs import check` rejects; a public repository (no override); a token that cannot push; a repository that is not merge-commit-only (run `ci-docs init`); `main` already having `articles/<slug>/`; and any `round/<slug>/...` branch or `<slug>/...` tag that the plan's `applied` block does not account for. Nothing is ever deleted, moved or force-pushed.
+
+**Resuming.** After every step the plan file is rewritten with that step's result in its `applied` block (`branch`, `commits`, `pull_request`, `reviews`, `merge`, `tag` per round). After a failure, run the same command again: a step that is recorded and still true is skipped, one that is recorded and gone is an error and is never redone, and one GitHub has but the plan does not record (the process died between the two) is adopted when its commit carries this import's `Plan-event` trailer. Running it on a finished plan makes no write.
+
+| Flag | Meaning |
+|---|---|
+| `PLAN.json` | the plan, outside the checkout (it is rewritten as the import proceeds) |
+| `--repo OWNER/NAME` | the document repository to write; required |
+| `--dry-run` | print every write and make none |
+| `--config-dir DIR` | where `user.yaml` is read from, for `path_prefix` and the API keys no file may contain (default `configs`) |
 
 ---
 
@@ -866,10 +1099,21 @@ content-intelligence/
 │   │   │   │                          citation resolution
 │   │   │   ├── handoff_parser.py      parses Template A and Template C documents
 │   │   │   ├── handoff_gaps.py        what each missing handoff field cost the run, and the line to paste
+│   │   │   ├── github_documents.py    reads one round of an article from a GitHub repository (--github)
+│   │   │   ├── github_writeback.py    commits a run's review to the round's branch and posts the pull request review (--write-back, ci-docs push-run)
+│   │   │   ├── github_archive.py      pipeline/archive.md and archive.json: every cited URL's Wayback status on the round's branch (--archive-only --github)
+│   │   │   ├── review_body.py         the body of that review: summary and a checklist of the Section 1 findings
+│   │   │   ├── github_put.py          ci-docs ls and put: an article's rounds and files; one file onto the open round's branch
+│   │   │   ├── github_rounds.py       automatic round tagging, and ci-docs tag and accept
 │   │   │   ├── history.py             saves run artifacts to pipeline_history/
+│   │   │   ├── chat_export.py         reads a claude.ai data export for ci-docs import scan (--chat-export)
+│   │   │   ├── history_import.py      ci-docs import scan/check: merge an article's local sources into an editable plan
+│   │   │   ├── history_apply.py       ci-docs import apply: write a checked plan as merged, dated pull requests; resumes from the plan
 │   │   │   ├── history_analytics.py   cross-run analytics over pipeline_history/ (ci-history-report)
 │   │   │   ├── passage_match.py       decides when two quoted passages are the same passage
 │   │   │   ├── voice_pattern_report.py  recurring voice patterns across articles (ci-voice-patterns)
+│   │   │   ├── documents_cli.py       ci-docs: the entry point for the private document repository
+│   │   │   ├── documents_init.py      what `ci-docs init` renders, and its never-clobber plan
 │   │   │   ├── markers.py           reports/strips machine-authorship markers in a
 │   │   │   │                        draft (ci-markers); --fix removes, default only reports
 │   │   │   ├── report_markdown.py     renders the readable run_N_*_review.md from the report
@@ -879,6 +1123,7 @@ content-intelligence/
 │   │   │   ├── reproducibility.py     scores this run's findings against earlier runs of
 │   │   │   │                          the same draft, free, from pipeline_history/
 │   │   │   ├── check.py               connectivity/credential check for all services
+│   │   │   ├── checkout_freshness.py  warns, or refuses a write-back, when the running checkout is behind origin/master
 │   │   │   ├── discover.py            live model discovery — queries provider APIs
 │   │   │   ├── live_model_check.py    caches that discovery and reports, in the run
 │   │   │   │                          report, when a model newer than the one used shipped
@@ -900,6 +1145,7 @@ content-intelligence/
 │   │   │   │       ├── page_cache.py         one fetch per page per run, shared by the quote check and Section 9
 │   │   │   │       ├── pagination.py         reads past page one of a paginated source
 │   │   │   │       ├── wayback.py            Wayback archive check + Save Page Now submission
+│   │   │   │       ├── wayback_lookup_cache.py  one archive.org lookup per URL per run, remembered across runs
 │   │   │   │       ├── topic_match.py        keyword gating for pointer-only adapters
 │   │   │   │       └── sources/              10 adapters: census, crossref, eia, epa, ferc,
 │   │   │   │                                 fhwa, fred, icc, ilga, pjm
@@ -919,6 +1165,8 @@ content-intelligence/
 │   │   │   ├── configs/               committed defaults: presets.yaml + *.example.yaml
 │   │   │   │                          (real user.yaml + publication.yaml are gitignored;
 │   │   │   │                          pricing/timeouts/model_registry live in ci-core)
+│   │   │   ├── document_repo/         sources (*.tmpl) for the files `ci-docs init` commits
+│   │   │   │                          to the document repository
 │   │   │   └── handoff_templates/     fill these out to submit drafts, publish, and
 │   │   │                              hand an article between sessions
 │   │   └── tests/                     pipeline test suite, all external calls mocked
@@ -955,6 +1203,8 @@ content-intelligence/
 │   │   │   ├── text_repair.py    undoes Perplexity's low-byte narrowing of
 │   │   │   │                     General Punctuation (U+2019 arriving as 0x19)
 │   │   │   ├── http.py           USER_AGENT + DEFAULT_HEADERS for all outbound calls
+│   │   │   ├── github_repo.py    thin GitHub REST client: read at a ref, list a directory,
+│   │   │   │                     fast-forward-only multi-file commit (no clone, no library)
 │   │   │   ├── concurrency.py    run_with_timeout — the wall-clock backstop both
 │   │   │   │                     applications run their provider calls under
 │   │   │   ├── redact.py         scrubs API keys from error output before logging;

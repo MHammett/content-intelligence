@@ -7,10 +7,12 @@ import secrets
 import threading
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 
 from ci_core.concurrency import run_all_bounded
 from ci_core.http import (
+    _MAX_REDIRECTS,
     HOST_NON_PUBLIC,
     HOST_PUBLIC,
     UnsafeURLError,
@@ -73,6 +75,17 @@ _UNVERIFIABLE_NOTES = {
 #: Cheap/fast model used for the relevance check — this runs once per known_url
 #: citation, so it deliberately avoids a heavyweight reasoning model.
 _VERIFICATION_MODEL = "mistral-small-latest"
+
+#: Retries for that call, where every other model call gets one. Mistral
+#: limits mistral-small to 100 requests a minute on this account (the console,
+#: 2026-10-24; the docs publish no figure), and three of these calls at once at
+#: ~1.1s each run at ~160 a minute, so a 429 is a burst, not a fault. Measured
+#: 2026-10-24: four back-to-back calls went ok, ok, 429, 429, and with one retry
+#: each refused call cost its claim the verdict (#389). The call is well under a
+#: cent and ``_with_retry`` honours ``Retry-After``, so a few more attempts are
+#: cheaper than a lost claim; the limiter in ``ci_core.llm.ratelimit`` is what
+#: keeps a run from needing them.
+_VERIFICATION_RETRIES = 3
 
 _VERIFICATION_SYSTEM_PROMPT = (
     "You verify whether a web page's content supports a specific factual claim. "
@@ -155,12 +168,62 @@ _VERIFY_SEMAPHORE = threading.Semaphore(_MAX_VERIFY_PARALLEL)
 #: after the main resolution completes, rather than inline per-claim.
 _MAX_SUBMIT_PARALLEL = 2
 
-#: Per-call safety-net timeout for one claim resolution (fetch + adapters +
-#: Wayback check + relevance call). Generous on purpose — the real bound on
-#: each of those steps is the timeout already inside it (safe_get,
-#: wayback.check); this one exists only to catch whatever those don't, e.g. a
-#: DNS resolution that hangs past what requests' own timeout covers.
-_RESOLVE_TIMEOUT_SECONDS = 90
+#: The request timeout every fetch in this module is made with: ``safe_get``'s
+#: default, and the ``timeout`` ``_resolve_known_url`` hands down.
+_FETCH_TIMEOUT_SECONDS = 15
+
+#: The budgets one claim can spend, in sequence, before its own cap below. Each
+#: is the timeout already inside the step; they are named here, and summed,
+#: because the cap used to be a constant (90s) chosen on the premise that those
+#: inner timeouts were the real bound and the cap "exists only to catch
+#: whatever those don't". That premise is false for a chain: the steps run one
+#: after another, so their budgets add, and on a 190K-character draft 80-117
+#: claims out of 255-267 ran past 90s and were reported as
+#: ``resolution_error`` while their threads finished the work (issue #389).
+#:
+#: * The direct fetch: ``safe_get`` follows redirects one validated hop at a
+#:   time, each hop with its own timeout. A page-cache waiter spends one
+#:   timeout on the leader before fetching for itself.
+#: * Escalation, 403 only: ``impersonating_get`` with the same timeout.
+#: * Extraction: a PDF is parsed for up to ``extract.PDF_MAX_SECONDS`` before the
+#:   read stops and says so. It was not budgeted here while the PDF page cap
+#:   (400) bounded it to ~15 s; the 981-page packet that cap cut off takes
+#:   134 s, so extraction is a step of its own now.
+#: * The archive: ``wayback.check`` (spn_client's 10s default) and, on the
+#:   fallback path, the snapshot fetch. archive.org pacing (a 3s shared clock,
+#:   5s backoff base, shared by every worker) sits on top and is not budgeted.
+#: * Pagination: up to ``MAX_PAGES - 1`` further fetches.
+#: * The relevance call: mistral-small answers in ~1-2s, but the call queues
+#:   behind ``_MAX_VERIFY_PARALLEL`` others and the token meter, and a 429
+#:   puts up to three waits of up to 30s before it. Measured on the first
+#:   live replay of a 267-claim draft: median 18.7s, p90 81s, max 166s.
+#:
+#: Not every claim walks the whole chain, and a claim citing several URLs
+#: walks it once per URL (``_resolve_candidates``), so this is neither a
+#: minimum nor a hard maximum. It is the point past which a claim stops holding
+#: one of the ``_MAX_PARALLEL`` slots: ``run_all_bounded`` releases the slot
+#: then, logs it (``on_overrun``), and still keeps the claim's result if it
+#: finishes before the batch ceiling, so a cap that is somewhat low costs
+#: concurrency, not findings.
+_FETCH_CHAIN_SECONDS = _FETCH_TIMEOUT_SECONDS * (_MAX_REDIRECTS + 1)
+_ESCALATION_SECONDS = _FETCH_TIMEOUT_SECONDS
+_EXTRACT_SECONDS = extract.PDF_MAX_SECONDS
+_ARCHIVE_CHECK_SECONDS = 10
+_ARCHIVE_SECONDS = _ARCHIVE_CHECK_SECONDS + _FETCH_TIMEOUT_SECONDS
+_PAGINATION_SECONDS = _FETCH_TIMEOUT_SECONDS * (pagination.MAX_PAGES - 1)
+_RELEVANCE_SECONDS = 120
+
+#: Per-claim budget for one resolution job: the chain above, summed (490s at
+#: the values this was written with). ``batch_ceiling`` sizes the whole batch
+#: from it, so raising a step's timeout raises both.
+_RESOLVE_TIMEOUT_SECONDS = (
+    _FETCH_CHAIN_SECONDS
+    + _ESCALATION_SECONDS
+    + _EXTRACT_SECONDS
+    + _ARCHIVE_SECONDS
+    + _PAGINATION_SECONDS
+    + _RELEVANCE_SECONDS
+)
 
 #: Per-call safety-net timeout for one Wayback submission, above wayback.submit's
 #: own 30s default for the same reason as _RESOLVE_TIMEOUT_SECONDS.
@@ -193,6 +256,89 @@ _SUBMIT_TIMEOUT_SECONDS = 45
 #: credentials the unauthenticated path already answers synchronously, off the
 #: redirect, so there is nothing here to wait for either way.
 _CAPTURE_POLL_BUDGET_SECONDS = 45
+
+
+class _StepClock:
+    """Wall time per step of one claim's resolution, readable from another thread.
+
+    The counterpart of ``stream_timing`` on a model call. ``enter(step)`` closes
+    the step in progress and opens ``step``; a step entered twice (a claim
+    citing three URLs walks the chain three times) accumulates. ``report()`` is
+    what a result carries as ``resolution_timing``, and what the overrun hook
+    reads while the claim is still running: each step's seconds so far, the
+    total, and ``in_progress`` naming the step it is in. A timeout can then say
+    where the claim died instead of only that it did (issue #389: 117 timeouts,
+    all logged in one lump after the batch, none naming a step).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # Set on the first step, not here: the batch makes every clock up
+        # front and a claim in wave 30 waits half an hour for a slot. Measured
+        # on the first live run of this: "total" read 1,048s at the median
+        # while the steps summed to 24s. Queue time is not the claim's.
+        self.started = None
+        self._steps = {}
+        self._current = None
+        self._since = None
+
+    def enter(self, step):
+        with self._lock:
+            now = time.monotonic()
+            if self.started is None:
+                self.started = now
+            self._close(now)
+            self._current = step
+            self._since = now
+
+    def done(self):
+        with self._lock:
+            self._close(time.monotonic())
+            self._current = None
+
+    def _close(self, now):
+        if self._current is not None:
+            self._steps[self._current] = self._steps.get(self._current, 0.0) + (
+                now - self._since
+            )
+
+    def report(self):
+        with self._lock:
+            now = time.monotonic()
+            steps = dict(self._steps)
+            if self._current is not None:
+                steps[self._current] = steps.get(self._current, 0.0) + (
+                    now - self._since
+                )
+            current = self._current
+        out = {step: round(seconds, 1) for step, seconds in steps.items()}
+        out["total"] = round(now - self.started, 1) if self.started is not None else 0.0
+        if current is not None:
+            out["in_progress"] = current
+        return out
+
+
+#: The clock of the claim this thread is resolving, if any. Set by
+#: ``_resolve_one`` for the duration of a claim; the steps below read it rather
+#: than carrying a parameter through every helper and the pagination callback.
+_clock = threading.local()
+
+
+def _step(name):
+    """Mark that the current claim's resolution has entered step ``name``."""
+    clock = getattr(_clock, "current", None)
+    if clock is not None:
+        clock.enter(name)
+
+
+def _format_timing(timing):
+    """``fetch 1.0s, extract 1.9s, relevance 39.0s; 44.2s total`` from a report."""
+    parts = [
+        f"{step} {seconds}s"
+        for step, seconds in timing.items()
+        if step not in ("total", "in_progress")
+    ]
+    return f"{', '.join(parts) or 'no step entered'}; {timing.get('total', 0)}s total"
 
 
 #: Adapter names already warned about, so a 40-claim run logs each once rather
@@ -245,14 +391,71 @@ def _extract_fetched(resp, url):
 
     Returns ``(text, kind)``; an empty ``text`` means the body could not be
     read, which the caller must report as unverifiable rather than as a
-    content mismatch.
+    content mismatch. The paths that turn the text into a verdict about the
+    document use ``_extract_fetched_with_coverage`` instead, so the verdict can
+    say how much of the document it rests on.
     """
-    return extract.extract_response_text(
-        resp.content,
-        content_type=resp.headers.get("Content-Type"),
-        url=url,
-        encoding=resp.encoding or "utf-8",
-    )
+    text, kind, _coverage = _extract_fetched_with_coverage(resp, url)
+    return text, kind
+
+
+#: Where an extraction is kept on the response it came from. The page cache
+#: hands every claim citing one URL the same response object, so the text is
+#: extracted once per document per run instead of once per claim. Measured on
+#: the 2026-10-24 replay that raised the PDF page cap to 400 (since replaced
+#: by a time budget): 3,777 s of pypdf
+#: time over 90 PDF claims, 83 of them on 20 documents each cited by several
+#: claims (one 14 times) — the same packet parsed again for every claim.
+_EXTRACTED_ATTR = "_ci_extracted"
+
+#: One lock per URL, held while its response is extracted. Without it the memo
+#: only helps claims that arrive after the first parse has finished: eight
+#: workers citing one packet at once would all parse it, and a pure-Python
+#: parser under the GIL gives each of them an eighth of the CPU, so every one
+#: hits the PDF time budget with a fraction of the pages the first would have
+#: read. Locks are small and one run cites a few hundred URLs, so they are kept.
+_EXTRACT_LOCKS: dict = {}
+_EXTRACT_LOCKS_GUARD = threading.Lock()
+
+
+def _extract_lock(url):
+    with _EXTRACT_LOCKS_GUARD:
+        return _EXTRACT_LOCKS.setdefault(url, threading.Lock())
+
+
+def _extract_fetched_with_coverage(resp, url):
+    """``_extract_fetched`` plus how much of the document the text covers.
+
+    Returns ``(text, kind, coverage)``. ``coverage`` is ``extract.read_coverage``:
+    for a PDF, how many of its pages were read and whether the extractor's page
+    cap stopped short. A verdict formed on a partial read has to say so — see
+    ``_resolve_known_url``.
+
+    Memoised on ``resp`` (see ``_EXTRACTED_ATTR``), keyed by ``url`` so a
+    response reused under another address is read afresh.
+    """
+    kept = getattr(resp, _EXTRACTED_ATTR, None)
+    if kept is not None and kept[0] == url:
+        return kept[1]
+    with _extract_lock(url):
+        kept = getattr(resp, _EXTRACTED_ATTR, None)
+        if kept is not None and kept[0] == url:
+            return kept[1]
+        extracted = extract.extract_response_text_with_coverage(
+            resp.content,
+            content_type=resp.headers.get("Content-Type"),
+            url=url,
+            # Not ``resp.encoding``: that is Latin-1 for any text/html body
+            # whose header names no charset, and the page's own declaration
+            # is what a browser would honour (issue #439).
+            encoding=extract.response_encoding(resp),
+        )
+        try:
+            setattr(resp, _EXTRACTED_ATTR, (url, extracted))
+        except (AttributeError, TypeError):
+            # A response type that refuses new attributes just loses the memo.
+            pass
+    return extracted
 
 
 def build_checksum_index(history_root=None):
@@ -347,7 +550,9 @@ def _check_drift(result, checksum_index):
         "note": (
             "This source's content differs from the last time it was "
             f"checksummed (run {prior_run} of '{prior_article}'{when}). "
-            "A claim previously verified against it may need re-checking."
+            "This run read the current text and it still supports this "
+            "claim; other articles verified against the older text may want "
+            "a look."
         ),
     }
     return result
@@ -391,7 +596,7 @@ def _impersonation_fallback_content(url, timeout):
         return None
     final_url = str(getattr(resp, "url", "") or url)
     try:
-        content, kind = _extract_fetched(resp, final_url)
+        content, kind, coverage = _extract_fetched_with_coverage(resp, final_url)
     except Exception:
         # An unreadable body is a failed escalation, not a failed resolution:
         # the archive fallback below still deserves its turn.
@@ -400,7 +605,7 @@ def _impersonation_fallback_content(url, timeout):
         return None
     if len(content.strip()) < _MIN_VERIFIABLE_CHARS:
         return None
-    return final_url, content, kind
+    return final_url, content, kind, coverage
 
 
 def _fetch_following_page(url, timeout=15):
@@ -408,6 +613,36 @@ def _fetch_following_page(url, timeout=15):
     resp = safe_get(url, timeout=timeout)
     resp.raise_for_status()
     return resp
+
+
+#: A Google Drive file link that opens the viewer: ``/file/d/<id>/view`` (or
+#: ``/edit``, ``/preview``, nothing) and the older ``/open?id=<id>``.
+_DRIVE_VIEWER = re.compile(
+    r"^https?://drive\.google\.com/(?:file/d/([A-Za-z0-9_-]{10,})(?:/[a-z]*)?/?(?:[?#].*)?"
+    r"|open\?(?:[^#]*&)?id=([A-Za-z0-9_-]{10,})(?:[&#].*)?)$"
+)
+
+
+def direct_document_url(url):
+    """The URL that returns a cited document's bytes, when the cited one does not.
+
+    A Google Drive viewer link returns a JavaScript shell (90 KB of script, no
+    document text), so a claim cited to one could never be checked: two claims
+    on brockovich-fact-check run 2 (issue #447). For a publicly shared file
+    ``uc?export=download&id=<id>`` returns the file itself, redirecting to
+    drive.usercontent.google.com; checked live on that run's file, a 12.6 MB
+    PDF. Over 25 MB, Drive serves a virus-scan page needing a confirm token
+    first. ``gdown`` handles that, but a downloader dependency for one URL
+    shape is not worth it here: the scan page is HTML and is reported as
+    unreadable, which is true. A private file fails exactly as it did.
+
+    Anything else comes back unchanged.
+    """
+    match = _DRIVE_VIEWER.match(url or "")
+    if not match:
+        return url
+    file_id = match.group(1) or match.group(2)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 def _get_page(url, timeout=15, page_cache=None):
@@ -426,6 +661,7 @@ def _get_page(url, timeout=15, page_cache=None):
 
 def _escalate(url, timeout, page_cache=None):
     """``_impersonation_fallback_content``, taken from ``page_cache`` when it holds one."""
+    _step("escalate")
     if page_cache is None:
         return _impersonation_fallback_content(url, timeout)
     return page_cache.get_escalated(
@@ -433,7 +669,19 @@ def _escalate(url, timeout, page_cache=None):
     )
 
 
-def _wayback_fallback_content(url, timeout):
+def _wayback_check(url, stale_days, **kwargs):
+    """``wayback.check`` with the run's ``wayback_snapshot_stale_days``.
+
+    The threshold is passed only when one is configured, so an unset value
+    leaves spn-client's own default in force, exactly as the link pass does
+    (issue #438).
+    """
+    if stale_days is not None:
+        kwargs["stale_days"] = stale_days
+    return wayback.check(url, **kwargs)
+
+
+def _wayback_fallback_content(url, timeout, stale_days=None):
     """When the origin won't (or can't) serve the page, read archive.org's
     snapshot as the content source instead.
 
@@ -463,7 +711,8 @@ def _wayback_fallback_content(url, timeout):
     for the same URL, and carries the snapshot's own staleness flags onto the
     citation that was satisfied by it.
     """
-    wb = wayback.check(url, timeout=timeout)
+    _step("archive_fallback")
+    wb = _wayback_check(url, stale_days, timeout=timeout)
     snapshot_url = wb.get("snapshot_url")
     if not wb.get("archived") or not snapshot_url:
         return None, wb
@@ -476,8 +725,8 @@ def _wayback_fallback_content(url, timeout):
         # offer the reader a copy to open by hand even though the pipeline could
         # not fetch one.
         return None, wb
-    text, kind = _extract_fetched(resp, snapshot_url)
-    return (snapshot_url, text, kind), wb
+    text, kind, coverage = _extract_fetched_with_coverage(resp, snapshot_url)
+    return (snapshot_url, text, kind, coverage), wb
 
 
 #: Length of the stored page excerpt. Unchanged; only its shape is sanitised.
@@ -585,7 +834,7 @@ def _normalise_for_match(text):
     return " ".join((text or "").split()).casefold()
 
 
-def _quote_is_grounded(quote, content):
+def _quote_is_grounded(quote, content, claim=None):
     """True if ``quote`` actually occurs in the page text.
 
     The verifier's verdict is the one thing an injected page most wants to
@@ -601,12 +850,41 @@ def _quote_is_grounded(quote, content):
     """
     normalised_quote = _normalise_for_match(quote)
     if len(normalised_quote) < _MIN_QUOTE_CHARS:
-        return False
+        return _short_figure_is_grounded(normalised_quote, content, claim)
     return normalised_quote in _normalise_for_match(content)
 
 
-def _verify_relevance(claim, content, api_keys, author=None):
+#: A short quote that is nothing but a figure: "9,683", "4.4%", "$40". A quote
+#: with a word in it ("$40 billion") is not one.
+_BARE_FIGURE = re.compile(r"[$]?\d[\d,.]*%?")
+
+
+def _short_figure_is_grounded(normalised_quote, content, claim):
+    """A quote shorter than ``_MIN_QUOTE_CHARS`` that is exactly the claim's figure.
+
+    A stats page lays its headline number out as a block of its own ("9,683 /
+    Total Reports"), and the verifier, asked for the sentence it relied on,
+    quotes the number. The 12-character floor then threw away a correct
+    "supports" against the archived copy the draft cited (issue #442). The floor
+    exists because a few characters match almost any page by chance; a figure of
+    three or more digits that the claim itself states, found on the page, does
+    not match by chance and carries no instruction a page could inject.
+    """
+    if not claim or not _BARE_FIGURE.fullmatch(normalised_quote):
+        return False
+    if sum(ch.isdigit() for ch in normalised_quote) < 3:
+        return False
+    return normalised_quote in _normalise_for_match(
+        claim
+    ) and normalised_quote in _normalise_for_match(content)
+
+
+def _verify_relevance(claim, content, api_keys, author=None, hints=()):
     """Ask a cheap/fast model whether ``content`` actually supports ``claim``.
+
+    ``hints`` (the draft's citation entry for this URL, a fact-check model's
+    quote from it) only steer which part of a long document is shown; the
+    model is asked about ``claim`` alone (issue #440).
 
     ``known_url`` citations often come from an ungrounded model recalling a
     URL from training data rather than a live search — the URL loading is not
@@ -643,8 +921,8 @@ def _verify_relevance(claim, content, api_keys, author=None):
     # calls, 180,165 prompt tokens, averaging 1,566 — the ceiling only binds on
     # genuinely long documents, and mistral-small at $0.15/M input prices even
     # the worst case (every call maxed) at under $0.09 for the pass.
-    excerpt = extract.select_excerpt(
-        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL
+    excerpt, window = extract.select_excerpt_with_window(
+        content, claim, head=_EXCERPT_HEAD, tail=_EXCERPT_TAIL, hints=hints
     )
     user_prompt = _build_verification_prompt(claim, excerpt, author)
 
@@ -657,6 +935,7 @@ def _verify_relevance(claim, content, api_keys, author=None):
                 _VERIFICATION_SYSTEM_PROMPT,
                 user_prompt,
                 api_key,
+                retry=_VERIFICATION_RETRIES,
                 model=_VERIFICATION_MODEL,
             )
     except Exception as e:
@@ -684,7 +963,9 @@ def _verify_relevance(claim, content, api_keys, author=None):
         }, call_log_entry
 
     quote = str(data.get("quote", ""))
-    if verdict in _SUPPORTING_VERDICTS and not _quote_is_grounded(quote, content):
+    if verdict in _SUPPORTING_VERDICTS and not _quote_is_grounded(
+        quote, content, claim
+    ):
         # A "supports" verdict promotes the citation to the strongest tier, so
         # it is the answer an injected page most wants to produce. Requiring the
         # model to hand back text that is actually in the document turns the
@@ -712,6 +993,10 @@ def _verify_relevance(claim, content, api_keys, author=None):
         "verdict": verdict,
         "reason": data.get("reason", ""),
         "quote": quote,
+        # What the model was shown: the whole text, or a window of it. A
+        # negative verdict on a window is a verdict about the window.
+        "window": window,
+        "quote_grounded": bool(quote) and _quote_is_grounded(quote, content, claim),
     }, call_log_entry
 
 
@@ -725,6 +1010,8 @@ def _resolve_known_url(
     author=None,
     verify_claim=None,
     page_cache=None,
+    locate_hints=(),
+    stale_days=None,
 ):
     """Resolve a claim whose source URL is already known (e.g. supplied by the
     fact-check model itself), bypassing the narrow adapter matching entirely.
@@ -790,9 +1077,18 @@ def _resolve_known_url(
     # Which URL the archive lookup asks about. Only the escalation path moves it
     # off ``known_url`` — see where it is reassigned below.
     archive_lookup_url = known_url
+    # How much of the document the text below covers. Every path that produces
+    # ``content`` sets it; the verdict at the end reads it before calling a
+    # negative answer evidence.
+    coverage = None
     try:
-        resp = _get_page(known_url, timeout, page_cache)
-        content, content_kind = _extract_fetched(resp, known_url)
+        _step("fetch")
+        fetch_url = direct_document_url(known_url)
+        resp = _get_page(fetch_url, timeout, page_cache)
+        _step("extract")
+        content, content_kind, coverage = _extract_fetched_with_coverage(
+            resp, fetch_url
+        )
         # Where the fetch actually landed. `safe_get` follows redirects one
         # validated hop at a time and returns the last hop's response, so this
         # is the resolved URL and it was being thrown away.
@@ -805,7 +1101,10 @@ def _resolve_known_url(
         # redirect URLs were 817 of the 2,682 characters in one Section 9 entry,
         # while the page behind them was a Jalopnik article the pipeline had
         # already fetched, read and checksummed.
-        final_url = getattr(resp, "url", "") or ""
+        #
+        # Not for a rewritten Drive link: the download host it lands on is
+        # not a page a reader opens, and the viewer link the draft cites is.
+        final_url = "" if fetch_url != known_url else getattr(resp, "url", "") or ""
     except UnsafeURLError as e:
         # Distinct from a fetch failure, and never eligible for the Wayback
         # fallback: archive.org has no snapshot of an internal host, and asking
@@ -850,7 +1149,7 @@ def _resolve_known_url(
             _escalate(known_url, timeout, page_cache) if reason == "blocked" else None
         )
         if escalated is not None:
-            final_url, content, content_kind = escalated
+            final_url, content, content_kind, coverage = escalated
             verified_via = "tls_impersonation"
             fallback_reason = reason
             # Ask archive.org about the page that actually served the content,
@@ -869,7 +1168,11 @@ def _resolve_known_url(
             # was never looked up in the first place and never will be on a
             # re-run.
             fallback, wb = (
-                _wayback_fallback_content(known_url, timeout)
+                _wayback_fallback_content(
+                    known_url,
+                    timeout,
+                    **({"stale_days": stale_days} if stale_days is not None else {}),
+                )
                 if reason
                 else (None, None)
             )
@@ -903,13 +1206,14 @@ def _resolve_known_url(
                     # which the renderer says differently.
                     failed["wayback"] = wb
                 return failed
-            _, content, content_kind = fallback
+            _, content, content_kind, coverage = fallback
             verified_via = "wayback_fallback"
             fallback_reason = reason
 
     # The fallback path already asked archive.org; don't ask twice.
     if wb is None:
-        wb = wayback.check(archive_lookup_url)
+        _step("archive_check")
+        wb = _wayback_check(archive_lookup_url, stale_days)
     result = {
         "claim": claim,
         "source_name": "fact-check model",
@@ -982,11 +1286,19 @@ def _resolve_known_url(
         result["note"] = _UNVERIFIABLE_NOTES["access_wall"]
         return _check_drift(result, checksum_index)
 
-    if len(content.strip()) < _MIN_VERIFIABLE_CHARS:
+    if len(content.strip()) < _MIN_VERIFIABLE_CHARS or (
+        content_kind == "pdf"
+        # A partial read is never reported as a mismatch anyway (see below),
+        # so only a PDF read whole needs telling apart from a scan.
+        and not (coverage or {}).get("partial")
+        and extract.looks_like_scanned_pdf(content, (coverage or {}).get("pages_read"))
+    ):
         # We fetched a real document but could not read it: a PDF with no text
         # layer (or no pypdf installed), a JS-only render, a bot wall. Say that
         # — do NOT run verification and report "does not support the claim",
-        # which asserts something false about a source we never read.
+        # which asserts something false about a source we never read. A scan
+        # with a stamp on every page clears the character floor and is the
+        # same case (issue #447).
         result["verification"] = "unverifiable"
         result["note"] = _UNVERIFIABLE_NOTES.get(
             content_kind, _UNVERIFIABLE_NOTES["default"]
@@ -1004,6 +1316,7 @@ def _resolve_known_url(
     followed = None
     verify_content = content
     if verified_via == "direct":
+        _step("pagination")
         followed = pagination.follow(
             resp,
             known_url,
@@ -1031,8 +1344,9 @@ def _resolve_known_url(
     # model copied from its own source label (``pipeline._claim_for_verifier``).
     # The result keeps ``claim`` as the model wrote it; the verifier is shown
     # the cleaned text, and ``verified_as`` records what that was.
+    _step("relevance")
     verdict_info, verification_call_log = _verify_relevance(
-        verify_claim or claim, verify_content, api_keys, author
+        verify_claim or claim, verify_content, api_keys, author, hints=locate_hints
     )
     if call_log is not None and verification_call_log is not None:
         call_log.append(verification_call_log)
@@ -1058,29 +1372,135 @@ def _resolve_known_url(
         # source, search for this sentence, and see the same evidence the
         # verifier used. It was checked against the page before being stored.
         result["relevance_quote"] = verdict_info["quote"]
+    read = _read_coverage(coverage, verdict_info.get("window"), followed)
+    result["read_coverage"] = read
     if verdict_info["verdict"] not in _SUPPORTING_VERDICTS:
         # The URL loaded and checksummed fine, but content verification says
         # it doesn't actually back the claim — never let that pass silently
         # at checksum-level confidence.
         result["resolved"] = False
-        result["verification"] = "content_mismatch"
-        result["note"] = (
-            f"Source URL loaded, and its extracted article text was read and "
-            f"checked, but content verification found it does not support this "
-            f"specific claim ({verdict_info['verdict']}): {verdict_info['reason']}"
+        # A negative verdict is evidence only when the verifier saw the whole
+        # document. When the pipeline's own limits left part of it unread (the
+        # PDF time budget or page ceiling, the pagination cap, or the excerpt
+        # window) a "not addressed" says the claim was not in the part read, and
+        # nothing more. The one exception is a contradiction the model backed with a
+        # sentence that is actually on the page: text found is evidence
+        # whatever was left unread. Issue #395: 40 of 111 "not supporting"
+        # verdicts on one run were council packets read to page 40.
+        grounded_contradiction = verdict_info["verdict"] == "contradicts" and bool(
+            verdict_info.get("quote_grounded")
         )
-        if followed is not None and followed.stopped == "page cap":
-            result["note"] += (
-                f" Only the first {followed.pages_read} pages of a longer source "
-                "were read, so the claim may sit further on."
+        if read["partial"] and not grounded_contradiction:
+            result["verification"] = "partial_read"
+            result["note"] = (
+                f"Read in part only. {_coverage_sentence(read)} The claim was not "
+                f"found in what was read ({verdict_info['verdict']}: "
+                f"{verdict_info['reason']}). This is a limit of the read, NOT "
+                f"evidence against the claim — open the document at the cited "
+                f"page before treating it as unsupported."
             )
-        elif followed is not None and followed.stopped == "byte budget":
-            result["note"] += (
-                f" Reading stopped at a size limit after {followed.pages_read} "
-                "pages of a longer source, so the claim may sit further on."
+        else:
+            result["verification"] = "content_mismatch"
+            result["note"] = (
+                f"Source URL loaded, and its extracted article text was read in "
+                f"full and checked, but content verification found it does not "
+                f"support this specific claim ({verdict_info['verdict']}): "
+                f"{verdict_info['reason']}"
             )
 
     return _check_drift(result, checksum_index)
+
+
+#: Limits that can leave part of a document unread, as the report names them.
+_LIMIT_NAMES = {
+    "pdf_page_cap": "the PDF page cap",
+    "pdf_time_budget": "the PDF time budget",
+    "pagination_cap": "the pagination cap",
+    "byte_budget": "the pagination size budget",
+    "excerpt_window": "the excerpt window",
+}
+
+
+def _read_coverage(coverage, window, followed):
+    """One record of how much of the document the verdict rests on.
+
+    Three limits can leave text unread, and a reader needs all three in one
+    place: the PDF time budget or page ceiling (``coverage``, whose
+    ``stopped_by`` says which), the pagination follower's
+    page cap or byte budget (``followed``), and the verifier's excerpt window
+    (``window``, from ``extract.select_excerpt_with_window``). ``partial`` is
+    True when any of them did. Every Section 9 entry that reached a verdict
+    carries this, so a reader can tell "not there" from "not found".
+    """
+    coverage = coverage or {}
+    window = window or {}
+    limits = []
+    if coverage.get("partial"):
+        # A coverage record from before ``stopped_by`` existed (a saved run
+        # replayed) was cut by the page cap, the only limit there was.
+        limits.append(
+            "pdf_time_budget"
+            if coverage.get("stopped_by") == "time_budget"
+            else "pdf_page_cap"
+        )
+    if followed is not None and followed.stopped == "page cap":
+        limits.append("pagination_cap")
+    elif followed is not None and followed.stopped == "byte budget":
+        limits.append("byte_budget")
+    if window.get("windowed"):
+        limits.append("excerpt_window")
+    read = {
+        "kind": coverage.get("kind"),
+        "pages_total": coverage.get("pages_total"),
+        "pages_read": coverage.get("pages_read"),
+        "chars_total": window.get("chars_total"),
+        "chars_shown": window.get("chars_read"),
+        "window": window.get("how"),
+        "limits": limits,
+        "partial": bool(limits),
+    }
+    if followed is not None and followed.noteworthy:
+        read["web_pages_read"] = followed.pages_read
+    return read
+
+
+def _coverage_sentence(read):
+    """``read`` as one plain sentence, for notes and the readable report."""
+    parts = []
+    total, done = read.get("pages_total"), read.get("pages_read")
+    if total is not None and done is not None:
+        stopped = ""
+        for limit in ("pdf_time_budget", "pdf_page_cap"):
+            if done < total and limit in read.get("limits", ()):
+                stopped = f" before {_LIMIT_NAMES[limit]} stopped it"
+        parts.append(
+            f"{done} of {total} PDF pages were read{stopped}"
+            if done < total
+            else f"all {total} PDF page(s) were read"
+        )
+    if read.get("web_pages_read"):
+        stopped = ""
+        if "pagination_cap" in read.get("limits", ()):
+            stopped = " before the pagination cap stopped it"
+        elif "byte_budget" in read.get("limits", ()):
+            stopped = " before the size budget stopped it"
+        parts.append(f"{read['web_pages_read']} web page(s) were read{stopped}")
+    shown, chars = read.get("chars_shown"), read.get("chars_total")
+    if chars is not None and shown is not None:
+        if read.get("window") == "whole":
+            parts.append(
+                f"the verifier was shown the whole text ({chars:,} characters)"
+            )
+        else:
+            parts.append(
+                f"the verifier was shown the {shown:,} characters most likely to "
+                f"address the claim out of {chars:,}"
+            )
+    return (
+        (", and ".join(parts) + ".")
+        if parts
+        else "The extent of the read was not recorded."
+    )
 
 
 def verify_source_supports(
@@ -1133,7 +1553,9 @@ _UNRESOLVED_RANK = 1
 def _informativeness(result):
     if result.get("verification") == "content_mismatch":
         return _FAILURE_RANK.get(result.get("relevance_verdict"), _UNRESOLVED_RANK)
-    if result.get("verification") == "unverifiable":
+    if result.get("verification") in ("unverifiable", "partial_read"):
+        # A claim not found in the part of a document that was read says as
+        # little against the claim as a page that could not be read at all.
         return _UNVERIFIABLE_RANK
     return _UNRESOLVED_RANK
 
@@ -1147,6 +1569,9 @@ def _resolve_candidates(
     author=None,
     verify_claim=None,
     page_cache=None,
+    locate_hints=None,
+    secondary_urls=None,
+    stale_days=None,
 ):
     """Check a claim against the sources cited for it, best candidate first.
 
@@ -1160,7 +1585,17 @@ def _resolve_candidates(
     That ordering matters for honesty as much as cost. Reporting "the source
     does not support this" after checking one of three cited sources says
     something false about a draft that cited the right source second.
+
+    ``secondary_urls`` are candidates that reached the claim only through a
+    neighbouring span's marker or a weak span match. They are tried, and may
+    support the claim, but when none supports it the reported failure is drawn
+    from the claim's own sources whenever one of those was tried (issue #441).
+    On brockovich-fact-check run 2 a TV guest listing one span earlier won the
+    headline for three facility-count claims because the draft's own source, a
+    759,000-character JSON file, could only be read in part and a partial read
+    ranks below a clean "not addressed".
     """
+    secondary = set(secondary_urls or ())
     attempts = []
     for url in known_urls:
         result = _resolve_known_url(
@@ -1172,6 +1607,8 @@ def _resolve_candidates(
             author=author,
             verify_claim=verify_claim,
             page_cache=page_cache,
+            locate_hints=tuple((locate_hints or {}).get(url, ())),
+            stale_days=stale_days,
         )
         if verify_claim:
             result["verified_as"] = verify_claim
@@ -1180,11 +1617,26 @@ def _resolve_candidates(
             # citation list where only the third entry carries the claim is
             # worth knowing about, and it is invisible otherwise.
             if attempts:
-                result["alternates_checked"] = [a.get("url") for a in attempts]
+                result["alternates_checked"] = [a.get("url") for _u, a in attempts]
+                if draft_citations.is_archive_url(url) and any(
+                    a.get("relevance_verdict") == "contradicts" for _u, a in attempts
+                ):
+                    # A dated figure checked against the live page first: the
+                    # live page now says something else, and the archived copy
+                    # the draft cites says what the draft says (issue #442).
+                    result["note"] = (
+                        f"{result.get('note', '').rstrip()} The archived copy "
+                        "the draft cites supports this; a live page checked "
+                        "first now reads differently, which is a change in the "
+                        "page, not an error in the claim."
+                    ).lstrip()
             return result
-        attempts.append(result)
+        attempts.append((url, result))
 
-    best = max(attempts, key=_informativeness)
+    pairs = attempts
+    own = [result for url, result in pairs if url not in secondary]
+    attempts = [result for _url, result in pairs]
+    best = max(own or attempts, key=_informativeness)
     others = [a.get("url") for a in attempts if a is not best]
     if others:
         best["alternates_checked"] = others
@@ -1226,6 +1678,10 @@ def _resolve_one(
     author=None,
     verify_claim=None,
     page_cache=None,
+    clock=None,
+    locate_hints=None,
+    secondary_urls=None,
+    stale_days=None,
 ):
     """Resolve a single claim against the configured sources, in order.
 
@@ -1237,7 +1693,51 @@ def _resolve_one(
     points at a publication for manual retrieval) are reported with
     ``verification: "pointer"`` so the report does not imply the claim was
     checksummed against retrieved data.
+
+    ``clock`` (a ``_StepClock``) times the steps for the duration of this call
+    and the result carries its report as ``resolution_timing``. The caller
+    keeps a reference, which is how a claim that never returns still gets its
+    timing read.
     """
+    _clock.current = clock
+    try:
+        result = _resolve_one_steps(
+            claim,
+            citation_sources,
+            known_urls,
+            api_keys,
+            call_log,
+            checksum_index,
+            author,
+            verify_claim,
+            page_cache,
+            locate_hints=locate_hints,
+            secondary_urls=secondary_urls,
+            stale_days=stale_days,
+        )
+    finally:
+        _clock.current = None
+        if clock is not None:
+            clock.done()
+    if clock is not None and isinstance(result, dict):
+        result["resolution_timing"] = clock.report()
+    return result
+
+
+def _resolve_one_steps(
+    claim,
+    citation_sources,
+    known_urls,
+    api_keys,
+    call_log,
+    checksum_index,
+    author,
+    verify_claim,
+    page_cache,
+    locate_hints=None,
+    secondary_urls=None,
+    stale_days=None,
+):
     checksum_index = checksum_index if checksum_index is not None else {}
 
     if known_urls:
@@ -1250,6 +1750,9 @@ def _resolve_one(
             author=author,
             verify_claim=verify_claim,
             page_cache=page_cache,
+            locate_hints=locate_hints,
+            secondary_urls=secondary_urls,
+            stale_days=stale_days,
         )
 
     for source_config in citation_sources:
@@ -1263,11 +1766,17 @@ def _resolve_one(
             continue
         source_name = source_config.get("name", adapter_name)
         try:
+            _step("adapter")
             adapter = _load_adapter(adapter_name)
             result = adapter.resolve(claim)
             if result and result.get("found"):
                 resolved_url = result.get("url")
-                wb = wayback.check(resolved_url) if resolved_url else {"archived": None}
+                _step("archive_check")
+                wb = (
+                    _wayback_check(resolved_url, stale_days)
+                    if resolved_url
+                    else {"archived": None}
+                )
                 pointer_only = bool(result.get("pointer_only"))
                 return _check_drift(
                     {
@@ -1380,6 +1889,12 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
     """
     wb = entry.setdefault("wayback", {})
     wb["submitted"] = bool(sub.get("submitted"))
+    if wb["submitted"] and entry.get("url"):
+        # Whatever archive.org said about this URL before the submission is no
+        # longer what it would say after it. Drop the remembered answer so the
+        # next run's lookup asks, rather than repeating "not archived" for a
+        # page this run just had captured.
+        wayback.forget_lookup(entry["url"])
     if sub.get("job_id"):
         wb["submission_job_id"] = sub["job_id"]
     if sub.get("error"):
@@ -1412,8 +1927,12 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
             )
             if category:
                 wb["submission_retry_category"] = category
+            _record_failure_kind(wb, sub)
     elif sub.get("archived") and sub.get("snapshot_url"):
         _record_archived(wb, sub)
+        if entry.get("url"):
+            # The capture is the answer; the availability index will lag it.
+            wayback.remember_lookup(entry["url"], wb)
     elif sub.get("job_id"):
         wb["archive_outcome"] = wayback.ARCHIVE_PENDING
         wb["archive_outcome_detail"] = (
@@ -1424,6 +1943,64 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
         wb["archive_outcome_detail"] = sub.get("error_summary") or (
             "archive.org accepted the request but named no snapshot, and an "
             "unauthenticated submission has no job id to ask about it"
+        )
+
+
+#: Why a submission failed, as ``wayback.submission_failure_kind`` records it.
+#: Two of these are archive.org deciding, two are the connection, and an author
+#: does different things about each: wait for tomorrow, re-source the page, or
+#: run the pass again.
+FAILURE_POLICY = "archive_policy"  # archive.org answered and refused (an error code)
+FAILURE_RATE_LIMITED = "rate_limited"  # a 429, or skipped because the breaker was open
+FAILURE_CONNECTION = "connection"  # refused, dropped or unresolved: no answer at all
+FAILURE_HTTP = "http_error"  # archive.org answered with an error status
+FAILURE_OTHER = "other"
+
+
+def _failure_kind(sub):
+    """Classify a failed ``wayback.submit`` result. See ``FAILURE_*``.
+
+    Read off the fields spn-client sets rather than the message text, except for
+    the transport case: spn-client folds a ``ConnectionError`` into
+    ``error_summary`` ("could not reach archive.org ...") and keeps no exception
+    type, so that sentence, which it owns, is what marks it.
+    """
+    if sub.get("error_code"):
+        return FAILURE_POLICY
+    if sub.get("rate_limited"):
+        return FAILURE_RATE_LIMITED
+    summary = sub.get("error_summary") or ""
+    if summary.startswith("could not reach archive.org"):
+        return FAILURE_CONNECTION
+    if summary.startswith("archive.org answered HTTP"):
+        return FAILURE_HTTP
+    return FAILURE_OTHER
+
+
+def _record_failure_kind(wb, sub):
+    """Say whether a failed submission was archive.org's policy or the network.
+
+    Run 2 of chinese-carrier-bans and carrier-security-compliance (2026-11-10)
+    reported 13 refused connections in the same words as archive.org's own
+    refusals, with nothing to say whether the rate-limit breaker had tripped.
+    It had not, and no 429 preceded them. Re-running archive-only the same
+    afternoon reproduced it: web.archive.org refused every connection for about
+    50 seconds while archive.org, on the same address, answered 200 throughout.
+    That is a throttle below the 429 this pipeline listens for, not this
+    machine's network, and not a judgement about the page. So the record says
+    which it was, and whether the breaker was open when it happened.
+    """
+    kind = _failure_kind(sub)
+    breaker_open = bool(wayback.rate_limited_out())
+    wb["submission_failure_kind"] = kind
+    wb["breaker_open_at_failure"] = breaker_open
+    if kind == FAILURE_CONNECTION:
+        detail = (wb.get("archive_outcome_detail") or "").rstrip(". ")
+        wb["archive_outcome_detail"] = (
+            f"{detail}. This was the connection to archive.org, not a refusal "
+            f"by archive.org: no answer came back. The rate-limit breaker "
+            f"{'was' if breaker_open else 'was not'} open, and archive.org "
+            f"sent no 429 for this request. Run the archive pass again later"
         )
 
 
@@ -1449,6 +2026,8 @@ def _record_job_status(entry, status: wayback.JobStatusResult) -> str | None:
     state = status.get("state")
     if state == "success":
         _record_archived(wb, status)
+        if entry.get("url"):
+            wayback.remember_lookup(entry["url"], wb)
     elif state == "failed":
         wb["archive_outcome"] = wayback.ARCHIVE_CAPTURE_FAILED
         wb["archive_outcome_detail"] = status.get("reason")
@@ -1620,16 +2199,23 @@ def _note_breaker_state():
     exists to explain is precisely the run with zero targets, which returns
     early and never reaches the end of that function. It has to sit outside.
     """
-    if wayback.rate_limited_out():
+    if wayback.note_breaker_state():
+        summary = wayback.breaker_summary()
+        when = summary.get("first_seen_open_utc")
+        reopened = summary.get("reopened", 0)
         log.warning(
             "archive.org's rate-limit breaker was open at the end of the "
-            "archiving pass — lookups and submissions after it tripped were "
+            "archiving pass%s%s — lookups and submissions after it tripped were "
             "skipped, so an unknown archive status this run is this, not a "
-            "statement about the pages"
+            "statement about the pages",
+            f" (first seen open at {when})" if when else "",
+            f", after {reopened} retry(ies) this run" if reopened else "",
         )
 
 
-def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
+def _reconcile_prior_captures(
+    targets, history_root, access_key, secret_key, prior_pending=None
+):
     """Ask archive.org what became of captures an earlier run left pending.
 
     Returns the subset of ``targets`` still worth submitting.
@@ -1652,13 +2238,21 @@ def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
     Never raises: a citation whose prior job cannot be read is simply submitted
     again, which is exactly what would have happened before this existed.
     """
-    if not (access_key and secret_key and history_root):
+    if not (access_key and secret_key and (history_root or prior_pending)):
         return targets
-    try:
-        pending = build_pending_capture_index(history_root)
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning(f"Could not read prior Wayback capture jobs: {exc}")
-        return targets
+    pending = {}
+    if history_root:
+        try:
+            pending = build_pending_capture_index(history_root)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning(f"Could not read prior Wayback capture jobs: {exc}")
+    # Jobs an earlier archive-only pass left running are not in local history
+    # (archive-only saves no report); the caller hands them in. A job id in
+    # history wins over one of the same URL handed in: history is per URL, the
+    # most recent run's.
+    for url, prior in (prior_pending or {}).items():
+        if url not in pending and isinstance(prior, dict) and prior.get("job_id"):
+            pending[url] = prior
     if not pending:
         return targets
 
@@ -1707,7 +2301,15 @@ def _reconcile_prior_captures(targets, history_root, access_key, secret_key):
                     "error_code": status.get("error_code"),
                     "retry_category": category,
                 }
-                if category == "permanent":
+                if (
+                    category == "permanent"
+                    and status.get("error_code") != "error:not-found"
+                ):
+                    # A 404 is the exception: it is the target host's answer
+                    # on one afternoon, not archive.org's, and on 2026-11-10
+                    # four eCFR sections got it while 17 others on ecfr.gov
+                    # captured. It is resubmitted, once per run, below.
+                    #
                     # archive.org cannot capture this page — not this run, not
                     # any run. Resubmitting spends a capture request against a
                     # 3/min (anonymous) or 7/min (authenticated) ceiling to buy
@@ -1819,7 +2421,11 @@ def _poll_capture_outcomes(entries, access_key, secret_key):
 
 
 def _submit_missing_archives(
-    results, archive_org_creds=None, history_root=None, capture_settings=None
+    results,
+    archive_org_creds=None,
+    history_root=None,
+    capture_settings=None,
+    prior_pending=None,
 ):
     """Follow-up pass: request Wayback archiving for resolved citations whose
     URL isn't archived yet, and establish what became of the request.
@@ -1876,6 +2482,10 @@ def _submit_missing_archives(
         for r in results
         if r.get("resolved")
         and r.get("url")
+        # A citation that is itself a snapshot is the archive. Re-capturing it
+        # asks archive.org to archive its own page, and on 2026-11-10 two such
+        # citations were submitted and reported as stale gaps.
+        and not draft_citations.is_archive_url(r["url"])
         and (
             r.get("wayback", {}).get("archived") is False
             or r.get("wayback", {}).get("snapshot_stale")
@@ -1946,12 +2556,15 @@ def _submit_missing_archives(
             access_key,
             secret_key,
             options,
+            prior_pending=prior_pending,
         )
     finally:
         _fan_out_submission_outcomes(by_url, before)
 
 
-def _submit_one_per_url(targets, history_root, access_key, secret_key, options=None):
+def _submit_one_per_url(
+    targets, history_root, access_key, secret_key, options=None, prior_pending=None
+):
     """Run the archiving pass over one representative citation per URL.
 
     Split out of ``_submit_missing_archives`` so that the deduplication and the
@@ -1962,7 +2575,9 @@ def _submit_one_per_url(targets, history_root, access_key, secret_key, options=N
     # Settle last run's unfinished business first: a capture still running does
     # not want a second submission queued behind it, and one that failed has a
     # reason worth reporting before we try again.
-    targets = _reconcile_prior_captures(targets, history_root, access_key, secret_key)
+    targets = _reconcile_prior_captures(
+        targets, history_root, access_key, secret_key, prior_pending
+    )
     if not targets:
         return
 
@@ -2065,6 +2680,168 @@ def _submit_one_per_url(targets, history_root, access_key, secret_key, options=N
 
     # Bounded wait on anything archive.org queued rather than captured inline.
     _poll_capture_outcomes(targets, access_key, secret_key)
+
+    # Two refusals that have a better answer than "failed".
+    _adopt_same_day_snapshots(targets)
+    # Before the 404 retry reads "which hosts served a capture": a capture of a
+    # bot wall is not the host serving.
+    demote_off_site_snapshots(targets)
+    retry = _not_found_on_serving_hosts(targets)
+    if retry:
+        log.info(
+            "Wayback: retrying %d capture(s) that came back 404 from a host "
+            "archive.org captured other pages from this run",
+            len(retry),
+        )
+        for entry in retry:
+            entry["wayback"]["capture_retried_after_not_found"] = True
+            _submit_one(entry)
+        _poll_capture_outcomes(retry, access_key, secret_key)
+
+
+#: archive.org's code for a URL it will capture only once a day.
+DAILY_LIMIT_CODE = "error:too-many-daily-captures"
+
+
+def _adopt_same_day_snapshots(entries):
+    """After a once-a-day refusal, record the snapshot that refusal implies.
+
+    archive.org refuses a second capture of some resources in one day ("This URL
+    has been already captured 1 times today"). The refusal is itself evidence
+    that a snapshot from today exists: on 2026-11-10 DOC-426316 was refused for
+    carrier-security-compliance because chinese-carrier-bans' run had captured
+    it hours earlier, and the report said ``submit_failed``. One lookup finds
+    that snapshot. It bypasses the run's lookup memo, which holds the "not
+    archived" answer the run started with, and uses CDX, which sees a capture
+    the availability API has not indexed yet.
+
+    Only a snapshot no more than a day old is adopted. An older one is what the
+    run had already, and the refusal stays recorded beside it.
+    """
+    for entry in entries:
+        wb = entry.get("wayback") or {}
+        if wb.get("submission_error_code") != DAILY_LIMIT_CODE:
+            continue
+        url = entry.get("url")
+        if not url:
+            continue
+        wayback.forget_lookup(url)
+        try:
+            found = wayback.check(url, cdx_fallback=True)
+        except Exception as exc:  # pragma: no cover - check swallows
+            log.warning(f"Wayback lookup after a daily-limit refusal raised: {exc}")
+            continue
+        age = found.get("snapshot_age_days") if isinstance(found, dict) else None
+        if not (found.get("archived") and found.get("snapshot_url")):
+            continue
+        if not isinstance(age, int) or age > 1:
+            continue
+        _record_archived(wb, found)
+        wb["archive_outcome_detail"] = (
+            "archive.org refused a second capture today and the snapshot it "
+            "already made today is recorded instead"
+        )
+        wb["adopted_same_day_snapshot"] = True
+
+
+_SNAPSHOT_ORIGINAL_RE = re.compile(
+    r"^https?://web\.archive\.org/web/\d{4,14}[a-z_]*/(.+)$", re.IGNORECASE
+)
+
+
+def _site_of(url):
+    """The last two labels of a URL's host (``ecfr.gov``, ``fcc.gov``).
+
+    A rough registrable domain, good enough for the question it answers: is a
+    snapshot of the site that was cited? It is wrong for a two-label public
+    suffix such as ``co.uk``, where it treats two sites as one, which is the
+    lenient direction: a real off-site snapshot there goes unflagged, nothing
+    real is ever flagged.
+    """
+    host = _host_of(url)
+    if not host:
+        return None
+    return ".".join(host.split(".")[-2:])
+
+
+def demote_off_site_snapshots(entries):
+    """Refuse a snapshot that is of another site than the one cited.
+
+    archive.org follows redirects when it captures, and names the snapshot by
+    where it landed. On 2026-11-10, 15 of carrier-security-compliance's 28
+    eCFR citations had a "snapshot" of ``unblock.federalregister.gov``:
+    ecfr.gov sends archive.org's crawler to its bot check, so the capture is of
+    that page, not of the regulation, and the report counted it as archived.
+    The same block is the likelier reading of the eCFR 404s that run 2 took
+    for transient. A snapshot whose original URL is on a different site from the
+    cited URL is therefore recorded as a failed capture, with the snapshot it
+    did produce kept under ``off_site_snapshot_url`` for anyone who wants to
+    look. A redirect within one site (``http`` to ``https``, ``docs.fcc.gov`` to
+    ``www.fcc.gov``) is not touched. Returns the entries it demoted.
+    """
+    demoted = []
+    for entry in entries:
+        wb = entry.get("wayback") or {}
+        snap = wb.get("snapshot_url")
+        cited = entry.get("url")
+        if not (snap and cited):
+            continue
+        if _SNAPSHOT_ORIGINAL_RE.match(cited):
+            # The citation is itself a snapshot; there is nothing to compare.
+            continue
+        m = _SNAPSHOT_ORIGINAL_RE.match(snap)
+        if not m:
+            continue
+        landed = _site_of(m.group(1))
+        if not landed or landed == _site_of(cited):
+            continue
+        wb["off_site_snapshot_url"] = snap
+        for key in _SNAPSHOT_FIELDS:
+            wb.pop(key, None)
+        wb["archived"] = False
+        wb["archive_outcome"] = wayback.ARCHIVE_CAPTURE_FAILED
+        wb["archive_outcome_detail"] = (
+            f"archive.org's snapshot is of {landed}, not of the cited site: the "
+            f"page redirected the capture (often to a bot check), so the cited "
+            f"page is not archived. Snapshot: {snap}"
+        )
+        wb["capture_redirected_off_site"] = True
+        demoted.append(entry)
+    return demoted
+
+
+def _host_of(url):
+    try:
+        return (urlsplit(url).hostname or "").lower() or None
+    except ValueError:
+        return None
+
+
+def _not_found_on_serving_hosts(entries):
+    """Captures that failed 404 from a host that served other captures this pass.
+
+    archive.org's ``error:not-found`` is categorised ``permanent``, and for a page
+    that is gone it is. But on 2026-11-10 four eCFR sections came back 404 in a
+    run that captured 17 other ecfr.gov sections, and the same sections load in a
+    browser: a 404 from a host that is plainly serving is more likely the host's
+    bad moment than a missing page. One retry each, in the same pass, settles it
+    for the price of one capture request. A URL already retried is not retried
+    again, and a host with no successful capture this pass is not second-guessed.
+    """
+    serving = {
+        _host_of(e.get("url"))
+        for e in entries
+        if (e.get("wayback") or {}).get("archive_outcome") == wayback.ARCHIVE_ARCHIVED
+        and e.get("url")
+    }
+    serving.discard(None)
+    return [
+        e
+        for e in entries
+        if (e.get("wayback") or {}).get("capture_error_code") == "error:not-found"
+        and not e["wayback"].get("capture_retried_after_not_found")
+        and _host_of(e.get("url")) in serving
+    ]
 
 
 #: Bound on concurrent snapshot reads for archive-match verification, and the
@@ -2335,7 +3112,7 @@ def _note_confirmed_siblings(results):
         ).lstrip()
 
 
-def _resolution_error_result(claim, known_urls, error):
+def _resolution_error_result(claim, known_urls, error, timing=None):
     """The entry for a claim whose resolution job timed out or raised.
 
     Its own tier, ``resolution_error``, so it is neither "No source identified"
@@ -2343,6 +3120,10 @@ def _resolution_error_result(claim, known_urls, error):
     got to answer). The URL it was working on is kept when one was known: with
     several, ``_resolve_one`` tries them in order and a timeout does not say
     which was in flight, so the first is recorded and the note says how many.
+
+    ``timing`` is the claim's ``_StepClock.report()`` taken as it was written
+    off. It goes on the entry as ``resolution_timing``, the step it was in as
+    ``timed_out_in``, and the note says both, so a timeout names its cause.
     """
     timed_out = isinstance(error, TimeoutError)
     result = {
@@ -2351,9 +3132,17 @@ def _resolution_error_result(claim, known_urls, error):
         "verification": "resolution_error",
         "error_kind": "timeout" if timed_out else "error",
     }
+    where = ""
+    if timing:
+        timing = dict(timing)
+        step = timing.pop("in_progress", None)
+        result["resolution_timing"] = timing
+        if step:
+            result["timed_out_in"] = step
+            where = f" It was in the {step} step ({_format_timing(timing)})."
     note = (
         f"Resolution did not finish ({error}), so nothing about this claim's "
-        "source was checked. A re-run usually clears a timeout."
+        f"source was checked.{where} A re-run usually clears a timeout."
         if timed_out
         else f"Resolution error: {type(error).__name__}: {error}. Nothing about "
         "this claim's source was checked. A re-run may clear it."
@@ -2377,6 +3166,7 @@ def resolve_citations(
     author=None,
     capture_settings=None,
     page_cache=None,
+    stale_days=None,
 ):
     """
     For each claim, resolve a primary source. If the claim entry carries
@@ -2415,6 +3205,10 @@ def resolve_citations(
     this call, and the quote check that ran before it, share one fetch per cited
     URL. Without it every claim fetches its own copy.
 
+    ``stale_days`` is ``pipeline.wayback_snapshot_stale_days``: the age past
+    which a snapshot is flagged ``[STALE]``, the same threshold the link pass
+    uses. None leaves spn-client's own default (30 days) in force (issue #438).
+
     Returns a list of resolution results in the original claim order.
     """
     if not claims:
@@ -2425,6 +3219,17 @@ def resolve_citations(
         entry.get("verify_claim") if isinstance(entry, dict) else None
         for entry in claims
     ]
+    hints_per_claim = [
+        entry.get("locate_hints") if isinstance(entry, dict) else None
+        for entry in claims
+    ]
+    secondary_per_claim = [
+        set(entry.get("neighbour_urls") or ())
+        | set(entry.get("weak_source_urls") or ())
+        if isinstance(entry, dict)
+        else set()
+        for entry in claims
+    ]
     call_log = verification_call_log if verification_call_log is not None else []
     checksum_index = build_checksum_index(history_root) if history_root else {}
 
@@ -2433,10 +3238,16 @@ def resolve_citations(
     # never a ThreadPoolExecutor — see _submit_missing_archives just above for
     # why that distinction is the whole point: an abandoned call here must not
     # be able to hold the run open the way a pool's atexit join would.
+    #
+    # One clock per claim, held here and not only inside the job, so a claim
+    # that runs past its budget can be asked what it is doing while it is
+    # still doing it, and a claim written off at the ceiling still reports the
+    # step it died in.
+    clocks = [_StepClock() for _ in normalized]
     jobs = [
         (
             str(idx),
-            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim: (
+            lambda claim=claim, known_urls=known_urls, verify_claim=verify_claim, clock=clock, hints=hints, secondary=secondary: (
                 _resolve_one(
                     claim,
                     citation_sources,
@@ -2447,26 +3258,73 @@ def resolve_citations(
                     author,
                     verify_claim,
                     page_cache,
+                    clock=clock,
+                    locate_hints=hints,
+                    secondary_urls=secondary,
+                    stale_days=stale_days,
                 )
             ),
             _RESOLVE_TIMEOUT_SECONDS,
         )
-        for idx, ((claim, known_urls, _bucket), verify_claim) in enumerate(
-            zip(normalized, verify_claims)
+        for idx, (
+            (claim, known_urls, _bucket),
+            verify_claim,
+            clock,
+            hints,
+            secondary,
+        ) in enumerate(
+            zip(normalized, verify_claims, clocks, hints_per_claim, secondary_per_claim)
         )
     ]
-    outcomes = run_all_bounded(jobs, max_parallel=_MAX_PARALLEL)
+
+    overran = set()
+
+    def _log_overrun(name, timeout):
+        # Logged the moment it happens, from the batch's own thread, naming the
+        # step: the 117 timeouts of run 26 were logged in one lump after the
+        # batch, all at one timestamp, saying nothing about where each had
+        # spent its time.
+        idx = int(name)
+        overran.add(idx)
+        urls = normalized[idx][1]
+        timing = clocks[idx].report()
+        log.warning(
+            f"Citation resolution for claim {idx} ({urls[0] if urls else 'no URL'}) "
+            f"is past its {timeout}s budget, still in {timing.get('in_progress', '?')} "
+            f"({_format_timing(timing)}). Its slot is released; its result is kept "
+            f"if it finishes before the batch ceiling."
+        )
+
+    outcomes = run_all_bounded(
+        jobs, max_parallel=_MAX_PARALLEL, on_overrun=_log_overrun
+    )
 
     ordered: dict[int, dict] = {}
+    written_off = 0
     for idx_str, (value, error) in outcomes.items():
         idx = int(idx_str)
         if error is None:
             ordered[idx] = value
+            continue
+        timing = clocks[idx].report()
+        if isinstance(error, TimeoutError):
+            written_off += 1
+            log.warning(
+                f"Citation resolution for claim {idx} was written off at the batch "
+                f"ceiling in {timing.get('in_progress', '?')} ({_format_timing(timing)})."
+            )
         else:
             log.warning(f"Citation resolution raised for claim index {idx}: {error}")
-            ordered[idx] = _resolution_error_result(
-                normalized[idx][0], normalized[idx][1], error
-            )
+        ordered[idx] = _resolution_error_result(
+            normalized[idx][0], normalized[idx][1], error, timing
+        )
+    if overran:
+        log.info(
+            f"{len(overran)} of {len(normalized)} claim(s) ran past the "
+            f"{_RESOLVE_TIMEOUT_SECONDS}s per-claim budget; "
+            f"{len(overran) - written_off} finished before the batch ceiling and "
+            f"were kept, {written_off} written off."
+        )
 
     resolved_results = []
     for i in range(len(normalized)):

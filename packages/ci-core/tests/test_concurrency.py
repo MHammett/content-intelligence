@@ -458,12 +458,16 @@ class TestRunAllBounded:
         assert self._peak_concurrency(4, max_parallel=99) == 4
 
     def test_a_jobs_own_timeout_still_fires(self):
+        # An explicit group deadline: a job past its budget is waited for until
+        # the group deadline (see TestLateResultsAreKept), and the default one
+        # for a single 0.2s job is a minute of slack.
         results = run_all_bounded(
-            [("slow", lambda: time.sleep(10), 0.2)], max_parallel=1
+            [("slow", lambda: time.sleep(10), 0.2)], max_parallel=1, global_timeout=0.5
         )
         value, error = results["slow"]
         assert value is None
         assert isinstance(error, TimeoutError)
+        assert "0.2" in str(error)
 
     def test_reraises_what_a_call_raised(self):
         def _boom():
@@ -478,7 +482,7 @@ class TestRunAllBounded:
             ("fast", lambda: "ok", 5),
             ("slow", lambda: time.sleep(10), 0.2),
         ]
-        results = run_all_bounded(jobs, max_parallel=2)
+        results = run_all_bounded(jobs, max_parallel=2, global_timeout=1)
         assert results["fast"] == ("ok", None)
         assert isinstance(results["slow"][1], TimeoutError)
 
@@ -601,7 +605,7 @@ class TestBudgetStartsOnAcquire:
             ("fine", lambda: "ok", 5),
             ("wedged", lambda: time.sleep(30), 0.3),
         ]
-        results = run_all_bounded(jobs, max_parallel=2)
+        results = run_all_bounded(jobs, max_parallel=2, global_timeout=1)
 
         assert results["fine"] == ("ok", None)
         value, error = results["wedged"]
@@ -626,6 +630,146 @@ class TestBudgetStartsOnAcquire:
 
         run_all_bounded([(str(i), work, 30) for i in range(20)], max_parallel=4)
         assert peak == 4
+
+
+class TestLateResultsAreKept:
+    """A job that outlives its budget loses its slot, not its answer (#389).
+
+    The per-job budget used to go through ``run_with_timeout``, which raises on
+    expiry and drops whatever the worker returns afterwards, while the worker —
+    a daemon, never killed — ran on to the end. On a 267-claim citation batch
+    117 claims were reported as timed out although their threads completed
+    every fetch and every model call; the answers were paid for and discarded.
+    ``run_all_with_timeout`` already kept a straggler's value; this holds the
+    bounded form to the same contract, up to the group deadline.
+    """
+
+    def test_a_job_that_finishes_after_its_budget_but_before_the_deadline_returns(
+        self,
+    ):
+        def _late():
+            time.sleep(0.4)
+            return "late answer"
+
+        started = time.monotonic()
+        results = run_all_bounded(
+            [("late", _late, 0.1)], max_parallel=1, global_timeout=5
+        )
+        elapsed = time.monotonic() - started
+
+        assert results["late"] == ("late answer", None)
+        assert elapsed < 2, "waited past the job's own finish"
+
+    def test_a_job_that_never_finishes_is_still_a_timeout(self):
+        results = run_all_bounded(
+            [("stuck", lambda: time.sleep(30), 0.1)], max_parallel=1, global_timeout=0.5
+        )
+        value, error = results["stuck"]
+        assert value is None
+        assert isinstance(error, TimeoutError)
+        assert "0.1" in str(error), "names the budget it overran"
+        assert "group deadline" in str(error), (
+            "and says it was written off at the ceiling"
+        )
+
+    def test_a_late_job_raising_is_still_relayed(self):
+        def _late_boom():
+            time.sleep(0.3)
+            raise ValueError("provider said no, eventually")
+
+        value, error = run_all_bounded(
+            [("late", _late_boom, 0.05)], max_parallel=1, global_timeout=5
+        )["late"]
+        assert value is None
+        assert isinstance(error, ValueError)
+
+    def test_an_overrun_releases_its_slot_at_once(self):
+        """The trade the docstring names: the late job's slot goes to the next
+        queued job the moment the budget expires, not when the job ends."""
+        order = []
+
+        def _late():
+            time.sleep(0.6)
+            order.append("late")
+            return "late"
+
+        def _fast():
+            order.append("fast")
+            return "fast"
+
+        results = run_all_bounded(
+            [("late", _late, 0.1), ("fast", _fast, 5)],
+            max_parallel=1,
+            global_timeout=5,
+        )
+        assert order == ["fast", "late"], (
+            "the queued job should have run while the late one was still going"
+        )
+        assert results == {"late": ("late", None), "fast": ("fast", None)}
+
+    def test_on_overrun_fires_when_the_budget_expires_not_when_the_job_ends(self):
+        fired = []
+        finished = []
+
+        def _late():
+            time.sleep(0.5)
+            finished.append(time.monotonic())
+            return "late"
+
+        def _hook(name, timeout):
+            fired.append((name, timeout, time.monotonic()))
+
+        run_all_bounded(
+            [("late", _late, 0.1), ("prompt", lambda: "ok", 5)],
+            max_parallel=2,
+            global_timeout=5,
+            on_overrun=_hook,
+        )
+        assert [(n, t) for n, t, _ in fired] == [("late", 0.1)], (
+            "once, for the late job only"
+        )
+        assert fired[0][2] < finished[0], "called while the job was still running"
+
+    def test_keep_late_false_writes_the_job_off_at_its_budget(self):
+        """The opt-out for callers with a person waiting at a prompt."""
+        fired = []
+
+        def _late():
+            time.sleep(0.5)
+            return "late"
+
+        started = time.monotonic()
+        results = run_all_bounded(
+            [("late", _late, 0.1)],
+            max_parallel=1,
+            global_timeout=5,
+            keep_late=False,
+            on_overrun=lambda name, timeout: fired.append(name),
+        )
+        elapsed = time.monotonic() - started
+
+        value, error = results["late"]
+        assert value is None
+        assert isinstance(error, TimeoutError)
+        assert str(error) == "Timed out after 0.1s"
+        assert elapsed < 0.45, "did not wait for the job to finish"
+        assert fired == ["late"], "the hook still fires on the overrun"
+
+    def test_a_hook_that_raises_does_not_become_the_jobs_result(self):
+        def _late():
+            time.sleep(0.3)
+            return "late"
+
+        def _bad_hook(name, timeout):
+            raise RuntimeError("logging broke")
+
+        results = run_all_bounded(
+            [("late", _late, 0.05)],
+            max_parallel=1,
+            global_timeout=5,
+            on_overrun=_bad_hook,
+        )
+        assert results["late"] == ("late", None)
 
 
 class TestBoundedProcessExit:
@@ -657,6 +801,7 @@ class TestBoundedProcessExit:
             results = run_all_bounded(
                 [("stuck", lambda: time.sleep({abandoned}), 0.5)],
                 max_parallel=1,
+                global_timeout=1,
             )
             print("backstop fired" if results["stuck"][1] else "no backstop")
             print("exiting")

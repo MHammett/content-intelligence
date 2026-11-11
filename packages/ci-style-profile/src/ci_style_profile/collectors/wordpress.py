@@ -176,12 +176,16 @@ class WordPressCollector(Collector):
             # ours is ever alive while this generator is suspended.
             for start in range(0, len(pages), _MAX_PAGE_PARALLEL):
                 wave = pages[start : start + _MAX_PAGE_PARALLEL]
+                # keep_late=False: a page that has not answered in
+                # _PAGE_TIMEOUT_SECONDS is abandoned there, not waited for
+                # until the wave's ceiling (one budget plus a minute of slack).
                 outcomes = run_all_bounded(
                     [
                         (str(n), lambda n=n: _fetch_page(n), _PAGE_TIMEOUT_SECONDS)
                         for n in wave
                     ],
                     max_parallel=_MAX_PAGE_PARALLEL,
+                    keep_late=False,
                 )
                 # Page order, not completion order: document order across a run
                 # is now reproducible rather than however the network raced.
