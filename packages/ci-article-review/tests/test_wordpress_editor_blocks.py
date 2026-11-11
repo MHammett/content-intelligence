@@ -142,7 +142,6 @@ class TestWhatHasNoNativeFormIsSentWhole:
         "markdown",
         [
             pytest.param("> # A heading\n> and text", id="a-heading"),
-            pytest.param("> 1. one\n> 2. two", id="an-ordered-list"),
             pytest.param("> Intro.\n>\n>     indented code", id="a-code-block"),
             pytest.param("<blockquote>loose text</blockquote>", id="loose-text"),
             pytest.param("<blockquote></blockquote>", id="nothing"),
@@ -268,6 +267,12 @@ class TestEveryConstructTogether:
             "code",
             "separator",
             "image",
+            "quote",
+            "paragraph",
+            "list",
+            "list-item",
+            "list-item",
+            "paragraph",
             "html",
             "paragraph",
         ]

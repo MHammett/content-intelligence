@@ -91,6 +91,67 @@ BLOCK_MARKER = "<!-- wp:"
 #: lists; ``sane_lists`` stops a list from swallowing the paragraph beneath it.
 _MD_EXTENSIONS = ("extra", "sane_lists")
 
+#: A line that opens a list item, after any ``>`` quote markers: a bullet, or an
+#: ordered list starting at 1 (CommonMark lets only those interrupt a paragraph,
+#: so a wrapped line that happens to begin "2. " stays prose). Not a rule like
+#: ``* * *``. Up to three spaces of indent; four would be code.
+_LIST_OPENER = re.compile(r"^ {0,3}(?:[-+*]|1[.)]) +\S")
+_RULE = re.compile(r"^ {0,3}([-*_])( *\1){2,} *$")
+_FENCE = re.compile(r"^ {0,3}(```|~~~)")
+_QUOTE_PREFIX = re.compile(r"^(?: {0,3}> ?)*")
+
+
+def _let_lists_interrupt_paragraphs(text):
+    """Put a blank line before a list that starts straight after a paragraph.
+
+    Python-Markdown follows the original Markdown rule: a list needs a blank
+    line before it, so ``**TL;DR**`` followed directly by ``- a`` lines is one
+    paragraph holding literal "- a" text. CommonMark, GitHub and the block
+    editor's own Markdown paste let the list interrupt the paragraph, and the
+    handoffs are written that way: two posts went out with their TL;DR list
+    flattened into one paragraph inside its quote. The blank line inserted
+    carries the line's ``>`` markers, so it stays inside the quote.
+
+    ``mdx-breakless-lists`` is the published fix for this and was not taken:
+    it matches only unquoted lines, which misses the quoted TL;DR this exists
+    for, and it does not skip fenced code, where it would insert lines.
+    """
+    out = []
+    fenced = False
+    previous = None  # (quote prefix, kind) of the last line outside a fence
+    for line in text.split("\n"):
+        prefix = _QUOTE_PREFIX.match(line).group(0)
+        body = line[len(prefix) :]
+        if _FENCE.match(body):
+            fenced = not fenced
+            previous = None
+            out.append(line)
+            continue
+        if fenced:
+            out.append(line)
+            continue
+        if not body.strip():
+            kind = "blank"
+        elif _LIST_OPENER.match(body) and not _RULE.match(body):
+            kind = "item"
+        else:
+            kind = "text"
+        if (
+            kind == "item"
+            and previous is not None
+            and previous[1] == "text"
+            and previous[0].replace(" ", "") == prefix.replace(" ", "")
+        ):
+            out.append(prefix.rstrip())
+        # A line after an item continues it, as far as this is concerned: a
+        # later item in the same list needs no blank line.
+        if kind == "text" and previous is not None and previous[1] in ("item", "cont"):
+            kind = "cont"
+        previous = (prefix, kind)
+        out.append(line)
+    return "\n".join(out)
+
+
 _HEADINGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
 
 #: The attributes an image block carries. Anything else on an ``<img>`` (a
@@ -129,14 +190,20 @@ def _wrap(name, inner, attrs=""):
 
 
 def _list_block(el):
-    items = "".join(
-        _wrap("list-item", f"<li>{_inner_html(li)}</li>") + "\n"
-        for li in el.findall("li")
+    """``core/list`` of ``core/list-item``, spaced as the editor writes it.
+
+    The items sit flush against the list's tags and are joined by a blank line
+    (``blocks.json``, ``list-unordered``). The editor also accepted the spacing
+    this used to write, but only the editor's own can be held to a capture,
+    which a list inside a quote now is.
+    """
+    items = "\n\n".join(
+        _wrap("list-item", f"<li>{_inner_html(li)}</li>") for li in el.findall("li")
     )
     ordered = el.tag == "ol"
     attrs = ' {"ordered":true}' if ordered else ""
     tag = "ol" if ordered else "ul"
-    return _wrap("list", f'<{tag} class="wp-block-list">\n{items}</{tag}>', attrs)
+    return _wrap("list", f'<{tag} class="wp-block-list">{items}</{tag}>', attrs)
 
 
 def _blank(text):
@@ -159,17 +226,24 @@ def _only_children(el, tags):
 
 
 def _quote_block(el):
-    """``core/quote``: a ``blockquote`` of one ``core/paragraph`` per paragraph.
+    """``core/quote``: a ``blockquote`` of paragraphs and lists, as inner blocks.
 
-    The inner blocks are joined by a blank line, as the editor joins them. A
-    quote that holds anything but paragraphs (a list, a heading, another quote,
-    loose text) has no faithful form here, so it goes out as ``wp:html`` and is
-    not flattened into paragraphs.
+    Each paragraph is a ``core/paragraph`` and each list a ``core/list``, the
+    blocks a TL;DR box (a bold label over a list of points) is made of in the
+    editor. The inner blocks are joined by a blank line, as the editor joins
+    them. A quote that holds anything else (a heading, another quote, loose
+    text) has no faithful form here, so it goes out as ``wp:html`` and is not
+    flattened into paragraphs.
     """
-    paragraphs = _only_children(el, ("p",))
-    if not paragraphs:
+    kids = _only_children(el, ("p", "ul", "ol"))
+    if not kids:
         return None
-    inner = "\n\n".join(_wrap("paragraph", _element_html(p)) for p in paragraphs)
+    inner = "\n\n".join(
+        _list_block(kid)
+        if kid.tag in ("ul", "ol")
+        else _wrap("paragraph", _element_html(kid))
+        for kid in kids
+    )
     return _wrap("quote", f'<blockquote class="wp-block-quote">{inner}</blockquote>')
 
 
@@ -478,7 +552,9 @@ def _render(markdown, text, link=True):
     ``find_images`` turns it off: links wrap text and cannot add, move or remove
     an image, and the warning for a URL that cannot be linked would be given twice.
     """
-    html = markdown.markdown(text, extensions=list(_MD_EXTENSIONS))
+    html = markdown.markdown(
+        _let_lists_interrupt_paragraphs(text), extensions=list(_MD_EXTENSIONS)
+    )
     if link:
         html = _link_bare_urls(html)
     try:

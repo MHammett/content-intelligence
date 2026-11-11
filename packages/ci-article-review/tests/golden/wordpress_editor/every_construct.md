@@ -31,7 +31,14 @@ print("hi")
 
 ![Alt text](https://example.com/photo.png "A caption")
 
+> **TL;DR**
 > - A quote holding
-> - a list, which has no native form
+> - a list
+
+A paragraph between the quotes.
+
+> A quote holding
+>
+> > another quote, which has no native form
 
 Closing paragraph.
