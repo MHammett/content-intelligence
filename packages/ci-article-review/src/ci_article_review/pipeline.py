@@ -3396,6 +3396,13 @@ def run_draft_pipeline(
     # every archive lookup here, reporting each citation as "rate limit tripped
     # earlier this run" for a limit that expired before this run began.
     wayback.reset_rate_limit_state()
+    # One archive.org clock for every run on this machine, not one per process:
+    # see ``wayback.enable_shared_rate_limit``. --offline asks archive.org
+    # nothing, so it has no reason to open the file.
+    if not offline:
+        wayback.enable_shared_rate_limit(
+            pipeline_cfg.get("wayback_shared_rate_limit", True)
+        )
     # Fetched citation pages kept for the next run and reused only when the
     # origin answers 304 Not Modified (ci_core.http, "Page store"). Off for
     # --offline, which fetches nothing.
@@ -6541,6 +6548,11 @@ def run_archive_only(
     # answer is taken only if CDX was consulted when it was stored, a fresh
     # positive from anyone (see wayback_lookup_cache).
     wayback.reset_rate_limit_state()
+    # An archive pass is nothing but archive.org requests, and several run at
+    # once: the case the machine-wide clock exists for.
+    wayback.enable_shared_rate_limit(
+        config["pipeline"].get("wayback_shared_rate_limit", True)
+    )
     wayback.open_lookup_cache(
         _history_root()
         if config["pipeline"].get("wayback_lookup_cache", True)

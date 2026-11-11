@@ -313,6 +313,10 @@ pipeline:
   # the history root): a snapshot that exists for 7 days, "none" for 1 day.
   # Within a run the link pass and Section 9 share one lookup per URL either way.
   wayback_lookup_cache: true
+  # Share archive.org pacing, backoff and the rate-limit breaker with every
+  # other run on this machine (one file in your user cache directory), so
+  # several runs at once ask archive.org no more often than one would.
+  wayback_shared_rate_limit: true
   # Archive every URL in the draft's Sources list after Pass 3, not only the
   # claim citations that resolved. No model calls; archive.org requests only.
   archive_all_sources: true

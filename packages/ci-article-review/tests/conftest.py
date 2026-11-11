@@ -207,6 +207,21 @@ def isolate_model_discovery_cache(_model_discovery_cache_dir, request, monkeypat
 
 
 @pytest.fixture(autouse=True)
+def no_machine_wide_archive_clock(monkeypatch):
+    """Keep every test off the per-user archive.org rate-limit file.
+
+    A run turns on spn-client's machine-wide clock
+    (``wayback.enable_shared_rate_limit``), which is a SQLite file in the
+    user's cache directory shared with every real run on the machine. A test
+    that reached it would pace against, and could trip the breaker for, a
+    review running at the same moment. Tests of the switch itself put a fake
+    back in its place.
+    """
+    monkeypatch.setattr(wayback, "_spn_use_shared_state", lambda path: None)
+    monkeypatch.delenv("SPN_CLIENT_SHARED_STATE", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def neutralise_wayback_pacing(monkeypatch):
     """Take the archive.org pacing clock out of every test's wall-clock cost.
 

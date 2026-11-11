@@ -717,7 +717,7 @@ def _wayback_fallback_content(url, timeout, stale_days=None):
     if not wb.get("archived") or not snapshot_url:
         return None, wb
     try:
-        resp = safe_get(snapshot_url, timeout=timeout)
+        resp = wayback.paced_fetch(safe_get, snapshot_url, timeout=timeout)
         resp.raise_for_status()
     except Exception:
         # archive.org answered and *does* have a snapshot; we just could not read
@@ -2846,12 +2846,22 @@ def _not_found_on_serving_hosts(entries):
 
 #: Bound on concurrent snapshot reads for archive-match verification, and the
 #: per-call safety net. These are ordinary reads of an already-captured page —
-#: the same kind of fetch ``_wayback_fallback_content`` makes, and deliberately
-#: not routed through spn-client's pacing clock: that clock exists for the availability
-#: API and Save Page Now, which are the throttled endpoints. Serialising cheap
-#: snapshot reads behind a 3-second interval would add minutes to a run for no
-#: protection anybody asked for.
-_MAX_MATCH_PARALLEL = 4
+#: the same kind of fetch ``_wayback_fallback_content`` makes.
+#:
+#: They go through spn-client's pacing clock (``wayback.paced_fetch``). This
+#: comment used to say the opposite: that the clock was for the availability
+#: API and Save Page Now, "the throttled endpoints", and that pacing snapshot
+#: reads would add minutes for no protection anybody asked for. archive.org
+#: limits by address, not by endpoint: on 2026-11-10 and 11-11 web.archive.org
+#: refused every connection from this machine for minutes at a time, and these
+#: reads, four at a time and uncounted, were part of what it was refusing.
+#: Forty snapshots now take about two minutes instead of seconds. That is the
+#: cost of the run being one polite client rather than two.
+#:
+#: Two wide, not four: the clock lets one request out every three seconds
+#: however many threads wait, and each entry's budget starts when it takes a
+#: slot here, so a wider pool only spends that budget queueing.
+_MAX_MATCH_PARALLEL = 2
 _MATCH_TIMEOUT_SECONDS = 30
 
 #: Verdicts for "does the archived copy say what we checked?"
@@ -2914,7 +2924,9 @@ def _verify_archive_matches(results):
             )
             return
         try:
-            resp = safe_get(raw_url, timeout=_MATCH_TIMEOUT_SECONDS)
+            resp = wayback.paced_fetch(
+                safe_get, raw_url, timeout=_MATCH_TIMEOUT_SECONDS
+            )
             resp.raise_for_status()
         except Exception as exc:
             entry["archive_match"] = ARCHIVE_MATCH_UNCHECKED

@@ -10,6 +10,7 @@ archive copy, and how to summarize a wayback result for a human reader.
 """
 
 import logging
+import os
 import ssl
 import time
 from datetime import datetime, timezone
@@ -28,24 +29,40 @@ from spn_client import (
     ARCHIVE_SUBMIT_FAILED,
     ARCHIVE_SUBMITTED,
     DEFAULT_STALE_DAYS,
+    SHARED_STATE_ENV,
     CaptureCapacityResult,
     CheckResult,
     JobStatusResult,
     SubmitResult,
     SystemStatusResult,
+    breaker_reason,
     capture_capacity,
     categorize_job_error,
     check_job_status,
+    default_shared_state_path,
+    note_outcome,
+    pace,
+    paced_get,
     rate_limited_out,
     service_health_note,
     snapshot_raw_url,
     submit,
     system_status,
+    use_shared_state,
 )
 from spn_client import check as _spn_check
 from spn_client import reset_rate_limit_state as _spn_reset_rate_limit_state
 
 from .wayback_lookup_cache import STORE_FILENAME, LookupCache
+
+#: The spn-client 0.5.0 functions this module calls, under private names so a
+#: test can put a fake in one place (and so the suite can keep every test off
+#: the real per-user file: see ``no_machine_wide_archive_clock`` in conftest).
+_spn_pace = pace
+_spn_note_outcome = note_outcome
+_spn_breaker_reason = breaker_reason
+_spn_use_shared_state = use_shared_state
+_spn_default_shared_state_path = default_shared_state_path
 
 __all__ = [
     "ARCHIVE_ARCHIVED",
@@ -57,12 +74,15 @@ __all__ = [
     "ARCHIVE_SUBMITTED",
     "DEFAULT_STALE_DAYS",
     "FALLBACK_REASON_LABELS",
+    "SHARED_STATE_ENV",
+    "ArchiveBreakerOpen",
     "CaptureCapacityResult",
     "CheckResult",
     "JobStatusResult",
     "SubmitResult",
     "SystemStatusResult",
     "CAPTURE_SECRET_OPTIONS",
+    "breaker_reason",
     "CAPTURE_SETTING_OPTIONS",
     "capture_capacity",
     "capture_options",
@@ -72,13 +92,19 @@ __all__ = [
     "check",
     "check_job_status",
     "close_lookup_cache",
+    "default_shared_state_path",
+    "enable_shared_rate_limit",
     "fallback_reason_for_exception",
     "fallback_reason_for_status",
     "forget_lookup",
     "format_summary",
     "lookup_cache_summary",
     "lookup_was_rate_limited",
+    "note_outcome",
     "open_lookup_cache",
+    "pace",
+    "paced_fetch",
+    "paced_get",
     "rate_limited_out",
     "remember_lookup",
     "reset_rate_limit_state",
@@ -87,6 +113,7 @@ __all__ = [
     "submit",
     "system_status",
     "transport_failure_summary",
+    "use_shared_state",
 ]
 
 log = logging.getLogger(__name__)
@@ -125,6 +152,85 @@ def reset_rate_limit_state():
     _breaker.update(seen_open=None, first_seen_open_utc=None, reopened=0)
 
 
+def enable_shared_rate_limit(enabled=True):
+    """Put this process on the machine-wide archive.org clock. Returns the
+    file's path, or None when the clock is this process's own.
+
+    archive.org limits per IP address. Several reviews and archive passes run
+    on one machine at once, and until this each paced itself as if it had the
+    whole budget: four runs inside 45 minutes on 2026-10-29, and on 2026-11-11
+    archive passes whose connections archive.org refused outright. With the
+    shared file every process on the machine takes turns on one clock, a 429
+    or a refused connection in one backs all of them off, and the breaker one
+    trips stops the rest.
+
+    The file is spn-client's per-user default, so any other project using
+    spn-client shares it too. ``SPN_CLIENT_SHARED_STATE`` names a different
+    one; ``pipeline.wayback_shared_rate_limit: false`` turns it off. A file
+    that cannot be opened is spn-client's to report: it logs and paces the
+    process on its own.
+    """
+    if not enabled:
+        _spn_use_shared_state(None)
+        return None
+    path = os.environ.get(SHARED_STATE_ENV) or _spn_default_shared_state_path()
+    _spn_use_shared_state(path)
+    log.info("archive.org pacing is shared machine-wide through %s", path)
+    return path
+
+
+class ArchiveBreakerOpen(Exception):
+    """An archive.org fetch that was not made because the breaker is open."""
+
+
+def _retry_after(resp):
+    """The response's ``Retry-After`` in seconds, or None to let spn-client
+    choose. Only the delta-seconds form; archive.org does not send a date."""
+    try:
+        return float(resp.headers.get("Retry-After"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def paced_fetch(fetch, url, timeout):
+    """``fetch(url, timeout=timeout)`` for an archive.org URL, on spn-client's clock.
+
+    For the snapshot reads that cannot go through spn-client's own GET because
+    they need ``safe_get``'s SSRF guard: the resolver's archive fallback, the
+    archive-match comparison and link validation's fallback. They used to call
+    ``safe_get`` directly, so they were neither paced nor counted, and a run
+    kept reading snapshots while spn-client was backing off its own calls to
+    the same address.
+
+    Nothing is sent while the breaker is open (``ArchiveBreakerOpen``). The
+    caller passes its own ``fetch`` so the name its tests patch still works.
+    Whatever ``fetch`` returns or raises is passed on unchanged, after
+    spn-client has been told about it: a 429 or a refused connection here
+    backs off and counts exactly as one inside spn-client would.
+    """
+    if rate_limited_out():
+        raise ArchiveBreakerOpen()
+    _spn_pace()
+    try:
+        resp = fetch(url, timeout=timeout)
+    except Exception as exc:
+        _spn_note_outcome(exc=exc)
+        raise
+    _spn_note_outcome(
+        status_code=getattr(resp, "status_code", None),
+        retry_after=_retry_after(resp),
+    )
+    return resp
+
+
+#: Reasons ``reopen_breaker_if_cooled`` leaves alone. A refused connection is
+#: archive.org closing the address rather than pacing it (third-party reports
+#: put a firewall block at an hour), so five minutes is not a cooldown for it.
+#: A machine-wide trip lives in the shared file, which a reset here does not
+#: touch and which closes on its own.
+_NEVER_REOPENED = ("connection_refused", "machine_wide")
+
+
 def note_breaker_state():
     """Record when the breaker was first seen open; return whether it is open.
 
@@ -150,6 +256,8 @@ def reopen_breaker_if_cooled(cooldown=BREAKER_COOLDOWN_SECONDS, now=None):
     """
     if not note_breaker_state():
         return False
+    if _spn_breaker_reason() in _NEVER_REOPENED:
+        return False
     now = time.monotonic() if now is None else now
     waited = now - _breaker["seen_open"]
     if waited < cooldown or _breaker["reopened"] >= _MAX_BREAKER_REOPENS:
@@ -172,11 +280,16 @@ def breaker_summary():
     first = _breaker["first_seen_open_utc"]
     if first is None and not rate_limited_out():
         return {}
-    return {
+    summary = {
         "first_seen_open_utc": first.isoformat(timespec="seconds") if first else None,
         "reopened": _breaker["reopened"],
         "open_at_end": rate_limited_out(),
     }
+    reason = _spn_breaker_reason()
+    if reason is not None:
+        # Present only while the breaker is open.
+        summary["reason"] = reason
+    return summary
 
 
 def open_lookup_cache(history_root=None):
@@ -591,6 +704,11 @@ def transport_failure_summary(exc, what):
     """
     if isinstance(exc, UnsafeURLError):
         return f"the address {what} resolved to a non-public host and was not fetched"
+    if isinstance(exc, ArchiveBreakerOpen):
+        return (
+            f"archive.org's rate-limit breaker was open, so the request {what} "
+            f"was not fetched"
+        )
     if isinstance(exc, requests.exceptions.Timeout):
         return f"archive.org did not answer {what} within the timeout"
     # Before ConnectionError, which is where requests files SSLError. A
