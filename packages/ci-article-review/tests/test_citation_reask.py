@@ -289,6 +289,16 @@ class TestCostControls:
             )
         assert call.call_args.kwargs["provider_config"]["web_search"] is False
 
+    def test_gemini_grounding_is_switched_off_too(self):
+        """gemini ignores web_search; without this a re-ask ran 19 billed queries."""
+        with patch.object(
+            reask.llm,
+            "call_provider",
+            return_value=_response({"action": "stand", "reason": "r"}),
+        ) as call:
+            reask.reask_refuted([_refuted()], api_keys={"gemini": {"api_key": "k"}})
+        assert call.call_args.kwargs["provider_config"]["grounding"] is False
+
 
 class TestThePrompt:
     def test_the_refutation_and_claim_are_both_shown(self):

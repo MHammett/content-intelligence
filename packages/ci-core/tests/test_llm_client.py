@@ -963,6 +963,32 @@ class TestGeminiGrounding:
 
         assert seen["tools"] == [{"googleSearch": {}}]
 
+    def _sent_with(self, cfg, schema=None):
+        seen = {}
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return _completion_stream()
+
+        with patch.object(client.litellm, "completion", side_effect=_capture):
+            _call("gemini", provider_config=cfg)
+        return seen
+
+    def test_grounding_false_leaves_the_search_tool_off(self):
+        """Issue #330: a citation re-ask ran 19 billed queries because gemini
+        grounds every call and web_search=False was never read."""
+        assert "tools" not in self._sent_with({"grounding": False})
+
+    def test_web_search_false_alone_still_grounds_gemini(self):
+        """The pipeline turns a per-domain list into False on the domains it
+        omits; gemini must keep searching on those."""
+        sent = self._sent_with({"web_search": False})
+        assert sent["tools"] == [{"googleSearch": {}}]
+
+    def test_ungrounded_request_is_not_billed_as_searching(self):
+        params = client._provider_params("gemini", {"grounding": False})
+        assert not client._search_enabled("gemini", {"grounding": False}, params)
+
 
 # ---------------------------------------------------------------------------
 # Operator-facing guidance

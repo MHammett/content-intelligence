@@ -1296,7 +1296,15 @@ def _provider_params(provider, cfg, response_schema=None, model=None):
     if provider == "gemini":
         # Search grounding. This is the entire reason gemini is in the fact_check
         # ensemble; without it the model is answering from training recall.
-        params["tools"] = [{"googleSearch": {}}]
+        #
+        # The one way to leave it off is an explicit ``grounding: False`` in the
+        # config. ``web_search`` cannot carry that: the pipeline rewrites a
+        # per-domain list into a bool, so ``web_search: False`` reaches here on
+        # every domain a user's list omits, and gemini must still ground those.
+        # Gemini 3 bills each query Google runs, and a re-ask with the tool
+        # attached ran 19 on one citation ($0.27, issue #330).
+        if cfg.get("grounding") is not False:
+            params["tools"] = [{"googleSearch": {}}]
         if vertex.is_modern(_resolve_model(provider, model, cfg)):
             # Gemini 3 and later think by level, not by budget. litellm turns
             # `reasoning_effort` into thinkingConfig {thinkingLevel,
