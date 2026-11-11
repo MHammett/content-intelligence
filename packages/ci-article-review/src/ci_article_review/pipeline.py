@@ -4054,6 +4054,29 @@ def run_draft_pipeline(
     # the save path is known, so a later run can replay this one for free.
     captured_raw_results = dict(raw_results)
 
+    # Write the capture now, before any post-ensemble step can crash the
+    # process. A native fault later on (for example in lxml under trafilatura
+    # during the quote check, which no try/except can catch) previously took
+    # the paid ensemble with it, because the capture was written only after
+    # the report was saved. The file lands beside where the report will go,
+    # under the report's own name, and is a valid capture on its own. It is
+    # not a run: no `_report.json` exists until the report is saved, so history
+    # readers, which look for reports, never count it. Skipped on replay, as
+    # below.
+    if not replay_results and captured_raw_results:
+        early_cap_path = ensemble_capture.capture_path_for(
+            Path(_history_root())
+            / hist._slug(_history_key(handoff))
+            / f"run_{run_number}_{run_start_ts.strftime('%Y%m%d_%H%M%S')}_report.json"
+        )
+        if ensemble_capture.save(
+            early_cap_path,
+            captured_raw_results,
+            article_title=article_title,
+            run_number=run_number,
+        ):
+            log.info(f"Ensemble captured early: {early_cap_path}")
+
     # Re-key results as {(model_name, domain): result}
     results: dict[tuple[str, str], dict] = {}
     for result in raw_results.values():
@@ -7208,6 +7231,12 @@ def cli():
     ``sys.exit(1)`` — a bad config, a missing handoff — takes the same exit
     path as a successful one and cannot hang either.
     """
+    # A native crash (exit 139 / 0xC0000005) kills the process without a Python
+    # traceback. faulthandler writes the Python stack of every thread to stderr
+    # when that happens, so the next one says where it died.
+    import faulthandler
+
+    faulthandler.enable(all_threads=True)
     code = 0
     try:
         main()

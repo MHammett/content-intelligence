@@ -2426,18 +2426,27 @@ def build_report(
         if not r.get("failed") and not r.get("skipped") and result_is_empty(r)
     ]
 
-    # Delta from prior run
-    delta = (
-        _compute_delta(
-            corrected_draft,
-            prior_report,
-            consensus_flags,
-            primary_claim,
-            prior_report_path=prior_report_path,
+    # Delta from prior run. Best-effort: a comparison that raises must cost the
+    # report its delta section, not the run its report. The ensemble is already
+    # paid for by the time this runs, and the report is what the user came for.
+    try:
+        delta = (
+            _compute_delta(
+                corrected_draft,
+                prior_report,
+                consensus_flags,
+                primary_claim,
+                prior_report_path=prior_report_path,
+            )
+            if prior_report
+            else None
         )
-        if prior_report
-        else None
-    )
+    except Exception:
+        log.exception(
+            "Delta against the prior run failed; the report is written without "
+            "the comparison section."
+        )
+        delta = None
 
     # Ensemble metadata for the report header
     assignments = sorted(f"{m}:{d}" for (m, d) in results)
