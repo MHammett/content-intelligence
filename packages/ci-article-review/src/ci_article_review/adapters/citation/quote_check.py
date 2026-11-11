@@ -331,7 +331,7 @@ def _classify(texts, partial):
 
 
 def _get_checked(url, timeout):
-    resp = safe_get(url, timeout=timeout)
+    resp = wayback.polite_fetch(safe_get, url, timeout=timeout)
     resp.raise_for_status()
     return resp
 

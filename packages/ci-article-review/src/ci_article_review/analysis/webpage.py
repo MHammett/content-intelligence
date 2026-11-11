@@ -16,6 +16,8 @@ import logging
 from ci_core.extract import extract_article, response_encoding
 from ci_core.http import USER_AGENT, UnsafeURLError, safe_get
 
+from ..adapters.citation import wayback
+
 
 __all__ = ["extract_article", "fetch_url", "build_handoff_from_url"]
 
@@ -38,7 +40,7 @@ def fetch_url(url, timeout=_FETCH_TIMEOUT):
     # — the previous check validated only the URL the user typed and then let
     # requests follow an attacker-chosen chain (audit finding 15).
     try:
-        resp = safe_get(url, timeout=timeout)
+        resp = wayback.polite_fetch(safe_get, url, timeout=timeout)
     except UnsafeURLError as e:
         raise ValueError(str(e)) from e
     resp.raise_for_status()
