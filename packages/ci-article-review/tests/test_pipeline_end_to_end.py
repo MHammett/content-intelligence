@@ -2499,3 +2499,30 @@ class TestSourcesArchivePass:
 
         report = self._run(tmp_path, archive, offline=True)
         assert "source_archive" not in report
+
+
+class TestCaptureSurvivesLateCrash:
+    """A failure after the ensemble must not discard the paid ensemble.
+
+    The capture used to be written only once the report was saved, so anything
+    that died between the two (a native fault in the quote check, a bug in
+    consolidation) lost every call the run had paid for. It is now written as
+    soon as the ensemble is in, and a replay of it costs nothing.
+    """
+
+    def test_capture_is_on_disk_when_consolidation_crashes(self, tmp_path):
+        crash = patch(
+            "ci_article_review.consolidation.build_report",
+            side_effect=RuntimeError("late crash"),
+        )
+        with pytest.raises(RuntimeError, match="late crash"):
+            with _stubbed_run(tmp_path, extra_patches=[crash]):
+                pass
+
+        history = tmp_path / "history"
+        captures = list(history.rglob("*_results.json"))
+        assert len(captures) == 1, captures
+        assert ensemble_capture.load(captures[0])
+        # A capture without a report is not a run: history readers look for
+        # reports, so nothing here counts as one.
+        assert not list(history.rglob("*_report.json"))

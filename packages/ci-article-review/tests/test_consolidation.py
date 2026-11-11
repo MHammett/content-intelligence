@@ -1487,3 +1487,39 @@ class TestTruncationExtent:
         assert detail["max_tokens"] == 16000
         assert detail["missing_buckets"] == ["additional_observations"]
         assert detail["cut_in"] == "additional_observations"
+
+
+class TestDeltaFailureIsContained:
+    """A comparison against the prior run that raises must not take the report.
+
+    On 2026-11-11 a run died after the comparison started and before its capture
+    was written. The delta is the one part of the report that reads the prior
+    run, so it is the part that gets a guard: a failure there costs the report
+    its comparison section and nothing else.
+    """
+
+    def test_report_is_built_without_delta_when_comparison_raises(self):
+        from unittest.mock import patch
+
+        from ci_article_review import consolidation
+
+        base = TestBuildReport()
+        prior = {"corrected_draft": "Test draft content.", "section_1_consensus": []}
+        with patch.object(
+            consolidation, "_compute_delta", side_effect=RuntimeError("boom")
+        ):
+            report = build_report(
+                article_title="Test Article",
+                publication_name="test_pub",
+                run_number=2,
+                corrected_draft="Test draft content.",
+                lt_result=base._lt_ok(),
+                results=base._base_results(),
+                ensemble_cfg={},
+                api_call_log=[],
+                prior_report=prior,
+                prior_report_path="run_1_x_report.json",
+            )
+        assert report["delta"] is None
+        assert report["article_title"] == "Test Article"
+        assert "section_1_consensus" in report
