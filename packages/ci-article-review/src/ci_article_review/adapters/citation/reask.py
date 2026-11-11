@@ -219,6 +219,9 @@ def reask_one(
     # fetched and checked before it is reported, so search buys confidence in
     # the suggestion rather than in the result.
     config["web_search"] = False
+    # gemini ignores web_search and grounds every call unless told otherwise;
+    # grounded re-asks billed up to 19 queries each (issue #330).
+    config["grounding"] = False
 
     try:
         response = llm.call_provider(

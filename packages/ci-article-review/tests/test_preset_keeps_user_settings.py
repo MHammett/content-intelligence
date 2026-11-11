@@ -42,6 +42,9 @@ _PRESET_OWNED = frozenset(
         # by every tier — a reasoning flag, so the preset owns it as it owns
         # the budget it replaced.
         "thinking_level",
+        # Set only in code, by the citation re-ask (issue #330); no user or
+        # preset ever writes it, so nothing is dropped.
+        "grounding",
         # How many search-and-reason rounds Perplexity's Agent API may take:
         # how hard the seat works, set per tier like reasoning_effort.
         "max_steps",

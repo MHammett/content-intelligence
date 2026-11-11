@@ -863,7 +863,9 @@ disagree picks the nearest available action instead, and a fabricated
 `different_source` costs a fetch to disprove.
 
 **Cost.** One call per refutation, bounded by `citation_reask_limit`; live web
-search is disabled for these calls. Refutations past the limit are logged rather
+search is disabled for these calls, including gemini's `googleSearch` grounding,
+which `web_search` alone never turned off (issue #330; the re-ask sets the internal
+`grounding: false`). Refutations past the limit are logged rather
 than dropped silently. The pass does not run with `--offline`. A claim traced to
 the draft's own citation block was asserted by the author rather than by a
 model, so there is nobody to hand it back to and it is skipped.
