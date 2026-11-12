@@ -290,3 +290,55 @@ class TestEveryPageFetchIsPolite:
         result = links._check_http(CITED, timeout=5)
         assert seen == [CITED]
         assert result["ok"] is True
+
+
+class TestRequestSummary:
+    """How many requests the run, and the machine, sent to archive.org.
+
+    A report said what happened to each URL and never how many requests went
+    out, so nobody could say how hard this machine leaned on archive.org in a
+    day. spn-client 0.5.1 counts them; this puts the count in the report.
+    """
+
+    def _counts(self, monkeypatch, run, machine):
+        monkeypatch.setattr(
+            wayback,
+            "_spn_request_counts",
+            lambda machine_wide=False, day=None: dict(machine if machine_wide else run),
+        )
+
+    def test_a_run_that_sent_nothing_has_no_summary(self, monkeypatch):
+        self._counts(monkeypatch, {}, {"cdx": 9})
+        assert wayback.request_summary() == {}
+        assert wayback.format_request_summary({}) is None
+
+    def test_the_run_and_the_machine_are_both_totalled(self, monkeypatch):
+        self._counts(
+            monkeypatch,
+            {"availability": 41, "save": 12, "caller": 3},
+            {"availability": 300, "save": 40, "caller": 9},
+        )
+        summary = wayback.request_summary()
+        assert summary == {
+            "run": {"availability": 41, "caller": 3, "save": 12},
+            "run_total": 56,
+            "machine_today_utc": {"availability": 300, "caller": 9, "save": 40},
+            "machine_today_utc_total": 349,
+        }
+        text = wayback.format_request_summary(summary)
+        assert "56 this run" in text
+        assert "availability 41" in text and "save 12" in text
+        assert "349 from this machine today (UTC)" in text
+
+    def test_without_the_shared_file_only_the_run_is_reported(self, monkeypatch):
+        self._counts(monkeypatch, {"cdx": 2}, {})
+        summary = wayback.request_summary()
+        assert summary == {"run": {"cdx": 2}, "run_total": 2}
+        text = wayback.format_request_summary(summary)
+        assert "2 this run" in text and "machine" not in text
+
+    def test_the_real_counter_starts_each_run_at_zero(self):
+        wayback.pace()
+        assert wayback.request_summary()["run"] == {"caller": 1}
+        wayback.reset_rate_limit_state()
+        assert wayback.request_summary() == {}

@@ -45,6 +45,7 @@ from spn_client import (
     pace,
     paced_get,
     rate_limited_out,
+    request_counts,
     service_health_note,
     snapshot_raw_url,
     submit,
@@ -64,6 +65,7 @@ _spn_note_outcome = note_outcome
 _spn_breaker_reason = breaker_reason
 _spn_use_shared_state = use_shared_state
 _spn_default_shared_state_path = default_shared_state_path
+_spn_request_counts = request_counts
 
 __all__ = [
     "ARCHIVE_ARCHIVED",
@@ -98,6 +100,7 @@ __all__ = [
     "fallback_reason_for_exception",
     "fallback_reason_for_status",
     "forget_lookup",
+    "format_request_summary",
     "format_summary",
     "lookup_cache_summary",
     "lookup_was_rate_limited",
@@ -109,6 +112,8 @@ __all__ = [
     "polite_fetch",
     "rate_limited_out",
     "remember_lookup",
+    "request_counts",
+    "request_summary",
     "reset_rate_limit_state",
     "service_health_note",
     "snapshot_raw_url",
@@ -334,6 +339,38 @@ def breaker_summary():
         # Present only while the breaker is open.
         summary["reason"] = reason
     return summary
+
+
+def request_summary():
+    """Requests sent to archive.org: by this run, and by this machine today.
+
+    ``{}`` for a run that sent none, so a report archive.org never heard from
+    carries no new field. Otherwise ``run`` (per endpoint) and ``run_total``,
+    and, when the machine-wide clock is on, ``machine_today_utc`` and its
+    total: every run on this machine since midnight UTC, this one included.
+    That second number is the one archive.org limits and the one no single
+    run could see. Counts are requests, retries included, not URLs.
+    """
+    run = _spn_request_counts()
+    if not run:
+        return {}
+    summary = {"run": dict(sorted(run.items())), "run_total": sum(run.values())}
+    machine = _spn_request_counts(machine_wide=True)
+    if machine:
+        summary["machine_today_utc"] = dict(sorted(machine.items()))
+        summary["machine_today_utc_total"] = sum(machine.values())
+    return summary
+
+
+def format_request_summary(summary):
+    """One log line for ``request_summary()``, or None when it is empty."""
+    if not summary:
+        return None
+    parts = ", ".join(f"{name} {n}" for name, n in summary["run"].items())
+    text = f"archive.org requests: {summary['run_total']} this run ({parts})"
+    if "machine_today_utc_total" in summary:
+        text += f"; {summary['machine_today_utc_total']} from this machine today (UTC)"
+    return text
 
 
 def open_lookup_cache(history_root=None):

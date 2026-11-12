@@ -4821,6 +4821,13 @@ def run_draft_pipeline(
     breaker = wayback.breaker_summary()
     if breaker:
         report["wayback_breaker"] = breaker
+    # Requests, not URLs: what this run sent archive.org and, with the
+    # machine-wide clock, what the whole machine has sent today. Absent when
+    # the run sent none.
+    archive_requests = wayback.request_summary()
+    if archive_requests:
+        report["archive_org_requests"] = archive_requests
+        log.info(wayback.format_request_summary(archive_requests))
     if report["wayback_lookups"]["lookups"]:
         wl = report["wayback_lookups"]
         not_sent = (
@@ -6570,6 +6577,9 @@ def run_archive_only(
         lookups = wayback.lookup_cache_summary()
         wayback.close_lookup_cache()
     breaker = wayback.breaker_summary()
+    archive_requests = wayback.request_summary()
+    if archive_requests:
+        log.info(wayback.format_request_summary(archive_requests))
 
     if results is None:
         print(
