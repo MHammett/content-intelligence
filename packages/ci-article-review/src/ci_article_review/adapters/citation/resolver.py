@@ -591,7 +591,7 @@ def _impersonation_fallback_content(url, timeout):
     document actually read lives one hop away. The caller needs that hop for the
     archive lookup — see ``_resolve_known_url``.
     """
-    resp = impersonating_get(url, timeout=timeout)
+    resp = wayback.polite_fetch(impersonating_get, url, timeout=timeout)
     if resp is None:
         return None
     final_url = str(getattr(resp, "url", "") or url)
@@ -610,7 +610,7 @@ def _impersonation_fallback_content(url, timeout):
 
 def _fetch_following_page(url, timeout=15):
     """``safe_get`` for a further page of a source, raising on an HTTP error."""
-    resp = safe_get(url, timeout=timeout)
+    resp = wayback.polite_fetch(safe_get, url, timeout=timeout)
     resp.raise_for_status()
     return resp
 

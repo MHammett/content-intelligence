@@ -166,7 +166,8 @@ def _check_http(url, timeout=_HEAD_TIMEOUT):
         # The OS trust store, not certifi: see ci_core.http. On certifi alone
         # every link to www.ntia.gov failed with a certificate error, and was
         # reported as unreachable.
-        resp = os_trust_head(
+        resp = _wayback.polite_fetch(
+            os_trust_head,
             url,
             allow_redirects=True,
             timeout=timeout,
@@ -183,7 +184,8 @@ def _check_http(url, timeout=_HEAD_TIMEOUT):
         # been reporting as 403. That second case is why this matters most —
         # a dead link was being excused as "403 blocked, likely still valid".
         if resp.status_code in (403, 405):
-            with os_trust_get(
+            with _wayback.polite_fetch(
+                os_trust_get,
                 url,
                 allow_redirects=True,
                 timeout=timeout,
@@ -197,7 +199,9 @@ def _check_http(url, timeout=_HEAD_TIMEOUT):
                 # curl_cffi is absent or the block holds, in which case the
                 # original result stands and the Wayback fallback runs as before.
                 if get_resp.status_code == 403:
-                    impersonated = impersonating_get(url, timeout=timeout)
+                    impersonated = _wayback.polite_fetch(
+                        impersonating_get, url, timeout=timeout
+                    )
                     if impersonated is not None:
                         return {
                             "status_code": impersonated.status_code,

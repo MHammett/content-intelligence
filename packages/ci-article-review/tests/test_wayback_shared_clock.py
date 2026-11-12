@@ -17,8 +17,8 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
-from ci_article_review.adapters.citation import resolver, wayback
-from ci_article_review.analysis import links
+from ci_article_review.adapters.citation import quote_check, resolver, wayback
+from ci_article_review.analysis import links, webpage
 
 SNAPSHOT = "https://web.archive.org/web/20260905121627/https://example.com/"
 
@@ -190,3 +190,103 @@ class TestReopeningLeavesARefusalAlone:
         spn.reason = "rate_limited"
         assert wayback.reopen_breaker_if_cooled(cooldown=300, now=seen + 2400)
         assert resets == [1]
+
+
+CITED = "https://web.archive.org/web/2024/https://example.com/report"
+
+
+class TestPoliteFetch:
+    """A draft can cite an archive.org URL outright. That page is fetched like
+    any other source, by the same code that fetches nytimes.com, so the host
+    decides whether the request waits on archive.org's clock (issue #489)."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            CITED,
+            "https://archive.org/details/some-item",
+            "http://WEB.ARCHIVE.ORG/web/2024/https://example.com/",
+            "https://wayback.archive.org/web/2024/https://example.com/",
+        ],
+    )
+    def test_an_archive_org_url_is_paced_and_counted(self, spn, url):
+        fetch = MagicMock(return_value=_response(200))
+        wayback.polite_fetch(fetch, url, timeout=7)
+        assert spn.calls[0] == "pace"
+        assert spn.calls[-1][0] == "outcome"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.example.com/web.archive.org/page",
+            "https://web.archive.org.example.com/",
+            "https://notarchive.org/",
+            "https://archive.today/abc",
+            "not a url",
+            None,
+        ],
+    )
+    def test_any_other_url_is_fetched_as_before(self, spn, url):
+        fetch = MagicMock(return_value=_response(200))
+        wayback.polite_fetch(fetch, url, timeout=7)
+        fetch.assert_called_once_with(url, timeout=7)
+        assert spn.calls == []
+
+    def test_other_keywords_reach_the_fetch_either_way(self, spn):
+        fetch = MagicMock(return_value=_response(200))
+        wayback.polite_fetch(fetch, CITED, timeout=7, allow_redirects=True)
+        wayback.polite_fetch(fetch, "https://example.com/", timeout=7, stream=True)
+        assert fetch.call_args_list[0].kwargs == {"timeout": 7, "allow_redirects": True}
+        assert fetch.call_args_list[1].kwargs == {"timeout": 7, "stream": True}
+
+    def test_an_open_breaker_stops_only_the_archive_org_fetch(self, spn, monkeypatch):
+        monkeypatch.setattr(wayback, "rate_limited_out", lambda: True)
+        fetch = MagicMock(return_value=_response(200))
+        with pytest.raises(wayback.ArchiveBreakerOpen) as info:
+            wayback.polite_fetch(fetch, CITED, timeout=7)
+        assert "breaker" in str(info.value)
+        assert wayback.polite_fetch(fetch, "https://example.com/", timeout=7)
+        fetch.assert_called_once()
+
+
+class TestEveryPageFetchIsPolite:
+    """Each place a cited URL is fetched asks ``polite_fetch``."""
+
+    @pytest.fixture
+    def seen(self, monkeypatch):
+        seen = []
+        self.answer = _response(503)
+
+        def polite(fetch, url, timeout, **kwargs):
+            seen.append(url)
+            return self.answer
+
+        monkeypatch.setattr(wayback, "polite_fetch", polite)
+        return seen
+
+    def test_the_resolvers_page_fetch(self, seen):
+        with pytest.raises(requests.HTTPError):
+            resolver._fetch_following_page(CITED)
+        assert seen == [CITED]
+
+    def test_the_resolvers_escalation(self, seen):
+        self.answer = None
+        assert resolver._impersonation_fallback_content(CITED, 5) is None
+        assert seen == [CITED]
+
+    def test_the_quote_check(self, seen):
+        with pytest.raises(requests.HTTPError):
+            quote_check._get_checked(CITED, 5)
+        assert seen == [CITED]
+
+    def test_a_handoff_built_from_a_url(self, seen):
+        with pytest.raises(requests.HTTPError):
+            webpage.fetch_url(CITED)
+        assert seen == [CITED]
+
+    def test_link_validation(self, seen, monkeypatch):
+        monkeypatch.setattr(links, "_is_public_host", lambda url: True)
+        self.answer = _response(200)
+        result = links._check_http(CITED, timeout=5)
+        assert seen == [CITED]
+        assert result["ok"] is True

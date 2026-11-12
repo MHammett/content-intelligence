@@ -15,6 +15,7 @@ import ssl
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 
@@ -105,6 +106,7 @@ __all__ = [
     "pace",
     "paced_fetch",
     "paced_get",
+    "polite_fetch",
     "rate_limited_out",
     "remember_lookup",
     "reset_rate_limit_state",
@@ -182,6 +184,14 @@ def enable_shared_rate_limit(enabled=True):
 class ArchiveBreakerOpen(Exception):
     """An archive.org fetch that was not made because the breaker is open."""
 
+    def __init__(self, message=None):
+        # A default, because this reaches reports through ``str(exc)`` at
+        # call sites that know nothing about it.
+        super().__init__(
+            message
+            or "archive.org's rate-limit breaker is open, so the request was not sent"
+        )
+
 
 def _retry_after(resp):
     """The response's ``Retry-After`` in seconds, or None to let spn-client
@@ -192,8 +202,8 @@ def _retry_after(resp):
         return None
 
 
-def paced_fetch(fetch, url, timeout):
-    """``fetch(url, timeout=timeout)`` for an archive.org URL, on spn-client's clock.
+def paced_fetch(fetch, url, timeout, **kwargs):
+    """``fetch(url, timeout=timeout, **kwargs)`` for an archive.org URL, on spn-client's clock.
 
     For the snapshot reads that cannot go through spn-client's own GET because
     they need ``safe_get``'s SSRF guard: the resolver's archive fallback, the
@@ -212,7 +222,7 @@ def paced_fetch(fetch, url, timeout):
         raise ArchiveBreakerOpen()
     _spn_pace()
     try:
-        resp = fetch(url, timeout=timeout)
+        resp = fetch(url, timeout=timeout, **kwargs)
     except Exception as exc:
         _spn_note_outcome(exc=exc)
         raise
@@ -221,6 +231,40 @@ def paced_fetch(fetch, url, timeout):
         retry_after=_retry_after(resp),
     )
     return resp
+
+
+def _on_archive_org(url):
+    """True when ``url``'s host is archive.org or under it.
+
+    The host, parsed: ``example.com/web.archive.org/x`` and
+    ``web.archive.org.example.com`` are not archive.org. archive.today is a
+    different service with its own limits and is not on this clock.
+    """
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return host == "archive.org" or host.endswith(".archive.org")
+
+
+def polite_fetch(fetch, url, timeout, **kwargs):
+    """``fetch(url, timeout=timeout, **kwargs)``, on archive.org's clock when
+    that is where ``url`` points.
+
+    For every fetch of a URL the pipeline did not choose: a cited source, a
+    link, a page handed in to build a handoff from. A draft can cite a
+    ``web.archive.org`` URL outright (the report itself recommends citing the
+    archived copy), and that page was read by the same code as any other
+    source, off the clock and uncounted (issue #489). Any other host is
+    fetched exactly as before.
+
+    Decided on the URL asked for. A page elsewhere that redirects to
+    archive.org is still followed unpaced; ``safe_get`` follows redirects
+    itself and that hop is not visible here.
+    """
+    if _on_archive_org(url):
+        return paced_fetch(fetch, url, timeout, **kwargs)
+    return fetch(url, timeout=timeout, **kwargs)
 
 
 #: Reasons ``reopen_breaker_if_cooled`` leaves alone. A refused connection is
