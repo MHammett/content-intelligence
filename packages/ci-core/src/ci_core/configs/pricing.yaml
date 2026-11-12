@@ -401,8 +401,9 @@ models:
   # pricing_known TRUE. That is 25% over its real $4.00/$20.00 - one 100k-in /
   # 20k-out call read $1.00 against a true $0.80, with nothing in the report
   # saying the rate was borrowed. claude-fable-5-1 borrowed fable-5's $1.00
-  # cached read, 4x its real $0.25. claude-sonnet-5-5 borrowed a rate that
-  # happens to be right, which is luck, not a reason to omit the row. Same
+  # cached read, 4x its real $0.25. claude-sonnet-5-5 borrowed sonnet-5's
+  # $0.20 cached read, 2x its real $0.10 (the vendor footnote puts cache hits on
+  # Sonnet 5.5 and Opus 5.5 at 0.05x base input; found 2026-11-12). Same
   # failure gemini-3.5-flash-lite had; tests/test_cost.py now guards both.
   claude-fable-5-1:             [10.00, 50.00,  0.25]   # verified 2026-09-29; 0.025x cache read
   claude-fable-5-2:             [8.00,  40.00,  0.20]   # verified 2026-11-10
@@ -412,7 +413,7 @@ models:
   claude-fable-5:               [10.00, 50.00,  1.00]
   claude-opus-5-5:              [4.00,  20.00,  0.20]   # verified 2026-09-29; 0.05x cache read
   claude-opus-5:                [5.00,  25.00,  0.50]
-  claude-sonnet-5-5:            [2.00,  10.00,  0.20]   # verified 2026-09-29
+  claude-sonnet-5-5:            [2.00,  10.00,  0.10]   # in/out verified 2026-09-29; cache read 0.05x, corrected 2026-11-12
   claude-sonnet-5:              [2.00,  10.00,  0.20]
   claude-opus-4-8:              [5.00,  25.00,  0.50]
   claude-sonnet-4-6:            [3.00,  15.00,  0.30]

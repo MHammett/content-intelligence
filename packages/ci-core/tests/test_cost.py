@@ -116,7 +116,7 @@ class TestClaudeRates:
             ("claude-fable-5", (10.00, 50.00, 1.00)),
             ("claude-opus-5-5", (4.00, 20.00, 0.20)),
             ("claude-opus-5", (5.00, 25.00, 0.50)),
-            ("claude-sonnet-5-5", (2.00, 10.00, 0.20)),
+            ("claude-sonnet-5-5", (2.00, 10.00, 0.10)),
             ("claude-sonnet-5", (2.00, 10.00, 0.20)),
             ("claude-opus-4-8", (5.00, 25.00, 0.50)),
             ("claude-sonnet-4-6", (3.00, 15.00, 0.30)),
@@ -131,8 +131,8 @@ class TestClaudeRates:
         ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"],
     )
     def test_a_successor_never_prices_at_its_predecessors_row(self, model):
-        """claude-sonnet-5-5's borrowed rate happened to be correct. That is
-        luck; an exact row is what keeps it correct when either price moves."""
+        """claude-sonnet-5-5 borrowed sonnet-5's $0.20 cached read, twice its
+        real $0.10. An exact row is what keeps each rate its own."""
         assert model in cost._PRICING
 
     def test_opus_5_5_is_not_billed_as_opus_5(self):
@@ -165,14 +165,14 @@ class TestClaudeRates:
             ("claude-opus-5-5", 0.05),
             ("claude-fable-5", 0.1),
             ("claude-opus-5", 0.1),
-            ("claude-sonnet-5-5", 0.1),
+            ("claude-sonnet-5-5", 0.05),
             ("claude-sonnet-5", 0.1),
             ("claude-haiku-4-5-20251001", 0.1),
         ],
     )
     def test_the_cache_read_multiplier_is_the_published_one(self, model, multiplier):
         """0.1x is the rule, not a law. Anthropic publishes 0.025x on Fable 5.1
-        and Mythos 5.1, and 0.05x on Opus 5.5, so copying the row above a new
+        and Mythos 5.1, and 0.05x on Opus 5.5 and Sonnet 5.5, so copying the row above a new
         model gets its cached rate 4x or 2x too high."""
         in_rate, _out, cached = cost.known_price(model)
         assert cached == pytest.approx(in_rate * multiplier)
