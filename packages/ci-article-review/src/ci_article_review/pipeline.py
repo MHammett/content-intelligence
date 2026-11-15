@@ -101,6 +101,7 @@ from ci_core.llm import cost as cost_analysis
 from .analysis.webpage import build_handoff_from_url
 from . import fact_check_scope
 from .adapters.citation import draft_citations
+from .adapters.citation import archive_deferral
 from .adapters.citation import wayback
 from . import ensemble_capture
 from .passage_match import same_passage
@@ -3418,6 +3419,14 @@ def run_draft_pipeline(
         if pipeline_cfg.get("wayback_lookup_cache", True) and not offline
         else None
     )
+    # Capture requests and snapshot comparisons are handed to a slow pass that
+    # runs after the review, in a process of its own (``archive_followup``,
+    # issue #497). Lookups and snapshot reads that resolution needs stay here.
+    # ``archive_followup: false`` makes them inline again, as before.
+    if not offline and pipeline_cfg.get("archive_followup", True):
+        archive_deferral.begin()
+    else:
+        archive_deferral.end()
     # The handoff declares the run number, so re-running without editing it
     # writes a second report with the same number — pipeline_history ended up
     # with two run_16_* files for one article, and the later one is not
@@ -4964,6 +4973,16 @@ def run_draft_pipeline(
     # whole save path, still readable, invisible to anything scanning
     # pipeline_history/ for real runs (that scan looks for reports one level
     # down, and finds only the nested _replay/<slug>/ directory).
+    deferral = archive_deferral.active()
+    archive_deferral.end()
+    deferred_items = deferral.items() if deferral is not None else []
+    if deferred_items:
+        report["archive_followup"] = {
+            "urls": len(deferred_items),
+            "captures": sum(1 for i in deferred_items if i.get("capture")),
+            "comparisons": sum(1 for i in deferred_items if i.get("compare")),
+        }
+
     paths = hist.save_run(
         history_root,
         _history_key(handoff),
@@ -4978,6 +4997,10 @@ def run_draft_pipeline(
         log.info(f"Readable review: {paths['markdown_path']}")
     if paths.get("worklist_path"):
         log.info(f"Worklist: {paths['worklist_path']}")
+    if deferred_items and paths["report_path"]:
+        _start_archive_followup(
+            paths["report_path"], deferred_items, config_dir, publication_name
+        )
 
     # Capture the raw ensemble beside the report so this run can be replayed.
     # Skipped on a replay: re-writing a capture from a capture adds nothing and
@@ -6492,6 +6515,33 @@ def archive_status_counts(results):
         else:
             counts["missing"] += 1
     return counts
+
+
+def _start_archive_followup(report_path, items, config_dir, publication):
+    """Write the run's deferred archive.org work and start the pass on it.
+
+    Never raises: the review is done and saved, and archiving is the one part
+    of it that can always be finished later by hand."""
+    from . import archive_followup
+
+    try:
+        work = archive_followup.write_work(
+            report_path,
+            items,
+            history_root=_history_root(),
+            config_dir=config_dir,
+            publication=publication,
+        )
+    except OSError as exc:
+        log.warning(f"Could not write the archiving pass's work file: {exc}")
+        return
+    pid = archive_followup.spawn(work)
+    if pid is not None:
+        log.info(
+            f"Archiving pass started in the background (pid {pid}) for "
+            f"{len(items)} URL(s); it waits for archive.org and goes slowly. "
+            f"Work: {work}"
+        )
 
 
 #: How long after the breaker first opened the note below says to wait. A

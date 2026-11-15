@@ -26,6 +26,7 @@ from ci_core import llm
 
 from ci_article_review import history_analytics
 
+from . import archive_deferral
 from . import draft_citations
 from . import pagination
 from . import wayback
@@ -2572,6 +2573,20 @@ def _submit_missing_archives(
     if not targets:
         return
 
+    # A review hands its capture requests on to the pass that runs after it
+    # (``archive_deferral``, issue #497). Everything above still ran, so a
+    # non-public or unresolvable host is recorded exactly as before.
+    deferral = archive_deferral.active()
+    if deferral is not None:
+        for entry in targets:
+            deferral.defer_capture(entry)
+        log.info(
+            "Wayback: %d capture request(s) queued for the archiving pass after "
+            "this review",
+            len({_archive_target(e) for e in targets}),
+        )
+        return
+
     # One submission per URL, not one per claim. Several claims routinely cite
     # the same document, and each duplicate was a full Save Page Now capture
     # request — against a documented ceiling of 3 captures/minute anonymous, 7
@@ -3008,6 +3023,12 @@ def _verify_archive_matches(results):
             entry["archive_match"] = cached["verdict"]
             entry["archive_match_detail"] = cached["detail"]
             entry["archive_match_cached"] = True
+            return
+        deferral = archive_deferral.active()
+        if deferral is not None:
+            deferral.defer_match(entry)
+            entry["archive_match"] = ARCHIVE_MATCH_UNCHECKED
+            entry["archive_match_detail"] = archive_deferral.DEFERRED_MATCH_DETAIL
             return
         try:
             resp = wayback.paced_fetch(

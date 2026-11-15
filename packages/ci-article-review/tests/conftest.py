@@ -222,6 +222,25 @@ def no_machine_wide_archive_clock(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_background_archiving(monkeypatch):
+    """No test starts a real archiving process, and no deferral outlives a test.
+
+    ``run_draft_pipeline`` hands its archive.org work to
+    ``archive_followup.spawn``, which starts a detached process that talks to
+    archive.org (issue #497). Each spawn is recorded on ``spawned`` instead.
+    The deferral is module-level, so one left open by a test that raised would
+    otherwise swallow the next test's capture requests."""
+    from ci_article_review import archive_followup
+    from ci_article_review.adapters.citation import archive_deferral
+
+    spawned = []
+    monkeypatch.setattr(archive_followup, "spawn", lambda p: spawned.append(p))
+    archive_deferral.end()
+    yield spawned
+    archive_deferral.end()
+
+
+@pytest.fixture(autouse=True)
 def neutralise_wayback_pacing(monkeypatch):
     """Take the archive.org pacing clock out of every test's wall-clock cost.
 
