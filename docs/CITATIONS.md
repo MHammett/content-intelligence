@@ -339,7 +339,7 @@ A difference is reported, not judged. It has two innocent explanations (the page
 
 **Unreadable-origin fallback.** When a direct fetch of a `known_url` fails in a way that means *we couldn't read the origin* rather than *the resource is gone*, the pipeline makes one attempt (never a retry loop) to obtain the document another way, and uses whatever it gets for checksumming and relevance verification. There are two tiers, tried in this order:
 
-1. **The live page behind a browser TLS fingerprint** — 403 only. See "Escalating past a bot block" below.
+1. **The live page behind a browser TLS fingerprint** — 403 or 429. See "Escalating past a bot block" below.
 2. **An archive.org snapshot of the same URL** — every failure in the table below.
 
 It fires on:
@@ -363,9 +363,11 @@ The same rules govern draft link validation (`analysis/links.py`), so a link rec
 
 ### Escalating past a bot block
 
-A 403 gets one more attempt before the archive: the same request with a browser TLS fingerprint, via `ci_core.http.impersonating_get`. **For a public document, retrieval method does not affect citation validity** — the reader opening the link gets the same page — so a source that refuses scripts but serves browsers is a verifiable citation, not an unverifiable one. On the 2026-09-05 Honda run this was eight claims whose sources the *link checker* could already read, because it has escalated since 2026-08-12 and citation verification did not.
+A 403 or a 429 gets one more attempt before the archive: the same request with a browser TLS fingerprint, via `ci_core.http.impersonating_get`. **For a public document, retrieval method does not affect citation validity** — the reader opening the link gets the same page — so a source that refuses scripts but serves browsers is a verifiable citation, not an unverifiable one. On the 2026-09-05 Honda run this was eight claims whose sources the *link checker* could already read, because it has escalated since 2026-08-12 and citation verification did not.
 
-**Scope.** Only a 403. A 401 says an account is required, which is the access-controlled case this policy puts out of scope; a 429 is a rate limit, and changing fingerprint to slip one is abuse rather than verification; a timeout or DNS failure never reached the origin, and no handshake fixes that. Nor does one fix a certificate that failed verification (`tls_untrusted`): both tiers verify against the same roots, so a chain one rejects the other rejects too. No attempt is made at a CAPTCHA, a JS challenge or a subscription gate, and none would work — the measurement in `ci_core/http.py` records three academic publishers returning a challenge page to impersonation too.
+**Scope.** A 403 or a 429. A 401 says an account is required, which is the access-controlled case this policy puts out of scope; a timeout or DNS failure never reached the origin, and no handshake fixes that. Nor does one fix a certificate that failed verification (`tls_untrusted`): both tiers verify against the same roots, so a chain one rejects the other rejects too. No attempt is made at a CAPTCHA, a JS challenge or a subscription gate, and none would work — the measurement in `ci_core/http.py` records three academic publishers returning a challenge page to impersonation too.
+
+**The 429 has been in scope since 2026-11-15**, on the repo owner's word. Before that it was excluded as "a rate limit, and changing fingerprint to slip one is abuse rather than verification". The 429s this pipeline actually meets are a block on the honest User-Agent, not a rate limit. Every `www.yahoo.com/news` link since 2026-10-28, and a `startribune.com` one, answered 429 to the first request after half an hour of no traffic, to HEAD and GET alike, with no `Retry-After`. Waiting never clears that. Each path makes one attempt. In link validation a 429 skips the honest GET that a 403 gets first. When the tier cannot clear it, the archive fallback runs as before and the result is still reported as `rate_limited`. The rule lives in `_ESCALATED_STATUSES` (`analysis/links.py`) and `_ESCALATED_REASONS` (`adapters/citation/resolver.py`).
 
 **Live before archive**, deliberately, because the two are not competing options:
 

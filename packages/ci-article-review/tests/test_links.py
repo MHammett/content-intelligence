@@ -407,3 +407,118 @@ class TestWaybackFallbackOnUnreadableOrigin:
         assert entry["verified_via"] == "wayback_fallback"
         assert entry["wayback"]["snapshot_stale"] is True
         assert entry["wayback"]["snapshot_age_days"] == 245
+
+
+class TestBrowserTierEscalation:
+    """Which refusals get one try with a browser TLS fingerprint.
+
+    403 always did. 429 does since 2026-11-15: www.yahoo.com/news and
+    startribune.com answered 429 to a first request after half an hour of no
+    traffic, with no Retry-After, on every run — a block on the honest
+    User-Agent, which waiting can never clear.
+    """
+
+    URL = "https://example.com/refused"
+
+    @pytest.fixture(autouse=True)
+    def _example_com_is_public(self):
+        with patch(
+            "ci_article_review.analysis.links._is_public_host", return_value=True
+        ):
+            yield
+
+    @staticmethod
+    def _resp(status):
+        resp = MagicMock(status_code=status)
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        resp.headers = {}
+        resp.url = TestBrowserTierEscalation.URL
+        resp.history = []
+        return resp
+
+    def _check(self, head, get=None, impersonated=None, available=True, archived=False):
+        snapshot = "https://web.archive.org/web/20260101000000/" + self.URL
+        with (
+            patch(
+                "ci_article_review.analysis.links.os_trust_head",
+                return_value=self._resp(head),
+            ),
+            patch(
+                "ci_article_review.analysis.links.os_trust_get",
+                return_value=self._resp(get or head),
+            ) as honest_get,
+            patch(
+                "ci_article_review.analysis.links.impersonating_get",
+                return_value=impersonated,
+            ) as browser,
+            patch(
+                "ci_article_review.analysis.links.impersonation_available",
+                return_value=available,
+            ),
+            patch(
+                "ci_article_review.analysis.links.safe_get",
+                return_value=MagicMock(status_code=200),
+            ),
+            patch(
+                "ci_article_review.analysis.links.wayback_check",
+                return_value=(
+                    {"archived": True, "snapshot_url": snapshot}
+                    if archived
+                    else {"archived": False}
+                ),
+            ),
+        ):
+            result = links._check_http(self.URL)
+        return result, honest_get, browser
+
+    def test_a_429_is_read_through_the_browser_tier(self):
+        page = MagicMock(status_code=200, url=self.URL)
+        result, honest_get, browser = self._check(429, impersonated=page)
+        assert result["ok"] is True
+        assert result["verified_via"] == "tls_impersonation"
+        assert result["status_code"] == 200
+        browser.assert_called_once()
+
+    def test_a_429_skips_the_honest_get(self):
+        """A GET changes the method, not the identity the 429 refused."""
+        page = MagicMock(status_code=200, url=self.URL)
+        _, honest_get, _ = self._check(429, impersonated=page)
+        honest_get.assert_not_called()
+
+    def test_a_429_the_browser_tier_cannot_clear_falls_back_to_the_archive(self):
+        result, _, browser = self._check(429, archived=True)
+        browser.assert_called_once()
+        assert result["ok"] is True
+        assert result["status_code"] == 429
+        assert result["verified_via"] == "wayback_fallback"
+        assert result["origin_failure"] == "rate_limited"
+
+    def test_a_429_with_no_archive_stays_broken_as_a_429(self):
+        result, _, _ = self._check(429)
+        assert result["ok"] is False
+        assert result["status_code"] == 429
+        assert result["verified_via"] == "direct"
+        assert "escalation_unavailable" not in result
+
+    def test_a_429_never_escalated_says_so(self):
+        result, _, _ = self._check(429, available=False)
+        assert result["escalation_unavailable"] is True
+
+    def test_a_429_on_the_get_after_a_403_head_is_escalated(self):
+        page = MagicMock(status_code=200, url=self.URL)
+        result, honest_get, browser = self._check(403, get=429, impersonated=page)
+        honest_get.assert_called_once()
+        browser.assert_called_once()
+        assert result["verified_via"] == "tls_impersonation"
+
+    def test_a_403_is_still_escalated(self):
+        page = MagicMock(status_code=200, url=self.URL)
+        result, _, browser = self._check(403, impersonated=page)
+        browser.assert_called_once()
+        assert result["verified_via"] == "tls_impersonation"
+
+    @pytest.mark.parametrize("status", [401, 404, 410, 500])
+    def test_other_refusals_are_not_escalated(self, status):
+        _, _, browser = self._check(status)
+        browser.assert_not_called()

@@ -1401,6 +1401,17 @@ class TestKnownUrlImpersonationEscalation:
         assert "unverified" not in access.lower()
         assert "not support" not in access.lower()
 
+    def test_a_429_is_read_through_the_browser_tier(self):
+        result, _, mock_imp, _ = self._resolve(
+            status=429, impersonated=_impersonated_response()
+        )
+        mock_imp.assert_called_once()
+        assert result["verified_via"] == "tls_impersonation"
+        assert result["origin_failure"] == "rate_limited"
+        # The reader is told the status this source actually sent.
+        assert "(429)" in result["reader_access"]
+        assert "403" not in result["reader_access"]
+
     def test_escalated_content_is_still_relevance_checked(self):
         """Escalation changes how the page was obtained and nothing downstream.
 
@@ -1452,14 +1463,14 @@ class TestKnownUrlImpersonationEscalation:
 
 
 class TestEscalationIsScopedToARefusal:
-    """Only a 403 escalates.
+    """Only a 403 or a 429 escalates.
 
     Policy puts paywalled and access-controlled content out of scope, and the
     other qualifying failures are not refusals a different handshake can clear:
-    a 401 says an account is required, a 429 is a rate limit that changing
-    fingerprint to slip would be abuse rather than verification, and a timeout
-    or DNS failure never reached the origin at all. All of them keep going
-    straight to the archive, exactly as before.
+    a 401 says an account is required, and a timeout or DNS failure never
+    reached the origin at all. Those keep going straight to the archive,
+    exactly as before. A 429 joined the 403 on 2026-11-15: the ones met were
+    blocks on the honest User-Agent, not rate limits.
     """
 
     def _escalation_attempted_for(self, failure):
@@ -1488,11 +1499,17 @@ class TestEscalationIsScopedToARefusal:
             )
         return mock_imp.called, results[0]
 
-    @pytest.mark.parametrize("status", [401, 429])
-    def test_a_401_or_429_goes_straight_to_the_archive(self, status):
-        called, result = self._escalation_attempted_for(_http_error_response(status))
+    def test_a_401_goes_straight_to_the_archive(self):
+        called, result = self._escalation_attempted_for(_http_error_response(401))
         assert called is False
         assert result["verified_via"] == "wayback_fallback"
+
+    def test_a_429_escalates_then_falls_back_to_the_archive(self):
+        """In scope since 2026-11-15: the 429s met were identity blocks."""
+        called, result = self._escalation_attempted_for(_http_error_response(429))
+        assert called is True
+        assert result["verified_via"] == "wayback_fallback"
+        assert result["origin_failure"] == "rate_limited"
 
     @pytest.mark.parametrize(
         "exc",
