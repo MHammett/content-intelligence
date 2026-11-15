@@ -240,6 +240,101 @@ class TestSupportsVerdictMustBeGrounded:
         assert info["verdict"] == "not_addressed"
 
 
+class TestPdfSplitWordsDoNotDemoteARealQuote:
+    """pypdf splits words, and a model quoting the sentence mends them.
+
+    Both pages are pypdf's text of real DOT-OIG reports, as a 2026-11-15 run
+    read them: CC-2010-012 and the FTI follow-up audit (govinfo
+    GOVPUB-TD-PURL-gpo27442). Four "supports" verdicts against them were
+    demoted as unverifiable although the sentences are in the documents.
+    """
+
+    _CC_2010 = (
+        "the failure to append the “no” statement caused  the network to "
+        "begin using the wrong \nroutes and sending network traffic through Los "
+        "Angeles, which impacted services at \n129 facilities instead of the 21 "
+        "that should have been im pacted.  The error also broke \ndown the "
+        "separation between the old and new  networks"
+    )
+    _AUDIT = (
+        "We identified key FAA facilities in the New York metropolitan area that "
+        "lack FTI \ndiversity: the Kennedy Airport tower, th e New York Terminal "
+        "Radar Approach \nControl Center, and the New York ARTCC.   The FTI se "
+        "rvices at these facilities \nwere all routed through a single switching  "
+        "center operated by a single telephone \ncompany."
+    )
+
+    def test_a_mended_split_word_is_grounded(self):
+        assert resolver._quote_is_grounded(
+            "which impacted services at 129 facilities instead of the 21 that "
+            "should have been impacted",
+            self._CC_2010,
+        )
+
+    def test_straightened_quotes_and_mended_words_are_grounded(self):
+        assert resolver._quote_is_grounded(
+            'the failure to append the "no" statement caused the network',
+            self._CC_2010,
+        )
+        assert resolver._quote_is_grounded(
+            "the Kennedy Airport tower, the New York Terminal Radar Approach "
+            "Control Center, and the New York ARTCC. The FTI services at these "
+            "facilities were all routed through a single switching center",
+            self._AUDIT,
+        )
+
+    def test_the_verifier_accepts_the_verdict(self):
+        info = TestSupportsVerdictMustBeGrounded()._verify(
+            {
+                "verdict": "supports",
+                "reason": "stated",
+                "quote": "impacted services at 129 facilities instead of the 21 "
+                "that should have been impacted",
+            },
+            content=self._CC_2010,
+        )
+        assert info["checked"] is True
+        assert info["quote_grounded"] is True
+
+    def test_words_the_page_does_not_have_are_still_refused(self):
+        """Only spacing and punctuation are forgiven, never a word."""
+        assert not resolver._quote_is_grounded(
+            "which impacted services at 129 facilities instead of the 12 that "
+            "should have been impacted",
+            self._CC_2010,
+        )
+        assert not resolver._quote_is_grounded(
+            "the Kennedy Airport tower and the Newark tower were routed through "
+            "a single switching center",
+            self._AUDIT,
+        )
+
+    def test_markdown_the_extractor_added_does_not_block_a_quote(self):
+        """trafilatura keeps bold as ``**...**``; the page a reader sees has none."""
+        assert resolver._quote_is_grounded(
+            "the FAA originally awarded Verizon a 15-year, $2.4 billion contract",
+            "In March 2023, the FAA originally **awarded** Verizon a 15-year, "
+            "$2.4 billion contract to design, build, operate, and maintain",
+        )
+
+    def test_the_rejected_quote_is_logged(self, caplog):
+        with caplog.at_level("WARNING"):
+            TestSupportsVerdictMustBeGrounded()._verify(
+                {"verdict": "supports", "reason": "r", "quote": "an invented sentence"},
+                content=self._AUDIT,
+            )
+        assert "Quote: 'an invented sentence'" in caplog.text
+
+    def test_words_out_of_order_are_still_refused(self):
+        assert not resolver._quote_is_grounded(
+            "the New York ARTCC, the Kennedy Airport tower", self._AUDIT
+        )
+
+    def test_punctuation_cannot_pad_a_short_quote_past_the_floor(self):
+        """A quote long only in punctuation is as short as its letters."""
+        assert not resolver._quote_is_grounded("- - - - - - - the -", self._AUDIT)
+
+
 class TestInjectedPageCannotForgeAVerifiedCitation:
     """The end-to-end version of finding 1, as an attacker would run it."""
 
