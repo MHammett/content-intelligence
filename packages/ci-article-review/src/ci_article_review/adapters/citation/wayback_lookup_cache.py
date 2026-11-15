@@ -34,6 +34,12 @@ record, which is the whole reason that mode consults the CDX index. So a cached
 negative or stale answer satisfies a CDX caller only if CDX was consulted when
 it was stored; a fresh positive satisfies anyone.
 
+Snapshot comparisons. The same store keeps ``_verify_archive_matches``'s
+verdicts in a second table, keyed on ``(snapshot_url, checksum)``. A snapshot
+is addressed by its timestamp and never changes, and the checksum is the live
+page's, so the pair has one answer for good; only "identical" and "differs"
+are kept, never a snapshot that could not be read (issue #497).
+
 Where it lives. In memory always, so the two passes of one run share each
 answer. On disk, when the pipeline opens one, as a SQLite file under the
 history root — the place this repository already keeps what one run learns for
@@ -95,8 +101,23 @@ CREATE TABLE IF NOT EXISTS lookups (
     archived INTEGER NOT NULL,
     cdx_consulted INTEGER NOT NULL,
     answer TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snapshot_matches (
+    snapshot_url TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    checked_at REAL NOT NULL,
+    verdict TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    PRIMARY KEY (snapshot_url, checksum)
 )
 """
+
+#: How long a snapshot comparison is kept. A Wayback snapshot is addressed by
+#: its timestamp and never changes, and the checksum is over the live page's
+#: extracted text, so a ``(snapshot_url, checksum)`` pair has one answer for
+#: good. The limit only bounds the file; a year is longer than any article
+#: stays in revision.
+MATCH_TTL_SECONDS = 365 * 24 * 3600
 
 
 def _now() -> float:
@@ -150,7 +171,10 @@ class LookupCache:
             "archive_urls": 0,
             # Answers written to the store this run.
             "stored": 0,
+            # Snapshot comparisons answered without reading the snapshot.
+            "match_hits": 0,
         }
+        self._matches: dict[tuple[str, str], dict] = {}
         if self.path is not None:
             self._open_store()
 
@@ -161,11 +185,15 @@ class LookupCache:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(self.path), timeout=5, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(_SCHEMA)
+            conn.executescript(_SCHEMA)
             # Nothing older than the longest TTL can ever be read again.
             conn.execute(
                 "DELETE FROM lookups WHERE checked_at < ?",
                 (_now() - ARCHIVED_TTL_SECONDS,),
+            )
+            conn.execute(
+                "DELETE FROM snapshot_matches WHERE checked_at < ?",
+                (_now() - MATCH_TTL_SECONDS,),
             )
             conn.commit()
             self._conn = conn
@@ -335,6 +363,51 @@ class LookupCache:
         with self._lock:
             self._memo.pop(url, None)
             self._store_delete(url)
+
+    def match_get(self, snapshot_url, checksum):
+        """A remembered snapshot comparison, ``{"verdict", "detail"}``, or None.
+
+        Only definitive verdicts are ever stored (see ``match_put``), so a hit
+        is an answer, never a remembered failure to read the snapshot."""
+        key = (snapshot_url, checksum)
+        with self._lock:
+            hit = self._matches.get(key)
+            if hit is None and self._conn is not None:
+                try:
+                    row = self._conn.execute(
+                        "SELECT verdict, detail FROM snapshot_matches "
+                        "WHERE snapshot_url = ? AND checksum = ?",
+                        key,
+                    ).fetchone()
+                except sqlite3.Error as exc:
+                    log.debug(
+                        "Snapshot match read failed for %s: %s", snapshot_url, exc
+                    )
+                    row = None
+                if row is not None:
+                    hit = self._matches[key] = {"verdict": row[0], "detail": row[1]}
+            if hit is not None:
+                self.stats["match_hits"] += 1
+                return dict(hit)
+            return None
+
+    def match_put(self, snapshot_url, checksum, verdict, detail):
+        """Remember a comparison the caller actually made. The caller passes only
+        "identical" or "differs": an unread or unreadable snapshot is a fact
+        about this run, and remembering it would stop the next run trying."""
+        key = (snapshot_url, checksum)
+        with self._lock:
+            self._matches[key] = {"verdict": verdict, "detail": detail}
+            if self._conn is None:
+                return
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO snapshot_matches VALUES (?, ?, ?, ?, ?)",
+                    (snapshot_url, checksum, _now(), verdict, detail),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                log.debug("Snapshot match write failed for %s: %s", snapshot_url, exc)
 
     def summary(self):
         """Counts, plus whether answers were kept on disk, for the log and the

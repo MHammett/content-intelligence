@@ -50,6 +50,7 @@ import re
 # the same idea one level up — one status per claim — and imports only that
 # leaf, ``passage_match`` and ``fact_check_scope``.
 from . import claim_status
+from .adapters.citation import draft_citations
 from .adapters.citation.disposition import disposition as _disposition
 
 #: Ranked items rendered before the list is cut off. A list nobody finishes is
@@ -131,7 +132,8 @@ _STATUS_IN_NOTE = re.compile(r"\b(\d{3})\s+(?:Client|Server)\s+Error\b")
 #: wrapper expires roughly 30 days after the run (see ``ci_core.llm.client``'s
 #: ``_grounding_chunks``), so an author who files one of these away for later is
 #: filing away a dead link — worth saying on the item rather than in a doc.
-_GROUNDING_MARKER = "/grounding-api-redirect/"
+# The marker itself lives in ``draft_citations.GROUNDING_REDIRECT_MARKER``,
+# shared with the resolver's archiving pass.
 
 #: Tails the fact-check model appends to a document name to mean "or something
 #: like it". They are what stops three references to *the same* Furuno document
@@ -173,7 +175,7 @@ def _clip(text, limit=110):
 
 
 def _is_grounding_redirect(url):
-    return _GROUNDING_MARKER in (url or "")
+    return draft_citations.is_grounding_redirect(url)
 
 
 #: How the address on an item was arrived at, when it was not simply the URL

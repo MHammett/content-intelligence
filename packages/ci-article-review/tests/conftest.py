@@ -222,6 +222,25 @@ def no_machine_wide_archive_clock(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_background_archiving(monkeypatch):
+    """No test starts a real archiving process, and no deferral outlives a test.
+
+    ``run_draft_pipeline`` hands its archive.org work to
+    ``archive_followup.spawn``, which starts a detached process that talks to
+    archive.org (issue #497). Each spawn is recorded on ``spawned`` instead.
+    The deferral is module-level, so one left open by a test that raised would
+    otherwise swallow the next test's capture requests."""
+    from ci_article_review import archive_followup
+    from ci_article_review.adapters.citation import archive_deferral
+
+    spawned = []
+    monkeypatch.setattr(archive_followup, "spawn", lambda p: spawned.append(p))
+    archive_deferral.end()
+    yield spawned
+    archive_deferral.end()
+
+
+@pytest.fixture(autouse=True)
 def neutralise_wayback_pacing(monkeypatch):
     """Take the archive.org pacing clock out of every test's wall-clock cost.
 
@@ -253,9 +272,16 @@ def neutralise_wayback_pacing(monkeypatch):
     """
     monkeypatch.setattr(_spn_client_engine, "_MIN_INTERVAL_SECONDS", 0.0)
     monkeypatch.setattr(_spn_client_engine, "_BACKOFF_BASE_SECONDS", 0.0)
+    # The snapshot comparison asks for a wider gap of its own, which the
+    # default above does not cover.
+    monkeypatch.setattr(resolver, "_MATCH_READ_INTERVAL_SECONDS", 0.0)
+    # A fresh in-memory memo each test: a snapshot comparison remembered by one
+    # test would otherwise answer the next test's identical snapshot unread.
+    wayback.open_lookup_cache(None)
     wayback.reset_rate_limit_state()
     yield
     wayback.reset_rate_limit_state()
+    wayback.open_lookup_cache(None)
 
 
 @pytest.fixture(autouse=True)

@@ -260,6 +260,18 @@ def is_archive_url(url):
     return any(host in lowered for host in _ARCHIVE_HOSTS)
 
 
+#: The path segment of Vertex AI's search-grounding redirector
+#: (``vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIY...``), which
+#: gemini cites through. The wrapper is opaque and expires (see ``worklist``'s
+#: note on it); the publisher's page is wherever the redirect lands.
+GROUNDING_REDIRECT_MARKER = "/grounding-api-redirect/"
+
+
+def is_grounding_redirect(url):
+    """True for a Vertex AI grounding redirect rather than a publisher's URL."""
+    return GROUNDING_REDIRECT_MARKER in (url or "")
+
+
 def _archive_first(urls):
     """``urls`` with archived copies ahead of live ones, order otherwise kept."""
     return [u for u in urls if is_archive_url(u)] + [
