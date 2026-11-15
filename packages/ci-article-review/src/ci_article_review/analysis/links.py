@@ -359,3 +359,48 @@ def validate_links(
                 }
             )
     return results
+
+
+#: Lookups at once in ``lookup_archives``. They queue on spn-client's shared
+#: clock however many run, so two keep one waiting behind the other's request
+#: without spending everyone's budget in the queue.
+_MAX_LOOKUP_PARALLEL = 2
+
+
+def lookup_archives(results, *, wayback_timeout=10, wayback_stale_days=None):
+    """The Wayback half of ``validate_links``, for results it checked with
+    ``check_wayback=False``. Sets each result's ``wayback`` in place, exactly as
+    ``validate_links`` would have, and skips hosts the SSRF guard rejected.
+
+    Split out so the pipeline can run these lookups alongside the model reviews
+    instead of before them: nothing the models see depends on them, and on a
+    ``wide`` run of a 99-link draft they were five minutes the models waited
+    for (2026-11-15, issue #497). Never raises.
+    """
+    targets = [
+        r
+        for r in results or []
+        if r.get("url") and "SSRF guard" not in (r.get("error") or "")
+    ]
+    jobs = [
+        (
+            r["url"],
+            lambda r=r: r.__setitem__(
+                "wayback",
+                wayback_check(
+                    r["url"], timeout=wayback_timeout, stale_days=wayback_stale_days
+                ),
+            ),
+            3 * wayback_timeout + 30,
+        )
+        for r in targets
+    ]
+    outcomes = run_all_bounded(jobs, max_parallel=_MAX_LOOKUP_PARALLEL)
+    for r in targets:
+        _, error = outcomes.get(r["url"], (None, None))
+        if error is not None and "wayback" not in r:
+            r["wayback"] = {
+                "url": r["url"],
+                "archived": None,
+                "error": f"the archive lookup did not finish: {error}",
+            }
