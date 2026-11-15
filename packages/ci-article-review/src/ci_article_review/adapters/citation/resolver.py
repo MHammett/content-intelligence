@@ -6,6 +6,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -185,7 +186,7 @@ _FETCH_TIMEOUT_SECONDS = 15
 #: * The direct fetch: ``safe_get`` follows redirects one validated hop at a
 #:   time, each hop with its own timeout. A page-cache waiter spends one
 #:   timeout on the leader before fetching for itself.
-#: * Escalation, 403 only: ``impersonating_get`` with the same timeout.
+#: * Escalation, 403 or 429: ``impersonating_get`` with the same timeout.
 #: * Extraction: a PDF is parsed for up to ``extract.PDF_MAX_SECONDS`` before the
 #:   read stops and says so. It was not budgeted here while the PDF page cap
 #:   (400) bounded it to ~15 s; the 981-page packet that cap cut off takes
@@ -572,6 +573,12 @@ def _check_drift(result, checksum_index):
     return result
 
 
+#: Fallback reasons (``wayback.fallback_reason_for_*``) that earn one try with
+#: a browser TLS fingerprint, each with the status the reader is told about.
+#: See ``_impersonation_fallback_content`` for why these two and no others.
+_ESCALATED_REASONS = {"blocked": "403", "rate_limited": "429"}
+
+
 def _impersonation_fallback_content(url, timeout):
     """When the origin refuses an honest request, ask again with a browser TLS
     fingerprint and read the *live* page.
@@ -584,12 +591,15 @@ def _impersonation_fallback_content(url, timeout):
     to impersonation anyway, and ``impersonating_get`` reports that as a plain
     failure.
 
-    Scoped to 403 alone, which is where ``analysis/links.py`` draws the same
-    line. A 401 says an account is required, which is precisely the
-    access-controlled case policy puts out of scope; a 429 is a rate limit, and
-    changing fingerprint to slip one is abuse rather than verification; a
-    timeout or DNS failure is not a refusal and a different handshake cannot fix
-    it. Nor can it fix a certificate that failed verification
+    Scoped to a 403 or a 429 (``_ESCALATED_REASONS``), the same line
+    ``analysis/links.py`` draws. A 429 was out until 2026-11-15, as "a rate
+    limit, and changing fingerprint to slip one is abuse"; the repo owner put it
+    in once the 429s actually met turned out to be identity blocks:
+    www.yahoo.com/news and startribune.com answered 429 to a first request after
+    half an hour of no traffic, to HEAD and GET alike, with no Retry-After,
+    every run. A 401 says an account is required, which is precisely the
+    access-controlled case policy puts out of scope; a timeout or DNS failure is
+    not a refusal and a different handshake cannot fix it. Nor can it fix a certificate that failed verification
     (``tls_untrusted``): both tiers verify against the same roots, so a chain
     one rejects the other rejects too. Those keep going straight to the archive
     as before.
@@ -857,15 +867,41 @@ def _quote_is_grounded(quote, content, claim=None):
     document. A page that talks the model into a verdict without supplying real
     supporting text fails here.
 
-    Deliberately a substring check after whitespace/case normalisation, not
-    fuzzy matching — the model is asked to copy verbatim, and loosening this
-    would reopen the hole it exists to close. Very short quotes are rejected
-    because a handful of characters matches almost any document by chance.
+    Deliberately a substring check, not fuzzy matching — the model is asked to
+    copy verbatim, and loosening this would reopen the hole it exists to close.
+    Very short quotes are rejected because a handful of characters matches
+    almost any document by chance.
+
+    The substring is tried twice: after whitespace/case normalisation, then on
+    letters and digits alone (:func:`_letters_and_digits`). The second pass
+    exists for PDF extraction, which splits words: pypdf read DOT-OIG's
+    CC-2010-012 as "should have been im pacted" and its FTI audit as "th e New
+    York ... se rvices", so a model that copied the sentence and mended the
+    word was demoted on four claims of a real run (2026-11-15) whose text is
+    on the page. It accepts nothing the first pass would refuse except spacing
+    and punctuation: every letter and digit of the quote must still be on the
+    page, in order, and the page is the attacker's to write either way, so the
+    strictness of punctuation was never what stopped an injection.
     """
     normalised_quote = _normalise_for_match(quote)
     if len(normalised_quote) < _MIN_QUOTE_CHARS:
         return _short_figure_is_grounded(normalised_quote, content, claim)
-    return normalised_quote in _normalise_for_match(content)
+    if normalised_quote in _normalise_for_match(content):
+        return True
+    compact_quote = _letters_and_digits(quote)
+    return len(compact_quote) >= _MIN_QUOTE_CHARS and compact_quote in (
+        _letters_and_digits(content)
+    )
+
+
+def _letters_and_digits(text):
+    """Letters and digits of ``text``, NFKC-folded and casefolded, nothing else.
+
+    The same folding as ``quote_check._compact``, which cannot be imported here
+    (``quote_check`` imports this module).
+    """
+    folded = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(ch for ch in folded if ch.isalnum())
 
 
 #: A short quote that is nothing but a figure: "9,683", "4.4%", "$40". A quote
@@ -987,9 +1023,13 @@ def _verify_relevance(claim, content, api_keys, author=None, hints=()):
         # argued its way to "supports" without real supporting text lands here.
         # Reported as "could not assess", never as "does not support": we have
         # not established anything about the source either way.
+        # The rejected quote is logged because nothing else keeps it: without
+        # it, telling a fabricated quote from an extraction artifact means
+        # re-fetching the page and guessing what the model copied.
         log.warning(
             "Citation relevance check returned 'supports' with an unverifiable "
-            f"quote for claim '{claim[:50]}' — demoting to unverified."
+            f"quote for claim '{claim[:50]}' — demoting to unverified. "
+            f"Quote: {quote[:200]!r}"
         )
         return {
             "checked": False,
@@ -1038,7 +1078,7 @@ def _resolve_known_url(
     fetches or happened to be unreachable during this run. There are two
     fallback tiers, tried in this order:
 
-    1. **Live page behind a browser TLS fingerprint** (403 only —
+    1. **Live page behind a browser TLS fingerprint** (403 or 429 —
        ``_impersonation_fallback_content``). For a public document the reader
        gets the same page, so retrieval method does not bear on whether the
        citation is valid.
@@ -1166,7 +1206,9 @@ def _resolve_known_url(
         # archive still gets its turn immediately below and that trade is made
         # explicit in ``archive_provenance``.
         escalated = (
-            _escalate(known_url, timeout, page_cache) if reason == "blocked" else None
+            _escalate(known_url, timeout, page_cache)
+            if reason in _ESCALATED_REASONS
+            else None
         )
         if escalated is not None:
             final_url, content, content_kind, coverage = escalated
@@ -1264,7 +1306,8 @@ def _resolve_known_url(
         # something more specific, and this stays true regardless.
         result["origin_failure"] = fallback_reason
         result["reader_access"] = (
-            "This source refused an ordinary automated request (403) and served "
+            "This source refused an ordinary automated request "
+            f"({_ESCALATED_REASONS[fallback_reason]}) and served "
             "the page only to a browser-shaped client. The content read, "
             "checksummed and verified here is the live page, and a reader "
             "opening it in a normal browser will usually get through. But a host "

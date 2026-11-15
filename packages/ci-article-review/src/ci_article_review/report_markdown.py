@@ -16,6 +16,8 @@ kept in step by a test. ``adapters.citation.disposition`` is exempt because it i
 a leaf: a tuple, a lookup and a pure function, importing nothing itself.
 """
 
+import re
+
 from .adapters.citation.disposition import DISPOSITIONS, disposition
 from .adapters.citation.wayback import lookup_was_rate_limited
 
@@ -3118,17 +3120,55 @@ def _render_ensemble_width(report):
 
     backfilled = width.get("backfilled") or []
     if backfilled:
-        lines.append(
-            "**Backfilled for corroboration.** These domains lost a model the "
-            "preset names and were given a second one from what was available, "
-            "so no finding in them rests on a single pass:"
-        )
+        # A backfill is an assignment, not a result. The backfilled pass can
+        # fail or come back empty, and ``models_by_domain`` already leaves
+        # those out, so it is what says whether the second pass arrived. On
+        # the 2026-11-15 federal-network-outages `wide` run, gemini was
+        # backfilled into voice_style and returned nothing. This block still
+        # said "no finding in them rests on a single pass", three lines below
+        # a table that listed voice_style as single-model.
+        unmet = {
+            entry
+            for entry in backfilled
+            if (domain := _backfilled_domain(entry)) is not None
+            and len(models_by_domain.get(domain) or []) < 2
+        }
+        if unmet:
+            lines.append(
+                "**Backfilled for corroboration.** These domains lost a model "
+                "the preset names and were given a second one from what was "
+                "available. Not every backfill delivered: a domain marked "
+                "below still rests on a single pass or none."
+            )
+        else:
+            lines.append(
+                "**Backfilled for corroboration.** These domains lost a model "
+                "the preset names and were given a second one from what was "
+                "available, so no finding in them rests on a single pass:"
+            )
         lines.append("")
         for entry in backfilled:
-            lines.append(f"- {entry}")
+            if entry in unmet:
+                lines.append(
+                    f"- {entry} — **the backfilled pass produced no findings "
+                    f"(failed or empty), so this domain is not corroborated**"
+                )
+            else:
+                lines.append(f"- {entry}")
         lines.append("")
 
     return lines
+
+
+#: ``pipeline._build_assignments`` writes each backfill line as
+#: ``"<model> → <domain> — the preset names ..."``.
+_BACKFILL_LINE = re.compile(r"^\s*(\S+)\s+→\s+(\S+)")
+
+
+def _backfilled_domain(entry):
+    """The domain a backfill line names, or None for a line in another shape."""
+    match = _BACKFILL_LINE.match(entry) if isinstance(entry, str) else None
+    return match.group(2) if match else None
 
 
 def _consensus_meaning(width, min_models):

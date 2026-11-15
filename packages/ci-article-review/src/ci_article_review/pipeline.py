@@ -1239,12 +1239,12 @@ def _record_impersonation_degradation(report: dict, pre_analysis: dict) -> None:
     blocked = [
         r
         for r in (pre_analysis.get("links") or [])
-        if r.get("escalation_unavailable") or r.get("status_code") == 403
+        if r.get("escalation_unavailable") or r.get("status_code") in (403, 429)
     ]
     if not blocked:
         return
     detail = (
-        f"{len(blocked)} cited link(s) returned HTTP 403 and were never put "
+        f"{len(blocked)} cited link(s) returned HTTP 403 or 429 and were never put "
         f"through the TLS-impersonation escalation: the optional 'unblock' "
         f"extra (curl_cffi) is not installed. They are reported as blocked, "
         f"which is indistinguishable in this report from a source that refuses "
