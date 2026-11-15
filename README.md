@@ -1092,6 +1092,7 @@ content-intelligence/
 │   │   │   ├── config_loader.py       config parsing and validation
 │   │   │   ├── consolidation.py       weighted ensemble consolidation → one report
 │   │   │   ├── ensemble_capture.py    saves/loads raw ensemble output for --replay
+│   │   │   ├── archive_followup.py    the slow archive.org pass a review starts after it ends
 │   │   │   ├── fact_check_scope.py    claims no source can settle — author markings,
 │   │   │   │                          model classification, and what they exclude
 │   │   │   ├── claim_status.py        one net status per claim across Sections 1, 2
@@ -1146,6 +1147,7 @@ content-intelligence/
 │   │   │   │       ├── pagination.py         reads past page one of a paginated source
 │   │   │   │       ├── wayback.py            Wayback archive check + Save Page Now submission
 │   │   │   │       ├── wayback_lookup_cache.py  one archive.org lookup per URL per run, remembered across runs
+│   │   │   │       ├── archive_deferral.py   the captures and comparisons a review hands to archive_followup
 │   │   │   │       ├── topic_match.py        keyword gating for pointer-only adapters
 │   │   │   │       └── sources/              10 adapters: census, crossref, eia, epa, ferc,
 │   │   │   │                                 fhwa, fred, icc, ilga, pjm

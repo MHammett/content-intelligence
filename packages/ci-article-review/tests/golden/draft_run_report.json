@@ -1056,6 +1056,7 @@
     "archive_urls": 0,
     "live": 0,
     "lookups": 0,
+    "match_hits": 0,
     "persistent": true,
     "run_hits": 0,
     "skipped": 0,

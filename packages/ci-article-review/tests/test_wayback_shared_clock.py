@@ -30,7 +30,7 @@ class _Spn:
         self.calls = []
         self.shared = []
         self.reason = None
-        monkeypatch.setattr(wayback, "_spn_pace", lambda: self.calls.append("pace"))
+        monkeypatch.setattr(wayback, "_spn_pace", lambda *a: self.calls.append("pace"))
         monkeypatch.setattr(
             wayback,
             "_spn_note_outcome",
@@ -108,7 +108,7 @@ class TestTheThreeCallSites:
     def seen(self, monkeypatch):
         seen = []
 
-        def paced(fetch, url, timeout):
+        def paced(fetch, url, timeout, **kwargs):
             seen.append(url)
             return _response(503)
 

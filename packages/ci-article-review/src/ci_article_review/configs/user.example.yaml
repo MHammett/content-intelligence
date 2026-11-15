@@ -320,6 +320,10 @@ pipeline:
   # Archive every URL in the draft's Sources list after Pass 3, not only the
   # claim citations that resolved. No model calls; archive.org requests only.
   archive_all_sources: true
+  # Hand capture requests and snapshot comparisons to a slow pass that runs
+  # after the review, in a process of its own, once archive.org is taking
+  # requests (archive_followup). false does them inline, during the review.
+  archive_followup: true
   # Keep fetched citation pages (page_store.sqlite under the history root) and
   # reuse one on the next run only when its origin answers 304 Not Modified.
   # Pages with no ETag/Last-Modified are fetched in full every run, as before.
