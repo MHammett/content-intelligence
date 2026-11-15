@@ -532,6 +532,56 @@ class TestWidthIsRendered:
         assert "Backfilled for corroboration" in out
         assert "perplexity added to argument_integrity" in out
 
+    _FNO_BACKFILL = (
+        "gemini → voice_style — the preset names openai, claude here; "
+        "claude could not run"
+    )
+
+    def test_a_backfill_that_returned_nothing_is_not_called_corroboration(self):
+        """The 2026-11-15 federal-network-outages `wide` run: gemini was
+        backfilled into voice_style and returned a well-formed empty answer, so
+        `_ensemble_width` left it out and voice_style ran on openai alone. The
+        block still said no finding rested on a single pass."""
+        out = "\n".join(
+            _render_ensemble_width(
+                self._report(
+                    models_by_domain={"voice_style": ["openai"]},
+                    domains_single_model=["voice_style"],
+                    domains_expected=["voice_style"],
+                    backfilled=[self._FNO_BACKFILL],
+                )
+            )
+        )
+        assert "no finding in them rests on a single pass" not in out
+        assert "Not every backfill delivered" in out
+        assert f"- {self._FNO_BACKFILL} — **the backfilled pass produced" in out
+
+    def test_a_backfill_that_delivered_keeps_the_corroboration_claim(self):
+        out = "\n".join(
+            _render_ensemble_width(
+                self._report(
+                    models_by_domain={"voice_style": ["gemini", "openai"]},
+                    domains_single_model=[],
+                    domains_expected=["voice_style"],
+                    backfilled=[self._FNO_BACKFILL],
+                )
+            )
+        )
+        assert "no finding in them rests on a single pass" in out
+        assert "Not every backfill delivered" not in out
+        assert f"- {self._FNO_BACKFILL}\n" in out
+
+    def test_a_backfilled_domain_where_nothing_ran_is_flagged_too(self):
+        out = "\n".join(
+            _render_ensemble_width(
+                self._report(
+                    models_by_domain={"voice_style": []},
+                    backfilled=[self._FNO_BACKFILL],
+                )
+            )
+        )
+        assert "Not every backfill delivered" in out
+
     def test_a_report_without_a_width_block_renders_unchanged(self):
         """Reports written before this section must not gain an empty heading."""
         assert _render_ensemble_width({}) == []
