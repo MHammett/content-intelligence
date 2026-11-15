@@ -6,6 +6,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -843,15 +844,41 @@ def _quote_is_grounded(quote, content, claim=None):
     document. A page that talks the model into a verdict without supplying real
     supporting text fails here.
 
-    Deliberately a substring check after whitespace/case normalisation, not
-    fuzzy matching — the model is asked to copy verbatim, and loosening this
-    would reopen the hole it exists to close. Very short quotes are rejected
-    because a handful of characters matches almost any document by chance.
+    Deliberately a substring check, not fuzzy matching — the model is asked to
+    copy verbatim, and loosening this would reopen the hole it exists to close.
+    Very short quotes are rejected because a handful of characters matches
+    almost any document by chance.
+
+    The substring is tried twice: after whitespace/case normalisation, then on
+    letters and digits alone (:func:`_letters_and_digits`). The second pass
+    exists for PDF extraction, which splits words: pypdf read DOT-OIG's
+    CC-2010-012 as "should have been im pacted" and its FTI audit as "th e New
+    York ... se rvices", so a model that copied the sentence and mended the
+    word was demoted on four claims of a real run (2026-11-15) whose text is
+    on the page. It accepts nothing the first pass would refuse except spacing
+    and punctuation: every letter and digit of the quote must still be on the
+    page, in order, and the page is the attacker's to write either way, so the
+    strictness of punctuation was never what stopped an injection.
     """
     normalised_quote = _normalise_for_match(quote)
     if len(normalised_quote) < _MIN_QUOTE_CHARS:
         return _short_figure_is_grounded(normalised_quote, content, claim)
-    return normalised_quote in _normalise_for_match(content)
+    if normalised_quote in _normalise_for_match(content):
+        return True
+    compact_quote = _letters_and_digits(quote)
+    return len(compact_quote) >= _MIN_QUOTE_CHARS and compact_quote in (
+        _letters_and_digits(content)
+    )
+
+
+def _letters_and_digits(text):
+    """Letters and digits of ``text``, NFKC-folded and casefolded, nothing else.
+
+    The same folding as ``quote_check._compact``, which cannot be imported here
+    (``quote_check`` imports this module).
+    """
+    folded = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(ch for ch in folded if ch.isalnum())
 
 
 #: A short quote that is nothing but a figure: "9,683", "4.4%", "$40". A quote
@@ -973,9 +1000,13 @@ def _verify_relevance(claim, content, api_keys, author=None, hints=()):
         # argued its way to "supports" without real supporting text lands here.
         # Reported as "could not assess", never as "does not support": we have
         # not established anything about the source either way.
+        # The rejected quote is logged because nothing else keeps it: without
+        # it, telling a fabricated quote from an extraction artifact means
+        # re-fetching the page and guessing what the model copied.
         log.warning(
             "Citation relevance check returned 'supports' with an unverifiable "
-            f"quote for claim '{claim[:50]}' — demoting to unverified."
+            f"quote for claim '{claim[:50]}' — demoting to unverified. "
+            f"Quote: {quote[:200]!r}"
         )
         return {
             "checked": False,
