@@ -253,9 +253,16 @@ def neutralise_wayback_pacing(monkeypatch):
     """
     monkeypatch.setattr(_spn_client_engine, "_MIN_INTERVAL_SECONDS", 0.0)
     monkeypatch.setattr(_spn_client_engine, "_BACKOFF_BASE_SECONDS", 0.0)
+    # The snapshot comparison asks for a wider gap of its own, which the
+    # default above does not cover.
+    monkeypatch.setattr(resolver, "_MATCH_READ_INTERVAL_SECONDS", 0.0)
+    # A fresh in-memory memo each test: a snapshot comparison remembered by one
+    # test would otherwise answer the next test's identical snapshot unread.
+    wayback.open_lookup_cache(None)
     wayback.reset_rate_limit_state()
     yield
     wayback.reset_rate_limit_state()
+    wayback.open_lookup_cache(None)
 
 
 @pytest.fixture(autouse=True)

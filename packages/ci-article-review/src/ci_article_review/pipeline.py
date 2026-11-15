@@ -45,7 +45,7 @@ import re
 import time
 
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config_loader import (
@@ -4689,6 +4689,11 @@ def run_draft_pipeline(
         )
         if source_archive is not None:
             report["source_archive"] = source_archive
+        unsent = _unsent_archive_note(
+            citation_results, source_archive, handoff_path, publication_name
+        )
+        if unsent is not None:
+            report["archive_unsent"] = unsent
 
     # One net status per claim, built here and only here: after consolidation
     # (Section 2 is final) and after citation resolution and re-ask (Section 9
@@ -6487,6 +6492,58 @@ def archive_status_counts(results):
         else:
             counts["missing"] += 1
     return counts
+
+
+#: How long after the breaker first opened the note below says to wait. A
+#: refused connection is archive.org closing the address, and spn-client holds
+#: its machine-wide breaker an hour for one (``_REFUSED_COOLDOWN_SECONDS``);
+#: a 429 trip is shorter, but an hour is safe for both and one number is easier
+#: to act on.
+_UNSENT_RETRY_AFTER = timedelta(hours=1)
+
+
+def _unsent_archive_note(citation_results, source_archive, draft_path, publication):
+    """Say which URLs the breaker kept from being archived, and how to finish.
+
+    ``None`` when there are none. Otherwise logs a warning and returns
+    ``{"count", "retry_after_utc", "command"}`` for the report.
+
+    No queue is kept for these: every review and every ``--archive-only`` pass
+    works its URLs out from the draft again and archives what is still missing,
+    so the draft already is the list (issue #497). What was missing was being
+    told that a pass is needed, and when it is safe to run one.
+    """
+    urls = set()
+    for entry in list(citation_results or []) + list(source_archive or []):
+        wb = entry.get("wayback") if isinstance(entry, dict) else None
+        if (
+            isinstance(wb, dict)
+            and wb.get("breaker_open_at_failure")
+            and not wb.get("submitted")
+            and entry.get("url")
+        ):
+            urls.add(entry["url"])
+    if not urls:
+        return None
+    first = wayback.breaker_summary().get("first_seen_open_utc")
+    try:
+        since = datetime.fromisoformat(first) if first else datetime.now(timezone.utc)
+    except ValueError:
+        since = datetime.now(timezone.utc)
+    retry_after = (since + _UNSENT_RETRY_AFTER).strftime("%Y-%m-%d %H:%M UTC")
+    command = (
+        f'ci-review --archive-only --draft "{draft_path}" --publication {publication}'
+        if draft_path
+        else None
+    )
+    log.warning(
+        "%d URL(s) were never sent to archive.org because its breaker was open. "
+        "Nothing about them is known yet. To archive them, after %s run: %s",
+        len(urls),
+        retry_after,
+        command or "ci-review --archive-only on this draft",
+    )
+    return {"count": len(urls), "retry_after_utc": retry_after, "command": command}
 
 
 def run_archive_only(

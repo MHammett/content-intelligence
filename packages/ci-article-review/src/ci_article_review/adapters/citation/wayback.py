@@ -94,6 +94,7 @@ __all__ = [
     "certificate_failure_summary",
     "check",
     "check_job_status",
+    "cached_archive_match",
     "close_lookup_cache",
     "default_shared_state_path",
     "enable_shared_rate_limit",
@@ -108,6 +109,7 @@ __all__ = [
     "open_lookup_cache",
     "pace",
     "paced_fetch",
+    "remember_archive_match",
     "paced_get",
     "polite_fetch",
     "rate_limited_out",
@@ -207,7 +209,7 @@ def _retry_after(resp):
         return None
 
 
-def paced_fetch(fetch, url, timeout, **kwargs):
+def paced_fetch(fetch, url, timeout, *, min_interval=None, **kwargs):
     """``fetch(url, timeout=timeout, **kwargs)`` for an archive.org URL, on spn-client's clock.
 
     For the snapshot reads that cannot go through spn-client's own GET because
@@ -219,13 +221,17 @@ def paced_fetch(fetch, url, timeout, **kwargs):
 
     Nothing is sent while the breaker is open (``ArchiveBreakerOpen``). The
     caller passes its own ``fetch`` so the name its tests patch still works.
+
+    ``min_interval`` widens the gap before this request on the shared clock,
+    the way ``submit()`` widens it for a capture; ``None`` is spn-client's
+    default. It is not passed to ``fetch``.
     Whatever ``fetch`` returns or raises is passed on unchanged, after
     spn-client has been told about it: a 429 or a refused connection here
     backs off and counts exactly as one inside spn-client would.
     """
     if rate_limited_out():
         raise ArchiveBreakerOpen()
-    _spn_pace()
+    _spn_pace(min_interval)
     try:
         resp = fetch(url, timeout=timeout, **kwargs)
     except Exception as exc:
@@ -401,6 +407,16 @@ def close_lookup_cache():
 def lookup_cache_summary():
     """Counts for the log and report: see ``LookupCache.summary``."""
     return _lookup_cache.summary()
+
+
+def cached_archive_match(snapshot_url, checksum):
+    """A remembered snapshot-vs-live comparison, or None. See ``LookupCache.match_get``."""
+    return _lookup_cache.match_get(snapshot_url, checksum)
+
+
+def remember_archive_match(snapshot_url, checksum, verdict, detail):
+    """Remember a snapshot-vs-live comparison. See ``LookupCache.match_put``."""
+    _lookup_cache.match_put(snapshot_url, checksum, verdict, detail)
 
 
 def forget_lookup(url):

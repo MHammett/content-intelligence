@@ -2928,7 +2928,19 @@ def _not_found_on_serving_hosts(entries):
 #: however many threads wait, and each entry's budget starts when it takes a
 #: slot here, so a wider pool only spends that budget queueing.
 _MAX_MATCH_PARALLEL = 2
-_MATCH_TIMEOUT_SECONDS = 30
+#: Per-read budget. It includes the wait on the clock, which
+#: ``_MATCH_READ_INTERVAL_SECONDS`` makes longer, so it is above the 30s this
+#: was when reads waited three seconds.
+_MATCH_TIMEOUT_SECONDS = 45
+
+#: Gap before each snapshot read on spn-client's shared clock, wider than its
+#: 3s default. On 2026-11-15 a wide review was refused four connections in a
+#: row during this pass, its fastest stretch: about 20 reads a minute after
+#: 140 other archive.org requests (issue #497). archive.org does not publish
+#: what closes an address, so this is a guess to be measured, not a known
+#: threshold. The comparison cache below means a rerun reads only snapshots it
+#: has not compared before, so the slower pace is paid mostly once per draft.
+_MATCH_READ_INTERVAL_SECONDS = 10.0
 
 #: Verdicts for "does the archived copy say what we checked?"
 ARCHIVE_MATCH_IDENTICAL = "identical"
@@ -2989,9 +3001,20 @@ def _verify_archive_matches(results):
                 "without archive.org's own banner mixed in"
             )
             return
+        # A snapshot never changes and the checksum is the live page's, so a
+        # comparison made on an earlier run is still the answer.
+        cached = wayback.cached_archive_match(snapshot_url, entry["checksum"])
+        if cached is not None:
+            entry["archive_match"] = cached["verdict"]
+            entry["archive_match_detail"] = cached["detail"]
+            entry["archive_match_cached"] = True
+            return
         try:
             resp = wayback.paced_fetch(
-                safe_get, raw_url, timeout=_MATCH_TIMEOUT_SECONDS
+                safe_get,
+                raw_url,
+                timeout=_MATCH_TIMEOUT_SECONDS,
+                min_interval=_MATCH_READ_INTERVAL_SECONDS,
             )
             resp.raise_for_status()
         except Exception as exc:
@@ -3029,6 +3052,12 @@ def _verify_archive_matches(results):
                 f"captured something other than the document — open both before "
                 f"citing the archive."
             )
+        wayback.remember_archive_match(
+            snapshot_url,
+            entry["checksum"],
+            entry["archive_match"],
+            entry["archive_match_detail"],
+        )
 
     # Bounded to _MAX_MATCH_PARALLEL, on daemon threads, with each entry's
     # budget charged only from when it acquires the semaphore. This batch is the
