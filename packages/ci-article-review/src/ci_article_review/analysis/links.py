@@ -173,6 +173,11 @@ def _check_http(url, timeout=_HEAD_TIMEOUT):
             timeout=timeout,
             headers=DEFAULT_HEADERS,
         )
+        # A 429 goes straight to the browser tier, with no honest GET between:
+        # it is an identity refusal on the hosts that send it here, not a
+        # method one, and a GET is one more request to a host already refusing.
+        if resp.status_code == 429:
+            return _escalate(url, resp, timeout)
         # 405 means HEAD is not allowed. 403 often means the same thing in
         # practice: some servers and WAFs reject HEAD specifically while serving
         # GET to the identical client. Retrying with GET is a method change, not
@@ -192,37 +197,51 @@ def _check_http(url, timeout=_HEAD_TIMEOUT):
                 headers=DEFAULT_HEADERS,
                 stream=True,
             ) as get_resp:
-                # Last tier: a browser TLS fingerprint. Only for a link still
-                # refusing an honest request, and only to confirm a source the
-                # article already cites is real — an unverifiable citation is a
-                # worse outcome than a spoofed handshake. Returns None when
-                # curl_cffi is absent or the block holds, in which case the
-                # original result stands and the Wayback fallback runs as before.
-                if get_resp.status_code == 403:
-                    impersonated = _wayback.polite_fetch(
-                        impersonating_get, url, timeout=timeout
-                    )
-                    if impersonated is not None:
-                        return {
-                            "status_code": impersonated.status_code,
-                            "ok": True,
-                            "error": None,
-                            "verified_via": "tls_impersonation",
-                            "final_url": str(getattr(impersonated, "url", url)),
-                        }
-                    result = _finalize_http_result(url, get_resp, timeout)
-                    # A 403 that was never actually escalated is a different
-                    # fact about this link than a 403 that survived escalation,
-                    # and only one of the two is fixable by installing
-                    # something. `impersonating_get` reports both as None on
-                    # purpose — see `impersonation_available`.
-                    if not impersonation_available():
-                        result["escalation_unavailable"] = True
-                    return result
+                if get_resp.status_code in _ESCALATED_STATUSES:
+                    return _escalate(url, get_resp, timeout)
                 return _finalize_http_result(url, get_resp, timeout)
         return _finalize_http_result(url, resp, timeout)
     except Exception as exc:
         return _finalize_error_result(url, exc, timeout)
+
+
+#: Refusals that get one try with a browser TLS fingerprint before the archive
+#: fallback. 403 since the tier existed. 429 since 2026-11-15, on the repo
+#: owner's word: every www.yahoo.com/news link (since 2026-10-28) and a
+#: startribune.com one answered 429 to the first request after half an hour of
+#: no traffic, to HEAD and GET alike, with no Retry-After — a block on the
+#: honest User-Agent, not a rate limit, so slowing down could never clear it.
+#: A 401 stays out: it asks for an account, which no fingerprint provides.
+#: Citation resolution draws the same line (``resolver._ESCALATED_REASONS``).
+_ESCALATED_STATUSES = (403, 429)
+
+
+def _escalate(url, refused, timeout):
+    """Last tier for a link refusing an honest request: a browser TLS fingerprint.
+
+    Only to confirm that a source the article already cites is real; an
+    unverifiable citation is a worse outcome than a spoofed handshake. One
+    attempt. ``impersonating_get`` returns None when curl_cffi is absent or the
+    block holds, and then ``refused`` (the honest response) stands and the
+    Wayback fallback runs exactly as it would have without this tier.
+    """
+    impersonated = _wayback.polite_fetch(impersonating_get, url, timeout=timeout)
+    if impersonated is not None:
+        return {
+            "status_code": impersonated.status_code,
+            "ok": True,
+            "error": None,
+            "verified_via": "tls_impersonation",
+            "final_url": str(getattr(impersonated, "url", url)),
+        }
+    result = _finalize_http_result(url, refused, timeout)
+    # A refusal that was never actually escalated is a different fact about
+    # this link than one that survived escalation, and only one of the two is
+    # fixable by installing something. `impersonating_get` reports both as None
+    # on purpose — see `impersonation_available`.
+    if not impersonation_available():
+        result["escalation_unavailable"] = True
+    return result
 
 
 def _finalize_error_result(url, exc, timeout):
@@ -237,7 +256,7 @@ def _finalize_error_result(url, exc, timeout):
     A certificate failure's error is the verifier's reason rather than the raw
     exception, whose ``HTTPSConnectionPool(...)`` wrapper is all an author
     would otherwise see. It is never escalated to ``impersonating_get``, which
-    only a 403 reaches: both tiers verify against the same roots.
+    only a 403 or 429 reaches: both tiers verify against the same roots.
     """
     if isinstance(exc, requests.exceptions.Timeout):
         error = "timeout"

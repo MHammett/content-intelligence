@@ -579,6 +579,17 @@ class TestImpersonationDegradation:
         assert "curl_cffi" in entry["caused_by"][0]
         assert "SECTION 9" in entry["section"]
 
+    def test_a_429_link_with_no_extra_is_recorded(self):
+        """link validation escalates a 429 too, so a 429 with no extra lost it."""
+        report = {}
+        with patch.object(pipeline, "impersonation_available", return_value=False):
+            pipeline._record_impersonation_degradation(
+                report, {"links": self._links(429, 200)}
+            )
+        (entry,) = report["degradations"]
+        assert "1 cited link(s)" in entry["detail"]
+        assert "403 or 429" in entry["detail"]
+
     def test_the_detail_says_blocked_means_unknown(self):
         """The actionable part: do not conclude the source is unreachable."""
         report = {}
