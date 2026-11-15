@@ -42,6 +42,7 @@ if _missing:
 import argparse
 import logging
 import re
+import threading
 import time
 
 import requests
@@ -3272,6 +3273,43 @@ def _warn_if_draft_already_reviewed(draft_text, handoff, handoff_path, publicati
     return matches
 
 
+def _finish_link_archive_lookups(thread, links):
+    """Wait for the link check's background Wayback lookups, then report them.
+
+    ``None`` when none were started (offline, disabled, or no links). Pass 3 is
+    the first reader of a link's ``wayback``, so this is where the run waits;
+    by then the model reviews have usually given the lookups all the time they
+    needed. The wait is bounded by ``run_all_bounded``'s own ceiling inside
+    ``lookup_archives``; the join timeout here is only a backstop.
+    """
+    if thread is None:
+        return
+    started = time.monotonic()
+    thread.join(timeout=60 * 60)
+    waited = time.monotonic() - started
+    if thread.is_alive():
+        log.warning(
+            "Link validation's Wayback lookups were still running; not waited for"
+        )
+    not_archived = [
+        r for r in links or [] if (r.get("wayback") or {}).get("archived") is False
+    ]
+    log.info(
+        "Links: %d not archived in Wayback (lookups waited for %.0fs before Pass 3)",
+        len(not_archived),
+        waited,
+    )
+    # When archive.org's breaker opened, if it did, so Section 9 can tell
+    # whether it has been shut long enough to try again (issue #445).
+    if wayback.note_breaker_state():
+        log.warning(
+            "archive.org rate-limited link validation; its lookups were "
+            "skipped after the breaker opened. Section 9 tries again if "
+            "it starts at least %d min from now.",
+            wayback.BREAKER_COOLDOWN_SECONDS // 60,
+        )
+
+
 def run_draft_pipeline(
     handoff_path,
     publication_name,
@@ -3536,6 +3574,7 @@ def run_draft_pipeline(
             "Offline: skipping LanguageTool, link validation, Wayback, citation "
             "resolution and the SEO model calls"
         )
+    link_archive_lookups = None
     if link_check_enabled:
         from .analysis import links as links_analysis
 
@@ -3548,31 +3587,34 @@ def run_draft_pipeline(
             "Link validation: scanning for URLs%s",
             " + Wayback check" if check_wayback_links else "",
         )
+        # The HTTP checks now, because the review context the models read
+        # names the broken links. The archive lookups alongside the models,
+        # because nothing before Pass 3 reads them; joined there by
+        # ``_finish_link_archive_lookups`` (issue #497).
         pre_analysis["links"] = links_analysis.validate_links(
             corrected_draft,
-            check_wayback=check_wayback_links,
+            check_wayback=False,
             wayback_stale_days=wayback_stale_days,
         )
         broken = [r for r in pre_analysis["links"] if not r.get("ok")]
-        not_archived = [
-            r
-            for r in pre_analysis["links"]
-            if r.get("wayback", {}).get("archived") is False
-        ]
         log.info(
-            "Links: %d found, %d broken/error, %d not archived in Wayback",
+            "Links: %d found, %d broken/error",
             len(pre_analysis["links"]),
             len(broken),
-            len(not_archived),
         )
-        # When archive.org's breaker opened, if it did, so Section 9 can tell
-        # whether it has been shut long enough to try again (issue #445).
-        if wayback.note_breaker_state():
-            log.warning(
-                "archive.org rate-limited link validation; its lookups were "
-                "skipped after the breaker opened. Section 9 tries again if "
-                "it starts at least %d min from now.",
-                wayback.BREAKER_COOLDOWN_SECONDS // 60,
+        if check_wayback_links and pre_analysis["links"]:
+            link_archive_lookups = threading.Thread(
+                target=links_analysis.lookup_archives,
+                args=(pre_analysis["links"],),
+                kwargs={"wayback_stale_days": wayback_stale_days},
+                name="link-archive-lookups",
+                daemon=True,
+            )
+            link_archive_lookups.start()
+            log.info(
+                "Link validation: Wayback lookups for %d URL(s) running "
+                "alongside the review",
+                len(pre_analysis["links"]),
             )
     else:
         # Not checked, rather than checked and empty. An empty list here was
@@ -4518,6 +4560,7 @@ def run_draft_pipeline(
     # are Illinois/energy-specific, so that is the common case for a second user,
     # not an edge case. The adapter loop itself is still skipped when the list is
     # empty; see resolve_citations.
+    _finish_link_archive_lookups(link_archive_lookups, pre_analysis.get("links"))
     citation_sources = pub_config.get("citation_sources", [])
     log.info(
         "Pass 3: Citation resolution (%d source adapter(s) configured)",
