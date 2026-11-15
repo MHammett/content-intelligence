@@ -225,8 +225,21 @@ _RESOLVE_TIMEOUT_SECONDS = (
     + _RELEVANCE_SECONDS
 )
 
-#: Per-call safety-net timeout for one Wayback submission, above wayback.submit's
-#: own 30s default for the same reason as _RESOLVE_TIMEOUT_SECONDS.
+#: HTTP timeout handed to ``wayback.submit`` for each capture request. Passed
+#: explicitly: spn-client's own default is 120s (it has been since 0.3.1), and
+#: this module's budget below used to be documented as sitting "above
+#: wayback.submit's own 30s default" when it sat well below the real one. A
+#: read timeout is not a refusal (spn-client reports it as ``outcome_unknown``),
+#: so a shorter wait loses nothing the next run's reconciliation cannot recover.
+_SUBMIT_HTTP_TIMEOUT_SECONDS = 30
+
+#: Per-call safety-net budget for one Wayback submission, above
+#: _SUBMIT_HTTP_TIMEOUT_SECONDS for the same reason as _RESOLVE_TIMEOUT_SECONDS.
+#: It also covers spn-client's pacing wait, which a 429 backoff (up to 60s, up
+#: to three attempts) can outlast; a submission still running at its budget
+#: gives up its slot but is kept, and recorded when it answers, even after the
+#: batch deadline (see ``_submit_one_per_url``). Seen 2026-11-15: 23 URLs took
+#: 36 save attempts, and five answered moments after the 600s ceiling.
 _SUBMIT_TIMEOUT_SECONDS = 45
 
 #: Wall-clock ceiling for the same-run capture-status pass (see
@@ -1105,6 +1118,12 @@ def _resolve_known_url(
         # Not for a rewritten Drive link: the download host it lands on is
         # not a page a reader opens, and the viewer link the draft cites is.
         final_url = "" if fetch_url != known_url else getattr(resp, "url", "") or ""
+        # Same reasoning as the escalation path below: archive.org is asked
+        # about the publisher's page, not the redirector. The archiving pass
+        # submits the same URL (``_archive_target``), so the lookup and the
+        # submission agree about which page they mean.
+        if _archive_target({"url": known_url, "final_url": final_url}) != known_url:
+            archive_lookup_url = final_url
     except UnsafeURLError as e:
         # Distinct from a fetch failure, and never eligible for the Wayback
         # fallback: archive.org has no snapshot of an internal host, and asking
@@ -1868,6 +1887,33 @@ def _record_archived(wb, source):
     wb["archive_outcome_detail"] = None
 
 
+def _archive_target(entry):
+    """The URL the archiving pass asks archive.org about for one citation.
+
+    The cited URL, except for a Vertex AI grounding redirect that resolution
+    followed to the publisher's page (``final_url``). Archiving the wrapper
+    archives nothing durable: it is opaque, it expires, and archive.org names
+    the capture by where the redirect lands, so ``demote_off_site_snapshots``
+    then reads the publisher's page as an off-site bot wall. Seen 2026-11-15
+    on federal-network-outages: a gemini citation resolved to
+    en.cibercuba.com, was captured there, and was reported as a failed capture.
+
+    Only for grounding redirects. An ordinary redirect (``http`` to ``https``,
+    an AMP page to its canonical one) keeps the URL the draft cites, which is
+    the one a reader clicks; archive.org follows it the same way.
+    """
+    url = entry.get("url")
+    landed = entry.get("final_url")
+    if (
+        landed
+        and draft_citations.is_grounding_redirect(url)
+        and not draft_citations.is_grounding_redirect(landed)
+        and not draft_citations.is_archive_url(landed)
+    ):
+        return landed
+    return url
+
+
 def _record_submission(entry, sub: wayback.SubmitResult) -> None:
     """Fold one ``wayback.submit`` result into the citation's ``wayback`` dict.
 
@@ -1889,12 +1935,12 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
     """
     wb = entry.setdefault("wayback", {})
     wb["submitted"] = bool(sub.get("submitted"))
-    if wb["submitted"] and entry.get("url"):
+    if wb["submitted"] and _archive_target(entry):
         # Whatever archive.org said about this URL before the submission is no
         # longer what it would say after it. Drop the remembered answer so the
         # next run's lookup asks, rather than repeating "not archived" for a
         # page this run just had captured.
-        wayback.forget_lookup(entry["url"])
+        wayback.forget_lookup(_archive_target(entry))
     if sub.get("job_id"):
         wb["submission_job_id"] = sub["job_id"]
     if sub.get("error"):
@@ -1930,9 +1976,9 @@ def _record_submission(entry, sub: wayback.SubmitResult) -> None:
             _record_failure_kind(wb, sub)
     elif sub.get("archived") and sub.get("snapshot_url"):
         _record_archived(wb, sub)
-        if entry.get("url"):
+        if _archive_target(entry):
             # The capture is the answer; the availability index will lag it.
-            wayback.remember_lookup(entry["url"], wb)
+            wayback.remember_lookup(_archive_target(entry), wb)
     elif sub.get("job_id"):
         wb["archive_outcome"] = wayback.ARCHIVE_PENDING
         wb["archive_outcome_detail"] = (
@@ -2026,8 +2072,8 @@ def _record_job_status(entry, status: wayback.JobStatusResult) -> str | None:
     state = status.get("state")
     if state == "success":
         _record_archived(wb, status)
-        if entry.get("url"):
-            wayback.remember_lookup(entry["url"], wb)
+        if _archive_target(entry):
+            wayback.remember_lookup(_archive_target(entry), wb)
     elif state == "failed":
         wb["archive_outcome"] = wayback.ARCHIVE_CAPTURE_FAILED
         wb["archive_outcome_detail"] = status.get("reason")
@@ -2146,7 +2192,7 @@ def build_pending_capture_index(history_root=None):
             # what the calendar already says.
             continue
         for c in entry["report"].get("section_9_citations") or []:
-            url = c.get("url")
+            url = _archive_target(c)
             wb = c.get("wayback") or {}
             job_id = wb.get("submission_job_id")
             if not url or not job_id:
@@ -2265,7 +2311,7 @@ def _reconcile_prior_captures(
             # call is itself paced, and the answer cannot change the outcome.
             _record_quota_exhausted(entry)
             continue
-        prior = pending.get(entry["url"])
+        prior = pending.get(_archive_target(entry))
         if not prior:
             still_to_submit.append(entry)
             continue
@@ -2485,7 +2531,7 @@ def _submit_missing_archives(
         # A citation that is itself a snapshot is the archive. Re-capturing it
         # asks archive.org to archive its own page, and on 2026-11-10 two such
         # citations were submitted and reported as stale gaps.
-        and not draft_citations.is_archive_url(r["url"])
+        and not draft_citations.is_archive_url(_archive_target(r))
         and (
             r.get("wayback", {}).get("archived") is False
             or r.get("wayback", {}).get("snapshot_stale")
@@ -2502,7 +2548,7 @@ def _submit_missing_archives(
     # about, one step earlier in the pipeline.
     targets = []
     for entry in wants_archiving:
-        outcome = classify_host(entry["url"])
+        outcome = classify_host(_archive_target(entry))
         if outcome == HOST_PUBLIC:
             targets.append(entry)
             continue
@@ -2520,7 +2566,7 @@ def _submit_missing_archives(
         )
         log.info(
             "Wayback submission not attempted for %s (%s)",
-            entry["url"],
+            _archive_target(entry),
             outcome,
         )
     if not targets:
@@ -2539,7 +2585,7 @@ def _submit_missing_archives(
     # too — that is a paced archive.org request per duplicate as well.
     by_url = {}
     for entry in targets:
-        by_url.setdefault(entry["url"], []).append(entry)
+        by_url.setdefault(_archive_target(entry), []).append(entry)
 
     # What each representative knew before the pass ran, so the fan-out can copy
     # what the pass *established* rather than everything the citation happens to
@@ -2623,15 +2669,30 @@ def _submit_one_per_url(
     def _submit_one(entry):
         try:
             sub = wayback.submit(
-                entry["url"],
+                _archive_target(entry),
+                timeout=_SUBMIT_HTTP_TIMEOUT_SECONDS,
                 access_key=access_key,
                 secret_key=secret_key,
                 **(options or {}),
             )
         except Exception as e:
-            log.warning(f"Wayback submission raised for {entry['url']}: {e}")
+            log.warning(f"Wayback submission raised for {_archive_target(entry)}: {e}")
             sub = {"submitted": False, "error": str(e)}
+        # The batch below can give up on this call at its group deadline while
+        # the call itself runs on (a daemon thread, never killed) and answers
+        # moments later. Its answer is the better record -- a job id the next
+        # run can reconcile -- so it is kept, but said: otherwise the log reads
+        # "abandoned" for a citation the report shows as queued (2026-11-15).
+        late = (entry.get("wayback") or {}).pop("submission_abandoned", False)
         _record_submission(entry, sub)
+        if late:
+            entry["wayback"]["submission_finished_late"] = True
+            log.info(
+                "Wayback submission for %s answered after the batch had given "
+                "up on it; recorded as %s",
+                _archive_target(entry),
+                entry["wayback"].get("archive_outcome"),
+            )
 
     # Bounded to submit_parallel concurrent requests — a burst of unbounded
     # submissions risks the IP-block the low bound exists to avoid.
@@ -2644,7 +2705,7 @@ def _submit_one_per_url(
     # See :mod:`ci_core.concurrency`.
     jobs = [
         (
-            entry["url"],
+            _archive_target(entry),
             lambda entry=entry: _submit_one(entry),
             _SUBMIT_TIMEOUT_SECONDS,
         )
@@ -2653,17 +2714,22 @@ def _submit_one_per_url(
     outcomes = run_all_bounded(jobs, max_parallel=submit_parallel)
     for url, (_, error) in outcomes.items():
         if error is not None:
-            log.warning(f"Wayback submission abandoned for {url}: {error}")
+            log.warning(
+                f"Wayback submission abandoned for {url}: {error}. It may still "
+                f"answer; if it does, that answer is recorded instead"
+            )
             # An abandoned submission established nothing at all. Left alone it
             # would keep whatever `wayback` already said, which for these
             # entries is "archived: False" — indistinguishable from a submission
             # that ran and failed.
             for entry in targets:
-                if entry["url"] == url and "archive_outcome" not in entry.get(
+                if _archive_target(entry) == url and "archive_outcome" not in entry.get(
                     "wayback", {}
                 ):
                     wb = entry.setdefault("wayback", {})
                     wb["submitted"] = False
+                    # Read by ``_submit_one`` if the call answers after all.
+                    wb["submission_abandoned"] = True
                     # Abandoned, not refused — same reasoning as a read timeout
                     # in `submit`: we stopped waiting, which says nothing about
                     # what archive.org did with the request.
@@ -2722,7 +2788,7 @@ def _adopt_same_day_snapshots(entries):
         wb = entry.get("wayback") or {}
         if wb.get("submission_error_code") != DAILY_LIMIT_CODE:
             continue
-        url = entry.get("url")
+        url = _archive_target(entry)
         if not url:
             continue
         wayback.forget_lookup(url)
@@ -2783,7 +2849,7 @@ def demote_off_site_snapshots(entries):
     for entry in entries:
         wb = entry.get("wayback") or {}
         snap = wb.get("snapshot_url")
-        cited = entry.get("url")
+        cited = _archive_target(entry)
         if not (snap and cited):
             continue
         if _SNAPSHOT_ORIGINAL_RE.match(cited):
@@ -2829,10 +2895,10 @@ def _not_found_on_serving_hosts(entries):
     again, and a host with no successful capture this pass is not second-guessed.
     """
     serving = {
-        _host_of(e.get("url"))
+        _host_of(_archive_target(e))
         for e in entries
         if (e.get("wayback") or {}).get("archive_outcome") == wayback.ARCHIVE_ARCHIVED
-        and e.get("url")
+        and _archive_target(e)
     }
     serving.discard(None)
     return [
@@ -2840,7 +2906,7 @@ def _not_found_on_serving_hosts(entries):
         for e in entries
         if (e.get("wayback") or {}).get("capture_error_code") == "error:not-found"
         and not e["wayback"].get("capture_retried_after_not_found")
-        and _host_of(e.get("url")) in serving
+        and _host_of(_archive_target(e)) in serving
     ]
 
 

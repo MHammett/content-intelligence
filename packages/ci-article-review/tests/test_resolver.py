@@ -3890,7 +3890,13 @@ class TestCaptureOptionsReachArchiveOrg:
             return_value={"submitted": True, "job_id": None},
         ) as mock_submit:
             resolver._submit_missing_archives(self._results())
-        assert set(mock_submit.call_args.kwargs) == {"access_key", "secret_key"}
+        # ``timeout`` is the HTTP wait, not a capture option: spn-client's own
+        # default (120s) sits above this module's per-call budget.
+        assert set(mock_submit.call_args.kwargs) == {
+            "access_key",
+            "secret_key",
+            "timeout",
+        }
 
     def test_secret_options_travel_with_the_credentials(self):
         with (
