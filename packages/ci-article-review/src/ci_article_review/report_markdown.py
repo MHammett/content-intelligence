@@ -2710,13 +2710,23 @@ def _render_section_9(citations, out_of_scope=(), ledger=None):
             if rate_limited
             else ""
         )
+        # Handed to the archiving pass after the review (issue #497), which
+        # looks them up again and captures or compares what it finds.
+        deferred = sum(1 for c in unchecked if c["wayback"].get("lookup_deferred"))
+        retry = (
+            " The archiving pass that runs after this review looks "
+            + ("them" if deferred == len(unchecked) else f"{deferred} of them")
+            + " up again, slowly, and archives what it finds missing; a review "
+            "run after it reads the answers without asking archive.org."
+            if deferred
+            else " To retry just the archive lookups, with no review and no "
+            "model calls, run `ci-review --archive-only` on the draft."
+        )
         lines.append(
             f"> **Archive status is unknown for {len(unchecked)} of these "
             f"citations.**{reason} `archived: null` means the lookup did not "
             f"complete, **not** that the page is unarchived, and nothing was "
-            f"submitted for archiving on that basis. To retry just the archive "
-            f"lookups, with no review and no model calls, run `ci-review "
-            f"--archive-only` on the draft."
+            f"submitted for archiving on that basis.{retry}"
         )
         lines.append("")
 

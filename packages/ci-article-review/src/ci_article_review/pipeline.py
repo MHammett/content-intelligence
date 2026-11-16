@@ -5024,6 +5024,7 @@ def run_draft_pipeline(
             "urls": len(deferred_items),
             "captures": sum(1 for i in deferred_items if i.get("capture")),
             "comparisons": sum(1 for i in deferred_items if i.get("compare")),
+            "lookups": sum(1 for i in deferred_items if i.get("lookup")),
         }
 
     paths = hist.save_run(
