@@ -496,6 +496,15 @@ def check(
         else:
             cache.note("live")
         cache.put(url, result, cdx_fallback=cdx_fallback)
+        # A lookup refused for the rate limit is handed to the pass after the
+        # review (issue #497), when a review has one open. Imported here, not
+        # at the top: ``archive_deferral`` imports this module.
+        if lookup_was_rate_limited(result):
+            from . import archive_deferral
+
+            deferral = archive_deferral.active()
+            if deferral is not None:
+                deferral.defer_lookup({"url": url})
         return result
 
 

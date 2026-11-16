@@ -366,6 +366,7 @@ class TestARealRunHandsItOn:
             "urls": 1,
             "captures": 1,
             "comparisons": 0,
+            "lookups": 0,
         }
         [work] = no_background_archiving
         assert work.name.endswith(archive_followup.WORK_SUFFIX)

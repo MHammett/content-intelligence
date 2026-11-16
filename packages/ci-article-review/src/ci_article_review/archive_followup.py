@@ -12,10 +12,12 @@ This process then:
    never talk to archive.org at once (a second one waits its turn);
 2. waits while archive.org's machine-wide breaker is open, since a refused
    connection closes the address for about an hour;
-3. submits and compares at one request every ``REQUEST_INTERVAL_SECONDS``
+3. looks up the URLs the review could not, because archive.org was refusing
+   requests when it asked, so those are captured and compared like the rest;
+4. submits and compares at one request every ``REQUEST_INTERVAL_SECONDS``
    instead of the review's three, polling capture jobs far longer than a
    review can afford to;
-4. writes ``run_N_<ts>_archive_done.json`` beside the work file.
+5. writes ``run_N_<ts>_archive_done.json`` beside the work file.
 
 The next review does not need to read that file. A completed capture is kept
 in the shared lookup store as the URL's new answer and a comparison in its
@@ -121,9 +123,12 @@ def spawn(work_path):
     return proc.pid
 
 
+_ITEM_FLAGS = ("capture", "compare", "lookup", "citation")
+
+
 def _entry(item):
     """A citation-shaped dict the resolver's passes accept, from a work item."""
-    entry = {k: v for k, v in item.items() if k not in ("capture", "compare")}
+    entry = {k: v for k, v in item.items() if k not in _ITEM_FLAGS}
     entry["resolved"] = True
     entry["wayback"] = dict(item.get("wayback") or {})
     return entry
@@ -181,6 +186,19 @@ def _slow_down():
     resolver._CAPTURE_POLL_BUDGET_SECONDS = CAPTURE_POLL_SECONDS
 
 
+def _look_up(entries, stale_days):
+    """Ask archive.org about each entry the review could not, in place.
+
+    The answer replaces the entry's ``wayback``, as the review's own lookup
+    would have, and lands in the shared lookup store for the next review. A
+    lookup refused again leaves the entry with no answer, so nothing is
+    captured or compared for it this time."""
+    for entry in entries:
+        entry["wayback"] = resolver._wayback_check(
+            resolver._archive_target(entry), stale_days
+        )
+
+
 def _wait_for_breaker(max_wait, sleep=time.sleep):
     """Wait while archive.org's breaker is open. False if it never closed."""
     waited = 0.0
@@ -234,14 +252,27 @@ def run(work_path, *, sleep=time.sleep):
             log.warning("archive.org's breaker never closed; giving up for now")
             return None
         _slow_down()
-        entries = [_entry(item) for item in work["items"]]
-        captures = [e for e, i in zip(entries, work["items"]) if i.get("capture")]
+        items = work["items"]
+        entries = [_entry(item) for item in items]
+        lookups = [e for e, i in zip(entries, items) if i.get("lookup")]
         log.info(
-            "Archiving pass: %d capture(s), %d comparison(s) at one request every %ss",
-            len(captures),
-            sum(1 for i in work["items"] if i.get("compare")),
+            "Archiving pass: %d lookup(s), %d capture(s), %d comparison(s) at one "
+            "request every %ss",
+            len(lookups),
+            sum(1 for i in items if i.get("capture")),
+            sum(1 for i in items if i.get("compare")),
             REQUEST_INTERVAL_SECONDS,
         )
+        stale_days = pipeline_cfg.get("wayback_snapshot_stale_days")
+        _look_up(lookups, None if stale_days is None else int(stale_days))
+        # A citation looked up here is offered for capture too; the resolver
+        # submits only the ones the lookup found missing or stale. A URL only
+        # the link check cited is never captured, as in a review.
+        captures = [
+            e
+            for e, i in zip(entries, items)
+            if i.get("capture") or (i.get("lookup") and i.get("citation"))
+        ]
         resolver._submit_missing_archives(
             captures,
             creds,

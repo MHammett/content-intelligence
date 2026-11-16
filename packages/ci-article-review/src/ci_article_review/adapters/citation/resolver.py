@@ -2554,6 +2554,19 @@ def _submit_missing_archives(
     "not established", it does not fail the run.
     """
     creds = archive_org_creds or {}
+    # A citation archive.org would not look up has no answer to decide a
+    # capture or a comparison on. With a deferral open it goes to the pass
+    # after the review, which looks it up first (issue #497).
+    deferral = archive_deferral.active()
+    if deferral is not None:
+        for r in results:
+            if (
+                r.get("resolved")
+                and r.get("url")
+                and not draft_citations.is_archive_url(_archive_target(r))
+                and wayback.lookup_was_rate_limited(r.get("wayback"))
+            ):
+                deferral.defer_lookup(r, _archive_target(r), citation=True)
     access_key = creds.get("access_key")
     secret_key = creds.get("secret_key")
     # Built once per run, not per submission: the same options apply to every
@@ -2619,10 +2632,9 @@ def _submit_missing_archives(
     # A review hands its capture requests on to the pass that runs after it
     # (``archive_deferral``, issue #497). Everything above still ran, so a
     # non-public or unresolvable host is recorded exactly as before.
-    deferral = archive_deferral.active()
     if deferral is not None:
         for entry in targets:
-            deferral.defer_capture(entry)
+            deferral.defer_capture(entry, _archive_target(entry))
         log.info(
             "Wayback: %d capture request(s) queued for the archiving pass after "
             "this review",
@@ -3069,7 +3081,7 @@ def _verify_archive_matches(results):
             return
         deferral = archive_deferral.active()
         if deferral is not None:
-            deferral.defer_match(entry)
+            deferral.defer_match(entry, _archive_target(entry))
             entry["archive_match"] = ARCHIVE_MATCH_UNCHECKED
             entry["archive_match_detail"] = archive_deferral.DEFERRED_MATCH_DETAIL
             return
