@@ -837,6 +837,27 @@ prints without committing, and `--github-ref` never commits. A full review that
 is written back commits the same two files from its own Sources pass
 (`docs/CITATIONS.md`, "Then every other URL in the Sources list").
 
+**Look on the branch, not on disk.** The pass writes nothing to your checkout
+or to `pipeline_history/`. It makes no `run_N_*` files and no `_archive.log` or
+`_archive_done.json`; those come from a full review's background archiving
+(`archive_followup`). The per-URL results, the counts and the closing
+`Archive status committed to <branch>: <url>` line are printed to the terminal
+only. The day's `pipeline_history/pipeline_YYYYMMDD.log` gets a few lines:
+the round read at its commit, the archive.org pacing, any submission warnings,
+and last `Archive-only: N citation URL(s) found in the round at <commit>`,
+logged after the archiving finishes, not before it. A pass that exits 0 and seems to have left nothing has
+usually committed: check the branch for an `archive:` commit (2026-11-16, on a
+round whose pass was taken for a silent failure).
+
+**Do not re-run inside the breaker's hold.** archive.org's circuit breaker is
+shared by every process on the machine (spn-client's `rate-limit.sqlite`). A trip
+from refused connections holds it for an hour; a trip from 429s alone holds it
+for five minutes. A pass started during the hold sends no lookups, marks every
+URL the store cannot answer `not checked`, and still commits. That replaces a
+better status and fails the archive gate below. The last pass's
+`archive.json` says `"breaker": {"open_at_end": true, ...}` when this applies;
+wait for the hold to end before running another pass.
+
 **The archive gate.** `ci-docs init` also renders `.github/workflows/archive-gate.yml`
 and `.github/scripts/archive_gate.py` (sources `document_repo/archive-gate.yml.tmpl` and
 `archive_gate.py.tmpl`), a check on every pull request from a `round/` branch. It
