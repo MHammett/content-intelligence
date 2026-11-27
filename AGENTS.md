@@ -16,6 +16,7 @@ Guidance for any coding agent or human contributor working in this repository. A
 | learning how the pipeline fits together | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | naming a package, module or concept | [docs/NAMING.md](docs/NAMING.md), [docs/TERMINOLOGY.md](docs/TERMINOLOGY.md) |
 | changing what a publish writes into WordPress (`adapters/cms/`, the block conversion) | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#checking-block-markup-in-the-real-editor) |
+| posting or queuing an article link on LinkedIn, X, Facebook, Buffer or Reddit (every link carries UTMs) | [docs/SOCIAL-LINKS.md](docs/SOCIAL-LINKS.md) |
 
 ## Skills
 
