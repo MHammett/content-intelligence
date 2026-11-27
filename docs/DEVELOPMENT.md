@@ -123,7 +123,9 @@ audit that reads only `source_url` reports a clean library that is not clean.
 **Two things a rehearsal handoff needs.** A real `Article:` line: since PR #215
 `--publish` exits 1 when the title is missing, blank or a bracketed placeholder,
 before the SEO call and before the checklist, so a handoff without one never
-reaches the part being rehearsed. An unfilled `Post type:` is the opposite — it
+reaches the part being rehearsed. For a post, a `Featured image:` line naming a
+real image file, for the same reason: a post without one exits 1 at the same
+point (a page is exempt). An unfilled `Post type:` is the opposite — it
 fails inside `wp.push`, after both — so a placeholder there exercises more of the
 path, not less.
 

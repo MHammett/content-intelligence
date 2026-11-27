@@ -41,8 +41,8 @@ SEO
 [ ] Meta description under 155 characters
 [ ] OG tags set
 [ ] Featured image set: it is the share card (og:image) and the archive thumbnail
-    (the handoff's "Featured image:" line; listed under IMAGES above when there is
-    one, and public from the moment it is uploaded)
+    (the handoff's "Featured image:" line, required for a post; listed under
+    IMAGES above, and public from the moment it is uploaded)
 [ ] Schema type correct for content type (set in Rank Math, not by this script)
 
 PUBLICATION

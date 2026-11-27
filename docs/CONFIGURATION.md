@@ -1705,8 +1705,9 @@ and a note on any whose metadata was not stripped.
 
 ### Slug, excerpt and featured image
 
-Three optional lines under PUBLICATION PARAMETERS in the publication handoff, for
-the things a post needs to look right once it is shared or listed:
+Three lines under PUBLICATION PARAMETERS in the publication handoff, for the
+things a post needs to look right once it is shared or listed. Slug and excerpt
+are optional. **A post must have a featured image**; a page need not:
 
 ```text
 Slug: grid-report-2026
@@ -1718,11 +1719,16 @@ Featured image: ![A lineworker on a pole at dusk](images/hero.jpg)
 |---|---|---|
 | `Slug:` | The last part of the post's URL, sent as `slug`. | WordPress makes one from the title when the post is published. |
 | `Excerpt:` | One line of plain text for archive pages, search results and share cards, sent as `excerpt`. | WordPress uses the opening words of the post, which for most articles is a dek or a pull quote. |
-| `Featured image:` | The picture that stands for the post: the share card (`og:image`), the archive thumbnail, the schema `image`. Uploaded, then set as the post's `featured_media`. | The post has none. |
+| `Featured image:` | The picture that stands for the post: the share card (`og:image`), the archive thumbnail, the schema `image`. Uploaded, then set as the post's `featured_media`. | A post is refused; a page has none. |
 
-A line that is absent, blank or still on the template's bracketed placeholder
-sends nothing, so a handoff written before these lines existed publishes exactly
-the post it did.
+A slug or excerpt line that is absent, blank or still on the template's bracketed
+placeholder sends nothing. A featured image line in that state refuses a post:
+`--publish` exits 1 before the SEO suggestion call and before the checklist, the
+same point an unfilled category or tags line is refused, and the error says what
+line to add. Every post needs one because it is the share card and the archive
+thumbnail, and a post published without one goes out with neither. A page
+(`Post type: page`) is exempt, as it is from category and tags. A handoff for a
+post written before this rule needs the line added before it will publish.
 
 **Slug.** WordPress cleans the slug it is sent (`sanitize_title`): it lowercases,
 turns spaces into hyphens and drops punctuation, including the colon in a time,

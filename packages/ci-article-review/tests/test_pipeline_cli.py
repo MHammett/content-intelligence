@@ -758,6 +758,7 @@ class TestPublishRefusesUnfilledCategoryOrTags:
 
         path = tmp_path / "about-publication.md"
         path.write_text(self._HANDOFF.format(params=params_block), encoding="utf-8")
+        _write_card(tmp_path / "card.png")
         config = {
             "publication": {
                 "wordpress": {
@@ -825,12 +826,14 @@ class TestPublishRefusesUnfilledCategoryOrTags:
     def test_a_genuinely_blank_category_still_publishes(self, tmp_path):
         """The existing, unchanged behaviour this refusal must not touch: a
         blank category was never refused, and still is not."""
-        code, steps = self._publish(tmp_path, "WordPress category:\n")
+        code, steps = self._publish(
+            tmp_path, "WordPress category:\nFeatured image: card.png\n"
+        )
         assert code is None
         assert steps["post"].called
 
     def test_an_absent_category_still_publishes(self, tmp_path):
-        code, steps = self._publish(tmp_path, "")
+        code, steps = self._publish(tmp_path, "Featured image: card.png\n")
         assert code is None
         assert steps["post"].called
 
@@ -860,6 +863,62 @@ class TestPublishRefusesUnfilledCategoryOrTags:
             )
         assert code == 1
         assert not steps["post"].called
+
+
+def _write_card(path):
+    """A small real PNG, enough to pass the featured image's file checks."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (12, 6), (17, 17, 17)).save(buf, "PNG")
+    path.write_bytes(buf.getvalue())
+
+
+class TestPublishRequiresAFeaturedImage:
+    """Every post needs a featured image: it is the share card (og:image) and
+    the archive thumbnail. A post with none is refused before anything is
+    sent, the same way an unfilled category is. A page is exempt."""
+
+    _HANDOFF = TestPublishRefusesUnfilledCategoryOrTags._HANDOFF
+    _publish = TestPublishRefusesUnfilledCategoryOrTags._publish
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            "",
+            "Featured image:\n",
+            "Featured image: [optional. A path to an image file,\nrelative to THIS handoff.]\n",
+            "Post type: post\n",
+        ],
+        ids=["absent", "blank", "placeholder", "explicit-post"],
+    )
+    def test_a_post_without_one_is_refused_before_anything_is_sent(
+        self, tmp_path, caplog, params
+    ):
+        with caplog.at_level("ERROR"):
+            code, steps = self._publish(tmp_path, params)
+        assert code == 1
+        assert [name for name, mock in steps.items() if mock.called] == []
+        assert "no featured image" in caplog.text
+        assert "Featured image:" in caplog.text
+
+    def test_live_is_refused_the_same_way(self, tmp_path, caplog):
+        with caplog.at_level("ERROR"):
+            code, steps = self._publish(tmp_path, "", publish_live=True)
+        assert code == 1
+        assert not steps["post"].called
+
+    def test_a_post_with_one_goes_ahead(self, tmp_path):
+        code, steps = self._publish(tmp_path, "Featured image: ![A card](card.png)\n")
+        assert code is None
+        assert steps["confirm"].called and steps["post"].called
+
+    def test_a_page_is_exempt(self, tmp_path):
+        code, steps = self._publish(tmp_path, "Post type: page\n")
+        assert code is None
+        assert steps["post"].called
 
 
 class TestSeoSuggestionConsoleOutput:
