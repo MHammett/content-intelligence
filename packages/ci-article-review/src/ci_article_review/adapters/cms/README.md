@@ -12,7 +12,9 @@ vocabulary for an image's source, and the checks on a local file. `blocks.py` tu
 an image alone on a line into an image block, given where each one now lives.
 
 `pub_params` may also carry `slug`, `excerpt` and `featured_image` (the handoff's
-three optional lines). The first two are sent when they are not blank. The
+three lines; `run_publish_pipeline` refuses a post without a featured image
+before it gets here, so only a page arrives with none). The first two are sent
+when they are not blank. The
 featured image is a file that is uploaded, through the same checks and scrub as an
 image in the draft and ahead of them, and its attachment ID is what the post
 points at: a URL cannot be one, so it is refused. What the CMS kept of all three is

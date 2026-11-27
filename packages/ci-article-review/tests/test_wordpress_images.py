@@ -2741,7 +2741,9 @@ class TestPublishCommandPostFields:
     def test_a_handoff_without_them_prints_none_of_the_new_lines(
         self, tmp_path, capsys
     ):
-        _run_publish(tmp_path, "Just words.", post_type="post")
+        """A page: a post with no featured image is refused, so only a page can
+        leave all three out (TestPublishRequiresAFeaturedImage)."""
+        _run_publish(tmp_path, "Just words.", post_type="page")
         out = capsys.readouterr().out
         assert "WordPress push successful." in out
         assert not [
@@ -2751,7 +2753,8 @@ class TestPublishCommandPostFields:
         ]
 
     def test_an_unfilled_placeholder_sets_none_of_them(self, tmp_path):
-        """As the template ships: bracketed, and wrapped onto further lines."""
+        """As the template ships: bracketed, and wrapped onto further lines. On
+        a page, since a post's unfilled featured image is refused."""
         params = (
             "Slug: [optional. The last part of the web address:\n"
             "joined by hyphens.]\n"
@@ -2760,7 +2763,7 @@ class TestPublishCommandPostFields:
             "relative to THIS handoff.]\n"
         )
         code, fake, _ = _run_publish(
-            tmp_path, "Just words.", params=params, post_type="post"
+            tmp_path, "Just words.", params=params, post_type="page"
         )
         assert code is None
         assert not {"slug", "excerpt", "featured_media"} & set(fake.created[0])

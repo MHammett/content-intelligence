@@ -24,15 +24,16 @@ Excerpt: [optional. One line of plain text for archive pages, search results and
 share cards. Left out, WordPress uses the opening words of the post, which for
 most articles is a dek or a pull quote. A page has no excerpt unless the site
 adds one, and the push says so if it was dropped.]
-Featured image: [optional. The picture that stands for the post on share cards
-(og:image), in archive lists and in the schema. A path to an image file,
-relative to THIS handoff or absolute: images/hero.jpg. For alt text, write it
-as a Markdown image instead: ![Alt text: what it shows](images/hero.jpg)
+Featured image: [required for a post; optional for a page. The picture that
+stands for the post on share cards (og:image), in archive lists and in the
+schema; 1200x630 suits a share card. A path to an image file, relative to THIS
+handoff or absolute: images/hero.jpg. For alt text, write it as a Markdown
+image instead: ![Alt text: what it shows](images/hero.jpg)
 It goes through everything the images note below says about an image in the
 draft: the checks, the scrubbed copy, the list before the checklist, and public
 the moment it is uploaded. It has to be a file: a post's featured image lives in
-the site's media library, so an https:// URL is refused. Left out, the post has
-none.]
+the site's media library, so an https:// URL is refused. A post whose line is
+left out, blank or still this placeholder is refused before anything is sent.]
 
 SEO METADATA
 Focus keyword: [keyword or phrase | or: derive from primary claim]

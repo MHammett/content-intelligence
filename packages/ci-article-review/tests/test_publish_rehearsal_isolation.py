@@ -44,6 +44,7 @@ Status: draft
 Post type: post
 WordPress category: technical-analysis
 Tags: grid
+Featured image: ![A rehearsal card](card.png)
 
 SEO METADATA
 Focus keyword: rehearsal
@@ -57,6 +58,17 @@ FINAL DRAFT
 
 {LAST}
 """
+
+
+def _write_card(path):
+    """A small real PNG: every post needs a featured image to publish."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (12, 6), (17, 17, 17)).save(buf, "PNG")
+    path.write_bytes(buf.getvalue())
 
 
 def _config_dir(tmp_path):
@@ -77,6 +89,7 @@ def _rehearse(tmp_path, paragraphs=60, history=None):
     work.mkdir()
     handoff = work / "handoff.md"
     handoff.write_text(_handoff(paragraphs), encoding="utf-8")
+    _write_card(work / "card.png")
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     env.pop("CI_HISTORY_ROOT", None)
     if history is not None:
