@@ -39,6 +39,7 @@ Post type: post
 WordPress category: technical-analysis
 Tags: grid
 WordPress author: admin
+Featured image: ![A rehearsal card](card.png)
 
 SEO METADATA
 Focus keyword: rehearsal
@@ -61,6 +62,17 @@ def _load():
 
 
 rehearsal = _load()
+
+
+def _write_card(path):
+    """A small real PNG: every post needs a featured image to publish."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (12, 6), (17, 17, 17)).save(buf, "PNG")
+    path.write_bytes(buf.getvalue())
 
 
 def _config_dir(tmp_path):
@@ -129,6 +141,7 @@ class TestRehearsalEndToEnd:
     def _run(self, tmp_path, config_dir):
         handoff = tmp_path / "handoff.md"
         handoff.write_text(HANDOFF, encoding="utf-8")
+        _write_card(tmp_path / "card.png")
         env = {k: v for k, v in os.environ.items() if k not in (UNSET, UNSET_TOO)}
         env["PYTHONIOENCODING"] = "utf-8"
         return subprocess.run(

@@ -190,7 +190,9 @@ spent — see "What a run costs" in
 uv run ci-review --publish path/to/publication_handoff.md --publication your_publication_name
 ```
 
-Always saves as a WordPress draft unless you add `--publish-live`.
+Always saves as a WordPress draft unless you add `--publish-live`. A post needs a
+`Featured image:` line naming an image file, or it is refused before anything is
+sent; a page does not. See [Slug, excerpt and featured image](docs/CONFIGURATION.md#slug-excerpt-and-featured-image).
 
 Images in the FINAL DRAFT are ordinary Markdown,
 `![alt text](path/to/file.png "optional caption")`, alone on a line. A file on

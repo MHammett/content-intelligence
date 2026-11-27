@@ -422,12 +422,13 @@ def _extract_field(text, label):
 #: line exists to remind whoever fills in the template that ``--publish-live``
 #: is the actual switch, not this field.
 #:
-#: "Slug:", "Excerpt:" and "Featured image:" are optional, and each has a safe
-#: "unset": WordPress derives the slug from the title, builds the excerpt from
-#: the opening words of the body, and a post with no featured image is what every
-#: post published before these fields existed looked like. So an unfilled
-#: placeholder reads as blank, the same as Post type, rather than being flagged
-#: the way category and tags are (see _RAW_PUBLICATION_PARAMETER_FIELDS).
+#: "Slug:" and "Excerpt:" are optional, and each has a safe "unset": WordPress
+#: derives the slug from the title and builds the excerpt from the opening words
+#: of the body. So an unfilled placeholder reads as blank, the same as Post type,
+#: rather than being flagged the way category and tags are (see
+#: _RAW_PUBLICATION_PARAMETER_FIELDS). "Featured image:" reads as blank the same
+#: way, but blank is not safe for a post: run_publish_pipeline refuses a post
+#: whose featured image is blank, so absent, blank and placeholder all stop it.
 _PUBLICATION_PARAMETER_LABELS = {
     "status": "Status:",
     "post_type": "Post type:",

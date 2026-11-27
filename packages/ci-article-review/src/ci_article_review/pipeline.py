@@ -6264,6 +6264,25 @@ def run_publish_pipeline(
             )
             sys.exit(1)
 
+        if not (
+            pub_handoff["publication_parameters"].get("featured_image") or ""
+        ).strip():
+            # Every post needs one: it is the share card (og:image), the archive
+            # thumbnail and the schema image, and a post without one went out with
+            # nothing on its share card (post 327, November 2026). An absent,
+            # blank or placeholder line all read as blank here. A page is exempt,
+            # as it is from category and tags. Checked before the SEO suggestion
+            # call is paid for, and before the checklist asks for a yes.
+            log.error(
+                "The publication handoff has no featured image. Every post needs "
+                "one: it is the share card (og:image) and the archive thumbnail. "
+                "Add a 'Featured image:' line under PUBLICATION PARAMETERS naming "
+                "an image file (1200x630), relative to the handoff, with alt text: "
+                "Featured image: ![What it shows](img/<slug>.jpg) "
+                "Set it and re-run."
+            )
+            sys.exit(1)
+
     from .adapters.cms import wordpress as wp
 
     # Images are refused here with the other bad handoffs: before the SEO
