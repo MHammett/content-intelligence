@@ -26,6 +26,9 @@ CONTENT
 [ ] All consensus flags addressed or explicitly dismissed with reasoning
 [ ] All factual claims have primary source citations
 [ ] All citations have SHA-256 checksums recorded in pipeline_history/
+[ ] Every cited source carries its live URL AND its archive.org copy, as
+    "<live URL> (archived: <Wayback URL>)"; any listed above as lacking one are
+    live-only on purpose (archive.org could not capture them)
 [ ] Pre-draft analysis counterargument dispositions reflected in final draft
 
 TECHNICAL
@@ -50,6 +53,8 @@ PUBLICATION
 [ ] Tags applied
 [ ] Slug and excerpt are what you want (the handoff's "Slug:" and "Excerpt:"
     lines; WordPress makes both up when they are left out)
+[ ] After going live: request indexing in Google Search Console (URL Inspection >
+    paste the post URL > REQUEST INDEXING); the sitemap can lag by days
 [ ] Status is draft (default) -- confirm before switching to live
 """
 
