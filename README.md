@@ -1139,6 +1139,7 @@ content-intelligence/
 │   │   │   │   ├── cms/wordpress.py          WordPress REST API publisher
 │   │   │   │   ├── cms/blocks.py             Markdown -> WordPress block markup
 │   │   │   │   ├── cms/images.py             image sources, and the checks on local image files
+│   │   │   │   ├── cms/citation_pairs.py     publish-time check: each cited URL has its archive.org copy beside it
 │   │   │   │   └── citation/
 │   │   │   │       ├── resolver.py           primary source resolution, checksums, confidence tiers
 │   │   │   │       ├── disposition.py        the one vocabulary for what happened to a citation

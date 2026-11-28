@@ -48,6 +48,7 @@ import time
 import requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .config_loader import (
     apply_api_key_overrides,
@@ -104,6 +105,7 @@ from . import fact_check_scope
 from .adapters.citation import draft_citations
 from .adapters.citation import archive_deferral
 from .adapters.citation import wayback
+from .adapters.cms import citation_pairs
 from . import ensemble_capture
 from .passage_match import same_passage
 from .adapters.citation.disposition import DISPOSITIONS
@@ -6308,6 +6310,14 @@ def run_publish_pipeline(
         _suggest_seo_for_publish(pub_handoff, pub_config, config["api_keys"])
 
     wp.print_image_plan(image_plan)
+    # Said before the checklist asks for its yes, next to the images, so a draft
+    # whose sources lost their archive copies is not published by default.
+    _own_host = urlsplit(wp_config.get("site_url") or "").netloc
+    _unpaired = citation_pairs.describe_unpaired(
+        pub_handoff["final_draft"], own_hosts=[_own_host]
+    )
+    if _unpaired:
+        print("\n" + _unpaired + "\n")
     confirmed = wp.print_checklist_and_confirm(wp_config)
     if not confirmed:
         sys.exit(0)
@@ -6373,6 +6383,15 @@ def run_publish_pipeline(
         print(f"Type:     {result.get('post_type', 'post')}")
         print(f"Post URL: {result['post_url']}")
         print(f"Post ID:  {result['post_id']}")
+        if publish_live:
+            # Nothing submits a new post to Google: the sitemap lags (Rank Math
+            # served a 2026-11-18 lastmod for posts published a week later) and
+            # a post can sit unknown to Google. 2026-11-28: two articles from
+            # 2026-11-11 had never been requested.
+            print(
+                "NEXT: request indexing in Google Search Console: URL Inspection,"
+                f" paste {result['post_url']}, REQUEST INDEXING."
+            )
         wp.print_post_fields_result(result)
         wp.print_image_result(result)
         if result.get("ignored_terms"):
